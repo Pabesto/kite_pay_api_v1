@@ -182,7 +182,7 @@ app.post('/webhook', async (req, res) => {
     // Compare signatures
     if (expectedSignature === razorpaySignature) {
         console.log('✅ Webhook verified successfully');
-        console.log('📦 Webhook Data:', req.body);
+        // console.log('📦 Webhook Data:', req.body);
 
         // TODO: Handle payment/capture/order event here
 
