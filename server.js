@@ -30,7 +30,7 @@ const APPWRITE_BUCKET_ID = '688d2517002810ac532b'; // This was not in your webho
 
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
 const RAZORPAY_WEBHOOK_SECRET = '4@cQVD6GBGa2G7j';
-
+//
 // Initialize Appwrite SDK with the server key for backend operations
 const client = new Client();
 client
