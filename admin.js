@@ -15,7 +15,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 // router.use(roleAuth); // All routes will now have req.userMeta
 
     // 🔥 List all users
-    router.get('/users', async (req, res) => {
+    router.get('/users', authenticateAdmin, async (req, res) => {
         try {
             const result = await users.list();
 
