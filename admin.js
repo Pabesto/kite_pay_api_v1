@@ -12,7 +12,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectionId, webhook_collectionId, bucketId, authenticateAdmin, InputFile, roleAuth, requireRole) => {
 
-router.use(roleAuth); // All routes will now have req.userMeta
+// router.use(roleAuth); // All routes will now have req.userMeta
 
     // 🔥 List all users
     router.get('/users', async (req, res) => {
