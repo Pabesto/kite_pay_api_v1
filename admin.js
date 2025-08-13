@@ -192,8 +192,9 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     }
 
     router.get('/transactions', authenticateAdmin, async (req, res) => {
-        const { userId, qrId } = req.query;
-        console.log('Fetching transactions with userId:', userId, 'and qrId:', qrId);
+        const { userId, qrId ,cursor} = req.query;
+        console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+
         let filters = [];
 
         try {
@@ -230,18 +231,47 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             //     filters
             // );
 
-                 // Fetch latest 25 transactions
+            // Build query array
+            const queries = [
+                ...filters,
+                Query.orderDesc('created_at'),
+                Query.limit(25) // smaller chunks for pagination
+            ];
+
+            // If a cursor was sent, use it for pagination
+            if (cursor) {
+                queries.push(Query.cursorAfter(cursor));
+            }
+
             const transactions = await databases.listDocuments(
                 databaseId,
-                webhook_collectionId, // Transactions collection
-                [
-                    ...filters, // Keeps your existing filters
-                    Query.orderDesc('created_at'), // Add this line to sort descending by date
-                    Query.limit(100) // Limits the results to 10 documents
-                ]
+                webhook_collectionId,
+                queries
             );
 
-            res.status(200).json({ transactions: transactions.documents.reverse() });
+            // Determine if there’s more data
+            const hasMore = transactions.documents.length === 25;
+
+                 // Fetch latest 25 transactions
+            // const transactions = await databases.listDocuments(
+            //     databaseId,
+            //     webhook_collectionId, // Transactions collection
+            //     [
+            //         ...filters, // Keeps your existing filters
+            //         Query.orderDesc('created_at'), // Add this line to sort descending by date
+            //         Query.limit(100) // Limits the results to 10 documents
+            //     ]
+            // );
+
+            // res.status(200).json({ transactions: transactions.documents.reverse() });
+
+            res.status(200).json({
+                transactions: transactions.documents.reverse(),
+                hasMore,
+                nextCursor: hasMore ? transactions.documents[transactions.documents.length - 1].$id : null
+            });
+
+
         } catch (error) {
             console.error('Error fetching transactions:', error);
             res.status(500).json({ error: 'Failed to fetch transactions' });
