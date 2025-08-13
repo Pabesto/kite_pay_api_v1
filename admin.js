@@ -274,20 +274,21 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
+            // const transactions = await databases.listDocuments(
+            //     databaseId,
+            //     webhook_collectionId, // Transactions collection
+            //     filters
+            // );
+
+                // Fetch latest 25 transactions
             const transactions = await databases.listDocuments(
                 databaseId,
                 webhook_collectionId, // Transactions collection
-                filters
+                [
+                    ...filters, // Keeps your existing filters
+                    Query.orderDesc('created_at') // Add this line to sort descending by date
+                ]
             );
-
-                // Fetch latest 25 transactions
-            // const transactions = await databases.listDocuments(databaseId, webhook_collectionId, {
-            //     queries: filters,
-            //     limit: 50,
-            //     offset: 0,
-            //     orderField: 'created_at', // Make sure this is your timestamp field
-            //     orderType: 'DESC'         // Latest first
-            // });
 
             res.status(200).json({ transactions: transactions.documents });
         } catch (error) {
