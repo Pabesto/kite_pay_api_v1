@@ -271,12 +271,10 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
             // Set next cursor (last document's $id)
             const docs = transactions.documents;
-            // const nextCursor = docs.length > 0 ? docs[docs.length - 1].$id : null;
-
-            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
             res.status(200).json({
-                transactions: docs.reverse(), // oldest first if you want
+                transactions: docs, // still newest first
                 nextCursor
             });
 
