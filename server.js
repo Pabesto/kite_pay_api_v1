@@ -200,6 +200,9 @@ app.post('/webhook', async (req, res) => {
     }
 
     const qrCodeId = req.body?.payload?.qr_code?.entity?.id;
+    const paymentsAmount = req.body?.payload?.qr_code?.entity?.payments_amount_received;
+    const paymentsCount = req.body?.payload?.qr_code?.entity?.payments_count_received;
+
 
     if (!qrCodeId) {
         console.log('❌ QR Code ID not found in payload');
@@ -239,6 +242,37 @@ app.post('/webhook', async (req, res) => {
                 created_at: isoDate
             }
         );
+
+        /////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // 3️⃣ Update the corresponding QR code totals
+        if (qrCodeId && paymentsAmount != null && paymentsCount != null) {
+            const qrResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QR_CODES_COLLECTION_ID,
+                [
+                    Query.equal('qrId', qrCodeId),
+                    Query.limit(1)
+                ]
+            );
+
+            if (qrResult.documents.length) {
+                const qrDoc = qrResult.documents[0];
+                await databases.updateDocument(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_QRCODE_COLLECTION_ID,
+                    qrDoc.$id,
+                    {
+                        totalTransactions: paymentsCount,
+                        totalPayInAmount: paymentsAmount
+                    }
+                );
+                console.log(`QR totals updated for qrId ${qrCodeId}`);
+            } else {
+                console.log(`QR Code with qrId ${qrCodeId} not found`);
+            }
+        }
+
 
         console.log('✅ Webhook data saved to Appwrite:', result.$id);
         res.status(200).send('Webhook received and saved');
