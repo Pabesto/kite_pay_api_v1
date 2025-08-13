@@ -237,11 +237,11 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 [
                     ...filters, // Keeps your existing filters
                     Query.orderDesc('created_at'), // Add this line to sort descending by date
-                    Query.limit(50) // Limits the results to 10 documents
+                    Query.limit(100) // Limits the results to 10 documents
                 ]
             );
 
-            res.status(200).json({ transactions: transactions.documents });
+            res.status(200).json({ transactions: transactions.documents.reverse() });
         } catch (error) {
             console.error('Error fetching transactions:', error);
             res.status(500).json({ error: 'Failed to fetch transactions' });
@@ -293,7 +293,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 ]
             );
 
-            res.status(200).json({ transactions: transactions.documents });
+            res.status(200).json({ transactions: transactions.documents.reverse() });
         } catch (error) {
             console.error('❌ Error in /user/transactions:', error);
             res.status(500).json({ error: 'Failed to fetch user transactions' });
