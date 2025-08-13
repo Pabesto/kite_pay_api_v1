@@ -249,7 +249,7 @@ app.post('/webhook', async (req, res) => {
         if (qrCodeId && paymentsAmount != null && paymentsCount != null) {
             const qrResult = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_QR_CODES_COLLECTION_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 [
                     Query.equal('qrId', qrCodeId),
                     Query.limit(1)
