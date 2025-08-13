@@ -11,9 +11,17 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
     // GET all QR codes
     // This is a public endpoint
-    router.get('/qr-codes', async (req, res) => {
+    router.get('/qr-codes', authenticateAdmin, async (req, res) => {
         try {
-            const result = await databases.listDocuments(databaseId, Qr_collectionId);
+            // const result = await databases.listDocuments(databaseId, Qr_collectionId);
+
+            const result = await databases.listDocuments(databaseId, Qr_collectionId, // Transactions collection
+                [
+                    Query.orderDesc('createdAt'), // Add this line to sort descending by date
+                    Query.limit(100) // Limits the results to 10 documents
+                ]
+            );
+
             const qrCodes = result.documents.map(doc => ({
                 qrId: doc.qrId,
                 fileId: doc.fileId,
@@ -22,7 +30,9 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
                 createdAt: doc.createdAt,
                 isActive: doc.isActive,
             }));
-            res.status(200).json(qrCodes);
+
+            res.status(200).json(qrCodes.reverse());// Reverse the order to show the most recent first
+
         } catch (error) {
             console.error('Error fetching QR codes:', error);
             res.status(500).json({ message: "Failed to fetch QR codes.", error: error.message });

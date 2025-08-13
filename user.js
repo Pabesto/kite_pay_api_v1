@@ -74,7 +74,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     // GET all withdrawal requests
-    router.get('/withdrawals', async (req, res) => {
+    router.get('/withdrawals', authenticateAdmin, async (req, res) => {
       const status = req.query.status; // optional: 'pending', 'approved', 'rejected'
       const queries = [];
 
@@ -162,7 +162,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
 
     // POST /withdrawals/approve
-    router.post('/withdrawals/approve', async (req, res) => {
+    router.post('/withdrawals/approve', authenticateAdmin, async (req, res) => {
       const { id, utrNumber } = req.body;
 
       if (!id || !utrNumber || utrNumber.trim().length < 5) {
@@ -195,7 +195,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     // POST /withdrawals/reject
-    router.post('/withdrawals/reject', async (req, res) => {
+    router.post('/withdrawals/reject', authenticateAdmin, async (req, res) => {
       const { id, reason } = req.body;
 
       if (!id || !reason || reason.trim().length < 4) {
