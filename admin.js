@@ -224,20 +224,22 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 }
             }
 
+            // const transactions = await databases.listDocuments(
+            //     databaseId,
+            //     webhook_collectionId, // Transactions collection
+            //     filters
+            // );
+
+                 // Fetch latest 25 transactions
             const transactions = await databases.listDocuments(
                 databaseId,
                 webhook_collectionId, // Transactions collection
-                filters
+                [
+                    ...filters, // Keeps your existing filters
+                    Query.orderDesc('created_at'), // Add this line to sort descending by date
+                    Query.limit(50) // Limits the results to 10 documents
+                ]
             );
-
-                 // Fetch latest 25 transactions
-            // const transactions = await databases.listDocuments(databaseId, webhook_collectionId, {
-            //     queries: filters,
-            //     limit: 100,
-            //     offset: 0,
-            //     orderField: 'created_at', // Replace with your timestamp field if different
-            //     orderType: 'DESC'         // Latest first
-            // });
 
             res.status(200).json({ transactions: transactions.documents });
         } catch (error) {
@@ -286,7 +288,8 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 webhook_collectionId, // Transactions collection
                 [
                     ...filters, // Keeps your existing filters
-                    Query.orderDesc('created_at') // Add this line to sort descending by date
+                    Query.orderDesc('created_at'), // Add this line to sort descending by date
+                    Query.limit(50) // Limits the results to 10 documents
                 ]
             );
 
