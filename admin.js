@@ -192,8 +192,11 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     }
 
     router.get('/transactions', authenticateAdmin, async (req, res) => {
-        const { userId, qrId ,cursor} = req.query;
+        const { userId, qrId , limit = 25, cursor} = req.query;
         console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+
+        // Ensure limit is capped
+        const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         let filters = [];
 
@@ -235,7 +238,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             const queries = [
                 ...filters,
                 Query.orderDesc('created_at'),
-                Query.limit(25) // smaller chunks for pagination
+                Query.limit(limitNum) // smaller chunks for pagination
             ];
 
             // If a cursor was sent, use it for pagination
@@ -250,7 +253,8 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             );
 
             // Determine if there’s more data
-            const hasMore = transactions.documents.length === 25;
+
+            // const hasMore = transactions.documents.length === 25;
 
                  // Fetch latest 25 transactions
             // const transactions = await databases.listDocuments(
@@ -265,10 +269,15 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
             // res.status(200).json({ transactions: transactions.documents.reverse() });
 
+            // Set next cursor (last document's $id)
+            const docs = transactions.documents;
+            // const nextCursor = docs.length > 0 ? docs[docs.length - 1].$id : null;
+
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null
+
             res.status(200).json({
-                transactions: transactions.documents.reverse(),
-                hasMore,
-                nextCursor: hasMore ? transactions.documents[transactions.documents.length - 1].$id : null
+                transactions: docs.reverse(), // oldest first if you want
+                nextCursor
             });
 
 
