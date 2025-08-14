@@ -303,6 +303,12 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             if (cursor) {
                 queries.push(Query.cursorAfter(cursor));
             }
+
+            const transactions = await databases.listDocuments(
+                databaseId,
+                webhook_collectionId,
+                queries
+            );
                 
             const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
