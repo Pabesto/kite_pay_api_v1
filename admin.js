@@ -261,11 +261,11 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     router.get('/user/transactions', async (req, res) => {
-        const { userId, qrId, limit = 5, cursor} = req.query;
+        const { userId, qrId, limit = 25, cursor} = req.query;
         console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
 
         // Ensure limit is capped
-        const limitNum = Math.min(parseInt(limit) || 5, 50);
+        const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
