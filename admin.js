@@ -228,12 +228,6 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 }
             }
 
-            // const transactions = await databases.listDocuments(
-            //     databaseId,
-            //     webhook_collectionId, // Transactions collection
-            //     filters
-            // );
-
             // Build query array
             const queries = [
                 ...filters,
@@ -252,24 +246,6 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 queries
             );
 
-            // Determine if there’s more data
-
-            // const hasMore = transactions.documents.length === 25;
-
-                 // Fetch latest 25 transactions
-            // const transactions = await databases.listDocuments(
-            //     databaseId,
-            //     webhook_collectionId, // Transactions collection
-            //     [
-            //         ...filters, // Keeps your existing filters
-            //         Query.orderDesc('created_at'), // Add this line to sort descending by date
-            //         Query.limit(100) // Limits the results to 10 documents
-            //     ]
-            // );
-
-            // res.status(200).json({ transactions: transactions.documents.reverse() });
-
-            // Set next cursor (last document's $id)
             const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
@@ -278,7 +254,6 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 nextCursor
             });
 
-
         } catch (error) {
             console.error('Error fetching transactions:', error);
             res.status(500).json({ error: 'Failed to fetch transactions' });
@@ -286,16 +261,20 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     router.get('/user/transactions', async (req, res) => {
-        const { userId, qrId } = req.query;
-        console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId);
+        const { userId, qrId, limit = 25, cursor} = req.query;
+        console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+
+        // Ensure limit is capped
+        const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
         }
 
+        let filters = [];
+
         try {
             const userQrIds = await getQrIdsForUser(userId);
-            let filters = [];
 
             // If qrId is provided, validate ownership
             if (qrId) {
@@ -313,24 +292,26 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
-            // const transactions = await databases.listDocuments(
-            //     databaseId,
-            //     webhook_collectionId, // Transactions collection
-            //     filters
-            // );
+            // Build query array
+            const queries = [
+                ...filters,
+                Query.orderDesc('created_at'),
+                Query.limit(limitNum) // smaller chunks for pagination
+            ];
 
-                // Fetch latest 25 transactions
-            const transactions = await databases.listDocuments(
-                databaseId,
-                webhook_collectionId, // Transactions collection
-                [
-                    ...filters, // Keeps your existing filters
-                    Query.orderDesc('created_at'), // Add this line to sort descending by date
-                    Query.limit(50) // Limits the results to 10 documents
-                ]
-            );
+            // If a cursor was sent, use it for pagination
+            if (cursor) {
+                queries.push(Query.cursorAfter(cursor));
+            }
+                
+            const docs = transactions.documents;
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
-            res.status(200).json({ transactions: transactions.documents.reverse() });
+            res.status(200).json({
+                transactions: docs, // still newest first
+                nextCursor
+            });
+
         } catch (error) {
             console.error('❌ Error in /user/transactions:', error);
             res.status(500).json({ error: 'Failed to fetch user transactions' });
