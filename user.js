@@ -20,7 +20,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
     // Users can post a withdrawal request
     router.post('/withdraw', async (req, res) => {
-      const { userId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+      const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
         console.log('Withdraw request received:', req.body);
       // Input validation
       if (!['upi', 'bank'].includes(mode)) {
@@ -54,6 +54,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
           {
             id : wdh_id,
             userId : userId,
+            qrId : qrId || null,
             holderName : holderName,
             amount  : amount,
             mode : mode,
