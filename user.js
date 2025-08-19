@@ -21,7 +21,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     // Users can post a withdrawal request
     router.post('/withdraw', async (req, res) => {
       const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
-        console.log('Withdraw request received:', req.body);
+        // console.log('Withdraw request received:', req.body);
       // Input validation
       if (!['upi', 'bank'].includes(mode)) {
         return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
@@ -40,7 +40,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
       }
 
       const wdh_id = generateWithdrawalId();
-      console.log('Generated Withdrawal ID:', wdh_id);
+      // console.log('Generated Withdrawal ID:', wdh_id);
 
       const istOffset = 5.5 * 60 * 60 * 1000;
       const istTime = new Date(Date.now() + istOffset).toISOString();
