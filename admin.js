@@ -194,7 +194,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     router.get('/transactions', authenticateAdmin, async (req, res) => {
         const { userId, qrId , limit = 25, cursor, from, to} = req.query;
         console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-
+        console.log('Date filters:', { from, to });
         // Ensure limit is capped
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
@@ -277,9 +277,9 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     router.get('/user/transactions', async (req, res) => {
-        const { userId, qrId, limit = 25, cursor} = req.query;
+        const { userId, qrId, limit = 25, cursor, from, to} = req.query;
         console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-
+        console.log('🔍 [USER API] Date filters:', { from, to });
         // Ensure limit is capped
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
@@ -306,6 +306,22 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                     return res.status(200).json({ transactions: [] });
                 }
                 filters.push(Query.equal('qrCodeId', userQrIds));
+            }
+
+            // ✅ Date filters
+            if (from && to) {
+                filters.push(Query.greaterThanEqual('created_at', from));
+                filters.push(Query.lessThanEqual('created_at', to));
+            } else if (from) {
+                // only from -> treat as specific date (00:00 to 23:59)
+                const startOfDay = new Date(from);
+                startOfDay.setHours(0, 0, 0, 0);
+
+                const endOfDay = new Date(from);
+                endOfDay.setHours(23, 59, 59, 999);
+
+                filters.push(Query.greaterThanEqual('created_at', startOfDay.toISOString()));
+                filters.push(Query.lessThanEqual('created_at', endOfDay.toISOString()));
             }
 
             // Build query array
