@@ -230,19 +230,52 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
             // ✅ Date filters
             if (from && to) {
-                filters.push(Query.greaterThanEqual('created_at', from));
-                filters.push(Query.lessThanEqual('created_at', to));
-            } else if (from) {
-                // only from -> treat as specific date (00:00 to 23:59)
-                const startOfDay = new Date(from);
-                startOfDay.setHours(0, 0, 0, 0);
+                const fromDate = new Date(from);
+                fromDate.setUTCHours(0, 0, 0, 0);
 
-                const endOfDay = new Date(from);
-                endOfDay.setHours(23, 59, 59, 999);
+                const toDate = new Date(to);
+                toDate.setUTCHours(23, 59, 59, 999);
 
-                filters.push(Query.greaterThanEqual('created_at', startOfDay.toISOString()));
-                filters.push(Query.lessThanEqual('created_at', endOfDay.toISOString()));
+            if (from === to) {
+                // Same day → restrict to that single date
+                queries.push(Query.between(
+                'created_at',
+                fromDate.toISOString(),
+                toDate.toISOString()
+                ));
+            } else {
+                // Different days → full range
+                queries.push(Query.between(
+                'created_at',
+                fromDate.toISOString(),
+                toDate.toISOString()
+                ));
             }
+            } else if (from && !to) {
+            // Only from → that specific day
+            const fromStart = new Date(from);
+            fromStart.setUTCHours(0, 0, 0, 0);
+
+            const fromEnd = new Date(from);
+            fromEnd.setUTCHours(23, 59, 59, 999);
+
+            queries.push(Query.between(
+                'created_at',
+                fromStart.toISOString(),
+                fromEnd.toISOString()
+            ));
+            } else if (!from && to) {
+            // Only to → everything up to that day
+            const toDate = new Date(to);
+            toDate.setUTCHours(23, 59, 59, 999);
+
+            queries.push(Query.lessThanEqual(
+                'created_at',
+                toDate.toISOString()
+            ));
+            }
+            // else: no from & no to → no filter
+
 
             // Build query array
             const queries = [
