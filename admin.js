@@ -250,21 +250,21 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             if (from === to) {
                 // Same date → only that IST day
                 const { start, end } = toISTRange(from);
-                queries.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
             } else {
                 // Range → from start of 'from' IST day to end of 'to' IST day
                 const { start } = toISTRange(from);
                 const { end } = toISTRange(to);
-                queries.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
             }
             } else if (from && !to) {
             // Only 'from' → treat as single day filter
             const { start, end } = toISTRange(from);
-            queries.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
             } else if (!from && to) {
             // Only 'to' → everything until end of that IST day
             const { end } = toISTRange(to);
-            queries.push(Query.lessThanEqual("created_at", end.toISOString()));
+            filters.push(Query.lessThanEqual("created_at", end.toISOString()));
             }
 
 
