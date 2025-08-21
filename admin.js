@@ -238,14 +238,14 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
             if (from === to) {
                 // Same day → restrict to that single date
-                queries.push(Query.between(
+                filters.push(Query.between(
                 'created_at',
                 fromDate.toISOString(),
                 toDate.toISOString()
                 ));
             } else {
                 // Different days → full range
-                queries.push(Query.between(
+                filters.push(Query.between(
                 'created_at',
                 fromDate.toISOString(),
                 toDate.toISOString()
@@ -259,7 +259,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             const fromEnd = new Date(from);
             fromEnd.setUTCHours(23, 59, 59, 999);
 
-            queries.push(Query.between(
+            filters.push(Query.between(
                 'created_at',
                 fromStart.toISOString(),
                 fromEnd.toISOString()
@@ -269,7 +269,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             const toDate = new Date(to);
             toDate.setUTCHours(23, 59, 59, 999);
 
-            queries.push(Query.lessThanEqual(
+            filters.push(Query.lessThanEqual(
                 'created_at',
                 toDate.toISOString()
             ));
