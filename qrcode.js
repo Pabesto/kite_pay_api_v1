@@ -4,10 +4,46 @@
 
 const express = require('express');
 const { ID, Query } = require('node-appwrite');
+const Razorpay = require("razorpay");
+const fs = require("fs");
+const axios = require("axios");
+const { File } = require('buffer');
+const path = require('path');
+
+// --------------------
+// Razorpay Setup
+// --------------------
+const razorpay = new Razorpay({
+  key_id: 'rzp_test_R9fF4cePyFbq4m',
+  key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
+});
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bucketId, authenticateAdmin, roleAuth, requireRole) => {
     const router = express.Router();
+
+    async function assignQrToUser({qrId, assignedUserId }) {
+        // Find the QR document by qrId
+        const docResult = await databases.listDocuments(databaseId, Qr_collectionId, [
+            Query.equal('qrId', qrId)
+        ]);
+
+        if (docResult.documents.length === 0) {
+            throw new Error("QR Code not found");
+        }
+
+        const docId = docResult.documents[0].$id;
+
+        // Update assignment
+        await databases.updateDocument(
+            databaseId,
+            Qr_collectionId,
+            docId,
+            { assignedUserId: assignedUserId === '' ? null : assignedUserId }
+        );
+
+        return { success: true, docId };
+    }
 
     // GET all QR codes
     // This is a public endpoint
@@ -41,6 +77,28 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         }
     });
 
+    async function saveQrEntry({
+        qrId,
+        fileId,
+        imageUrl,
+        createdAt,
+        assignedUserId = null,
+        }) {
+        return await databases.createDocument(
+            databaseId,
+            Qr_collectionId,
+            ID.unique(),
+            {
+            qrId,
+            fileId,
+            imageUrl,
+            assignedUserId,
+            isActive: true,
+            createdAt,
+            }
+        );
+    }
+
     // POST a new QR code entry
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
@@ -51,21 +109,15 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         }
 
         try {
-            const newQrCode = await databases.createDocument(
-                databaseId,
-                Qr_collectionId,
-                ID.unique(),
-                {
-                    qrId,
-                    fileId,
-                    imageUrl,
-                    assignedUserId: null,
-                    isActive: true,
-                    createdAt: createdAt
-                }
-            );
 
-                // 2. If assignedUserId is provided, update user prefs
+            const newQrCode = await saveQrEntry({
+                qrId,
+                fileId,
+                imageUrl,
+                createdAt,
+            });
+
+            // 2. If assignedUserId is provided, update user prefs
             // if (assignedUserId) {
             //     await users.updatePrefs(assignedUserId, {
             //         qrId,
@@ -151,30 +203,17 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         const { assignedUserId } = req.body; // assignedUserId can now be null or a string
 
         try {
-            const docResult = await databases.listDocuments(databaseId, Qr_collectionId, [
-                Query.equal('qrId', qrId)
-            ]);
-
-            if (docResult.documents.length === 0) {
-                return res.status(404).json({ message: "QR Code not found." });
-            }
-
-            const docId = docResult.documents[0].$id;
-            
-            // If assignedUserId is null or empty, this will correctly clear the field in Appwrite
-            // otherwise, it will update the field with the new userId.
-            await databases.updateDocument(
-                databaseId,
-                Qr_collectionId,
-                docId,
-                { assignedUserId: assignedUserId === '' ? null : assignedUserId }
-            );
+            const result = await assignQrToUser({
+            qrId,
+            assignedUserId
+        });
 
             res.status(200).json({ message: "User assignment updated successfully." });
         } catch (error) {
             console.error('Error updating user assignment for QR code:', error);
             res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
         }
+
     });
     
     router.get('/qr-codes/user/:userId', async (req, res) => {
@@ -210,5 +249,219 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
     });
 
 
+    async function createRazorpayQr(userId) {
+        const qr = await razorpay.qrCode.create({
+            type: "upi_qr",
+            name: `user_test`,
+            usage: "multiple_use", // or "single_use"
+            fixed_amount: false,
+            description: "QR for user payment",
+            notes: {
+            userId,
+            },
+        });
+
+        return qr; // contains id, image_url, etc.
+    }
+
+    // --------------------
+    // Download QR image
+    // --------------------
+    async function downloadQrImage(url, path) {
+        const response = await axios.get(url, { responseType: "arraybuffer" });
+        fs.writeFileSync(path, response.data);
+        return path;
+    }
+
+    // --------------------
+    // Upload to Appwrite + Save Metadata
+    // --------------------
+    async function uploadQrToAppwrite(localPath, userId, razorpayQr) {
+
+        // 2. Ensure file exists
+        if (!fs.existsSync(localPath)) {
+        throw new Error(`Downloaded file missing: ${localPath}`);
+        }
+
+        // Use readFileSync to create a buffer instead of a stream
+        const fileBuffer = fs.readFileSync(localPath);
+    
+        // Get file name from path
+        const fileName = path.basename(localPath);
+        
+        // Create File object with proper metadata
+        const fileObject = new File([fileBuffer], fileName, {
+            type: 'image/png' // or appropriate MIME type
+        });
+
+        // 3. Upload to Appwrite Storage
+        const file = await storage.createFile(
+            bucketId,
+            ID.unique(),
+            fileObject
+        );
+
+        // console.log("File uploaded to Appwrite Storage:", file);
+
+        const imageUrl = 'https://fra.cloud.appwrite.io/v1/storage/buckets/'+bucketId+'/files/'+file.$id+'/view?project=688c98fd002bfe3cf596';
+
+        // Save metadata in Appwrite collection
+        // const newQrCode = await databases.createDocument(
+        //     databaseId,
+        //     Qr_collectionId,
+        //     ID.unique(),
+        //     {
+        //     userId,
+        //     razorpayQrId: razorpayQr.id,
+        //     razorpayQrUrl: razorpayQr.image_url,
+        //     storageFileId: file.$id,
+        //     active: true,
+        //     }
+        // );
+
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const istTime = new Date(Date.now() + istOffset).toISOString();
+
+        const newQrCode = await saveQrEntry({
+            qrId: razorpayQr.id,
+            fileId: file.$id,
+            imageUrl: imageUrl,
+            createdAt: istTime,
+        });
+
+        return { file, newQrCode, razorpayQr };
+
+    }
+
+    async function uploadQrDirect(url) {
+        const response = await axios.get(url, { responseType: "stream" });
+
+        const file = await storage.createFile(
+            bucketId,
+            ID.unique(),
+            response.data // 👈 pass stream directly
+        );
+
+        return file;
+    }
+
+    async function hasFiveActiveQRCodes(userId) {
+        if (!userId) {
+            throw new Error("Missing userId parameter");
+        }
+
+        try {
+            const response = await databases.listDocuments(
+                databaseId,
+                Qr_collectionId,
+                [Query.equal('assignedUserId', userId)]
+            );
+
+            // Count only active QR codes
+            const activeCount = response.documents.filter(doc => doc.isActive === true).length;
+
+            return {
+                hasFiveActive: activeCount >= 5,
+                activeCount
+            };
+        } catch (error) {
+            console.error('Error checking active QR codes:', error);
+            throw error;
+        }
+    }
+
+    router.post("/create-qr/:userId", async (req, res) => {
+        // console.log('Create QR request for userId:', req.params.userId);
+        try {
+            const { userId } = req.params;
+
+            // console.log('Creating QR for userId:', userId);
+
+            // Check limit before assigning
+            const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
+
+            if (hasFiveActive) {
+                console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
+                return res.status(400).json({
+                    message: `User already has ${activeCount} active QR codes. Cannot assign more.`
+                });
+            }
+
+            // 1. Create QR in Razorpay
+            const qr = await createRazorpayQr(userId);
+
+            // 2. Download QR image
+            const localPath = `/tmp/${qr.id}.png`;
+            await downloadQrImage(qr.image_url, localPath);
+
+            // 3. Save QR metadata in Appwrite (DB + Storage)
+            await uploadQrToAppwrite(localPath, userId, qr);
+
+            // 4. Assign QR to user using extracted method
+            await assignQrToUser({
+                qrId: qr.id,
+                assignedUserId: userId
+            });
+
+            res.json({
+                success: true,
+                razorpayQrId: qr.id,
+                // appwriteFileId: file.$id,
+                // appwriteDocId: doc.$id,
+                qrImageUrl: qr.image_url,
+            });
+        } catch (err) {
+            console.error("Error creating QR:", err);
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
+
+    router.post("/create-admin-qr/:userId", authenticateAdmin, async (req, res) => {
+        // console.log('Create QR request for userId:', req.params.userId);
+        try {
+            const { userId } = req.params;
+
+            // console.log('Creating QR for userId:', userId);
+
+            // Check limit before assigning
+            const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
+
+            if (hasFiveActive) {
+                console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
+                return res.status(400).json({
+                    message: `User already has ${activeCount} active QR codes. Cannot assign more.`
+                });
+            }
+
+            // 1. Create QR in Razorpay
+            const qr = await createRazorpayQr(userId);
+
+            // 2. Download QR image
+            const localPath = `/tmp/${qr.id}.png`;
+            await downloadQrImage(qr.image_url, localPath);
+
+            // 3. Save QR metadata in Appwrite (DB + Storage)
+            await uploadQrToAppwrite(localPath, userId, qr);
+
+            // 4. Assign QR to user using extracted method
+            await assignQrToUser({
+                qrId: qr.id,
+                assignedUserId: userId
+            });
+
+            res.json({
+                success: true,
+                razorpayQrId: qr.id,
+                // appwriteFileId: file.$id,
+                // appwriteDocId: doc.$id,
+                qrImageUrl: qr.image_url,
+            });
+        } catch (err) {
+            console.error("Error creating QR:", err);
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
+
     return router;
+
 };
