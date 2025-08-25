@@ -20,9 +20,12 @@ const path = require('path');
 // });
 // Production mode
 const razorpay = new Razorpay({
-  key_id: 'rzp_live_R9isOZf2f1NjPj',
-  key_secret: 'oWoXAr0LHEN3jQGxOaMb1zgm',
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+console.log(process.env.RAZORPAY_KEY_ID);
+// console.log(process.env.RAZORPAY_KEY_SECRET);
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bucketId, authenticateAdmin, roleAuth, requireRole) => {

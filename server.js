@@ -2,6 +2,7 @@
 // This is the main server file. It sets up the Express app, the Appwrite connection,
 // and the routes for QR code management and webhook processing.
 
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -41,6 +42,8 @@ client
 const databases = new Databases(client);
 const storage = new Storage(client);
 const users = new Users(client);
+
+// console.log(process.env.RAZORPAY_KEY_ID);
 
 // Middleware
 app.use(cors()); // Enables cross-origin requests
