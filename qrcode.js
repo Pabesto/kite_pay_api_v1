@@ -13,6 +13,12 @@ const path = require('path');
 // --------------------
 // Razorpay Setup
 // --------------------
+// TEST MODE
+// const razorpay = new Razorpay({
+//   key_id: 'rzp_test_R9fF4cePyFbq4m',
+//   key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
+// });
+// Production mode
 const razorpay = new Razorpay({
   key_id: 'rzp_test_R9fF4cePyFbq4m',
   key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
@@ -21,6 +27,39 @@ const razorpay = new Razorpay({
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bucketId, authenticateAdmin, roleAuth, requireRole) => {
     const router = express.Router();
+
+    async function getUserName(userId) {
+        try {
+            const user = await users.get(userId);
+            return user.name || null;
+        } catch (err) {
+            console.error("Error fetching user name:", err.message);
+            return null;
+        }
+    }
+
+    async function getUserEmail(userId) {
+        try {
+            const user = await users.get(userId);
+            return user.email || null;
+        } catch (err) {
+            console.error("Error fetching user email:", err.message);
+            return null;
+        }
+    }
+
+    async function getUserDetails(userId) {
+        try {
+            const user = await users.get(userId); // one API call
+            return {
+            name: user.name || null,
+            email: user.email || null,
+            };
+        } catch (err) {
+            console.error("Error fetching user details:", err.message);
+            return { name: null, email: null };
+        }
+    }
 
     async function assignQrToUser({qrId, assignedUserId }) {
         // Find the QR document by qrId
@@ -250,12 +289,15 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
 
     async function createRazorpayQr(userId) {
+
+        const { name, email } = await getUserDetails(userId);
+
         const qr = await razorpay.qrCode.create({
             type: "upi_qr",
-            name: `user_test`,
-            usage: "multiple_use", // or "single_use"
+            name: email || "Kite User",
+            usage: "multiple_use",
             fixed_amount: false,
-            description: "QR for user payment",
+            description: `${name || "Kite User"} : ${email || ""}`,
             notes: {
             userId,
             },
