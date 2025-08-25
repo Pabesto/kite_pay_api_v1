@@ -20,8 +20,8 @@ const path = require('path');
 // });
 // Production mode
 const razorpay = new Razorpay({
-  key_id: 'rzp_test_R9fF4cePyFbq4m',
-  key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
+  key_id: 'rzp_live_R9isOZf2f1NjPj',
+  key_secret: 'oWoXAr0LHEN3jQGxOaMb1zgm',
 });
 
 // We will now pass the required dependencies and middleware from the main server file
