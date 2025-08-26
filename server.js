@@ -12,7 +12,7 @@ const { Client, Databases, Storage, Users, Account, ID, Query, InputFile } = req
 // Import the route files
 const qrCodeRoutes = require('./qrcode');
 const adminRoutes = require('./admin');
-const userRoutes = require('./user');
+const withdrawRoutes = require('./withdraw');
 
 // --- Configuration & Initialization ---
 const app = express();
@@ -26,7 +26,7 @@ const APPWRITE_DATABASE_ID = '688ca9f3003e593a6227';
 const APPWRITE_QRCODE_COLLECTION_ID = '688f6b46002963a163aa';
 const APPWRITE_WEBHOOK_DATA_COLLECTION_ID = '688cf5920023475022df'; // This was not in your webhook file, keeping the placeholder for completeness
 const APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID = '68920fba001e27b604c9'
-const APPWRITE_USERS_META_COLLECTION_ID = '6897ba4500266be0a093';
+const APPWRITE_USERS_META_COLLECTION_ID = 'users_meta_test';
 const APPWRITE_BUCKET_ID = '688d2517002810ac532b'; // This was not in your webhook file, keeping the placeholder for completeness
 
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -40,6 +40,7 @@ client
     .setKey(APPWRITE_API_KEY);
 
 const databases = new Databases(client);
+const account = new Account(client);
 const storage = new Storage(client);
 const users = new Users(client);
 
@@ -67,6 +68,8 @@ const authenticateToken = async (req, res, next) => {
             return res.status(401).json({ error: 'Authentication token is required.' });
         }
 
+        console.log('Verifying token:', token);
+
         // Create a new client instance for this specific request with the user's JWT
         const userClient = new Client()
             .setEndpoint(APPWRITE_ENDPOINT)
@@ -76,7 +79,26 @@ const authenticateToken = async (req, res, next) => {
         const account = new Account(userClient);
         const user = await account.get(); // This call verifies the JWT with Appwrite
 
-        req.user = user;
+        console.log('Authenticated user:', user.$id);
+
+        // req.user = user;
+
+         // Query your users_meta collection by userId (user.$id)
+        const list = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [
+                Query.equal('userId', user.$id)
+            ]
+        );
+
+        if (list.documents.length === 0) {
+            return res.status(404).json({ error: 'User metadata not found' });
+        }
+
+        // Attach the users_meta document to req.user
+        req.user = list.documents[0];
+
         next();
     } catch (err) {
         console.error('JWT verification error:', err.message);
@@ -89,14 +111,86 @@ const authenticateToken = async (req, res, next) => {
 const authenticateAdmin = (req, res, next) => {
     authenticateToken(req, res, () => {
         // After successful token verification, check the user's labels
-        if (!req.user || !req.user.labels?.includes('admin')) {
-            return res.status(403).json({ error: 'Not authorized: Admin privileges required.' });
+        // if (!req.user || !req.user.labels?.includes('admin')) {
+        //     return res.status(403).json({ error: 'Not authorized: Admin privileges required.' });
+        // }
+
+        if (!req.user || !['admin'].includes(req.user.role)) {
+            return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
         }
+
         next();
     });
 };
 
+const authenticateAdminOrSubAdmin = (req, res, next) => {
+    authenticateToken(req, res, () => {
+        // After successful token verification, check the user's labels
+        // if (!req.user || !(req.user.labels?.includes('admin') || req.user.labels?.includes('subadmin'))) {
+        //     return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
+        // }
+
+        // if (!req.user || !(req.user.labels?.includes('admin') || req.user.labels?.includes('subadmin'))) {
+        //     return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
+        // }
+
+        if (!req.user || !['admin', 'subadmin'].includes(req.user.role)) {
+            return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
+        }
+
+        next();
+    });
+};
+
+// async function authenticateAdminOrSubAdmin(req, res, next) {
+//     try {
+//         const jwt = req.headers.authorization?.split(" ")[1]; // Bearer <token>
+//         if (!jwt) {
+//             return res.status(401).json({ error: "Missing token" });
+//         }
+
+//         // 🔑 Get user from Appwrite Account API
+//         const appwriteUser = await account.get();
+
+//         // 📦 Fetch role from your `users_meta` collection
+//         const userMeta = await databases.listDocuments(
+//             APPWRITE_DATABASE_ID,
+//             APPWRITE_USERS_META_COLLECTION_ID,
+//             [Query.equal("userId", appwriteUser.$id)]
+//         );
+
+//         console.log("User role data:", userMeta);
+
+//         if (userMeta.total === 0) {
+//             return res.status(403).json({ error: "User metadata not found" });
+//         }
+
+//         const meta = userMeta.documents[0];
+
+//         // Attach full user info for later use
+//         req.user = {
+//             $id: appwriteUser.$id,
+//             email: appwriteUser.email,
+//             name: appwriteUser.name,
+//             role: meta.role,
+//             parentId: meta.parentId || null,
+//         };
+
+//         // ✅ Allow only admin or sub-admin
+//         if (meta.role === "admin" || meta.role === "sub-admin") {
+//             return next();
+//         }
+
+//         return res.status(403).json({ error: "Not allowed" });
+//     } catch (err) {
+//         console.error("❌ Auth error:", err.message || err);
+//         return res.status(401).json({ error: "Invalid or expired token" });
+//     }
+// }
+
+
 // Middleware to load user role & meta info
+
 async function roleAuth(req, res, next) {
     try {
         const token = req.headers.authorization?.split(" ")[1];
@@ -156,13 +250,13 @@ function requireRole(...roles) {
 
 // Pass Appwrite and authentication dependencies to the route handlers
 // QR code routes use the admin authentication middleware
-app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateAdmin, roleAuth, requireRole));
+app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateAdmin, InputFile, roleAuth, requireRole));
+app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/user', userRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateAdmin, InputFile, roleAuth, requireRole));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
 // --- Webhook Endpoint ---
 // Secret:   4@cQVD6GBGa2G7j

@@ -9,7 +9,7 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectionId, Withdrawal_request_collectionId, bucketId, authenticateAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -48,7 +48,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
       try {
         const response = await databases.createDocument(
-          databaseId,
+          APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId, // <-- collection ID
           ID.unique(),
           {
@@ -87,7 +87,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
       queries.push(Query.limit(100)); // adjust limit as needed
 
       try {
-        const result = await databases.listDocuments(databaseId, Withdrawal_request_collectionId, queries);
+        const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, queries);
         
         const withdrawals = result.documents.map((doc) => {
           // Destructure and remove all Appwrite system fields
@@ -132,7 +132,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
       try {
         const result = await databases.listDocuments(
-          databaseId,
+          APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId,
           queries
         );
@@ -171,7 +171,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
       }
 
       try {
-        const result = await databases.listDocuments(databaseId, Withdrawal_request_collectionId, [
+        const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, [
           Query.equal('id', id),
           Query.limit(1),
         ]);
@@ -182,7 +182,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
         const doc = result.documents[0];
 
-        await databases.updateDocument(databaseId, Withdrawal_request_collectionId, doc.$id, {
+        await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, doc.$id, {
           status: 'approved',
           utrNumber: utrNumber.trim(),
           rejectionReason: null, // clear if any
@@ -204,7 +204,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
       }
 
       try {
-        const result = await databases.listDocuments(databaseId, Withdrawal_request_collectionId, [
+        const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, [
           Query.equal('id', id),
           Query.limit(1),
         ]);
@@ -215,7 +215,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
 
         const doc = result.documents[0];
 
-        await databases.updateDocument(databaseId, Withdrawal_request_collectionId, doc.$id, {
+        await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, doc.$id, {
           status: 'rejected',
           rejectionReason: reason.trim(),
           utrNumber: null, // clear if any
@@ -232,7 +232,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     // GET all config
     router.get("/config", async (req, res) => {
       try {
-        const docs = await databases.listDocuments(databaseId, '68a73217002ed987b246');
+        const docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
 
         // convert docs into a key:value map
         const config = {};

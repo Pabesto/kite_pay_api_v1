@@ -14,21 +14,21 @@ const path = require('path');
 // Razorpay Setup
 // --------------------
 // TEST MODE
-// const razorpay = new Razorpay({
-//   key_id: 'rzp_test_R9fF4cePyFbq4m',
-//   key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
-// });
-// Production mode
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: 'rzp_test_R9fF4cePyFbq4m',
+  key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
 });
+// Production mode
+// const razorpay = new Razorpay({
+//   key_id: process.env.RAZORPAY_KEY_ID,
+//   key_secret: process.env.RAZORPAY_KEY_SECRET,
+// });
 
-console.log(process.env.RAZORPAY_KEY_ID);
+// console.log(process.env.RAZORPAY_KEY_ID);
 // console.log(process.env.RAZORPAY_KEY_SECRET);
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bucketId, authenticateAdmin, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole) => {
     const router = express.Router();
 
     async function getUserName(userId) {
@@ -66,7 +66,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
     async function assignQrToUser({qrId, assignedUserId }) {
         // Find the QR document by qrId
-        const docResult = await databases.listDocuments(databaseId, Qr_collectionId, [
+        const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
             Query.equal('qrId', qrId)
         ]);
 
@@ -78,7 +78,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
         // Update assignment
         await databases.updateDocument(
-            databaseId,
+            APPWRITE_DATABASE_ID,
             Qr_collectionId,
             docId,
             { assignedUserId: assignedUserId === '' ? null : assignedUserId }
@@ -93,7 +93,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         try {
             // const result = await databases.listDocuments(databaseId, Qr_collectionId);
 
-            const result = await databases.listDocuments(databaseId, Qr_collectionId, // Transactions collection
+            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
                 [
                     Query.orderDesc('createdAt'), // Add this line to sort descending by date
                     Query.limit(100) // Limits the results to 10 documents
@@ -123,11 +123,12 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         qrId,
         fileId,
         imageUrl,
+        createdByUserId,
         createdAt,
         assignedUserId = null,
         }) {
         return await databases.createDocument(
-            databaseId,
+            APPWRITE_DATABASE_ID,
             Qr_collectionId,
             ID.unique(),
             {
@@ -135,6 +136,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
             fileId,
             imageUrl,
             assignedUserId,
+            createdByUserId,
             isActive: true,
             createdAt,
             }
@@ -156,6 +158,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
                 qrId,
                 fileId,
                 imageUrl,
+                createdByUserId: req.user.$id, // set by your JWT middleware
                 createdAt,
             });
 
@@ -180,7 +183,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         const { qrId } = req.params;
 
         try {
-            const docResult = await databases.listDocuments(databaseId, Qr_collectionId, [
+            const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
                 Query.equal('qrId', qrId)
             ]);
             
@@ -193,7 +196,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
             const docId = doc.$id;
 
             await storage.deleteFile(bucketId, fileId);
-            await databases.deleteDocument(databaseId, Qr_collectionId, docId);
+            await databases.deleteDocument(APPWRITE_DATABASE_ID, Qr_collectionId, docId);
 
             res.status(200).json({ message: "QR Code and file deleted successfully." });
         } catch (error) {
@@ -204,16 +207,18 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
     // PUT to toggle the isActive status
     // This is an admin-only endpoint
-    router.put('/toggle-qr-status/:qrId', authenticateAdmin, async (req, res) => {
+    router.put('/toggle-qr-status/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
         const { qrId } = req.params;
         const { isActive } = req.body;
+
+        const userRequested = req.user; // set by your JWT middleware
 
         if (typeof isActive !== 'boolean') {
             return res.status(400).json({ message: "Invalid value for 'isActive'." });
         }
 
         try {
-            const docResult = await databases.listDocuments(databaseId, Qr_collectionId, [
+            const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
                 Query.equal('qrId', qrId)
             ]);
 
@@ -221,10 +226,18 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
                 return res.status(404).json({ message: "QR Code not found." });
             }
 
+            if(userRequested.role === 'subadmin'){
+                if(docResult.documents[0].createdByUserId !== userRequested.$id){
+                    return res.status(403).json({ message: 'Forbidden: Cannot edit QR codes not created by you' });
+                }   
+            } else {    
+                // sub-admins can only edit QR codes they created
+            }
+
             const docId = docResult.documents[0].$id;
 
             await databases.updateDocument(
-                databaseId,
+                APPWRITE_DATABASE_ID,
                 Qr_collectionId,
                 docId,
                 { isActive }
@@ -240,7 +253,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
     // PUT to assign a user to a QR code
     // This is an admin-only endpoint
     // MODIFIED: Endpoint to assign or unlink a user from a QR code
-    router.put('/assign-qr/:qrId', authenticateAdmin, async (req, res) => {
+    router.put('/assign-qr/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
         const { qrId } = req.params;
         const { assignedUserId } = req.body; // assignedUserId can now be null or a string
 
@@ -267,9 +280,15 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
         try {
             const response = await databases.listDocuments(
-                databaseId,
+                APPWRITE_DATABASE_ID,
                 Qr_collectionId,
-                [Query.equal('assignedUserId', userId)]
+                [
+                Query.or([
+                    Query.equal('assignedUserId', userId),
+                    Query.equal('createdByUserId', userId),
+                ]),
+                // Query.limit(50),
+            ]
             );
 
             const userQrCodes = response.documents.map(doc => ({
@@ -371,6 +390,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
             qrId: razorpayQr.id,
             fileId: file.$id,
             imageUrl: imageUrl,
+            createdByUserId: userId,
             createdAt: istTime,
         });
 
@@ -397,7 +417,7 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
 
         try {
             const response = await databases.listDocuments(
-                databaseId,
+                APPWRITE_DATABASE_ID,
                 Qr_collectionId,
                 [Query.equal('assignedUserId', userId)]
             );
@@ -415,11 +435,12 @@ module.exports = (databases, storage, users, ID, databaseId, Qr_collectionId, bu
         }
     }
 
-    router.post("/create-qr/:userId", async (req, res) => {
+    router.post("/create-qr/:userId",authenticateAdminOrSubAdmin, async (req, res) => {
         // console.log('Create QR request for userId:', req.params.userId);
         try {
-            const { userId } = req.params;
-
+            // const { userId } = req.params;
+            const userId = req.user.$id; // set by your JWT middleware
+            
             // console.log('Creating QR for userId:', userId);
 
             // Check limit before assigning

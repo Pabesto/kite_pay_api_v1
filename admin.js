@@ -10,21 +10,61 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectionId, webhook_collectionId, bucketId, authenticateAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+    // router.use(roleAuth); // All routes will now have req.userMeta
 
-// router.use(roleAuth); // All routes will now have req.userMeta
+    function getISTDateTime() {
+        const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
+        return new Date(Date.now() + istOffset).toISOString();
+    }
 
-    // 🔥 List all users
-    router.get('/users', authenticateAdmin, async (req, res) => {
+    // 🔥 List all users AppWrite Users
+    // router.get('/users', authenticateAdmin, async (req, res) => {
+    //     try {
+    //         const result = await users.list();
+
+    //         const simplifiedUsers = result.users.map(user => ({
+    //             $id: user.$id,
+    //             email: user.email,
+    //             name: user.name,
+    //             status: user.status,
+    //             labels: user.labels,
+    //         }));
+
+    //         return res.json(simplifiedUsers);
+    //     } catch (err) {
+    //         console.error('List users error:', err);
+    //         return res.status(500).json({ error: 'Failed to fetch users' });
+    //     }
+    // });
+
+    // 🔥 List all users AppWrite Collections users_meta
+    router.get('/users', authenticateAdminOrSubAdmin, async (req, res) => {
+        const requestorId = req.user.$id;
+        const role = req.user.role; // 'admin' | 'subadmin'
+
         try {
-            const result = await users.list();
+            const queries = [];
 
-            const simplifiedUsers = result.users.map(user => ({
-                $id: user.$id,
-                email: user.email,
-                name: user.name,
-                status: user.status,
-                labels: user.labels,
+            if (role === 'subadmin') {
+            queries.push(Query.equal('parentId', requestorId));
+            }
+            // admins see all; subadmins only their users
+
+            const result = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            queries // must be an array
+            );
+
+            const simplifiedUsers = result.documents.map(doc => ({
+            $id: doc.userId,
+            email: doc.email,
+            name: doc.name,
+            role: doc.role,
+            parentId: doc.parentId,
+            status: doc.status,
+            labels: doc.labels,
             }));
 
             return res.json(simplifiedUsers);
@@ -45,29 +85,107 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     // });
 
     // 🔐 Create new user (admin-only)
-    router.post('/create-user', authenticateAdmin, async (req, res) => {
-        const {name, email, password } = req.body;
+    // router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
+    //     const {name, email, password } = req.body;
 
-        if (!name || !email || !password) {
-            return res.status(400).json({ error: 'Name, Email and password are required' });
+    //     if (!name || !email || !password) {
+    //         return res.status(400).json({ error: 'Name, Email and password are required' });
+    //     }
+
+    //     try {
+    //         const response = await users.create(
+    //             ID.unique(),
+    //             email,
+    //             undefined,
+    //             password,
+    //             name
+    //         );
+
+    //         return res.status(201).json({
+    //             message: 'User created successfully',
+    //             user: {
+    //                 $id: response.$id,
+    //                 email: response.email,
+    //                 name: response.name,
+    //             },
+    //         });
+    //     } catch (err) {
+    //         console.error('❌ Create user error:', err.message || err);
+    //         return res.status(500).json({ error: err.message || 'User creation failed' });
+    //     }
+    // });
+
+    // 🔐 Create new user (admin/sub-admin allowed)
+    router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
+        const { name, email, password, role } = req.body;
+        creatorId = req.user.$id;
+
+        if(role === 'admin'){
+            return res.status(400).json({ error: 'admin cant be created' });
+        }
+
+        if (!name || !email || !password || !role) {
+            return res.status(400).json({ error: 'Name, Email, Password and Role are required' });
+        }
+
+        if (req.user.role === 'subadmin' && role !== 'user') {
+            return res.status(403).json({ error: 'Sub-admins can only create users' });
+        }
+
+        if(req.user.role === 'admin'){
+            creatorId = null; // if users have been created by admin, parentId will be null
         }
 
         try {
-            const response = await users.create(
-                ID.unique(),
-                email,
-                undefined,
-                password,
-                name
+            // 1) Create Appwrite auth user
+            const response = await users.create(ID.unique(), email, undefined, password, name);
+
+            await users.updateLabels(response.$id, [role]);
+
+            // 2) Prepare payload
+            const userId = response.$id; // must be $id
+            const payload = {
+                userId,
+                email: response.email,
+                name: response.name,
+                role,
+                parentId: creatorId,
+                status: true,
+            };
+
+            // 3) Idempotent metadata write: use 1:1 docId = userId
+            try {
+            console.log('Creating user metadata document for userId:', userId);
+            await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                userId,                // <-- 1:1 mapping: docId equals auth user $id
+                payload
             );
+            } catch (e) {
+            console.error('Error creating user metadata document:', e);
+            if (e?.code === 409) {
+                // Either docId already exists or a unique index collided; update in place
+                await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                userId,
+                payload
+                );
+            } else {
+                throw e;
+            }
+            }
 
             return res.status(201).json({
-                message: 'User created successfully',
-                user: {
-                    $id: response.$id,
-                    email: response.email,
-                    name: response.name,
-                },
+            message: 'User created successfully',
+            user: {
+                $id: response.$id,
+                email: response.email,
+                name: response.name,
+                role,
+                parentId: creatorId,
+            },
             });
         } catch (err) {
             console.error('❌ Create user error:', err.message || err);
@@ -76,29 +194,65 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     // ✏️ Edit user endpoint
-    router.put('/edit-user/:id', authenticateAdmin, async (req, res) => {
-        const userId = req.params.id;
+    router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
+        const userIdtoEdit = req.params.id;
         const { name, email, labels } = req.body;
 
-        if (!userId || (!name && !email && !labels)) {
+        const userRequested = req.user; // set by your JWT middleware
+
+        if (!userIdtoEdit || (!name && !email && !labels)) {
             return res.status(400).json({ error: 'User ID and at least one field (name or email or labels) are required' });
         }
 
         try {
-            const user = await users.get(userId);
+            const user = await users.get(userIdtoEdit);
 
             if (user.labels?.includes('admin')) {
                 return res.status(403).json({ error: 'Cannot edit admin users' });
             }
 
-            if (name) await users.updateName(userId, name);
-            if (email) await users.updateEmail(userId, email);
-            if (labels) {
-                if (!Array.isArray(labels)) {
-                    return res.status(400).json({ error: 'Labels must be an array' });
-                }
-                await users.updateLabels(userId, labels);
+            if (name) await users.updateName(userIdtoEdit, name);
+            if (email) await users.updateEmail(userIdtoEdit, email);
+            // if (labels) {
+            //     if (!Array.isArray(labels)) {
+            //         return res.status(400).json({ error: 'Labels must be an array' });
+            //     }
+            //     await users.updateLabels(userId, labels);
+            // }
+
+            // Find document in users_mets collection matching userId
+            const list = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                [
+                    Query.equal('userId', userIdtoEdit)
+                ]
+            );
+            if (list.documents.length === 0) {
+                return res.status(404).json({ error: 'User metadata document not found in users_mets' });
             }
+
+            if(userRequested.role === 'subadmin'){
+                if(list.documents[0].parentId !== userRequested.$id){
+                    return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
+                }   
+            } else {    
+                // sub-admins can only edit users they created
+            }
+
+            const doc = list.documents[0];
+            const docId = doc.$id;
+
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                docId,
+                {
+                    ...(name && { name }),
+                    ...(email && { email }),
+                    ...(labels && { labels }),
+                }
+            );
 
             return res.json({ message: 'User updated successfully' });
         } catch (err) {
@@ -106,10 +260,34 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
         }
     });
 
+
+
     // 🔐 Reset user password
-    router.post('/reset-password/:id', authenticateAdmin, async (req, res) => {
+    router.post('/reset-password/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userId = req.params.id;
         const { password } = req.body;
+
+        const userRequested = req.user; // set by your JWT middleware
+
+        // Find document in users_mets collection matching userId
+        const list = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [
+                Query.equal('userId', userId)
+            ]
+        );
+        if (list.documents.length === 0) {
+            return res.status(404).json({ error: 'User metadata document not found in users_mets' });
+        }
+
+        if(userRequested.role === 'subadmin'){
+            if(list.documents[0].parentId !== userRequested.$id){
+                return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
+            }   
+        } else {    
+            // sub-admins can only edit users they created
+        }
 
         if (!password || password.length < 6) {
             return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -132,8 +310,9 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
     });
 
     // POST /update-user-status
-    router.post('/update-user-status',authenticateAdmin, async (req, res) => {
+    router.post('/update-user-status',authenticateAdminOrSubAdmin, async (req, res) => {
         const { userId, status } = req.body;
+        const userRequested = req.user; // set by your JWT middleware
 
         if (!userId || typeof status !== 'boolean') {
             return res.status(400).json({ error: 'Missing or invalid fields' });
@@ -147,6 +326,36 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             }
 
             const result = await users.updateStatus(userId, status);
+
+           // Update status in users_mets collection
+            const list = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                [
+                    Query.equal('userId', userId)
+                ]
+            );
+            if (list.documents.length === 0) {
+                return res.status(404).json({ error: 'User metadata document not found in users_meta' });
+            }
+
+             if(userRequested.role === 'subadmin'){
+                if(list.documents[0].parentId !== userRequested.$id){
+                    return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
+                }   
+            } else {    
+                // sub-admins can only edit users they created
+            }
+
+            const docId = list.documents[0].$id;
+
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                docId,
+                { status }
+            );
+
             return res.json({ success: true, status: result.status });
         } catch (err) {
             console.error('❌ Status update failed:', err.message);
@@ -169,18 +378,35 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
                 return res.status(403).json({ error: 'Cannot delete admin users' });
             }
 
+            // Delete user in Appwrite users service
             await users.delete(userId);
+
+            // Find and delete corresponding document in users_mets collection
+            const list = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_USERS_META_COLLECTION_ID,
+                [
+                    Query.equal('userId', userId)
+                ]
+            );
+
+            if (list.documents.length > 0) {
+                const docId = list.documents[0].$id;
+                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, docId);
+            }
+
             return res.status(200).json({ message: 'User deleted successfully' });
         } catch (err) {
             return res.status(500).json({ error: err.message || 'Failed to delete user' });
         }
     });
+
     
     // Helper to get QR IDs for a user
     async function getQrIdsForUser(userId) {
     try {
         const response = await databases.listDocuments(
-        databaseId,
+        APPWRITE_DATABASE_ID,
         Qr_collectionId, // Ensure this matches your actual QR codes collection ID
         [Query.equal('assignedUserId', userId)]
         );
@@ -280,7 +506,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             }
 
             const transactions = await databases.listDocuments(
-                databaseId,
+                APPWRITE_DATABASE_ID,
                 webhook_collectionId,
                 queries
             );
@@ -384,7 +610,7 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
             }
 
             const transactions = await databases.listDocuments(
-                databaseId,
+                APPWRITE_DATABASE_ID,
                 webhook_collectionId,
                 queries
             );
@@ -403,6 +629,48 @@ module.exports = (databases, storage, users, ID, Query, databaseId, Qr_collectio
         }
     });
         
+
+    router.get('/getMyMetaData', authenticateToken, async (req, res) => {
+        try {
+            const userId = req.user.$id; // set by your JWT middleware
+
+            console.log('getMyMetaData for userId:', userId);
+
+            const result = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [Query.equal('userId', userId)] // must be in an array
+            );
+
+            if (!result.documents.length) {
+            return res.status(404).json({ error: 'User metadata not found' });
+            }
+
+            const doc = result.documents[0];
+
+            console.log('getMyMetaData doc:', doc);
+
+            // Optionally pick only safe fields
+            const payload = {
+            id: doc.userId,
+            email: doc.email,
+            name: doc.name,
+            role: doc.role,
+            parentId: doc.parentId,
+            status: doc.status,
+            labels: doc.labels,
+            // childrenCount: doc.childrenCount, // if you added counter cache
+            };
+
+            console.log('getMyMetaData payload:', payload);
+
+            return res.json(payload);
+        } catch (err) {
+            console.error('getMyMetaData error:', err);
+            return res.status(500).json({ error: 'Failed to fetch metadata' });
+        }
+    });
+
     return router;
     
 };
