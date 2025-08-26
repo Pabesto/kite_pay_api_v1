@@ -632,7 +632,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     router.get('/getMyMetaData', authenticateToken, async (req, res) => {
         try {
-            const userId = req.user.$id; // set by your JWT middleware
+            const userId = req.user.userId; // set by your JWT middleware
 
             console.log('getMyMetaData for userId:', userId);
 
@@ -643,7 +643,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             );
 
             if (!result.documents.length) {
-            return res.status(404).json({ error: 'User metadata not found' });
+            return res.status(404).json({ error: 'User metadata not found 2' });
             }
 
             const doc = result.documents[0];
