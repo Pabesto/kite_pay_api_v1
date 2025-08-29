@@ -47,7 +47,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const queries = [];
 
             if (role === 'subadmin') {
-            queries.push(Query.equal('parentId', requestorId));
+                queries.push(Query.equal('parentId', requestorId));
             }
             // admins see all; subadmins only their users
 
@@ -74,6 +74,51 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    router.get('/subadmins', authenticateAdmin, async (req, res) => {
+        const requestorId = req.user.$id;
+        const role = req.user.role; // 'admin' | 'subadmin'
+
+        try {
+            const queries = [];
+
+            if (role !== 'admin') {
+                return res.status(403).json({ error: 'only admins can see sub-admins' });
+            }
+
+            queries.push(Query.equal('role', 'subadmin'));
+            // admins see all subadmins; subadmins see none
+
+            const search = req.query.search; // ?search=John or ?search=email@host
+            if (search !== undefined && search.trim().length > 0) {
+                // For partial matches (Appwrite >= v1.0.0), use Query.search:
+                queries.push(Query.search('name', search));
+                queries.push(Query.search('email', search));
+                // For exact, use Query.equal('email', search) or Query.equal('name', search)
+            }
+
+            const result = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            queries // must be an array
+            );
+
+            const simplifiedUsers = result.documents.map(doc => ({
+            $id: doc.userId,
+            email: doc.email,
+            name: doc.name,
+            role: doc.role,
+            parentId: doc.parentId,
+            status: doc.status,
+            labels: doc.labels,
+            }));
+
+            return res.json(simplifiedUsers);
+        } catch (err) {
+            console.error('List sub-admins error:', err);
+            return res.status(500).json({ error: 'Failed to fetch sub-admins' });
+        }
+    });
+    
     // // 🔥 List all users
     // router.get('/userss', async (req, res) => {
     //     try {
