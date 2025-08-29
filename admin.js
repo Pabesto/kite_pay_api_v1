@@ -92,7 +92,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (search !== undefined && search.trim().length > 0) {
                 // For partial matches (Appwrite >= v1.0.0), use Query.search:
                 queries.push(Query.search('name', search));
-                queries.push(Query.search('email', search));
+                // queries.push(Query.search('email', search));
                 // For exact, use Query.equal('email', search) or Query.equal('name', search)
             }
 
@@ -262,7 +262,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // Validate target is a SUBADMIN
             const targetSubadmin = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, subadminId);
-            if (targetSubadmin.role !== 'SUBADMIN') {
+            if (targetSubadmin.role !== 'subadmin') {
                 return res.status(400).json({ message: 'Target is not a SUBADMIN' });
             }
 

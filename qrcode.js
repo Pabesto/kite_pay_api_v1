@@ -229,7 +229,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             if(userRequested.role === 'subadmin'){
                 if(docResult.documents[0].createdByUserId !== userRequested.$id){
                     return res.status(403).json({ message: 'Forbidden: Cannot edit QR codes not created by you' });
-                }   
+                }
+                if(isActive === true){
+                    return res.status(403).json({ message: 'Forbidden: Subadmin cannot activate an active QR code' });
+                }
             } else {    
                 // sub-admins can only edit QR codes they created
             }
