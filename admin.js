@@ -508,8 +508,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     router.get('/transactions', authenticateAdmin, async (req, res) => {
         const { userId, qrId , limit = 25, cursor, from, to} = req.query;
-        console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-        console.log('Date filters:', { from, to });
+        // console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+        // console.log('Date filters:', { from, to });
         // Ensure limit is capped
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
@@ -616,8 +616,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     router.get('/user/transactions', async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to} = req.query;
-        console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-        console.log('🔍 [USER API] Date filters:', { from, to });
+        // console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+        // console.log('🔍 [USER API] Date filters:', { from, to });
         // Ensure limit is capped
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
@@ -723,7 +723,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             const userId = req.user.userId; // set by your JWT middleware
 
-            console.log('getMyMetaData for userId:', userId);
+            // console.log('getMyMetaData for userId:', userId);
 
             const result = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
@@ -737,7 +737,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const doc = result.documents[0];
 
-            console.log('getMyMetaData doc:', doc);
+            // console.log('getMyMetaData doc:', doc);
 
             // Optionally pick only safe fields
             const payload = {
@@ -751,7 +751,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // childrenCount: doc.childrenCount, // if you added counter cache
             };
 
-            console.log('getMyMetaData payload:', payload);
+            // console.log('getMyMetaData payload:', payload);
 
             return res.json(payload);
         } catch (err) {

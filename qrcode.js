@@ -425,11 +425,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 [Query.equal('assignedUserId', userId)]
             );
 
-            console.log(`User ${userId} has ${response.total} total QR codes assigned.`);
+            // console.log(`User ${userId} has ${response.total} total QR codes assigned.`);
 
-            for (const doc of response.documents) {
-                console.log(`QR Code ${doc.qrId} isActive: ${doc.isActive}`);
-            }
+            // for (const doc of response.documents) {
+            //     console.log(`QR Code ${doc.qrId} isActive: ${doc.isActive}`);
+            // }
 
             // Count only active QR codes
             const activeCount = response.documents.filter(doc => doc.isActive === true).length;
