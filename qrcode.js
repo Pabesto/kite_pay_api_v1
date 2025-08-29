@@ -158,7 +158,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 qrId,
                 fileId,
                 imageUrl,
-                createdByUserId: req.user.$id, // set by your JWT middleware
+                createdByUserId: req.user.userId, // set by your JWT middleware
                 createdAt,
             });
 
@@ -425,6 +425,12 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 [Query.equal('assignedUserId', userId)]
             );
 
+            console.log(`User ${userId} has ${response.total} total QR codes assigned.`);
+
+            for (const doc of response.documents) {
+                console.log(`QR Code ${doc.qrId} isActive: ${doc.isActive}`);
+            }
+
             // Count only active QR codes
             const activeCount = response.documents.filter(doc => doc.isActive === true).length;
 
@@ -442,7 +448,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         // console.log('Create QR request for userId:', req.params.userId);
         try {
             // const { userId } = req.params;
-            const userId = req.user.$id; // set by your JWT middleware
+            const userId = req.user.userId; // set by your JWT middleware
             
             // console.log('Creating QR for userId:', userId);
 
@@ -450,7 +456,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
 
             if (hasFiveActive) {
-                console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
+                console.log(`User already has ${activeCount} active QR codes. Cannot assign more.`);
                 return res.status(400).json({
                     message: `User already has ${activeCount} active QR codes. Cannot assign more.`
                 });

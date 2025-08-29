@@ -40,7 +40,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // 🔥 List all users AppWrite Collections users_meta
     router.get('/users', authenticateAdminOrSubAdmin, async (req, res) => {
-        const requestorId = req.user.$id;
+        const requestorId = req.user.userId;
         const role = req.user.role; // 'admin' | 'subadmin'
 
         try {
@@ -75,7 +75,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     router.get('/subadmins', authenticateAdmin, async (req, res) => {
-        const requestorId = req.user.$id;
+        const requestorId = req.user.userId;
         const role = req.user.role; // 'admin' | 'subadmin'
 
         try {
@@ -163,7 +163,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // 🔐 Create new user (admin/sub-admin allowed)
     router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
         const { name, email, password, role } = req.body;
-        creatorId = req.user.$id;
+        creatorId = req.user.userId;
 
         if(role === 'admin'){
             return res.status(400).json({ error: 'admin cant be created' });
@@ -324,7 +324,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             if(userRequested.role === 'subadmin'){
-                if(list.documents[0].parentId !== userRequested.$id){
+                if(list.documents[0].parentId !== userRequested.userId){
                     return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
                 }   
             } else {    
@@ -351,8 +351,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-
-
     // 🔐 Reset user password
     router.post('/reset-password/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userId = req.params.id;
@@ -373,7 +371,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
 
         if(userRequested.role === 'subadmin'){
-            if(list.documents[0].parentId !== userRequested.$id){
+            if(list.documents[0].parentId !== userRequested.userId){
                 return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
             }   
         } else {    
@@ -431,7 +429,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
              if(userRequested.role === 'subadmin'){
-                if(list.documents[0].parentId !== userRequested.$id){
+                if(list.documents[0].parentId !== userRequested.userId){
                     return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
                 }   
             } else {    
