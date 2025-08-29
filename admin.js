@@ -238,6 +238,52 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    router.put('/assign-user/:subadminId', authenticateAdmin, async (req, res) => {
+        const { subadminId } = req.params;
+        const { userId, unassign = false } = req.body; // userId can be string; unassign=true clears parentId
+
+        try {
+
+            if (!userId) {
+                return res.status(400).json({ message: 'userId is required' });
+            }
+
+            const requester = req.user; // { id, role }
+            const isAdmin = requester.role === 'admin';
+            // const isSubadmin = requester.role === 'subadmin';
+
+            if (!isAdmin) {
+                return res.status(403).json({ message: 'Forbidden only admins can assign users to SUBADMINS' });
+            }
+
+            // if (isSubadmin && requester.id !== subadminId) {
+            //     return res.status(403).json({ message: 'Subadmin can only assign to self' });
+            // }
+
+            // Validate target is a SUBADMIN
+            const targetSubadmin = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, subadminId);
+            if (targetSubadmin.role !== 'SUBADMIN') {
+                return res.status(400).json({ message: 'Target is not a SUBADMIN' });
+            }
+
+            // Optional extra guard for subadmins: only modify users already under them
+            // if (isSubadmin) {
+            //     const u = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId);
+            //     if (u.parentId && u.parentId !== requester.id) {
+            //         return res.status(403).json({ message: 'Not allowed to modify this user' });
+            //     }
+            // }
+
+            const update = { parentId: unassign ? null : subadminId };
+            await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId, update);
+
+            return res.status(200).json({ message: 'Assignment updated.' });
+        } catch (err) {
+            console.error('Assign user error:', err);
+            return res.status(500).json({ message: 'Failed to update assignment', error: err.message });
+        }
+    });
+
     // ✏️ Edit user endpoint
     router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userIdtoEdit = req.params.id;
