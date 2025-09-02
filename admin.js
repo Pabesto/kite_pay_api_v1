@@ -534,7 +534,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         [Query.equal("assignedUserId", managedUserIds)]
         );
         managedQrs = qrDocs.documents;
-        console.log(`Subadmin ${subadminId} has access to QRs of managed users:`, managedQrs.map(q => q.qrId));
+        // console.log(`Subadmin ${subadminId} has access to QRs of managed users:`, managedQrs.map(q => q.qrId));
     }
 
     return [
@@ -661,7 +661,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const userRequested = req.user; // set by your JWT middleware
         const isSubadmin = userRequested.role === 'subadmin';
 
-        console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
+        // console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
             
         // Basic auth checks
         if (!isSubadmin && userRequested.userId !== userId) {
@@ -678,7 +678,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // const userQrIds = await getQrIdsForUser(userId);
             // Usage in your API
 
-            console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
+            // console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
 
             // Get all QR IDs the user (or subadmin) can access
             // Subadmin: all QRs they created + QRs of users under them
@@ -688,7 +688,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ? await getQrIdsForSubadmin(userId)
             : await getQrIdsForUser(userId); // existing fn for end-users
 
-            console.log(`User ${userId} has access to QR IDs:`, userQrIds);
+            // console.log(`User ${userId} has access to QR IDs:`, userQrIds);
 
             // If qrId is provided, validate ownership
             if (qrId) {
