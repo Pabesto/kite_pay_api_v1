@@ -14,15 +14,15 @@ const path = require('path');
 // Razorpay Setup
 // --------------------
 // TEST MODE
-// const razorpay = new Razorpay({
-//   key_id: 'rzp_test_R9fF4cePyFbq4m',
-//   key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
-// });
-// Production mode
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: 'rzp_test_R9fF4cePyFbq4m',
+  key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
 });
+// Production mode
+// const razorpay = new Razorpay({
+//   key_id: process.env.RAZORPAY_KEY_ID,
+//   key_secret: process.env.RAZORPAY_KEY_SECRET,
+// });
 
 // console.log(process.env.RAZORPAY_KEY_ID);
 // console.log(process.env.RAZORPAY_KEY_SECRET);

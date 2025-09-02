@@ -523,6 +523,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     );
     const managedUserIds = managedUsers.documents.map(u => u.userId);
 
+    // console.log(`Subadmin ${subadminId} manages users:`, managedUsers);
+
     // QRs assigned to those managed users
     let managedQrs = [];
     if (managedUserIds.length > 0) {
@@ -532,11 +534,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         [Query.equal("assignedUserId", managedUserIds)]
         );
         managedQrs = qrDocs.documents;
+        console.log(`Subadmin ${subadminId} has access to QRs of managed users:`, managedQrs.map(q => q.qrId));
     }
 
     return [
-        ...createdQrs.documents.map(q => q.$id),
-        ...managedQrs.map(q => q.$id),
+        ...createdQrs.documents.map(q => q.qrId),
+        ...managedQrs.map(q => q.qrId),
     ];
     }
 
@@ -657,6 +660,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const userRequested = req.user; // set by your JWT middleware
         const isSubadmin = userRequested.role === 'subadmin';
+
+        console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
             
         // Basic auth checks
         if (!isSubadmin && userRequested.userId !== userId) {
@@ -672,10 +677,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             // const userQrIds = await getQrIdsForUser(userId);
             // Usage in your API
+
+            console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
+
+            // Get all QR IDs the user (or subadmin) can access
+            // Subadmin: all QRs they created + QRs of users under them
+            // End-user: only their assigned QRs
+
             const userQrIds = isSubadmin
             ? await getQrIdsForSubadmin(userId)
             : await getQrIdsForUser(userId); // existing fn for end-users
 
+            console.log(`User ${userId} has access to QR IDs:`, userQrIds);
 
             // If qrId is provided, validate ownership
             if (qrId) {
