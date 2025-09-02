@@ -506,6 +506,40 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
     }
 
+    // Helper to fetch QR IDs a subadmin can access
+    async function getQrIdsForSubadmin(subadminId) {
+    // QRs created by the subadmin
+    const createdQrs = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        Qr_collectionId,
+        [Query.equal("createdByUserId", subadminId)]
+    );
+
+    // Users under the subadmin
+    const managedUsers = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        USERS_META_COLLECTION_ID,
+        [Query.equal("parentId", subadminId)]
+    );
+    const managedUserIds = managedUsers.documents.map(u => u.userId);
+
+    // QRs assigned to those managed users
+    let managedQrs = [];
+    if (managedUserIds.length > 0) {
+        const qrDocs = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        Qr_collectionId,
+        [Query.equal("assignedUserId", managedUserIds)]
+        );
+        managedQrs = qrDocs.documents;
+    }
+
+    return [
+        ...createdQrs.documents.map(q => q.$id),
+        ...managedQrs.map(q => q.$id),
+    ];
+    }
+
     router.get('/transactions', authenticateAdmin, async (req, res) => {
         const { userId, qrId , limit = 25, cursor, from, to} = req.query;
         // console.log('Fetching transactions with userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
@@ -614,13 +648,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    router.get('/user/transactions', async (req, res) => {
+    router.get('/user/transactions', authenticateToken, async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to} = req.query;
         // console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
         // console.log('🔍 [USER API] Date filters:', { from, to });
         // Ensure limit is capped
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
+        const userRequested = req.user; // set by your JWT middleware
+        const isSubadmin = userRequested.role === 'subadmin';
+            
+        // Basic auth checks
+        if (!isSubadmin && userRequested.userId !== userId) {
+            return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+        }
+        
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
         }
@@ -628,7 +670,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         let filters = [];
 
         try {
-            const userQrIds = await getQrIdsForUser(userId);
+            // const userQrIds = await getQrIdsForUser(userId);
+            // Usage in your API
+            const userQrIds = isSubadmin
+            ? await getQrIdsForSubadmin(userId)
+            : await getQrIdsForUser(userId); // existing fn for end-users
+
 
             // If qrId is provided, validate ownership
             if (qrId) {
