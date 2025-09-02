@@ -47,6 +47,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
 
       try {
+
+        // 🔹 Check existing pending requests
+        const pendingRequests = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [
+            Query.equal("userId", userId),
+            Query.equal("status", "pending"),
+          ]
+        );
+
+        if (pendingRequests.total >= 2) {
+          return res.status(400).json({
+            error: "You already have the maximum number of pending withdrawal requests (2)."
+          });
+        }
+
         const response = await databases.createDocument(
           APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId, // <-- collection ID
