@@ -518,7 +518,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // Users under the subadmin
     const managedUsers = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
-        USERS_META_COLLECTION_ID,
+        APPWRITE_USERS_META_COLLECTION_ID,
         [Query.equal("parentId", subadminId)]
     );
     const managedUserIds = managedUsers.documents.map(u => u.userId);
@@ -662,7 +662,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         if (!isSubadmin && userRequested.userId !== userId) {
             return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
         }
-        
+
         if (!userId) {
             return res.status(400).json({ error: 'userId is required' });
         }
