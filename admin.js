@@ -493,55 +493,61 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     
     // Helper to get QR IDs for a user
     async function getQrIdsForUser(userId) {
-    try {
-        const response = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        Qr_collectionId, // Ensure this matches your actual QR codes collection ID
-        [Query.equal('assignedUserId', userId)]
-        );
-        return response.documents.map(doc => doc.qrId);
-    } catch (error) {
-        console.error('Error fetching QR codes for user:', error);
-        return [];
-    }
+        try {
+            const response = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId, // Ensure this matches your actual QR codes collection ID
+            [Query.equal('assignedUserId', userId)]
+            );
+            return response.documents.map(doc => doc.qrId);
+        } catch (error) {
+            console.error('Error fetching QR codes for user:', error);
+            return [];
+        }
     }
 
     // Helper to fetch QR IDs a subadmin can access
     async function getQrIdsForSubadmin(subadminId) {
-    // QRs created by the subadmin
-    const createdQrs = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        Qr_collectionId,
-        [Query.equal("createdByUserId", subadminId)]
-    );
+        const qrIds = new Set();
 
-    // Users under the subadmin
-    const managedUsers = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_USERS_META_COLLECTION_ID,
-        [Query.equal("parentId", subadminId)]
-    );
-    const managedUserIds = managedUsers.documents.map(u => u.userId);
+        try {
+            // QRs created by the subadmin
+            const createdQrs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            [Query.equal("createdByUserId", subadminId)]
+            );
+            createdQrs.documents.forEach(q => qrIds.add(q.qrId));
 
-    // console.log(`Subadmin ${subadminId} manages users:`, managedUsers);
+            // QRs assigned directly to the subadmin
+            const subadminAssignedQrs = await getQrIdsForUser(subadminId);
+            subadminAssignedQrs.forEach(id => qrIds.add(id));
 
-    // QRs assigned to those managed users
-    let managedQrs = [];
-    if (managedUserIds.length > 0) {
-        const qrDocs = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        Qr_collectionId,
-        [Query.equal("assignedUserId", managedUserIds)]
-        );
-        managedQrs = qrDocs.documents;
-        // console.log(`Subadmin ${subadminId} has access to QRs of managed users:`, managedQrs.map(q => q.qrId));
+            // Users under the subadmin
+            const managedUsers = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [Query.equal("parentId", subadminId)]
+            );
+            const managedUserIds = managedUsers.documents.map(u => u.userId);
+
+            // QRs assigned to those managed users
+            if (managedUserIds.length > 0) {
+            const qrDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal("assignedUserId", managedUserIds)]
+            );
+            qrDocs.documents.forEach(q => qrIds.add(q.qrId));
+            }
+
+            return Array.from(qrIds);
+        } catch (err) {
+            console.error(`❌ Error in getQrIdsForSubadmin(${subadminId}):`, err);
+            return [];
+        }
     }
 
-    return [
-        ...createdQrs.documents.map(q => q.qrId),
-        ...managedQrs.map(q => q.qrId),
-    ];
-    }
 
     router.get('/transactions', authenticateAdmin, async (req, res) => {
         const { userId, qrId , limit = 25, cursor, from, to} = req.query;
