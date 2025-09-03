@@ -68,7 +68,7 @@ const authenticateToken = async (req, res, next) => {
             return res.status(401).json({ error: 'Authentication token is required.' });
         }
 
-        console.log('Verifying token:', token);
+        // console.log('Verifying token:', token);
 
         // Create a new client instance for this specific request with the user's JWT
         const userClient = new Client()
@@ -79,7 +79,7 @@ const authenticateToken = async (req, res, next) => {
         const account = new Account(userClient);
         const user = await account.get(); // This call verifies the JWT with Appwrite
 
-        console.log('Authenticated user:', user.$id);
+        // console.log('Authenticated user:', user.$id);
 
         // req.user = user;
 
