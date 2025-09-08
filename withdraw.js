@@ -45,7 +45,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const istOffset = 5.5 * 60 * 60 * 1000;
       const istTime = new Date(Date.now() + istOffset).toISOString();
 
-
       try {
 
         // 🔹 Check existing pending requests

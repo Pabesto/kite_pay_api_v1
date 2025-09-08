@@ -655,7 +655,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         queries.push(Query.cursorAfter(cursor));
         }
 
-        console.log('Transaction query filters:', queries);
+        // console.log('Transaction query filters:', queries);
 
         const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
         const docs = transactions.documents;
@@ -667,6 +667,48 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         console.error('Error fetching transactions:', error);
         res.status(500).json({ error: 'Failed to fetch transactions' });
     }
+    });
+
+    router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
+    try {
+            const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
+
+            // ✅ Validate required fields
+            if (!qrCodeId || !rrnNumber || !amount || !isoDate) {
+            return res.status(400).json({
+                error: "qrCodeId, rrnNumber, amount, and isoDate are required",
+            });
+            }
+
+            console.log("Payload:", isoDate);
+
+            const istOffset = 5.5 * 60 * 60 * 1000;
+            const istTime = new Date(Date.now()).toISOString();
+
+            // Create document in webhook_data collection
+            const result = await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                '688cf5920023475022df', // webhook_data collection ID
+                ID.unique(),
+                    {
+                        payload: "", // optional, can be passed too
+                        qrCodeId: qrCodeId,
+                        paymentId: "", // optional
+                        rrnNumber: rrnNumber,
+                        amount: (amount*100),
+                        vpa: "", // optional
+                        created_at: isoDate, // current IST time
+                    }
+            );
+
+            return res.status(201).json({
+            message: "Transaction uploaded successfully",
+            transaction: result,
+            });
+        } catch (err) {
+            console.error("❌ Manual transaction error:", err.message || err);
+            return res.status(500).json({ error: err.message || "Transaction upload failed" });
+        }
     });
 
 

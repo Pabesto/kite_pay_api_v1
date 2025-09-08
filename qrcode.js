@@ -154,6 +154,17 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
         try {
 
+            // ✅ 1. Check if qrId already exists
+            const existing = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            [Query.equal("qrId", qrId)]
+            );
+
+            if (existing.total > 0) {
+                return res.status(400).json({ message: `QR Code ID "${qrId}" already exists.` });
+            }
+
             const newQrCode = await saveQrEntry({
                 qrId,
                 fileId,
