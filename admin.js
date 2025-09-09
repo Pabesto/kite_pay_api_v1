@@ -573,101 +573,106 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdmin, async (req, res) => {
-    const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 25, 50);
+        const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 50);
 
-    let filters = [];
+        let filters = [];
 
-    try {
-        if (userId && qrId) {
-        const userQrIds = await getQrIdsForUser(userId);
-        if (userQrIds.includes(qrId)) {
+        console.log('Transaction query params:', req.query);
+
+        try {
+            if (userId && qrId) {
+            const userQrIds = await getQrIdsForUser(userId);
+            if (userQrIds.includes(qrId)) {
+                filters.push(Query.equal('qrCodeId', qrId));
+            } else {
+                return res.status(200).json({ transactions: [] });
+            }
+            } else if (qrId) {
             filters.push(Query.equal('qrCodeId', qrId));
-        } else {
-            return res.status(200).json({ transactions: [] });
-        }
-        } else if (qrId) {
-        filters.push(Query.equal('qrCodeId', qrId));
-        } else if (userId) {
-        const userQrIds = await getQrIdsForUser(userId);
-        if (userQrIds.length > 0) {
-            filters.push(Query.equal('qrCodeId', userQrIds));
-        } else {
-            return res.status(200).json({ transactions: [] });
-        }
-        }
+            } else if (userId) {
+            const userQrIds = await getQrIdsForUser(userId);
+            if (userQrIds.length > 0) {
+                filters.push(Query.equal('qrCodeId', userQrIds));
+            } else {
+                return res.status(200).json({ transactions: [] });
+            }
+            }
 
-        // Date filtering helper (unchanged)
-        function toISTRange(dateStr) {
-        const d = new Date(dateStr);
-        const start = new Date(d);
-        start.setHours(0, 0, 0, 0);
-        start.setMinutes(start.getMinutes() - 330);
-        const end = new Date(d);
-        end.setHours(23, 59, 59, 999);
-        end.setMinutes(end.getMinutes() - 330);
-        return { start, end };
-        }
+            // Date filtering helper (unchanged)
+            function toISTRange(dateStr) {
+            const d = new Date(dateStr);
+            const start = new Date(d);
+            start.setHours(0, 0, 0, 0);
+            start.setMinutes(start.getMinutes() - 330);
+            const end = new Date(d);
+            end.setHours(23, 59, 59, 999);
+            end.setMinutes(end.getMinutes() - 330);
+            return { start, end };
+            }
 
-        // Date filters
-        if (from && to) {
-        if (from === to) {
+            // Date filters
+            if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            }
+            } else if (from && !to) {
             const { start, end } = toISTRange(from);
             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-        } else {
-            const { start } = toISTRange(from);
+            } else if (!from && to) {
             const { end } = toISTRange(to);
-            filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-        }
-        } else if (from && !to) {
-        const { start, end } = toISTRange(from);
-        filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-        } else if (!from && to) {
-        const { end } = toISTRange(to);
-        filters.push(Query.lessThanEqual("created_at", end.toISOString()));
-        }
-
-        // Add single-field search if both parameters provided
-        if (searchField && searchValue) {
-            const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
-            const exactMatchFields = ['amount', 'rrnNumber'];
-
-            if (fulltextFields.includes(searchField)) {
-                // Use fulltext search for these fields
-                filters.push(Query.search(searchField, searchValue));
-            } else if (searchField === 'amount') {
-                const amountValue = parseInt(searchValue, 10);
-                if (isNaN(amountValue)) {
-                return res.status(400).json({ error: 'Amount must be an integer value' });
-                }
-                filters.push(Query.equal('amount', amountValue*100));
-            } else if (searchField === 'rrnNumber') {
-                // rrnNumber exact match as string
-                filters.push(Query.equal('rrnNumber', searchValue));
-            } else {
-                return res.status(400).json({ error: 'Invalid searchField parameter' });
+            filters.push(Query.lessThanEqual("created_at", end.toISOString()));
             }
+
+            // Add single-field search if both parameters provided
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                const exactMatchFields = ['amount', 'rrnNumber'];
+
+                if (fulltextFields.includes(searchField)) {
+                    // Use fulltext search for these fields
+                    filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                    const amountValue = parseInt(searchValue, 10);
+                    if (isNaN(amountValue)) {
+                    return res.status(400).json({ error: 'Amount must be an integer value' });
+                    }
+                    filters.push(Query.equal('amount', amountValue*100));
+                } else if (searchField === 'rrnNumber') {
+                    // rrnNumber exact match as string
+                    filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                    return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+
+            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            if (cursor) {
+            queries.push(Query.cursorAfter(cursor));
+            }
+
+            // console.log('Transaction query filters:', queries);
+
+            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+            const docs = transactions.documents;
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+            res.status(200).json({ transactions: docs, nextCursor });
+
+        } catch (error) {
+            console.error('Error fetching transactions:', error);
+            res.status(500).json({ error: 'Failed to fetch transactions' });
         }
-
-
-        const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
-        if (cursor) {
-        queries.push(Query.cursorAfter(cursor));
-        }
-
-        // console.log('Transaction query filters:', queries);
-
-        const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-        const docs = transactions.documents;
-        const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
-
-        res.status(200).json({ transactions: docs, nextCursor });
-
-    } catch (error) {
-        console.error('Error fetching transactions:', error);
-        res.status(500).json({ error: 'Failed to fetch transactions' });
-    }
     });
+
+    // Helper: convert amount to paise
+    const toPaise = (amt) => Math.round(amt * 100);
 
     router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
     try {
@@ -680,10 +685,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             });
             }
 
-            console.log("Payload:", isoDate);
+            // ✅ Check for duplicate RRN
+            const duplicate = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                "688cf5920023475022df", // webhook_data collection ID
+                [Query.equal("rrnNumber", rrnNumber)]
+            );
 
-            const istOffset = 5.5 * 60 * 60 * 1000;
-            const istTime = new Date(Date.now()).toISOString();
+            if (duplicate.documents.length) {
+                return res.status(400).json({ error: "Duplicate RRN detected" });
+            }
+
+            // ✅ Convert values
+            const finalAmount = toPaise(amount);
 
             // Create document in webhook_data collection
             const result = await databases.createDocument(
@@ -695,15 +709,54 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                         qrCodeId: qrCodeId,
                         paymentId: "", // optional
                         rrnNumber: rrnNumber,
-                        amount: (amount*100),
+                        amount: finalAmount,
                         vpa: "", // optional
                         created_at: isoDate, // current IST time
                     }
             );
 
+            // 3️⃣ Update the corresponding QR code totals
+            if (qrCodeId) {
+                const qrResult = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    [
+                        Query.equal('qrId', qrCodeId),
+                        Query.limit(1)
+                    ]
+                );
+
+                if (qrResult.documents.length) {
+                    const qrDoc = qrResult.documents[0];
+
+                    // Current values from DB (default to 0 if missing)
+                    const currentTransactions = qrDoc.totalTransactions || 0;
+                    const currentPayInAmount = qrDoc.totalPayInAmount || 0;
+
+                    // Increment values
+                    const newTransactions = currentTransactions + 1;       // increment by one
+                    const newPayInAmount = currentPayInAmount + finalAmount; // add your amount variable
+
+                    // Update document with new totals
+                    await databases.updateDocument(
+                        APPWRITE_DATABASE_ID,
+                        Qr_collectionId,
+                        qrDoc.$id,
+                        {
+                            totalTransactions: newTransactions,
+                            totalPayInAmount: newPayInAmount
+                        }
+                    );
+
+                    // console.log(`QR totals updated for qrId ${qrCodeId}`);
+                } else {
+                    // console.log(`QR Code with qrId ${qrCodeId} not found`);
+                }
+            }
+
             return res.status(201).json({
-            message: "Transaction uploaded successfully",
-            transaction: result,
+                message: "Transaction uploaded successfully",
+                transaction: result,
             });
         } catch (err) {
             console.error("❌ Manual transaction error:", err.message || err);
@@ -711,120 +764,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-
     // User or subadmin restricted: fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
-    const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 25, 50);
-
-    const userRequested = req.user;
-    const isSubadmin = userRequested.role === 'subadmin';
-
-    if (!isSubadmin && userRequested.userId !== userId) {
-        return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
-    }
-
-    if (!userId) {
-        return res.status(400).json({ error: 'userId is required' });
-    }
-
-    const filters = [];
-
-    try {
-        const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-
-        if (qrId) {
-        if (userQrIds.includes(qrId)) {
-            filters.push(Query.equal('qrCodeId', qrId));
-        } else {
-            return res.status(200).json({ transactions: [] });
-        }
-        } else {
-        if (userQrIds.length === 0) {
-            return res.status(200).json({ transactions: [] });
-        }
-        filters.push(Query.equal('qrCodeId', userQrIds));
-        }
-
-        // Date filter helper same as above
-        function toISTRange(dateStr) {
-        const d = new Date(dateStr);
-        const start = new Date(d);
-        start.setHours(0, 0, 0, 0);
-        start.setMinutes(start.getMinutes() - 330);
-        const end = new Date(d);
-        end.setHours(23, 59, 59, 999);
-        end.setMinutes(end.getMinutes() - 330);
-        return { start, end };
-        }
-
-        if (from && to) {
-        if (from === to) {
-            const { start, end } = toISTRange(from);
-            filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-        } else {
-            const { start } = toISTRange(from);
-            const { end } = toISTRange(to);
-            filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-        }
-        } else if (from && !to) {
-        const { start, end } = toISTRange(from);
-        filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-        } else if (!from && to) {
-        const { end } = toISTRange(to);
-        filters.push(Query.lessThanEqual('created_at', end.toISOString()));
-        }
-
-        // Single field search if provided and valid
-        if (searchField && searchValue) {
-            const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
-            const exactMatchFields = ['amount', 'rrnNumber'];
-
-            if (fulltextFields.includes(searchField)) {
-                // Use fulltext search for these fields
-                filters.push(Query.search(searchField, searchValue));
-            } else if (searchField === 'amount') {
-                const amountValue = parseInt(searchValue, 10);
-                if (isNaN(amountValue)) {
-                return res.status(400).json({ error: 'Amount must be an integer value' });
-                }
-                filters.push(Query.equal('amount', amountValue*100));
-            } else if (searchField === 'rrnNumber') {
-                // rrnNumber exact match as string
-                filters.push(Query.equal('rrnNumber', searchValue));
-            } else {
-                return res.status(400).json({ error: 'Invalid searchField parameter' });
-            }
-        }
-
-        const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
-        if (cursor) queries.push(Query.cursorAfter(cursor));
-
-        const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-        const docs = transactions.documents;
-        const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
-
-        res.status(200).json({ transactions: docs, nextCursor });
-
-    } catch (error) {
-        console.error('❌ Error in /user/transactions:', error);
-        res.status(500).json({ error: 'Failed to fetch user transactions' });
-    }
-    });
-
-    router.get('/user/transactions', authenticateToken, async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to} = req.query;
-        // console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-        // console.log('🔍 [USER API] Date filters:', { from, to });
-        // Ensure limit is capped
+        const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
-        const userRequested = req.user; // set by your JWT middleware
-        const isSubadmin = userRequested.role === 'subadmin';
+        // console.log('Transaction query params:', req.query);
 
-        // console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
-            
-        // Basic auth checks
+        const userRequested = req.user;
+        const isSubadmin = userRequested.role === 'subadmin';
+        const isAdmin = userRequested.role === 'admin';
+
         if (!isSubadmin && userRequested.userId !== userId) {
             return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
         }
@@ -833,112 +783,216 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(400).json({ error: 'userId is required' });
         }
 
-        let filters = [];
+        const filters = [];
 
         try {
-            // const userQrIds = await getQrIdsForUser(userId);
-            // Usage in your API
-
-            // console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
-
-            // Get all QR IDs the user (or subadmin) can access
-            // Subadmin: all QRs they created + QRs of users under them
-            // End-user: only their assigned QRs
-
-            const userQrIds = isSubadmin
-            ? await getQrIdsForSubadmin(userId)
-            : await getQrIdsForUser(userId); // existing fn for end-users
-
-            // console.log(`User ${userId} has access to QR IDs:`, userQrIds);
-
-            // If qrId is provided, validate ownership
+            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+            // console.log('User QR IDs:', userQrIds);
             if (qrId) {
-                if (userQrIds.includes(qrId)) {
+                if (userQrIds.includes(qrId) || isAdmin) {
                     filters.push(Query.equal('qrCodeId', qrId));
                 } else {
-                    console.warn(`QR ID ${qrId} does not belong to user ${userId}`);
-                    return res.status(200).json({ transactions: [] }); // Safe fallback
+                    return res.status(200).json({ transactions: [] });
                 }
             } else {
-                // Get all transactions for all QR codes the user owns
                 if (userQrIds.length === 0) {
                     return res.status(200).json({ transactions: [] });
                 }
                 filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
-            // Helper: convert a date string (yyyy-mm-dd) into IST start/end of day ranges
+            // Date filter helper same as above
             function toISTRange(dateStr) {
             const d = new Date(dateStr);
-
-            // Start of IST day
             const start = new Date(d);
             start.setHours(0, 0, 0, 0);
-            start.setMinutes(start.getMinutes() - 330); // shift -5:30 to UTC
-
-            // End of IST day
+            start.setMinutes(start.getMinutes() - 330);
             const end = new Date(d);
             end.setHours(23, 59, 59, 999);
-            end.setMinutes(end.getMinutes() - 330); // shift -5:30 to UTC
-
+            end.setMinutes(end.getMinutes() - 330);
             return { start, end };
             }
 
-            // DATE FILTER CONDITIONS
             if (from && to) {
             if (from === to) {
-                // Same date → only that IST day
                 const { start, end } = toISTRange(from);
-                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
             } else {
-                // Range → from start of 'from' IST day to end of 'to' IST day
                 const { start } = toISTRange(from);
                 const { end } = toISTRange(to);
-                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
             }
             } else if (from && !to) {
-                // Only 'from' → treat as single day filter
-                const { start, end } = toISTRange(from);
-                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            const { start, end } = toISTRange(from);
+            filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
             } else if (!from && to) {
-                // Only 'to' → everything until end of that IST day
-                const { end } = toISTRange(to);
-                filters.push(Query.lessThanEqual("created_at", end.toISOString()));
+            const { end } = toISTRange(to);
+            filters.push(Query.lessThanEqual('created_at', end.toISOString()));
             }
 
+            // Single field search if provided and valid
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                const exactMatchFields = ['amount', 'rrnNumber'];
 
-            // Build query array
-            const queries = [
-                ...filters,
-                Query.orderDesc('created_at'),
-                Query.limit(limitNum) // smaller chunks for pagination
-            ];
-
-            // If a cursor was sent, use it for pagination
-            if (cursor) {
-                queries.push(Query.cursorAfter(cursor));
+                if (fulltextFields.includes(searchField)) {
+                    // Use fulltext search for these fields
+                    filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                    const amountValue = parseInt(searchValue, 10);
+                    if (isNaN(amountValue)) {
+                    return res.status(400).json({ error: 'Amount must be an integer value' });
+                    }
+                    filters.push(Query.equal('amount', amountValue*100));
+                } else if (searchField === 'rrnNumber') {
+                    // rrnNumber exact match as string
+                    filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                    return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
             }
 
-            const transactions = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                webhook_collectionId,
-                queries
-            );
-                
+            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
             const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
-            res.status(200).json({
-                transactions: docs, // still newest first
-                nextCursor
-            });
+            res.status(200).json({ transactions: docs, nextCursor });
 
         } catch (error) {
             console.error('❌ Error in /user/transactions:', error);
             res.status(500).json({ error: 'Failed to fetch user transactions' });
         }
     });
-        
+
+    // router.get('/user/transactions', authenticateToken, async (req, res) => {
+    //     const { userId, qrId, limit = 25, cursor, from, to} = req.query;
+    //     // console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
+    //     // console.log('🔍 [USER API] Date filters:', { from, to });
+    //     // Ensure limit is capped
+    //     const limitNum = Math.min(parseInt(limit) || 25, 50);
+
+    //     const userRequested = req.user; // set by your JWT middleware
+    //     const isSubadmin = userRequested.role === 'subadmin';
+
+    //     // console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
+            
+    //     // Basic auth checks
+    //     if (!isSubadmin && userRequested.userId !== userId) {
+    //         return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+    //     }
+
+    //     if (!userId) {
+    //         return res.status(400).json({ error: 'userId is required' });
+    //     }
+
+    //     let filters = [];
+
+    //     try {
+    //         // const userQrIds = await getQrIdsForUser(userId);
+    //         // Usage in your API
+
+    //         // console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
+
+    //         // Get all QR IDs the user (or subadmin) can access
+    //         // Subadmin: all QRs they created + QRs of users under them
+    //         // End-user: only their assigned QRs
+
+    //         const userQrIds = isSubadmin
+    //         ? await getQrIdsForSubadmin(userId)
+    //         : await getQrIdsForUser(userId); // existing fn for end-users
+
+    //         // console.log(`User ${userId} has access to QR IDs:`, userQrIds);
+
+    //         // If qrId is provided, validate ownership
+    //         if (qrId) {
+    //             if (userQrIds.includes(qrId)) {
+    //                 filters.push(Query.equal('qrCodeId', qrId));
+    //             } else {
+    //                 console.warn(`QR ID ${qrId} does not belong to user ${userId}`);
+    //                 return res.status(200).json({ transactions: [] }); // Safe fallback
+    //             }
+    //         } else {
+    //             // Get all transactions for all QR codes the user owns
+    //             if (userQrIds.length === 0) {
+    //                 return res.status(200).json({ transactions: [] });
+    //             }
+    //             filters.push(Query.equal('qrCodeId', userQrIds));
+    //         }
+
+    //         // Helper: convert a date string (yyyy-mm-dd) into IST start/end of day ranges
+    //         function toISTRange(dateStr) {
+    //         const d = new Date(dateStr);
+
+    //         // Start of IST day
+    //         const start = new Date(d);
+    //         start.setHours(0, 0, 0, 0);
+    //         start.setMinutes(start.getMinutes() - 330); // shift -5:30 to UTC
+
+    //         // End of IST day
+    //         const end = new Date(d);
+    //         end.setHours(23, 59, 59, 999);
+    //         end.setMinutes(end.getMinutes() - 330); // shift -5:30 to UTC
+
+    //         return { start, end };
+    //         }
+
+    //         // DATE FILTER CONDITIONS
+    //         if (from && to) {
+    //         if (from === to) {
+    //             // Same date → only that IST day
+    //             const { start, end } = toISTRange(from);
+    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+    //         } else {
+    //             // Range → from start of 'from' IST day to end of 'to' IST day
+    //             const { start } = toISTRange(from);
+    //             const { end } = toISTRange(to);
+    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+    //         }
+    //         } else if (from && !to) {
+    //             // Only 'from' → treat as single day filter
+    //             const { start, end } = toISTRange(from);
+    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+    //         } else if (!from && to) {
+    //             // Only 'to' → everything until end of that IST day
+    //             const { end } = toISTRange(to);
+    //             filters.push(Query.lessThanEqual("created_at", end.toISOString()));
+    //         }
+
+
+    //         // Build query array
+    //         const queries = [
+    //             ...filters,
+    //             Query.orderDesc('created_at'),
+    //             Query.limit(limitNum) // smaller chunks for pagination
+    //         ];
+
+    //         // If a cursor was sent, use it for pagination
+    //         if (cursor) {
+    //             queries.push(Query.cursorAfter(cursor));
+    //         }
+
+    //         const transactions = await databases.listDocuments(
+    //             APPWRITE_DATABASE_ID,
+    //             webhook_collectionId,
+    //             queries
+    //         );
+                
+    //         const docs = transactions.documents;
+    //         const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+    //         res.status(200).json({
+    //             transactions: docs, // still newest first
+    //             nextCursor
+    //         });
+
+    //     } catch (error) {
+    //         console.error('❌ Error in /user/transactions:', error);
+    //         res.status(500).json({ error: 'Failed to fetch user transactions' });
+    //     }
+    // });
 
     router.get('/getMyMetaData', authenticateToken, async (req, res) => {
         try {
