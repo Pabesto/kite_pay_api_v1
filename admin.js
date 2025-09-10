@@ -540,6 +540,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             Qr_collectionId,
             [Query.equal("createdByUserId", subadminId)]
             );
+
             createdQrs.documents.forEach(q => qrIds.add(q.qrId));
 
             // QRs assigned directly to the subadmin
@@ -578,7 +579,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         let filters = [];
 
-        console.log('Transaction query params:', req.query);
+        // console.log('Transaction query params:', req.query);
 
         try {
             if (userId && qrId) {
