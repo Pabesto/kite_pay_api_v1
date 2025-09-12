@@ -344,8 +344,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     });
 
-
-        // Helper to fetch QR IDs a subadmin can access
+    // Helper to fetch QR IDs a subadmin can access
     async function getQrIdsForSubadmin(subadminId) {
         const qrIds = new Set();
 

@@ -90,6 +90,152 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
+    // GET /withdrawals?status=pending&limit=20&cursor=docId
+    router.get('/withdrawals_paginated', authenticateAdmin, async (req, res) => {
+      try {
+        const { status, limit: limitStr, cursor } = req.query;
+
+        // 1) Parse limit with sane default + cap
+        const DEFAULT_LIMIT = 25;
+        const MAX_LIMIT = 100;
+        const limit = Math.min(
+          Math.max(parseInt(limitStr ?? DEFAULT_LIMIT, 10) || DEFAULT_LIMIT, 1),
+          MAX_LIMIT
+        );
+
+        // 2) Build Appwrite queries
+        const queries = [];
+
+        if (status) {
+          queries.push(Query.equal('status', status));
+        }
+
+        // Stable order by creation time (newest first)
+        queries.push(Query.orderDesc('$createdAt'));
+
+        // Apply cursor if provided (keyset pagination using $id)
+        if (cursor) {
+          queries.push(Query.cursorAfter(cursor));
+        }
+
+        // Page size
+        queries.push(Query.limit(limit));
+
+        // 3) Execute
+        const result = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          queries
+        );
+
+        // 4) Prepare response: map documents, compute nextCursor
+        const docs = result.documents || [];
+
+        // Keep $id for pagination cursor
+        const withdrawals = docs.map((doc) => {
+          const {
+            $id,
+            // $collectionId,
+            // $databaseId,
+            // $createdAt,
+            // $updatedAt,
+            // $permissions,
+            ...customFields
+          } = doc;
+
+          // Optionally include these for debugging/admin needs:
+          // customFields._id = $id;
+          // customFields._createdAt = $createdAt;
+
+          return customFields;
+        });
+
+        // When full page returned, expose the nextCursor as last doc $id
+        const lastDoc = docs.length > 0 ? docs[docs.length - 1] : null;
+        const nextCursor = docs.length === limit && lastDoc ? lastDoc.$id : null;
+
+        return res.json({
+          count: result.total,     // total matching (may be approximate for large sets)
+          withdrawals,
+          nextCursor,              // client passes this as cursor on next request
+        });
+      } catch (error) {
+        console.error('❌ Error fetching withdrawals:', error);
+        return res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
+      }
+    });
+
+    // GET /user_withdrawals?userId=...&status=pending&limit=20&cursor=<docId>
+    router.get('/user_withdrawals_paginated', async (req, res) => {
+      try {
+        const { status, userId, limit: limitStr, cursor } = req.query;
+
+        // Parse and cap limit
+        const DEFAULT_LIMIT = 25;
+        const MAX_LIMIT = 100;
+        const limit = Math.min(
+          Math.max(parseInt(limitStr ?? DEFAULT_LIMIT, 10) || DEFAULT_LIMIT, 1),
+          MAX_LIMIT
+        );
+
+        // Build queries (order by newest first for stable keyset pagination)
+        const queries = [];
+
+        if (status) {
+          queries.push(Query.equal('status', status));
+        }
+
+        if (userId) {
+          queries.push(Query.equal('userId', userId));
+        }
+
+        // Order by $createdAt descending
+        queries.push(Query.orderDesc('$createdAt')); // ensure index on $createdAt for performance
+
+        // Cursor-based pagination
+        if (cursor) {
+          queries.push(Query.cursorAfter(cursor));
+        }
+
+        // Page size
+        queries.push(Query.limit(limit));
+
+        // Fetch
+        const result = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          queries
+        );
+
+        // Map documents while computing nextCursor from the last doc's $id
+        const docs = result.documents || [];
+        const withdrawals = docs.map((doc) => {
+          const {
+            $id,
+            $collectionId,
+            $databaseId,
+            $createdAt,
+            $updatedAt,
+            $permissions,
+            ...customFields
+          } = doc;
+          return customFields;
+        });
+
+        const lastDoc = docs.length ? docs[docs.length - 1] : null;
+        const nextCursor = docs.length === limit && lastDoc ? lastDoc.$id : null;
+
+        return res.json({
+          count: result.total,   // optional total
+          withdrawals,
+          nextCursor,            // pass this back as cursor on next request
+        });
+      } catch (error) {
+        console.error('❌ Error fetching withdrawals:', error.message);
+        return res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
+      }
+    });
+
     // GET all withdrawal requests
     router.get('/withdrawals', authenticateAdmin, async (req, res) => {
       const status = req.query.status; // optional: 'pending', 'approved', 'rejected'
@@ -176,7 +322,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
       }
     });
-
 
     // POST /withdrawals/approve
     router.post('/withdrawals/approve', authenticateAdmin, async (req, res) => {
