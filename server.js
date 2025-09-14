@@ -258,6 +258,140 @@ app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
+app.post('/cashfree/webhook', async (req, res) => {
+  console.log('Webhook Event Received: Cashfree');
+
+  // 1) Signature headers (required)
+  const cfSignature = req.headers['x-webhook-signature'];
+  const cfTimestamp = req.headers['x-webhook-timestamp'];
+  if (!cfSignature || !cfTimestamp) {
+    return res.status(400).send('Missing Cashfree signature headers');
+  }
+
+  // 2) Verify signature: Base64(HMACSHA256(timestamp + rawBody, Client Secret))
+  try {
+    const signedPayload = `${cfTimestamp}${req.rawBody}`;
+    const expectedSig = crypto
+      .createHmac('sha256', CASHFREE_CLIENT_SECRET)
+      .update(signedPayload)
+      .digest('base64');
+
+    // Alternatively, via SDK:
+    // Cashfree.PGVerifyWebhookSignature(cfSignature, req.rawBody, cfTimestamp);
+
+    if (expectedSig !== cfSignature) {
+      console.warn('❌ Cashfree webhook signature mismatch');
+      return res.status(400).send('Invalid signature');
+    }
+  } catch (err) {
+    console.error('Signature verification error:', err.message);
+    return res.status(400).send('Signature verification failed');
+  }
+  console.log('✅ Cashfree webhook verified'); // [verified]
+
+  // 3) Event filter (Payments)
+  const cfEventType = req.body?.type;
+  if (cfEventType !== 'PAYMENT_SUCCESS_WEBHOOK') {
+    console.log('❌ Unsupported event type:', cfEventType);
+    return res.status(400).send('Unsupported event type');
+  }
+
+  // 4) Extract and map fields from the provided sample JSON
+  const payload = req.body?.data || {};
+  const order = payload?.order || {};
+  const payment = payload?.payment || {};
+  const upi = payment?.payment_method?.upi || {};
+
+  // Prefer the custom QR code tag as the identifier
+  const qrCodeId = order?.order_tags?.cf_form_id || order?.order_id;
+  const paymentId = payment?.cf_payment_id; // unique per attempt
+  const rrnNumber = payment?.bank_reference;
+  const amount = Number(payment?.payment_amount || 0);
+  const vpa = upi?.upi_id;
+  const createdAt = req.body?.event_time || payment?.payment_time;
+
+  if (!qrCodeId) return res.status(400).send('QR Code ID not found');
+  if (!paymentId) return res.status(400).send('Payment ID not found');
+
+  // 5) Idempotency guard (process each cf_payment_id once)
+  try {
+    // Strategy A: dedicated collection with unique index on paymentId
+    await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_WEBHOOK_DATA_COLLECTION_ID, // define with unique index on 'paymentId'
+      ID.unique(),
+      {
+        paymentId: paymentId,
+      }
+    );
+  } catch (e) {
+    // Appwrite duplicate unique index -> already processed
+    if (e?.code === 409) {
+      return res.status(200).send('Duplicate webhook ignored');
+    }
+    console.error('Idempotency check error:', e?.message || e);
+    return res.status(500).send('Idempotency check failed');
+  }
+
+  // 6) Persist raw webhook payload + mapped fields
+  const payloadString = JSON.stringify(req.body);
+  try {
+    await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+      ID.unique(),
+      {
+        payload: payloadString,
+        qrCodeId: qrCodeId,
+        paymentId: paymentId,
+        rrnNumber: rrnNumber,
+        amount: amount,
+        vpa: vpa,
+        created_at: createdAt,
+      }
+    );
+  } catch (e) {
+    console.error('Persist webhook error:', e?.message || e);
+    return res.status(500).send('Error saving webhook');
+  }
+
+  // 7) Update QR totals atomically
+  try {
+    const qrResult = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_QRCODE_COLLECTION_ID,
+      [Query.equal('qrId', qrCodeId), Query.limit(1)]
+    );
+
+    if (qrResult.documents.length) {
+      const qrDoc = qrResult.documents;
+      const newCount = (qrDoc.totalTransactions || 0) + 1;
+      const newAmount = (qrDoc.totalPayInAmount || 0) + amount;
+
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDoc.$id,
+        {
+          totalTransactions: newCount,
+          totalPayInAmount: newAmount,
+        }
+      );
+      console.log(`QR totals updated for qrId ${qrCodeId}`);
+    } else {
+      console.log(`QR Code with qrId ${qrCodeId} not found`);
+    }
+  } catch (e) {
+    console.error('QR totals update error:', e?.message || e);
+    // optional: roll back processedPayments marker if strict exactly-once is required
+    // await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_PROCESSED_PAYMENTS_COLLECTION_ID, markerId)
+    return res.status(500).send('Error updating QR totals');
+  }
+
+  // 8) Final response
+  return res.status(200).send('Webhook received and processed');
+});
+
 // --- Webhook Endpoint ---
 // Secret:   4@cQVD6GBGa2G7j
 app.post('/webhook', async (req, res) => {
