@@ -266,6 +266,12 @@ app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
+function rupeesToPaiseStrict(rupees) {
+  const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');
+  const frac = (fracPart + '00').slice(0, 2); // exactly 2 decimals
+  return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
+}
+
 app.post('/cashfree/webhook', async (req, res) => {
   console.log('Webhook Event Received: Cashfree');
 
@@ -314,7 +320,9 @@ app.post('/cashfree/webhook', async (req, res) => {
   const qrCodeId = order?.order_tags?.cf_form_id || order?.order_id;
   const paymentId = payment?.cf_payment_id; // unique per attempt
   const rrnNumber = payment?.bank_reference;
-  const amount = Number(payment?.payment_amount || 0);
+//   const amount = Number(payment?.payment_amount || 0);
+  const amountRupees = payment?.payment_amount; // e.g., "10.01" or 10.01
+  const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
   const vpa = upi?.upi_id;
   const createdAt = req.body?.event_time || payment?.payment_time;
 
@@ -353,7 +361,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         qrCodeId: qrCodeId,
         paymentId: paymentId,
         rrnNumber: rrnNumber,
-        amount: amount,
+        amount: amountPaise,
         vpa: vpa,
         created_at: createdAt,
       }
@@ -363,38 +371,42 @@ app.post('/cashfree/webhook', async (req, res) => {
     return res.status(500).send('Error saving webhook');
   }
 
-  // 7) Update QR totals atomically
-  try {
+    // 7) Update QR totals atomically
+    try {
     const qrResult = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_QRCODE_COLLECTION_ID,
-      [Query.equal('qrId', qrCodeId), Query.limit(1)]
-    );
-
-    if (qrResult.documents.length) {
-      const qrDoc = qrResult.documents;
-      const newCount = (qrDoc.totalTransactions || 0) + 1;
-      const newAmount = (qrDoc.totalPayInAmount || 0) + amount;
-
-      await databases.updateDocument(
         APPWRITE_DATABASE_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
-        qrDoc.$id,
-        {
-          totalTransactions: newCount,
-          totalPayInAmount: newAmount,
-        }
-      );
-      console.log(`QR totals updated for qrId ${qrCodeId}`);
-    } else {
-      console.log(`QR Code with qrId ${qrCodeId} not found`);
+        [Query.equal('qrId', qrCodeId), Query.limit(1)]
+    );
+
+    if (!qrResult.documents.length) {
+        console.log(`QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).send('OK'); // or handle not-found differently
     }
-  } catch (e) {
+
+    const qrDoc = qrResult.documents[0];            // <- take first doc
+    // const qrDoc = qrResult.documents;           
+    const qrDocId = qrDoc.$id;                     // <- required documentId
+    const newCount = (qrDoc.totalTransactions || 0) + 1;
+    const newAmount = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+    await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDocId,                                     // <- pass $id here
+        {
+            totalTransactions: newCount,
+            totalPayInAmount: newAmount,
+        }
+    );
+
+    console.log(`QR totals updated for qrId ${qrCodeId}`);
+    return; // continue flow as needed
+    } catch (e) {
     console.error('QR totals update error:', e?.message || e);
-    // optional: roll back processedPayments marker if strict exactly-once is required
-    // await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_PROCESSED_PAYMENTS_COLLECTION_ID, markerId)
     return res.status(500).send('Error updating QR totals');
-  }
+    }
+
 
   // 8) Final response
   return res.status(200).send('Webhook received and processed');
