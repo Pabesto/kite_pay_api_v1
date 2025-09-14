@@ -712,6 +712,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                         rrnNumber: rrnNumber,
                         amount: finalAmount,
                         vpa: "", // optional
+                        provider: 'manual',
                         created_at: isoDate, // current IST time
                     }
             );

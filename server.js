@@ -355,6 +355,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         rrnNumber: rrnNumber,
         amount: amountPaise,
         vpa: vpa,
+        provider: 'cashfree',
         created_at: createdAt,
       }
     );
