@@ -330,24 +330,16 @@ app.post('/cashfree/webhook', async (req, res) => {
   if (!paymentId) return res.status(400).send('Payment ID not found');
 
   // 5) Idempotency guard (process each cf_payment_id once)
-  try {
-    // Strategy A: dedicated collection with unique index on paymentId
-    await databases.createDocument(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_WEBHOOK_DATA_COLLECTION_ID, // define with unique index on 'paymentId'
-      ID.unique(),
-      {
-        paymentId: paymentId,
-      }
-    );
-  } catch (e) {
-    // Appwrite duplicate unique index -> already processed
-    if (e?.code === 409) {
-      return res.status(200).send('Duplicate webhook ignored');
+  // Idempotency guard: skip if this paymentId is already recorded
+    const existing = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        [Query.equal('paymentId', paymentId), Query.limit(1)]
+    ); // requires an index on paymentId for performance
+
+    if (existing.documents.length) {
+        return res.status(200).send('Duplicate webhook ignored'); // already processed
     }
-    console.error('Idempotency check error:', e?.message || e);
-    return res.status(500).send('Idempotency check failed');
-  }
 
   // 6) Persist raw webhook payload + mapped fields
   const payloadString = JSON.stringify(req.body);
