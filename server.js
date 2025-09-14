@@ -49,10 +49,18 @@ const users = new Users(client);
 // Middleware
 app.use(cors()); // Enables cross-origin requests
 // Parse raw body for signature verification
+// app.use(
+//   bodyParser.json({
+//     verify: (req, res, buf) => {
+//       req.rawBody = buf.toString(); // Store raw body for HMAC check
+//     },
+//   })
+// );
+
 app.use(
   bodyParser.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf.toString(); // Store raw body for HMAC check
+    verify: (req, res, buf, encoding) => {
+      req.rawBody = buf.toString(encoding || 'utf8'); // keep exact raw text
     },
   })
 );
@@ -268,26 +276,35 @@ app.post('/cashfree/webhook', async (req, res) => {
     return res.status(400).send('Missing Cashfree signature headers');
   }
 
-  // 2) Verify signature: Base64(HMACSHA256(timestamp + rawBody, Client Secret))
-  try {
-    const signedPayload = `${cfTimestamp}${req.rawBody}`;
-    const expectedSig = crypto
-      .createHmac('sha256', CASHFREE_CLIENT_SECRET)
-      .update(signedPayload)
-      .digest('base64');
+    // 2) Verify signature: Base64(HMACSHA256(timestamp + rawBody, Client Secret))
+    // Preconditions: req.rawBody set via bodyParser.json verify hook as UTF-8
+    const ts = String(req.headers['x-webhook-timestamp'] || '');
+    const sig = String(req.headers['x-webhook-signature'] || '');
+    if (!ts || !sig) return res.status(400).send('Missing signature headers');
 
-    // Alternatively, via SDK:
-    // Cashfree.PGVerifyWebhookSignature(cfSignature, req.rawBody, cfTimestamp);
+    // Optional freshness check (5 minutes)
+    // const now = Date.now();
+    // if (Math.abs(now - Number(ts)) > 5 * 60 * 1000) {
+    // return res.status(400).send('Stale webhook timestamp');
+    // }
 
-    if (expectedSig !== cfSignature) {
-      console.warn('❌ Cashfree webhook signature mismatch');
-      return res.status(400).send('Invalid signature');
-    }
-  } catch (err) {
-    console.error('Signature verification error:', err.message);
+    let expected;
+    try {
+    expected = crypto
+        .createHmac('sha256', process.env.CASHFREE_CLIENT_SECRET)
+        .update(ts + req.rawBody) // exact concat, no extra whitespace
+        .digest('base64');
+    } catch (e) {
+    console.error('HMAC error:', e?.message || e);
     return res.status(400).send('Signature verification failed');
-  }
-  console.log('✅ Cashfree webhook verified'); // [verified]
+    }
+
+    if (expected !== sig) {
+    console.warn('❌ Cashfree webhook signature mismatch');
+    return res.status(400).send('Invalid signature');
+    }
+
+    console.log('✅ Cashfree webhook verified');
 
   // 3) Event filter (Payments)
   const cfEventType = req.body?.type;
