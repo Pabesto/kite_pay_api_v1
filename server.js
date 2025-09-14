@@ -349,7 +349,7 @@ app.post('/cashfree/webhook', async (req, res) => {
       APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
       ID.unique(),
       {
-        payload: payloadString,
+        payload: '', // avoid storing full payload for Cashfree to save space
         qrCodeId: qrCodeId,
         paymentId: paymentId,
         rrnNumber: rrnNumber,
@@ -392,10 +392,10 @@ app.post('/cashfree/webhook', async (req, res) => {
         }
     );
 
-    console.log(`QR totals updated for qrId ${qrCodeId}`);
+    // console.log(`QR totals updated for qrId ${qrCodeId}`);
     return; // continue flow as needed
     } catch (e) {
-    console.error('QR totals update error:', e?.message || e);
+    // console.error('QR totals update error:', e?.message || e);
     return res.status(500).send('Error updating QR totals');
     }
 
