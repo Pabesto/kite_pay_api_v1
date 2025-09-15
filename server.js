@@ -355,7 +355,7 @@ app.post('/cashfree/webhook', async (req, res) => {
   // 6) Persist raw webhook payload + mapped fields
   const payloadString = JSON.stringify(req.body);
   try {
-    await databases.createDocument(
+    const created = await databases.createDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
       ID.unique(),
@@ -370,6 +370,24 @@ app.post('/cashfree/webhook', async (req, res) => {
         created_at: createdAt,
       }
     );
+
+    const eventPayload = {
+        id: created.$id,                                    // document id
+        qrCodeId,                                           // string
+        amountPaise: amountPaise,                           // exact integer
+        rrnNumber: rrnNumber || null,
+        vpa: vpa || null,
+        provider: 'cashfree',
+        created_at: new Date(createdAt).toISOString(),    // normalize to ISO
+    }; // normalized event payload for clients [2]
+
+    // 5) Emit only to intended audiences (user + QR rooms)
+    emitTxnNew({
+        assignedUserId : '',      // may be null if QR not found
+        qrCodeId,
+        payload: eventPayload,
+    }); // Socket.IO selective emit via rooms [1]
+
   } catch (e) {
     console.error('Persist webhook error:', e?.message || e);
     return res.status(500).send('Error saving webhook');
@@ -409,6 +427,12 @@ app.post('/cashfree/webhook', async (req, res) => {
             amountAvailableForWithdrawal: newAvailable, // <-- add this
         }
     );
+
+    // emitTxnNew({
+    //     assignedUserId: qrDoc.assignedUserId,
+    //     qrCodeId,
+    //     payload,
+    // });
 
     // console.log(`QR totals updated for qrId ${qrCodeId}`);
     return; // continue flow as needed
