@@ -836,53 +836,53 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
         }
 
-            // ADDED: On-hold reconciliation when status crosses normal <-> non-normal
-            // Treat any non-'normal' status as a hold state; adjust amountOnHold and recompute available
+        // After computing prevStatus and nextStatus (both lowercased) and updating the transaction:
+        const isPrevNormal = prevStatus === 'normal';
+        const isNextNormal = nextStatus === 'normal';
 
-            if (nextStatus && prevStatus !== nextStatus && tx.qrCodeId) {
-            const enteringHold = nextStatus !== 'normal';
-            const leavingHold = prevStatus !== 'normal' && nextStatus === 'normal';
+        // Only adjust when crossing the boundary between normal and non-normal
+        const crossingToHold = isPrevNormal && !isNextNormal;   // normal -> non-normal
+        const releasingHold = !isPrevNormal && isNextNormal;    // non-normal -> normal
 
-            if (enteringHold || leavingHold) {
-                const qrList = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                [Query.equal('qrId', tx.qrCodeId), Query.limit(1)]
-                );
-                if (qrList.documents.length) {
-                const qrDoc = qrList.documents[0];
+        if ((crossingToHold || releasingHold) && tx.qrCodeId) {
+        const qrList = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            [Query.equal('qrId', tx.qrCodeId), Query.limit(1)]
+        ); // read QR doc to adjust aggregates [3]
+        if (qrList.documents.length) {
+            const qrDoc = qrList.documents;
 
-                // Use updated.amount if changed, otherwise old amount
-                const amt = Number(updated.amount ?? tx.amount ?? 0);
+            // Use updated.amount if changed this patch, else old tx amount
+            const amt = Number(updated.amount ?? tx.amount ?? 0);
 
-                const currentHold = Number(qrDoc.amountOnHold || 0);
-                let nextHold = currentHold;
+            const currentHold = Number(qrDoc.amountOnHold || 0);
+            let nextHold = currentHold;
 
-                if (enteringHold) {
-                    nextHold = Math.max(0, currentHold + amt);
-                } else if (leavingHold) {
-                    nextHold = Math.max(0, currentHold - amt);
-                }
-
-                const nextAvailable = (() => {
-                    const total = Number(qrDoc.totalPayInAmount || 0);
-                    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                    return (total - approved - requested - nextHold);
-                })();
-
-                const doneQr = await databases.updateDocument(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    qrDoc.$id,
-                    {
-                    amountOnHold: nextHold,
-                    amountAvailableForWithdrawal: nextAvailable,
-                    }
-                ); // atomic partial update of both fields [6][7]
-
-                }
+            if (crossingToHold) {
+            nextHold = currentHold + amt; // allow negative available downstream if needed [1]
+            } else if (releasingHold) {
+            nextHold = currentHold - amt;
             }
+
+            const nextAvailable = (() => {
+            const total = Number(qrDoc.totalPayInAmount || 0);
+            const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+            const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+            // No clamp: allow negative available as per requirement
+            return total - approved - requested - nextHold;
+            })();
+
+            await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            qrDoc.$id,
+            {
+                amountOnHold: nextHold,
+                amountAvailableForWithdrawal: nextAvailable,
+            }
+            ); // atomic partial update of hold and available [3]
+        }
         }
 
 
