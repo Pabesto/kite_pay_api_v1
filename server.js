@@ -283,6 +283,29 @@ function rupeesToPaiseStrict(rupees) {
   return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
 
+app.get('/test_websocket', (req, res) => {
+  const nowIso = new Date().toISOString(); // simple ISO timestamp
+
+  const eventPayload = {
+    id: 'test-id-1',
+    qrCodeId: '119188392',
+    amountPaise: 100,             // integer paise
+    rrnNumber: 'rrnNumber',
+    vpa: 'vpa@ybl',
+    provider: 'cashfree',
+    createdAtIso: nowIso,         // normalized ISO field name
+  }; // compact UI-ready payload [1]
+
+  // Emit to QR room only for this test
+  emitTxnNew({
+    assignedUserId: null,         // avoid empty string
+    qrCodeId: '119188392',
+    payload: eventPayload,
+  }); // Socket.IO rooms emit [2]
+
+  return res.status(200).send('OK');
+});
+
 app.post('/cashfree/webhook', async (req, res) => {
   console.log('Webhook Event Received: Cashfree');
 
