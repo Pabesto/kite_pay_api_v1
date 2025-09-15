@@ -957,7 +957,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-
     router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
         try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
@@ -1164,6 +1163,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 amount: d.amount,
                 vpa: d.vpa,
                 created_at: d.created_at,
+                status: d.status,
             });
             const docs = transactions.documents.map(pickTxn);
 
