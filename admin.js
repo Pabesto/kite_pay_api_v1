@@ -940,7 +940,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 paymentId : "",                                           // string
                 amount: finalAmount,                           // exact integer
                 rrnNumber: rrnNumber || null,
-                vpa: vpa || null,
+                vpa: "",
                 provider: 'manual',
                 created_at: isoDate,    // normalize to ISO
             }; // normalized event payload for clients [2]
