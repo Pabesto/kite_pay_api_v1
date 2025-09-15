@@ -112,6 +112,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 withdrawalRequestedAmount : doc.withdrawalRequestedAmount || 0,
                 withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
                 amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
+                amountOnHold : doc.amountOnHold || 0,
             }));
 
             res.status(200).json(qrCodes.reverse());// Reverse the order to show the most recent first
@@ -341,6 +342,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 withdrawalRequestedAmount : doc.withdrawalRequestedAmount || 0,
                 withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
                 amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
+                amountOnHold : doc.amountOnHold || 0,
             }));
 
             res.status(200).json(userQrCodes);

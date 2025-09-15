@@ -671,6 +671,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 amount: d.amount,
                 vpa: d.vpa,
                 created_at: d.created_at,
+                status: d.status,
             });
             const docs = transactions.documents.map(pickTxn);
 
@@ -693,7 +694,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     try {
         const { id: TxnID } = req.params;
 
-        const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
+        const { qrCodeId, rrnNumber, amount, isoDate, status } = req.body;
 
         // 1) Fetch existing transaction
         const Txndocuments = await databases.listDocuments(
@@ -731,14 +732,30 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             updates.amount = newAmountPaise;
         }
 
+        // New: validate and stage status
+        const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+        let nextStatus = undefined;
+        if (status !== undefined && status !== null) {
+            if (typeof status !== 'string' || !allowedStatuses.has(status.toLowerCase())) {
+                return res.status(400).json({ error: 'Invalid status' }); // 400 on bad input [14]
+            }
+            nextStatus = status.toLowerCase();
+            updates.status = nextStatus; // partial update field [9][17]
+        }
+
         // 3) Early exit if no updates
         if (Object.keys(updates).length === 0) {
             return res.status(400).json({ error: 'No valid fields to update' });
         }
 
-        // 4) Capture old values for reconciliation
+            // 4) Capture old values for reconciliation
         const oldQrId = tx.qrCodeId;
         const oldAmountPaise = Number(tx.amount || 0);
+        const prevStatus = ((tx.status && tx.status.trim()) || 'normal').toLowerCase();
+
+        // // 4) Capture old values for reconciliation
+        // const oldQrId = tx.qrCodeId;
+        // const oldAmountPaise = Number(tx.amount || 0);
 
         // 5) Update transaction document
         const updated = await databases.updateDocument(
@@ -748,83 +765,140 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             updates
         );
 
-        // 6) Reconcile QR totals if amount or qrCodeId changed
-// Helpers
-    const recomputeAvailable = (qrDocLike) => {
-      const total = Number(qrDocLike.totalPayInAmount || 0);
-      const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
-      const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
-      return Math.max(0, total - approved - requested);
-    };
+            // 6) Reconcile QR totals if amount or qrCodeId changed
+            // Helpers
+        const recomputeAvailable = (qrDocLike) => {
+            const total = Number(qrDocLike.totalPayInAmount || 0);
+            const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
+            const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
+            const hold = Number(qrDocLike.amountOnHold || 0); // ADDED: include holds in formula
+            return (total - approved - requested - hold);
+        };
 
-    const hasAmountChange = typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
-    const newQrId = updates.qrCodeId ?? oldQrId;
-    const movedQr = newQrId !== oldQrId;
+        const hasAmountChange = typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
+        const newQrId = updates.qrCodeId ?? oldQrId;
+        const movedQr = newQrId !== oldQrId;
 
-    // 5A) Same QR, only amount changed: update that QR by the difference
-    if (hasAmountChange && !movedQr) {
-      const amountDiff = newAmountPaise - oldAmountPaise; // + or -
-      const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-        Query.equal('qrId', oldQrId),
-        Query.limit(1),
-      ]);
-      if (oldQrList.documents.length) {
-        const oldQr = oldQrList.documents[0];
-        const newTotal = (oldQr.totalPayInAmount || 0) + amountDiff;
-        await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
-          totalPayInAmount: newTotal,
-          amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
-        });
-      }
-    }
-
-    // 5B) QR changed: subtract full old from old QR, add new/old to new QR, adjust counts
-    if (movedQr) {
-      // Old QR
-      if (oldQrId) {
+        // 5A) Same QR, only amount changed: update that QR by the difference
+        if (hasAmountChange && !movedQr) {
+        const amountDiff = newAmountPaise - oldAmountPaise; // + or -
         const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-          Query.equal('qrId', oldQrId),
-          Query.limit(1),
+            Query.equal('qrId', oldQrId),
+            Query.limit(1),
         ]);
         if (oldQrList.documents.length) {
-          const oldQr = oldQrList.documents[0];
-          const newTotal = (oldQr.totalPayInAmount || 0) - oldAmountPaise;
-          await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+            const oldQr = oldQrList.documents[0];
+            const newTotal = (oldQr.totalPayInAmount || 0) + amountDiff;
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
             totalPayInAmount: newTotal,
-            totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
             amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
-          });
+            });
         }
-      }
-
-      // New QR
-      if (newQrId) {
-        const newQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-          Query.equal('qrId', newQrId),
-          Query.limit(1),
-        ]);
-        if (newQrList.documents.length) {
-          const newQr = newQrList.documents[0];
-          const addAmount = hasAmountChange ? newAmountPaise : oldAmountPaise;
-          const newTotal = (newQr.totalPayInAmount || 0) + addAmount;
-          await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, newQr.$id, {
-            totalPayInAmount: newTotal,
-            totalTransactions: (newQr.totalTransactions || 0) + 1,
-            amountAvailableForWithdrawal: recomputeAvailable({ ...newQr, totalPayInAmount: newTotal }),
-          });
-        } else {
-          console.warn(`Target QR ${newQrId} not found while reconciling`);
         }
-      }
-    }
 
-
-        return res.status(200).json({ message: 'Transaction updated', transaction: updated });
-        } catch (err) {
-        console.error('❌ Edit transaction error:', err.message || err);
-        return res.status(500).json({ error: err.message || 'Update failed' });
+        // 5B) QR changed: subtract full old from old QR, add new/old to new QR, adjust counts
+        if (movedQr) {
+        // Old QR
+        if (oldQrId) {
+            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            Query.equal('qrId', oldQrId),
+            Query.limit(1),
+            ]);
+            if (oldQrList.documents.length) {
+            const oldQr = oldQrList.documents[0];
+            const newTotal = (oldQr.totalPayInAmount || 0) - oldAmountPaise;
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+                totalPayInAmount: newTotal,
+                totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
+                amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
+            });
+            }
         }
-    }
+
+        // New QR
+        if (newQrId) {
+            const newQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            Query.equal('qrId', newQrId),
+            Query.limit(1),
+            ]);
+            if (newQrList.documents.length) {
+            const newQr = newQrList.documents[0];
+            const addAmount = hasAmountChange ? newAmountPaise : oldAmountPaise;
+            const newTotal = (newQr.totalPayInAmount || 0) + addAmount;
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, newQr.$id, {
+                totalPayInAmount: newTotal,
+                totalTransactions: (newQr.totalTransactions || 0) + 1,
+                amountAvailableForWithdrawal: recomputeAvailable({ ...newQr, totalPayInAmount: newTotal }),
+            });
+            } else {
+            console.warn(`Target QR ${newQrId} not found while reconciling`);
+            }
+        }
+        }
+
+            // ADDED: On-hold reconciliation when status crosses normal <-> non-normal
+            // Treat any non-'normal' status as a hold state; adjust amountOnHold and recompute available
+
+            console.log('Reconcile hold: prevStatus=', prevStatus, ' nextStatus=', nextStatus, ' tx.qrCodeId=', tx.qrCodeId);
+
+            if (nextStatus && prevStatus !== nextStatus && tx.qrCodeId) {
+            const enteringHold = nextStatus !== 'normal';
+            const leavingHold = prevStatus !== 'normal' && nextStatus === 'normal';
+
+            console.log('Entering hold?', enteringHold, ' Leaving hold?', leavingHold);
+
+            if (enteringHold || leavingHold) {
+                const qrList = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal('qrId', tx.qrCodeId), Query.limit(1)]
+                );
+                if (qrList.documents.length) {
+                const qrDoc = qrList.documents[0];
+
+                // Use updated.amount if changed, otherwise old amount
+                const amt = Number(updated.amount ?? tx.amount ?? 0);
+
+                const currentHold = Number(qrDoc.amountOnHold || 0);
+                let nextHold = currentHold;
+
+                if (enteringHold) {
+                    nextHold = Math.max(0, currentHold + amt);
+                } else if (leavingHold) {
+                    nextHold = Math.max(0, currentHold - amt);
+                }
+
+                const nextAvailable = (() => {
+                    const total = Number(qrDoc.totalPayInAmount || 0);
+                    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                    return (total - approved - requested - nextHold);
+                })();
+
+                const doneQr = await databases.updateDocument(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    qrDoc.$id,
+                    {
+                    amountOnHold: nextHold,
+                    amountAvailableForWithdrawal: nextAvailable,
+                    }
+                ); // atomic partial update of both fields [6][7]
+
+                console.log(`Reconciled QR ${qrDoc.qrId} hold: ${currentHold} -> ${nextHold}, available: ${doneQr.amountAvailableForWithdrawal}`);
+                console.log('Done QR doc:', doneQr);
+
+                }
+            }
+        }
+
+
+                return res.status(200).json({ message: 'Transaction updated', transaction: updated });
+            } catch (err) {
+                console.error('❌ Edit transaction error:', err.message || err);
+                return res.status(500).json({ error: err.message || 'Update failed' });
+            }
+        }
     );
 
     // DELETE /admin/transactions/:id
@@ -931,6 +1005,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                         vpa: "", // optional
                         provider: 'manual',
                         created_at: isoDate, // current IST time
+                        status: 'normal', // default status
                     }
             );
 
@@ -943,6 +1018,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 vpa: "",
                 provider: 'manual',
                 created_at: isoDate,    // normalize to ISO
+                status: 'normal',                                 // default status
             }; // normalized event payload for clients [2]
 
             // 5) Emit only to intended audiences (user + QR rooms)

@@ -393,6 +393,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         vpa: vpa,
         provider: 'cashfree',
         created_at: createdAt,
+        status: 'normal',
       }
     );
 
