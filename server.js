@@ -283,17 +283,19 @@ function rupeesToPaiseStrict(rupees) {
   return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
 
+// http://localhost:3000/test_websocket
 app.get('/test_websocket', (req, res) => {
   const nowIso = new Date().toISOString(); // simple ISO timestamp
 
   const eventPayload = {
-    id: 'test-id-1',
+    $id: 'test-id-1',
     qrCodeId: '119188392',
-    amountPaise: 100,             // integer paise
+    paymentId: 'test-payment-id-1',
+    amount: 100,             // integer paise
     rrnNumber: 'rrnNumber',
     vpa: 'vpa@ybl',
     provider: 'cashfree',
-    createdAtIso: nowIso,         // normalized ISO field name
+    created_at: nowIso,         // normalized ISO field name
   }; // compact UI-ready payload [1]
 
   // Emit to QR room only for this test
