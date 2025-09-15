@@ -285,27 +285,39 @@ function rupeesToPaiseStrict(rupees) {
 
 // http://localhost:3000/test_websocket
 app.get('/test_websocket', (req, res) => {
-  const nowIso = new Date().toISOString(); // simple ISO timestamp
+  // random helpers
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // inclusive [9]
+  const randAlnum = (len) => crypto.randomBytes(Math.ceil(len / 2)).toString('hex').slice(0, len); // [16]
+  const recentIso = (minutesBack = 60) => {
+    const now = Date.now();
+    const past = now - minutesBack * 60 * 1000;
+    const ts = randInt(past, now);
+    return new Date(ts).toISOString(); // ISO 8601 [15]
+  };
+
+  // sample sets
+  const vpAs = ['vpa@ybl', 'merchant@upi', 'random@okicici', 'shop@oksbi'];
+  const providers = ['cashfree', 'razorpay', 'ccavenue', 'payu'];
+  const qrId = String(randInt(100000000, 999999999)); // 9-digit QR code ID
 
   const eventPayload = {
-    $id: 'test-id-1',
-    qrCodeId: '119188392',
-    paymentId: 'test-payment-id-1',
-    amount: 100,             // integer paise
-    rrnNumber: 'rrnNumber',
-    vpa: 'vpa@ybl',
-    provider: 'cashfree',
-    created_at: nowIso,         // normalized ISO field name
-  }; // compact UI-ready payload [1]
+    $id: crypto.randomUUID(),                 // unique id [16]
+    qrCodeId: qrId,
+    paymentId: `pay_${randAlnum(10)}`,        // random payment-like id [16]
+    amount: randInt(100, 50_000),             // paise: 1.00 to 500.00 INR [9]
+    rrnNumber: `RRN${randInt(1000000000, 9999999999)}`, // 10-digit RRN-style
+    vpa: vpAs[randInt(0, vpAs.length - 1)],
+    provider: providers[randInt(0, providers.length - 1)],
+    created_at: recentIso(240),               // anywhere in last 4 hours [15]
+  };
 
-  // Emit to QR room only for this test
   emitTxnNew({
-    assignedUserId: null,         // avoid empty string
-    qrCodeId: '119188392',
+    assignedUserId: null,
+    qrCodeId: qrId,
     payload: eventPayload,
-  }); // Socket.IO rooms emit [2]
+  }); // Socket.IO rooms emit
 
-  return res.status(200).send('OK');
+  return res.status(200).json({ ok: true, payload: eventPayload });
 });
 
 app.post('/cashfree/webhook', async (req, res) => {
