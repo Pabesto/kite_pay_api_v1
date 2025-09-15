@@ -397,9 +397,10 @@ app.post('/cashfree/webhook', async (req, res) => {
     );
 
     const eventPayload = {
-        id: created.$id,                                    // document id
-        qrCodeId,                                           // string
-        amountPaise: amountPaise,                           // exact integer
+        $id: created.$id,                                    // document id
+        qrCodeId,
+        paymentId,                                           // string
+        amount: amountPaise,                           // exact integer
         rrnNumber: rrnNumber || null,
         vpa: vpa || null,
         provider: 'cashfree',
