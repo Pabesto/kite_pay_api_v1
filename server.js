@@ -9,14 +9,25 @@ const crypto = require('crypto');
 const cors = require('cors');
 const { Client, Databases, Storage, Users, Account, ID, Query, InputFile } = require('node-appwrite');
 
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+
 // Import the route files
 const qrCodeRoutes = require('./qrcode');
 const adminRoutes = require('./admin');
 const withdrawRoutes = require('./withdraw');
 
+const { initSocket } = require('./socketServer');
+
 // --- Configuration & Initialization ---
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const { httpServer, emitTxnNew } = initSocket(app);
+
+httpServer.listen(PORT, () => {
+  console.log(`HTTP + WS listening on :${PORT}`);
+});
 
 // Appwrite Configuration from your provided webhook file
 const APPWRITE_ENDPOINT = 'https://fra.cloud.appwrite.io/v1';
