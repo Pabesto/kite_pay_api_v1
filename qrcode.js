@@ -109,6 +109,9 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 isActive: doc.isActive,
                 totalTransactions : doc.totalTransactions || 0,
                 totalPayInAmount : doc.totalPayInAmount || 0,
+                withdrawalRequestedAmount : doc.withdrawalRequestedAmount || 0,
+                withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
+                amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
             }));
 
             res.status(200).json(qrCodes.reverse());// Reverse the order to show the most recent first
@@ -335,6 +338,9 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 isActive: doc.isActive,
                 totalTransactions: doc.totalTransactions || 0,
                 totalPayInAmount: doc.totalPayInAmount || 0,
+                withdrawalRequestedAmount : doc.withdrawalRequestedAmount || 0,
+                withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
+                amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
             }));
 
             res.status(200).json(userQrCodes);

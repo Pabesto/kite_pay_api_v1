@@ -381,7 +381,12 @@ app.post('/cashfree/webhook', async (req, res) => {
     // const qrDoc = qrResult.documents;           
     const qrDocId = qrDoc.$id;                     // <- required documentId
     const newCount = (qrDoc.totalTransactions || 0) + 1;
-    const newAmount = (qrDoc.totalPayInAmount || 0) + amountPaise;
+    const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+    // Recompute available after changing total
+    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+    const newAvailable = Math.max(0, newTotal - approved - requested);
 
     await databases.updateDocument(
         APPWRITE_DATABASE_ID,
@@ -389,7 +394,8 @@ app.post('/cashfree/webhook', async (req, res) => {
         qrDocId,                                     // <- pass $id here
         {
             totalTransactions: newCount,
-            totalPayInAmount: newAmount,
+            totalPayInAmount: newTotal ,
+            amountAvailableForWithdrawal: newAvailable, // <-- add this
         }
     );
 

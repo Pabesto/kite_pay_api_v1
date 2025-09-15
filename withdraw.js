@@ -90,6 +90,100 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
+    // Users can post a withdrawal request (new version with validations and balance checks)
+    router.post('/withdraw_new', async (req, res) => {
+      const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+
+      // basic validations
+      if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
+      if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
+      if (mode === 'upi' && !upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
+      if (mode === 'bank' && (!bankName || !accountNumber || !ifscCode)) {
+        return res.status(400).json({ error: 'Bank details are incomplete' });
+      }
+
+      // normalize money to paise
+      const toPaise = (val) => {
+        const n = Number(val);
+        if (!isFinite(n) || n <= 0) return null;
+        return Math.round(n * 100);
+      };
+      const amountPaise = toPaise(amount);
+      if (amountPaise == null) return res.status(400).json({ error: 'Invalid amount' });
+
+      const wdh_id = generateWithdrawalId();
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const istTime = new Date(Date.now() + istOffset).toISOString();
+
+      try {
+        // Enforce max 2 pending per user
+        const pendingRequests = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [Query.equal('userId', userId), Query.equal('status', 'pending')]
+        );
+        if (pendingRequests.total >= 2) {
+          return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
+        } [1]
+
+        // Load QR and validate available balance
+        const qrList = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          [Query.equal('qrId', qrId), Query.limit(1)]
+        );
+        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' }); [1]
+        const qr = qrList.documents[0]; // has totals in paise [1]
+
+        const total = Number(qr.totalPayInAmount || 0);
+        const approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requested = Number(qr.withdrawalRequestedAmount || 0);
+        const available = Math.max(0, total - approved - requested);
+        if (amountPaise > available) {
+          return res.status(400).json({ error: 'Requested amount exceeds available balance' });
+        } [1]
+
+        // Update QR ledger: bump requested, recompute available
+        const newRequested = requested + amountPaise;
+        const newAvailable = Math.max(0, total - approved - newRequested);
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          qr.$id,
+          {
+            withdrawalRequestedAmount: newRequested,
+            amountAvailableForWithdrawal: newAvailable,
+          }
+        ); [1]
+
+        // Create withdrawal document
+        const response = await databases.createDocument(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          ID.unique(),
+          {
+            id: wdh_id,
+            userId,
+            qrId: qrId || null,
+            holderName,
+            amount: amountPaise, // store paise
+            mode,
+            upiId: upiId || null,
+            bankName: bankName || null,
+            accountNumber: accountNumber || null,
+            ifscCode: ifscCode || null,
+            status: 'pending',
+            createdAt: istTime,
+          }
+        ); [1]
+
+        return res.json({ success: true, data: response });
+      } catch (err) {
+        console.error('Error saving withdraw request:', err);
+        return res.status(500).json({ error: 'Failed to save withdrawal request' });
+      }
+    });
+
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdmin, async (req, res) => {
       try {
@@ -356,6 +450,97 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
+    // POST /withdrawals/approve_new (with balance and ledger updates)
+    router.post('/withdrawals/approve_new', authenticateAdmin, async (req, res) => {
+      const { id, utrNumber } = req.body;
+
+      if (!id || !utrNumber || utrNumber.trim().length < 5) {
+        return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
+      }
+
+      const istOffsetMs = 5.5 * 60 * 60 * 1000;
+      const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
+
+      try {
+        // 1) Find withdrawal by business id
+        const list = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [Query.equal('id', id), Query.limit(1)]
+        ); // query -> then pick documents [19][9]
+
+        if (!list.total) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+        const w = list.documents[0];
+
+        if (w.status !== 'pending') {
+          return res.status(400).json({ error: `Cannot approve a ${w.status} request` });
+        }
+
+        const amountPaise = Number(w.amount || 0);
+        const qrId = w.qrId;
+        if (!qrId || amountPaise <= 0) {
+          return res.status(400).json({ error: 'Invalid withdrawal document data' });
+        }
+
+        // 2) Load QR document
+        const qrList = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          [Query.equal('qrId', qrId), Query.limit(1)]
+        ); // list and index 0 safely [19]
+        if (!qrList.documents.length) {
+          return res.status(404).json({ error: 'QR not found for withdrawal' });
+        }
+        const qr = qrList.documents[0];
+
+        // 3) Compute new ledger values (all in paise)
+        const total = Number(qr.totalPayInAmount || 0);
+        const approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requested = Number(qr.withdrawalRequestedAmount || 0);
+
+        if (requested < amountPaise) {
+          // Defensive: don’t go negative if pending bucket is lower than request
+          return res.status(409).json({ error: 'Pending requested amount is lower than approval amount' });
+        }
+
+        const newRequested = requested - amountPaise;
+        const newApproved = approved + amountPaise;
+        const newAvailable = Math.max(0, total - newApproved - newRequested);
+
+        // 4) Update QR ledger first
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          qr.$id,
+          {
+            withdrawalRequestedAmount: newRequested,
+            withdrawalApprovedAmount: newApproved,
+            amountAvailableForWithdrawal: newAvailable,
+          }
+        ); // update by $id [5][19]
+
+        // 5) Update withdrawal doc
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          w.$id,
+          {
+            status: 'approved',
+            utrNumber: utrNumber.trim(),
+            approvedAt: approvedAtIST,
+            rejectionReason: null,
+          }
+        ); // update by $id [5]
+
+        return res.json({ success: true, message: 'Withdrawal approved' });
+      } catch (err) {
+        console.error('❌ Approve error:', err);
+        return res.status(500).json({ error: 'Failed to approve withdrawal' });
+      }
+    });
+
     // POST /withdrawals/reject
     router.post('/withdrawals/reject', authenticateAdmin, async (req, res) => {
       const { id, reason } = req.body;
@@ -389,6 +574,91 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
+    // POST /withdrawals/reject_new (new with balance and ledger updates)
+    router.post('/withdrawals/reject_new', authenticateAdmin, async (req, res) => {
+      const { id, reason } = req.body;
+
+      if (!id || !reason || reason.trim().length < 4) {
+        return res.status(400).json({ error: 'Invalid ID or reason too short' });
+      }
+
+      try {
+        // 1) Find withdrawal by business id
+        const result = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [Query.equal('id', id), Query.limit(1)]
+        ); // list then index 0 [19][1]
+
+        if (!result.total) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+
+        const w = result.documents[0];
+        if (w.status !== 'pending') {
+          return res.status(400).json({ error: `Cannot reject a ${w.status} request` });
+        }
+
+        const amountPaise = Number(w.amount || 0);
+        const qrId = w.qrId;
+        if (!qrId || amountPaise <= 0) {
+          return res.status(400).json({ error: 'Invalid withdrawal document data' });
+        }
+
+        // 2) Load QR document
+        const qrList = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          [Query.equal('qrId', qrId), Query.limit(1)]
+        ); // list then index 0 [19]
+        if (!qrList.documents.length) {
+          return res.status(404).json({ error: 'QR not found for withdrawal' });
+        }
+        const qr = qrList.documents[0];
+
+        // 3) Compute new ledger values (all in paise)
+        const total = Number(qr.totalPayInAmount || 0);
+        const approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requested = Number(qr.withdrawalRequestedAmount || 0);
+
+        if (requested < amountPaise) {
+          return res.status(409).json({ error: 'Pending requested amount is lower than rejection amount' });
+        }
+
+        const newRequested = requested - amountPaise;                 // return amount to availability
+        const newApproved = approved;                                  // unchanged
+        const newAvailable = Math.max(0, total - newApproved - newRequested);
+
+        // 4) Update QR ledger
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          qr.$id,
+          {
+            withdrawalRequestedAmount: newRequested,
+            amountAvailableForWithdrawal: newAvailable,
+          }
+        ); // by $id [18]
+
+        // 5) Update withdrawal document
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          w.$id,
+          {
+            status: 'rejected',
+            rejectionReason: reason.trim(),
+            utrNumber: null,
+            rejectedAt: new Date().toISOString(),
+          }
+        ); // by $id [18]
+
+        return res.json({ success: true, message: 'Withdrawal rejected' });
+      } catch (err) {
+        console.error('❌ Reject error:', err);
+        return res.status(500).json({ error: 'Failed to reject withdrawal' });
+      }
+    });
 
     // GET all config
     router.get("/config", async (req, res) => {

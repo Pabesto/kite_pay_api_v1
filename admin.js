@@ -675,6 +675,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // Helper: convert amount to paise
     const toPaise = (amt) => Math.round(amt * 100);
 
+    // ✏️ Edit transaction endpoint
     router.patch('/transactions/:id', authenticateAdmin, async (req, res) => {
     try {
         const { id: TxnID } = req.params;
@@ -735,84 +736,74 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         );
 
         // 6) Reconcile QR totals if amount or qrCodeId changed
+// Helpers
+    const recomputeAvailable = (qrDocLike) => {
+      const total = Number(qrDocLike.totalPayInAmount || 0);
+      const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
+      const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
+      return Math.max(0, total - approved - requested);
+    };
 
-        // oldAmountPaise: integer from tx.amount
-        // newAmountPaise: integer from toPaise(...) ONLY if amount provided
-        const hasAmountChange =
-        typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
+    const hasAmountChange = typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
+    const newQrId = updates.qrCodeId ?? oldQrId;
+    const movedQr = newQrId !== oldQrId;
 
-        const newQrId = updates.qrCodeId ?? oldQrId;
-        const movedQr = newQrId !== oldQrId;
+    // 5A) Same QR, only amount changed: update that QR by the difference
+    if (hasAmountChange && !movedQr) {
+      const amountDiff = newAmountPaise - oldAmountPaise; // + or -
+      const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+        Query.equal('qrId', oldQrId),
+        Query.limit(1),
+      ]);
+      if (oldQrList.documents.length) {
+        const oldQr = oldQrList.documents[0];
+        const newTotal = (oldQr.totalPayInAmount || 0) + amountDiff;
+        await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+          totalPayInAmount: newTotal,
+          amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
+        });
+      }
+    }
 
-        // 1) Only amount changed on SAME QR -> single update on old QR
-        if (hasAmountChange && !movedQr) {
-        const amountDiff = newAmountPaise - oldAmountPaise; // can be + or -
-        const oldQrList = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            [Query.equal('qrId', oldQrId), Query.limit(1)]
-        );
+    // 5B) QR changed: subtract full old from old QR, add new/old to new QR, adjust counts
+    if (movedQr) {
+      // Old QR
+      if (oldQrId) {
+        const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+          Query.equal('qrId', oldQrId),
+          Query.limit(1),
+        ]);
         if (oldQrList.documents.length) {
-            const oldQr = oldQrList.documents[0];
-            await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            oldQr.$id,
-            {
-                totalPayInAmount: (oldQr.totalPayInAmount || 0) + amountDiff,
-            }
-            );
+          const oldQr = oldQrList.documents[0];
+          const newTotal = (oldQr.totalPayInAmount || 0) - oldAmountPaise;
+          await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+            totalPayInAmount: newTotal,
+            totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
+            amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
+          });
         }
-        // done; no changes to any "new" QR [1]
-        }
+      }
 
-        // 2) QR moved (with or without amount change) -> update both sides
-        if (movedQr) {
-        // subtract from old QR
-        if (oldQrId) {
-            const oldQrList = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            [Query.equal('qrId', oldQrId), Query.limit(1)]
-            );
-            if (oldQrList.documents.length) {
-            const oldQr = oldQrList.documents[0];
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                oldQr.$id,
-                {
-                totalPayInAmount: (oldQr.totalPayInAmount || 0) - oldAmountPaise,
-                totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
-                }
-            );
-            }
+      // New QR
+      if (newQrId) {
+        const newQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+          Query.equal('qrId', newQrId),
+          Query.limit(1),
+        ]);
+        if (newQrList.documents.length) {
+          const newQr = newQrList.documents[0];
+          const addAmount = hasAmountChange ? newAmountPaise : oldAmountPaise;
+          const newTotal = (newQr.totalPayInAmount || 0) + addAmount;
+          await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, newQr.$id, {
+            totalPayInAmount: newTotal,
+            totalTransactions: (newQr.totalTransactions || 0) + 1,
+            amountAvailableForWithdrawal: recomputeAvailable({ ...newQr, totalPayInAmount: newTotal }),
+          });
+        } else {
+          console.warn(`Target QR ${newQrId} not found while reconciling`);
         }
-
-        // add to new QR
-        if (newQrId) {
-            const newQrList = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            [Query.equal('qrId', newQrId), Query.limit(1)]
-            );
-            if (newQrList.documents.length) {
-            const newQr = newQrList.documents[0];
-            const addAmount = hasAmountChange ? newAmountPaise : oldAmountPaise;
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                newQr.$id,
-                {
-                totalPayInAmount: (newQr.totalPayInAmount || 0) + addAmount,
-                totalTransactions: (newQr.totalTransactions || 0) + 1,
-                }
-            );
-            } else {
-            console.warn(`Target QR ${newQrId} not found while reconciling`);
-            }
-        }
-        }
+      }
+    }
 
 
         return res.status(200).json({ message: 'Transaction updated', transaction: updated });
@@ -825,63 +816,66 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // DELETE /admin/transactions/:id
     router.delete('/transactions/:id', authenticateAdmin, async (req, res) => {
-    try {
-        const { id } = req.params;
+        try {
+            const { id } = req.params;
 
-        // 1) Load transaction by $id
-        const tx = await databases.getDocument(
-        APPWRITE_DATABASE_ID,
-        '688cf5920023475022df', // webhook_data
-        id
-        ); // fetch by $id [6]
-
-        if (!tx) {
-            return res.status(404).json({ error: 'Transaction not found' });
-        }
-
-        const amountPaise = Number(tx.amount || 0); // stored in paise
-        const qrId = tx.qrCodeId;
-
-        // 2) Reconcile QR totals
-        if (qrId) {
-        const qrList = await databases.listDocuments(
+            // 1) Load transaction by $id
+            const tx = await databases.getDocument(
             APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            [Query.equal('qrId', qrId), Query.limit(1)]
-        ); // list then take  [6]
+            '688cf5920023475022df', // webhook_data
+            id
+            ); // by $id [1]
+            if (!tx) return res.status(404).json({ error: 'Transaction not found' });
 
-        if (qrList.documents.length) {
-            const qrDoc = qrList.documents[0];
+            const amountPaise = Number(tx.amount || 0); // paise
+            const qrId = tx.qrCodeId;
 
-            await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            qrDoc.$id,
-            {
-                totalPayInAmount: Math.max(0,(qrDoc.totalPayInAmount || 0) - amountPaise),
-                totalTransactions: Math.max(0,(qrDoc.totalTransactions || 0) - 1),
+            // 2) Reconcile QR totals (if linked)
+            if (qrId) {
+            const qrList = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal('qrId', qrId), Query.limit(1)]
+            ); // query then pick  [19]
+
+            if (qrList.documents.length) {
+                const qrDoc = qrList.documents[0];
+
+                const newTotal = Math.max(0, (qrDoc.totalPayInAmount || 0) - amountPaise);
+                const recomputeAvailable = () => {
+                const total = Number(newTotal);
+                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                return Math.max(0, total - approved - requested);
+                };
+
+                await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                qrDoc.$id,
+                {
+                    totalPayInAmount: newTotal,
+                    totalTransactions: Math.max(0, (qrDoc.totalTransactions || 0) - 1),
+                    amountAvailableForWithdrawal: recomputeAvailable(),
+                }
+                ); // update by $id [1]
+            } else {
+                console.warn(`QR ${qrId} not found during delete reconciliation`);
             }
-            ); // update by $id [6]
-        } else {
-            console.warn(`QR ${qrId} not found during delete reconciliation`);
-        }
-        }
+            }
 
-        // 3) Delete the transaction
-        await databases.deleteDocument(
-        APPWRITE_DATABASE_ID,
-        '688cf5920023475022df',
-        id
-        ); // delete by $id [6]
+            // 3) Delete the transaction
+            await databases.deleteDocument(
+            APPWRITE_DATABASE_ID,
+            '688cf5920023475022df',
+            id
+            ); // delete by $id [1]
 
-        return res.status(200).json({
-        message: 'Transaction deleted',
-        id,
-        });
-    } catch (err) {
-        console.error('❌ Delete transaction error:', err.message || err);
-        return res.status(500).json({ error: err.message || 'Delete failed' });
-    }
+            return res.status(200).json({ message: 'Transaction deleted', id });
+        } catch (err) {
+            console.error('❌ Delete transaction error:', err.message || err);
+            return res.status(500).json({ error: err.message || 'Delete failed' });
+        }
     });
 
 
