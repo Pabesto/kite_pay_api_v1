@@ -893,7 +893,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
 
     router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
-    try {
+        try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
 
             // ✅ Validate required fields
@@ -936,41 +936,34 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // 3️⃣ Update the corresponding QR code totals
             if (qrCodeId) {
-                const qrResult = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    [
-                        Query.equal('qrId', qrCodeId),
-                        Query.limit(1)
-                    ]
-                );
+            const qrResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal('qrId', qrCodeId), Query.limit(1)]
+            );
 
-                if (qrResult.documents.length) {
-                    const qrDoc = qrResult.documents[0];
+            if (qrResult.documents.length) {
+                const qrDoc = qrResult.documents[0];
 
-                    // Current values from DB (default to 0 if missing)
-                    const currentTransactions = qrDoc.totalTransactions || 0;
-                    const currentPayInAmount = qrDoc.totalPayInAmount || 0;
+                const newTransactions = (qrDoc.totalTransactions || 0) + 1;
+                const newTotal = (qrDoc.totalPayInAmount || 0) + finalAmount;
 
-                    // Increment values
-                    const newTransactions = currentTransactions + 1;       // increment by one
-                    const newPayInAmount = currentPayInAmount + finalAmount; // add your amount variable
+                // Recompute available from updated total
+                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                const newAvailable = Math.max(0, newTotal - approved - requested);
 
-                    // Update document with new totals
-                    await databases.updateDocument(
-                        APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
-                        qrDoc.$id,
-                        {
-                            totalTransactions: newTransactions,
-                            totalPayInAmount: newPayInAmount
-                        }
-                    );
-
-                    // console.log(`QR totals updated for qrId ${qrCodeId}`);
-                } else {
-                    // console.log(`QR Code with qrId ${qrCodeId} not found`);
+                await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                qrDoc.$id,
+                {
+                    totalTransactions: newTransactions,
+                    totalPayInAmount: newTotal,
+                    amountAvailableForWithdrawal: newAvailable, // <-- add this
                 }
+                );
+            }
             }
 
             return res.status(201).json({
