@@ -661,7 +661,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // console.log('Transaction query filters:', queries);
 
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-            const docs = transactions.documents;
+
+            const pickTxn = (d) => ({
+                $id: d.$id,   
+                id: d.$id,                // keep if needed
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                rrnNumber: d.rrnNumber,
+                amount: d.amount,
+                vpa: d.vpa,
+                created_at: d.created_at,
+            });
+            const docs = transactions.documents.map(pickTxn);
+
+            // const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
             res.status(200).json({ transactions: docs, nextCursor });
@@ -1062,7 +1075,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-            const docs = transactions.documents;
+
+            const pickTxn = (d) => ({
+                $id: d.$id,   
+                id: d.$id,                // keep if needed
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                rrnNumber: d.rrnNumber,
+                amount: d.amount,
+                vpa: d.vpa,
+                created_at: d.created_at,
+            });
+            const docs = transactions.documents.map(pickTxn);
+
+            // const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
             res.status(200).json({ transactions: docs, nextCursor });
