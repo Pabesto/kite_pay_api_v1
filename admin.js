@@ -851,7 +851,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             [Query.equal('qrId', tx.qrCodeId), Query.limit(1)]
         ); // read QR doc to adjust aggregates [3]
         if (qrList.documents.length) {
-            const qrDoc = qrList.documents;
+            const qrDoc = qrList.documents[0];
 
             // Use updated.amount if changed this patch, else old tx amount
             const amt = Number(updated.amount ?? tx.amount ?? 0);
@@ -884,7 +884,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ); // atomic partial update of hold and available [3]
         }
         }
-
 
                 return res.status(200).json({ message: 'Transaction updated', transaction: updated });
             } catch (err) {
