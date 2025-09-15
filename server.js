@@ -299,10 +299,11 @@ app.get('/test_websocket', (req, res) => {
   const vpAs = ['vpa@ybl', 'merchant@upi', 'random@okicici', 'shop@oksbi'];
   const providers = ['cashfree', 'razorpay', 'ccavenue', 'payu'];
 //   const qrId = String(randInt(100000000, 999999999)); // 9-digit QR code ID
+  const qrId = '119188392'; // 9-digit QR code ID
 
   const eventPayload = {
     $id: crypto.randomUUID(),                 // unique id [16]
-    qrCodeId: '119188392',
+    qrCodeId: qrId,
     paymentId: `pay_${randAlnum(10)}`,        // random payment-like id [16]
     amount: randInt(100, 50_000),             // paise: 1.00 to 500.00 INR [9]
     rrnNumber: `RRN${randInt(1000000000, 9999999999)}`, // 10-digit RRN-style
