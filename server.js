@@ -286,7 +286,7 @@ function rupeesToPaiseStrict(rupees) {
 // http://localhost:3000/test_websocket
 app.get('/test_websocket', (req, res) => {
   // random helpers
-  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // inclusive [9]
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // [1] 
   const randAlnum = (len) => crypto.randomBytes(Math.ceil(len / 2)).toString('hex').slice(0, len); // [16]
   const recentIso = (minutesBack = 60) => {
     const now = Date.now();
@@ -301,11 +301,15 @@ app.get('/test_websocket', (req, res) => {
 //   const qrId = String(randInt(100000000, 999999999)); // 9-digit QR code ID
   const qrId = '119188392'; // 9-digit QR code ID
 
+  // Ensure amount is a multiple of 100 paise
+  const rupees = randInt(1, 100000);     // 1–500 INR [1]
+  const amount = rupees * 100;        // paise [1]
+
   const eventPayload = {
     $id: crypto.randomUUID(),                 // unique id [16]
     qrCodeId: qrId,
     paymentId: `pay_${randAlnum(10)}`,        // random payment-like id [16]
-    amount: randInt(100, 50_000),             // paise: 1.00 to 500.00 INR [9]
+    amount: amount,             // paise: 1.00 to 500.00 INR [9]
     rrnNumber: `RRN${randInt(1000000000, 9999999999)}`, // 10-digit RRN-style
     vpa: vpAs[randInt(0, vpAs.length - 1)],
     provider: providers[randInt(0, providers.length - 1)],
