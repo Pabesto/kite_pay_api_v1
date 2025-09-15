@@ -839,13 +839,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // ADDED: On-hold reconciliation when status crosses normal <-> non-normal
             // Treat any non-'normal' status as a hold state; adjust amountOnHold and recompute available
 
-            console.log('Reconcile hold: prevStatus=', prevStatus, ' nextStatus=', nextStatus, ' tx.qrCodeId=', tx.qrCodeId);
-
             if (nextStatus && prevStatus !== nextStatus && tx.qrCodeId) {
             const enteringHold = nextStatus !== 'normal';
             const leavingHold = prevStatus !== 'normal' && nextStatus === 'normal';
-
-            console.log('Entering hold?', enteringHold, ' Leaving hold?', leavingHold);
 
             if (enteringHold || leavingHold) {
                 const qrList = await databases.listDocuments(
@@ -884,9 +880,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     amountAvailableForWithdrawal: nextAvailable,
                     }
                 ); // atomic partial update of both fields [6][7]
-
-                console.log(`Reconciled QR ${qrDoc.qrId} hold: ${currentHold} -> ${nextHold}, available: ${doneQr.amountAvailableForWithdrawal}`);
-                console.log('Done QR doc:', doneQr);
 
                 }
             }
