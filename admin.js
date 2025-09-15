@@ -934,6 +934,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     }
             );
 
+            const eventPayload = {
+                $id: result.$id,                                    // document id
+                qrCodeId : qrCodeId,
+                paymentId : "",                                           // string
+                amount: finalAmount,                           // exact integer
+                rrnNumber: rrnNumber || null,
+                vpa: vpa || null,
+                provider: 'manual',
+                created_at: isoDate,    // normalize to ISO
+            }; // normalized event payload for clients [2]
+
+            // 5) Emit only to intended audiences (user + QR rooms)
+            emitTxnNew({
+                assignedUserId : '',      // may be null if QR not found
+                qrCodeId,
+                payload: eventPayload,
+            });
+
             // 3️⃣ Update the corresponding QR code totals
             if (qrCodeId) {
             const qrResult = await databases.listDocuments(
