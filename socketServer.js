@@ -39,6 +39,7 @@ function initSocket(app) {
 
     // client asks to subscribe to specific QR codes it owns
     socket.on('subscribe:qrs', async ({ qrIds }) => {
+      // console.log('User subscribing to QR rooms:', qrIds);
       if (!Array.isArray(qrIds)) return;
       for (const qrId of qrIds) {
         // TODO: validate ownership: isQrAssignedToUser(qrId, userId)
@@ -46,6 +47,25 @@ function initSocket(app) {
         socket.join(`room:qr:${qrId}`);
       }
     });
+
+    // admin suscribes to all QR alerts for Work Starting
+    socket.on('subscribe:qrsAlert', async ({qrId}) => {
+        console.log('Admin subscribed to QR alerts');
+        socket.join(`qrsAlert`);
+      }
+    );
+
+    // admin Un-suscribes to all QR alerts for Work Starting
+    socket.on('unsubscribe:qrsAlert', async (qrId) => {
+        socket.leave(`qrsAlert`);
+      }
+    );
+
+    socket.on('send:qrsAlert', async (qrId) => {
+      // console.log('User sending QR alert for QR ID:', qrId);
+      emitQrAlert({ payload: qrId });
+      }
+    );
 
     socket.on('unsubscribe:qrs', ({ qrIds }) => {
       if (!Array.isArray(qrIds)) return;
@@ -67,7 +87,15 @@ function initSocket(app) {
     }
   }
 
-  return { httpServer, io, emitTxnNew };
+  function emitQrAlert({ payload }) {
+    // console.log('Emitting QR alert with payload');
+    if (payload) {
+      // io.to(`qrsAlert`).emit('qr', payload);
+      io.emit('qrsAlert', payload); // emit to all connected clients
+    }
+  }
+
+  return { httpServer, io, emitTxnNew, emitQrAlert };
 }
 
 module.exports = { initSocket };

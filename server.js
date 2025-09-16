@@ -23,7 +23,7 @@ const { initSocket } = require('./socketServer');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const { httpServer, emitTxnNew } = initSocket(app);
+const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
 
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
@@ -282,6 +282,38 @@ function rupeesToPaiseStrict(rupees) {
   const frac = (fracPart + '00').slice(0, 2); // exactly 2 decimals
   return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
+
+// http://localhost:3000/test_qralert
+app.get('/test_qralert', (req, res) => {
+    const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // [1] 
+    const recentIso = (minutesBack = 60) => {
+        const now = Date.now();
+        const past = now - minutesBack * 60 * 1000;
+        const ts = randInt(past, now);
+        return new Date(ts).toISOString(); // ISO 8601 [15]
+  };
+
+  const eventPayload = {
+        qrId: 'doc.qrId',
+        fileId: 'doc.fileId' || null,
+        imageUrl: 'oc.imageUrl',
+        assignedUserId: 'doc.assignedUserId '|| null,
+        createdAt: recentIso(240),               // anywhere in last 4 hours [15]
+        isActive: true,
+        totalTransactions: 0 || 0,
+        totalPayInAmount: 0 || 0,
+        withdrawalRequestedAmount : 0 || 0,
+        withdrawalApprovedAmount : 0 || 0,
+        amountAvailableForWithdrawal : 0 || 0,
+        amountOnHold : 0 || 0,              // anywhere in last 4 hours [15]
+  };
+
+  emitQrAlert({
+    payload: eventPayload,
+  }); // Socket.IO rooms emit
+
+  return res.status(200).json({ ok: true, payload: eventPayload });
+});
 
 // http://localhost:3000/test_websocket
 app.get('/test_websocket', (req, res) => {
