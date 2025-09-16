@@ -574,7 +574,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdmin, async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
+        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         let filters = [];
@@ -652,6 +652,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
+            if(status){
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+                if (!allowedStatuses.has(status.toLowerCase())) {
+                    return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
+                }
+                if(status.toLowerCase() === 'normal'){
+                    filters.push(
+                        Query.or([
+                            Query.equal('status', 'normal'),
+                            Query.equal('status', ''),       // if some docs stored empty string
+                            Query.isNull('status'),          // null or missing field
+                        ])
+                    );
+                }else{
+                    filters.push(Query.equal('status', status.toLowerCase()));
+                }
+            }
 
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) {
@@ -1063,7 +1080,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // User or subadmin restricted: fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to, searchField, searchValue } = req.query;
+        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         // console.log('Transaction query params:', req.query);
@@ -1146,6 +1163,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     filters.push(Query.equal('rrnNumber', searchValue));
                 } else {
                     return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+            if(status){
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+                if (!allowedStatuses.has(status.toLowerCase())) {
+                    return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
+                }
+                if(status.toLowerCase() === 'normal'){
+                    filters.push(
+                        Query.or([
+                            Query.equal('status', 'normal'),
+                            Query.equal('status', ''),       // if some docs stored empty string
+                            Query.isNull('status'),          // null or missing field
+                        ])
+                    );
+                }else{
+                    filters.push(Query.equal('status', status.toLowerCase()));
                 }
             }
 
