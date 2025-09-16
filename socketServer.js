@@ -90,8 +90,8 @@ function initSocket(app) {
   function emitQrAlert({ payload }) {
     // console.log('Emitting QR alert with payload');
     if (payload) {
-      // io.to(`qrsAlert`).emit('qr', payload);
-      io.emit('qrsAlert', payload); // emit to all connected clients
+      io.to(`qrsAlert`).emit('qrsAlert', payload);
+      // io.emit('qrsAlert', payload); // emit to all connected clients
     }
   }
 
