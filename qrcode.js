@@ -352,6 +352,55 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     });
 
+    router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
+        const { userId } = req.params;
+
+        if (!userId) {
+            return res.status(400).json({ message: 'Missing userId parameter' });
+        }
+
+        const userRequested = req.user;
+
+        if(userRequested.userId !== userId){
+            return res.status(403).json({ message: 'Forbidden: Cannot access QR codes of other users' });
+        }
+
+        try {
+            let documents = [];
+
+            const response = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [
+                    Query.equal('assignedUserId', userId),
+                    Query.limit(100),
+                ]
+            );
+            
+            documents = response.documents;
+
+            const userQrCodes = documents.map(doc => ({
+                qrId: doc.qrId,
+                fileId: doc.fileId,
+                imageUrl: doc.imageUrl,
+                assignedUserId: doc.assignedUserId || null,
+                createdAt: doc.createdAt,
+                isActive: doc.isActive,
+                totalTransactions: doc.totalTransactions || 0,
+                totalPayInAmount: doc.totalPayInAmount || 0,
+                withdrawalRequestedAmount : doc.withdrawalRequestedAmount || 0,
+                withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
+                amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
+                amountOnHold : doc.amountOnHold || 0,
+            }));
+
+            res.status(200).json(userQrCodes);
+        } catch (error) {
+            console.error('Error fetching QR codes for user:', error);
+            res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
+        }
+    });
+
     // Helper to fetch QR IDs a subadmin can access
     async function getQrIdsForSubadmin(subadminId) {
         const qrIds = new Set();

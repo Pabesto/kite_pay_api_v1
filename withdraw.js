@@ -94,6 +94,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdraw_new', async (req, res) => {
       const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
+      console.log('Withdraw request received:', req.body);
+
+      // return res.status(503).json({ error: 'Withdrawals are temporarily disabled for maintenance' });
+
       // basic validations
       if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
       if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
@@ -139,6 +143,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
         const available = Math.max(0, total - approved - requested);
+
+        console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
+
         if (amountPaise > available) {
           return res.status(400).json({ error: 'Requested amount exceeds available balance' });
         } [1]
@@ -166,7 +173,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             userId,
             qrId: qrId || null,
             holderName,
-            amount: amountPaise, // store paise
+            amount: amount, // store in Rs Not paise
             mode,
             upiId: upiId || null,
             bankName: bankName || null,
@@ -478,7 +485,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           return res.status(400).json({ error: `Cannot approve a ${w.status} request` });
         }
 
-        const amountPaise = Number(w.amount || 0);
+        // normalize money to paise
+        const toPaise = (val) => {
+        const n = Number(val);
+          if (!isFinite(n) || n <= 0) return null;
+          return Math.round(n * 100);
+        };
+
+        const amountPaise = toPaise(w.amount);
         const qrId = w.qrId;
         if (!qrId || amountPaise <= 0) {
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
@@ -529,7 +543,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             status: 'approved',
             utrNumber: utrNumber.trim(),
-            approvedAt: approvedAtIST,
+            processed_at: approvedAtIST,
             rejectionReason: null,
           }
         ); // update by $id [5]
@@ -599,7 +613,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           return res.status(400).json({ error: `Cannot reject a ${w.status} request` });
         }
 
-        const amountPaise = Number(w.amount || 0);
+        // normalize money to paise
+        const toPaise = (val) => {
+        const n = Number(val);
+          if (!isFinite(n) || n <= 0) return null;
+          return Math.round(n * 100);
+        };
+
+        const amountPaise = toPaise(w.amount);
         const qrId = w.qrId;
         if (!qrId || amountPaise <= 0) {
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
@@ -649,7 +670,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'rejected',
             rejectionReason: reason.trim(),
             utrNumber: null,
-            rejectedAt: new Date().toISOString(),
+            processed_at: new Date().toISOString(),
           }
         ); // by $id [18]
 
