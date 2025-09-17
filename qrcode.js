@@ -602,7 +602,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
 
             if (hasFiveActive) {
-                console.log(`User already has ${activeCount} active QR codes. Cannot assign more.`);
+                // console.log(`User already has ${activeCount} active QR codes. Cannot assign more.`);
                 return res.status(400).json({
                     message: `User already has ${activeCount} active QR codes. Cannot assign more.`
                 });
@@ -648,7 +648,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
 
             if (hasFiveActive) {
-                console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
+                // console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
                 return res.status(400).json({
                     message: `User already has ${activeCount} active QR codes. Cannot assign more.`
                 });

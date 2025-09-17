@@ -478,7 +478,7 @@ app.post('/cashfree/webhook', async (req, res) => {
     );
 
     if (!qrResult.documents.length) {
-        console.log(`QR Code with qrId ${qrCodeId} not found`);
+        // console.log(`QR Code with qrId ${qrCodeId} not found`);
         return res.status(200).send('OK'); // or handle not-found differently
     }
 
@@ -556,7 +556,7 @@ app.post('/webhook', async (req, res) => {
     const eventType = req.body?.event;
 
     if (eventType !== 'qr_code.credited') {
-        console.log('❌ Unsupported event type:', eventType);
+        // console.log('❌ Unsupported event type:', eventType);
         return res.status(400).send('Unsupported event type');
     }
 
@@ -566,13 +566,13 @@ app.post('/webhook', async (req, res) => {
 
 
     if (!qrCodeId) {
-        console.log('❌ QR Code ID not found in payload');
+        // console.log('❌ QR Code ID not found in payload');
         return res.status(400).send('QR Code ID not found');
     }
 
     const paymentId = req.body?.payload?.payment?.entity?.id;
     if (!paymentId) {
-        console.log('❌ Payment ID not found in payload');
+        // console.log('❌ Payment ID not found in payload');
         return res.status(400).send('Payment ID not found');
     }
     const rrnNumber = req.body?.payload?.payment?.entity?.acquirer_data?.rrn;
@@ -628,14 +628,14 @@ app.post('/webhook', async (req, res) => {
                         totalPayInAmount: paymentsAmount
                     }
                 );
-                console.log(`QR totals updated for qrId ${qrCodeId}`);
+                // console.log(`QR totals updated for qrId ${qrCodeId}`);
             } else {
-                console.log(`QR Code with qrId ${qrCodeId} not found`);
+                // console.log(`QR Code with qrId ${qrCodeId} not found`);
             }
         }
 
 
-        console.log('✅ Webhook data saved to Appwrite:', result.$id);
+        // console.log('✅ Webhook data saved to Appwrite:', result.$id);
         res.status(200).send('Webhook received and saved');
     } catch (error) {
         console.error('❌ Failed to save webhook:', error.message);

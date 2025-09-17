@@ -224,7 +224,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // 3) Idempotent metadata write: use 1:1 docId = userId
             try {
-            console.log('Creating user metadata document for userId:', userId);
+            // console.log('Creating user metadata document for userId:', userId);
             await databases.createDocument(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_USERS_META_COLLECTION_ID,
@@ -1259,133 +1259,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             res.status(500).json({ error: 'Failed to fetch user transactions' });
         }
     });
-
-    // router.get('/user/transactions', authenticateToken, async (req, res) => {
-    //     const { userId, qrId, limit = 25, cursor, from, to} = req.query;
-    //     // console.log('🔍 [USER API] Fetching transactions for userId:', userId, 'qrId:', qrId, 'cursor:', cursor);
-    //     // console.log('🔍 [USER API] Date filters:', { from, to });
-    //     // Ensure limit is capped
-    //     const limitNum = Math.min(parseInt(limit) || 25, 50);
-
-    //     const userRequested = req.user; // set by your JWT middleware
-    //     const isSubadmin = userRequested.role === 'subadmin';
-
-    //     // console.log(`User ${userRequested.userId} with role ${userRequested.role} is accessing /user/transactions`);
-            
-    //     // Basic auth checks
-    //     if (!isSubadmin && userRequested.userId !== userId) {
-    //         return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
-    //     }
-
-    //     if (!userId) {
-    //         return res.status(400).json({ error: 'userId is required' });
-    //     }
-
-    //     let filters = [];
-
-    //     try {
-    //         // const userQrIds = await getQrIdsForUser(userId);
-    //         // Usage in your API
-
-    //         // console.log(`User ${userRequested.userId} with role ${userRequested.role} is fetching transactions for userId: ${userId}, qrId: ${qrId}`);
-
-    //         // Get all QR IDs the user (or subadmin) can access
-    //         // Subadmin: all QRs they created + QRs of users under them
-    //         // End-user: only their assigned QRs
-
-    //         const userQrIds = isSubadmin
-    //         ? await getQrIdsForSubadmin(userId)
-    //         : await getQrIdsForUser(userId); // existing fn for end-users
-
-    //         // console.log(`User ${userId} has access to QR IDs:`, userQrIds);
-
-    //         // If qrId is provided, validate ownership
-    //         if (qrId) {
-    //             if (userQrIds.includes(qrId)) {
-    //                 filters.push(Query.equal('qrCodeId', qrId));
-    //             } else {
-    //                 console.warn(`QR ID ${qrId} does not belong to user ${userId}`);
-    //                 return res.status(200).json({ transactions: [] }); // Safe fallback
-    //             }
-    //         } else {
-    //             // Get all transactions for all QR codes the user owns
-    //             if (userQrIds.length === 0) {
-    //                 return res.status(200).json({ transactions: [] });
-    //             }
-    //             filters.push(Query.equal('qrCodeId', userQrIds));
-    //         }
-
-    //         // Helper: convert a date string (yyyy-mm-dd) into IST start/end of day ranges
-    //         function toISTRange(dateStr) {
-    //         const d = new Date(dateStr);
-
-    //         // Start of IST day
-    //         const start = new Date(d);
-    //         start.setHours(0, 0, 0, 0);
-    //         start.setMinutes(start.getMinutes() - 330); // shift -5:30 to UTC
-
-    //         // End of IST day
-    //         const end = new Date(d);
-    //         end.setHours(23, 59, 59, 999);
-    //         end.setMinutes(end.getMinutes() - 330); // shift -5:30 to UTC
-
-    //         return { start, end };
-    //         }
-
-    //         // DATE FILTER CONDITIONS
-    //         if (from && to) {
-    //         if (from === to) {
-    //             // Same date → only that IST day
-    //             const { start, end } = toISTRange(from);
-    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-    //         } else {
-    //             // Range → from start of 'from' IST day to end of 'to' IST day
-    //             const { start } = toISTRange(from);
-    //             const { end } = toISTRange(to);
-    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-    //         }
-    //         } else if (from && !to) {
-    //             // Only 'from' → treat as single day filter
-    //             const { start, end } = toISTRange(from);
-    //             filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-    //         } else if (!from && to) {
-    //             // Only 'to' → everything until end of that IST day
-    //             const { end } = toISTRange(to);
-    //             filters.push(Query.lessThanEqual("created_at", end.toISOString()));
-    //         }
-
-
-    //         // Build query array
-    //         const queries = [
-    //             ...filters,
-    //             Query.orderDesc('created_at'),
-    //             Query.limit(limitNum) // smaller chunks for pagination
-    //         ];
-
-    //         // If a cursor was sent, use it for pagination
-    //         if (cursor) {
-    //             queries.push(Query.cursorAfter(cursor));
-    //         }
-
-    //         const transactions = await databases.listDocuments(
-    //             APPWRITE_DATABASE_ID,
-    //             webhook_collectionId,
-    //             queries
-    //         );
-                
-    //         const docs = transactions.documents;
-    //         const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
-
-    //         res.status(200).json({
-    //             transactions: docs, // still newest first
-    //             nextCursor
-    //         });
-
-    //     } catch (error) {
-    //         console.error('❌ Error in /user/transactions:', error);
-    //         res.status(500).json({ error: 'Failed to fetch user transactions' });
-    //     }
-    // });
 
     router.get('/getMyMetaData', authenticateToken, async (req, res) => {
         try {

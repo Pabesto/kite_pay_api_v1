@@ -94,7 +94,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdraw_new', async (req, res) => {
       const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
-      console.log('Withdraw request received:', req.body);
+      // console.log('Withdraw request received:', req.body);
 
       // return res.status(503).json({ error: 'Withdrawals are temporarily disabled for maintenance' });
 
@@ -144,7 +144,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const requested = Number(qr.withdrawalRequestedAmount || 0);
         const available = Math.max(0, total - approved - requested);
 
-        console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
+        // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
 
         if (amountPaise > available) {
           return res.status(400).json({ error: 'Requested amount exceeds available balance' });
