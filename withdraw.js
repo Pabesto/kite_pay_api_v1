@@ -128,7 +128,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         );
         if (pendingRequests.total >= 2) {
           return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
-        } [1]
+        }
 
         // Load QR and validate available balance
         const qrList = await databases.listDocuments(
@@ -136,8 +136,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           Qr_collectionId,
           [Query.equal('qrId', qrId), Query.limit(1)]
         );
-        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' }); [1]
-        const qr = qrList.documents[0]; // has totals in paise [1]
+        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' });
+        const qr = qrList.documents[0]; // has totals in paise
 
         const total = Number(qr.totalPayInAmount || 0);
         const approved = Number(qr.withdrawalApprovedAmount || 0);
@@ -148,7 +148,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         if (amountPaise > available) {
           return res.status(400).json({ error: 'Requested amount exceeds available balance' });
-        } [1]
+        }
 
         // Update QR ledger: bump requested, recompute available
         const newRequested = requested + amountPaise;
@@ -161,7 +161,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             withdrawalRequestedAmount: newRequested,
             amountAvailableForWithdrawal: newAvailable,
           }
-        ); [1]
+        );
 
         // Create withdrawal document
         const response = await databases.createDocument(
