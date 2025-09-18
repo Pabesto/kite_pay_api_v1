@@ -142,7 +142,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const total = Number(qr.totalPayInAmount || 0);
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
-        const available = Math.max(0, total - approved - requested);
+        const onHold = Number(qr.amountOnHold || 0);
+        const available = Math.max(0, total - approved - requested - onHold);
 
         // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
 
@@ -513,6 +514,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const total = Number(qr.totalPayInAmount || 0);
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
+        const onHold = Number(qr.amountOnHold || 0);
 
         if (requested < amountPaise) {
           // Defensive: don’t go negative if pending bucket is lower than request
@@ -521,7 +523,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const newRequested = requested - amountPaise;
         const newApproved = approved + amountPaise;
-        const newAvailable = Math.max(0, total - newApproved - newRequested);
+        const newAvailable = Math.max(0, total - newApproved - newRequested - onHold);
 
         // 4) Update QR ledger first
         await databases.updateDocument(
@@ -641,6 +643,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const total = Number(qr.totalPayInAmount || 0);
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
+        const onHold = Number(qr.amountOnHold || 0);
 
         if (requested < amountPaise) {
           return res.status(409).json({ error: 'Pending requested amount is lower than rejection amount' });
@@ -648,7 +651,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const newRequested = requested - amountPaise;                 // return amount to availability
         const newApproved = approved;                                  // unchanged
-        const newAvailable = Math.max(0, total - newApproved - newRequested);
+        const newAvailable = Math.max(0, total - newApproved - newRequested - onHold);
 
         // 4) Update QR ledger
         await databases.updateDocument(
