@@ -3,6 +3,7 @@
 // and the routes for QR code management and webhook processing.
 
 require('dotenv').config();
+const moment = require('moment-timezone');
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -38,6 +39,7 @@ const APPWRITE_QRCODE_COLLECTION_ID = '688f6b46002963a163aa';
 const APPWRITE_WEBHOOK_DATA_COLLECTION_ID = '688cf5920023475022df'; // This was not in your webhook file, keeping the placeholder for completeness
 const APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID = '68920fba001e27b604c9'
 const APPWRITE_USERS_META_COLLECTION_ID = 'users_meta_test';
+const APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID = 'daily_qr_summaries';
 const APPWRITE_BUCKET_ID = '688d2517002810ac532b'; // This was not in your webhook file, keeping the placeholder for completeness
 
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -125,19 +127,29 @@ const authenticateToken = async (req, res, next) => {
     }
 };
 
+// Higher-order middleware for label-based auth
+const authenticateAdminOrLabel = (requiredLabel, { isSubadminAllowed = false } = {}) => (req, res, next) => {
+    authenticateToken(req, res, () => {
+        const { role, labels } = req.user || {};
+        if  (role === 'admin' ||
+            (isSubadminAllowed && role === 'subadmin') ||
+            (role === 'employee' && Array.isArray(labels) && labels.includes(requiredLabel))
+        ) {
+            return next();
+        }
+
+        return res.status(403).json({ error: 'Not authorized for this action.' });
+    });
+};
+
+
 // --- Admin Authentication Middleware ---
 // This middleware first authenticates the token and then checks for the 'admin' label.
 const authenticateAdmin = (req, res, next) => {
     authenticateToken(req, res, () => {
-        // After successful token verification, check the user's labels
-        // if (!req.user || !req.user.labels?.includes('admin')) {
-        //     return res.status(403).json({ error: 'Not authorized: Admin privileges required.' });
-        // }
-
-        if (!req.user || !['admin'].includes(req.user.role)) {
-            return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
+        if ( !req.user || !['admin'].includes(req.user.role) ) {
+            return res.status(403).json({ error: 'Not authorized: Admin required.' });
         }
-
         next();
     });
 };
@@ -245,6 +257,7 @@ async function roleAuth(req, res, next) {
             appwrite_id: response.documents[0].appwrite_id,
             role: response.documents[0].role,
             parent_id: response.documents[0].parent_id,
+            labels : response.documents[0].labels || [],
         };
 
         next();
@@ -269,13 +282,13 @@ function requireRole(...roles) {
 
 // Pass Appwrite and authentication dependencies to the route handlers
 // QR code routes use the admin authentication middleware
-app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole));
+app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
+app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');
@@ -449,6 +462,19 @@ app.post('/cashfree/webhook', async (req, res) => {
         status: 'normal',
       }
     );
+
+    (async () => {
+    try {
+        await updateDailyQrTotal(
+        qrCodeId,
+        createdAt,
+        amountPaise
+        );
+        console.log('Daily QR total updated successfully.');
+    } catch (error) {
+        console.error('Error updating daily QR total:', error);
+    }
+    })();
 
     const eventPayload = {
         $id: created.$id,                                    // document id
@@ -647,25 +673,71 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// A test endpoint to list all users, adapted from your provided file.
-// It uses the pre-initialized users client.
-app.get('/test/users', async (req, res) => {
+async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
+  // Convert txnDate to IST date string "YYYY-MM-DD"
+  const istDate = moment.tz(txnDate, 'Asia/Kolkata');
+  const dayString = istDate.format('YYYY-MM-DD');
+
+  console.log('IST dayString:', dayString);
+  console.log('qrId:', qrCodeId);
+
+  // Query existing aggregate document for the day
+  const existingDocs = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+    [
+      Query.equal('date', dayString),
+      Query.limit(1),
+    ]
+  );
+
+  if (existingDocs.total > 0) {
+    // Document exists - parse JSON string and update totals object
+    const doc = existingDocs.documents[0];
+    const totalsJsonStr = doc.totalsJson || '{}';
+
+    let totalsObj;
     try {
-        const result = await users.list();
-
-        const simplifiedUsers = result.users.map(user => ({
-            $id: user.$id,
-            email: user.email,
-            name: user.name,
-            labels: user.labels,
-        }));
-
-        return res.json(simplifiedUsers);
-    } catch (err) {
-        console.error('Test user list error:', err);
-        return res.status(500).json({ error: 'Failed to fetch users' });
+      totalsObj = JSON.parse(totalsJsonStr);
+    } catch (e) {
+      // fallback if corrupted JSON
+      totalsObj = {};
     }
-});
+
+    // Compute new amount for given qrCodeId
+    const oldAmount = Number(totalsObj[qrCodeId] || 0);
+    const newAmount = oldAmount + amountDelta;
+
+    if (newAmount < 0) {
+      throw new Error('Total amount cannot be negative');
+    }
+
+    totalsObj[qrCodeId] = newAmount;
+
+    // Serialize back and update document
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+      doc.$id,
+      {
+        totalsJson: JSON.stringify(totalsObj),
+      }
+    );
+  } else {
+    // Create new document with totalsJson initialized
+    const totalsObj = { [qrCodeId]: amountDelta };
+
+    await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+      ID.unique(),
+      {
+        date: dayString,
+        totalsJson: JSON.stringify(totalsObj),
+      }
+    );
+  }
+}
 
 // Root endpoint for testing
 app.get('/', (req, res) => {

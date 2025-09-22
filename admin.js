@@ -4,13 +4,14 @@
 
 const express = require('express');
 const multer = require('multer');
+const moment = require('moment-timezone');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -39,7 +40,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // });
 
     // 🔥 List all users AppWrite Collections users_meta
-    router.get('/users', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.get('/users', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const {limit = 25, cursor} = req.query;
     
         const requestorId = req.user.userId;
@@ -98,6 +99,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // 🔥 List all Subadmin
     router.get('/subadmins', authenticateAdmin, async (req, res) => {
         const requestorId = req.user.userId;
         const role = req.user.role; // 'admin' | 'subadmin'
@@ -143,10 +145,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
     
-    // // 🔥 List all users
-    // router.get('/userss', async (req, res) => {
-    //     try {
-    //         return "Test";
     //     } catch (err) {
     //         console.error('List users error:', err);
     //         return res.status(500).json({ error: 'Failed to fetch users' });
@@ -262,6 +260,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // 🔐 Assign user to sub-admin (admin-only or employee with all_users)
     router.put('/assign-user/:subadminId', authenticateAdmin, async (req, res) => {
         const { subadminId } = req.params;
         const { userId, unassign = false } = req.body; // userId can be string; unassign=true clears parentId
@@ -308,7 +307,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // ✏️ Edit user endpoint
+    // ✏️ Edit user endpoint ( admin/sub-admin or employee with all_users allowed )
     router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userIdtoEdit = req.params.id;
         const { name, email, labels } = req.body;
@@ -375,7 +374,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // 🔐 Reset user password
+    // 🔐 Reset user password ( admin/sub-admin or employee with all_users allowed )
     router.post('/reset-password/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userId = req.params.id;
         const { password } = req.body;
@@ -573,11 +572,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // Admin-only: fetch all or filtered transactions
-    router.get('/transactions', authenticateAdmin, async (req, res) => {
+    router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
 
         let filters = [];
+
+        const userRequested = req.user;
+        const isSubadmin = userRequested.role === 'subadmin';
+        const isAdmin = userRequested.role === 'admin';
+
+        // userRequested.labels;
+        console.log('User role and labels:', userRequested.role, userRequested.labels);
 
         // console.log('Transaction query params:', req.query);
 
@@ -706,7 +712,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // Helper: convert amount to paise
     const toPaise = (amt) => Math.round(amt * 100);
 
-    router.patch('/transactions/:id/status', authenticateAdmin, async (req, res) => {
+    router.patch('/transactions/:id/status', authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
         try {
             const { id: TxnID } = req.params;
             const { status } = req.body;
@@ -771,14 +777,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // ✏️ Edit transaction endpoint
-    router.patch('/transactions/:id', authenticateAdmin, async (req, res) => {
+    router.patch('/transactions/:id',  authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
     try {
         const { id: TxnID } = req.params;
         const { qrCodeId, rrnNumber, amount, isoDate /* status removed */ } = req.body;
 
         // Guard: status is not allowed in this endpoint
         if ('status' in req.body) {
-        return res.status(400).json({ error: 'Use /transactions/:id/status to update status' });
+            return res.status(400).json({ error: 'Use /transactions/:id/status to update status' });
         } // enforce separation of concerns [web:185][web:198]
 
         // 1) Fetch existing transaction
@@ -799,7 +805,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         updates.qrCodeId = qrCodeId.trim();
         }
         if (typeof isoDate === 'string' && isoDate.trim()) {
-        const iso = new Date(isoDate);
+            const iso = new Date(isoDate);
         if (isNaN(iso.getTime())) {
             return res.status(400).json({ error: 'isoDate must be ISO-8601' });
         } // input validation best practice [web:185]
@@ -807,13 +813,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
         let newAmountPaise;
         if (amount !== undefined && amount !== null) {
-        newAmountPaise = toPaise(String(amount)); // normalize rupees to paise [web:185]
-        updates.amount = newAmountPaise;
+            newAmountPaise = toPaise(String(amount)); // normalize rupees to paise [web:185]
+            updates.amount = newAmountPaise;
         }
 
         // 3) Early exit if no updates
         if (Object.keys(updates).length === 0) {
-        return res.status(400).json({ error: 'No valid fields to update' });
+            return res.status(400).json({ error: 'No valid fields to update' });
         } // minimal mutation principle [web:185]
 
         // 4) Capture old for reconciliation
@@ -831,11 +837,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // 6) Helpers
         const recomputeAvailable = (qrDocLike) => {
-        const total = Number(qrDocLike.totalPayInAmount || 0);
-        const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
-        const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
-        const hold = Number(qrDocLike.amountOnHold || 0);
-        return total - approved - requested - hold;
+            const total = Number(qrDocLike.totalPayInAmount || 0);
+            const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
+            const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
+            const hold = Number(qrDocLike.amountOnHold || 0);
+            return total - approved - requested - hold;
         }; // available is derived, not set arbitrarily [web:170][web:176]
 
         const hasAmountChange = typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
@@ -856,24 +862,97 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 const qr = qrList.documents[0];
 
                 if (isPrevNormal) {
-                // Normal: adjust ledger total; available derives from totals
-                const newTotal = Number(qr.totalPayInAmount || 0) + amountDiff;
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
-                    totalPayInAmount: newTotal,
-                    amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal }),
-                }); // no hold change in normal edits [web:176][web:179]
+                    // Normal: adjust ledger total; available derives from totals
+                    const newTotal = Number(qr.totalPayInAmount || 0) + amountDiff;
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                        totalPayInAmount: newTotal,
+                        amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal }),
+                    }); // no hold change in normal edits [web:176][web:179]
                 } else {
-                // Non-normal: adjust both ledger total and hold; available derives from both
-                const delta = (newAmountPaise - oldAmountPaise);
-                const newTotal = Number(qr.totalPayInAmount || 0) + delta;
-                const newHold = Number(qr.amountOnHold || 0) + delta;
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
-                    totalPayInAmount: newTotal,
-                    amountOnHold: newHold,
-                    amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal, amountOnHold: newHold }),
-                });
+                    // Non-normal: adjust both ledger total and hold; available derives from both
+                    const delta = (newAmountPaise - oldAmountPaise);
+                    const newTotal = Number(qr.totalPayInAmount || 0) + delta;
+                    const newHold = Number(qr.amountOnHold || 0) + delta;
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                        totalPayInAmount: newTotal,
+                        amountOnHold: newHold,
+                        amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal, amountOnHold: newHold }),
+                    });
                 }
             }
+
+            // const iso = new Date(isoDate);
+
+            const istDate = moment.tz(tx.created_at, 'Asia/Kolkata');
+            const istDateFromIso = istDate.format('YYYY-MM-DD HH:mm:ss');
+            console.log('istDate:', istDateFromIso);
+
+            const dayString = istDate.format('YYYY-MM-DD'); // directly format date only
+
+            console.log('dayString:', dayString);
+            console.log('isoDate:', dayString);
+            console.log('qrId:', oldQrId);
+
+            // Query existing document by date only (no qrId filter, since totalsJson covers all)
+            const existingQrSummary = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', dayString),
+                Query.limit(1),
+            ]
+            );
+
+            const delta = newAmountPaise - oldAmountPaise;
+
+            if (existingQrSummary.total > 0) {
+            // Document exists - parse JSON string and update totals object
+            const doc = existingQrSummary.documents[0];
+            const totalsJsonStr = doc.totalsJson || '{}';
+
+            let totalsObj;
+            try {
+                totalsObj = JSON.parse(totalsJsonStr);
+            } catch (e) {
+                totalsObj = {};
+            }
+
+            const oldAmount = Number(totalsObj[oldQrId] || 0);
+            const newAmount = oldAmount + delta;
+
+            if (newAmount < 0) {
+                throw new Error('Total amount cannot be negative');
+            }
+
+            totalsObj[oldQrId] = newAmount;
+
+            // Serialize and update the document
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                doc.$id,
+                {
+                totalsJson: JSON.stringify(totalsObj),
+                }
+            );
+            }
+            // else {
+            // // No summary exists - create a new one if newAmount > 0
+            // if (newAmount > 0) {
+            //     await databases.createDocument(
+            //     APPWRITE_DATABASE_ID,
+            //     APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            //     ID.unique(),
+            //     {
+            //         qrId: oldQrId,
+            //         date: dayString,
+            //         total_amount: newAmount,
+            //         last_updated: new Date().toISOString(),
+            //     }
+            //     );
+            // }
+            // }
+
         }
 
         // 5B) QR changed: remove prior impact from old QR, add new impact to new QR, based on existing status
@@ -1001,9 +1080,62 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     amountAvailableForWithdrawal: nextAvailable,
                 }
                 );
-            } else {
-                console.warn(`QR ${qrId} not found during delete reconciliation`);
+
+            const istDate = moment.tz(tx.created_at, 'Asia/Kolkata');
+            const istDateFromIso = istDate.format('YYYY-MM-DD HH:mm:ss');
+            console.log('istDate:', istDateFromIso);
+
+            const dayString = istDate.format('YYYY-MM-DD'); // direct date format
+            console.log('dayString:', dayString);
+            console.log('isoDate:', dayString);
+            console.log('qrId:', qrId);
+
+            // Query existing document only by date because totalsJson contains all qrId totals
+            const existingQrSummary = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', dayString),
+                Query.limit(1),
+            ]
+            );
+
+            if (existingQrSummary.total > 0) {
+            const doc = existingQrSummary.documents[0];
+
+            // Parse totalsJson string or fallback to empty object
+            let totalsObj = {};
+            try {
+                totalsObj = JSON.parse(doc.totalsJson || '{}');
+            } catch (e) {
+                totalsObj = {};
             }
+
+            const currentTotal = Number(totalsObj[qrId] || 0);
+            const newTotal = currentTotal - amountPaise;
+
+            if (newTotal < 0) {
+                throw new Error('Total amount cannot be negative');
+            }
+
+            totalsObj[qrId] = newTotal;
+
+            // Serialize updated object and save
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                doc.$id,
+                {
+                totalsJson: JSON.stringify(totalsObj),
+                }
+            );
+            } 
+            // Optionally handle creation of new document if none exists
+
+
+            } else {
+                    console.warn(`QR ${qrId} not found during delete reconciliation`);
+                }
             }
 
             // 3) Delete the transaction
@@ -1020,8 +1152,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-
-    router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
+    router.post("/transactions/manual", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
         try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
 
@@ -1063,6 +1194,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                         status: 'normal', // default status
                     }
             );
+
+            (async () => {
+            try {
+                await updateDailyQrTotal(
+                    qrCodeId,
+                    isoDate,
+                    finalAmount
+                );
+                console.log('Daily QR total updated successfully.');
+            } catch (error) {
+                console.error('Error updating daily QR total:', error);
+            }
+            })();
 
             const eventPayload = {
                 $id: result.$id,                                    // document id
@@ -1125,7 +1269,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // User or subadmin restricted: fetch transactions only for that user with optional one-field search
+    // Fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);

@@ -9,7 +9,7 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -193,7 +193,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // GET /withdrawals?status=pending&limit=20&cursor=docId
-    router.get('/withdrawals_paginated', authenticateAdmin, async (req, res) => {
+    router.get('/withdrawals_paginated', authenticateAdminOrLabel('all_withdrawals'), async (req, res) => {
       try {
         const { status, limit: limitStr, cursor } = req.query;
 
@@ -426,7 +426,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // POST /withdrawals/approve
-    router.post('/withdrawals/approve', authenticateAdmin, async (req, res) => {
+    router.post('/withdrawals/approve', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, utrNumber } = req.body;
 
       if (!id || !utrNumber || utrNumber.trim().length < 5) {
@@ -459,7 +459,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // POST /withdrawals/approve_new (with balance and ledger updates)
-    router.post('/withdrawals/approve_new', authenticateAdmin, async (req, res) => {
+    router.post('/withdrawals/approve_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, utrNumber } = req.body;
 
       if (!id || !utrNumber || utrNumber.trim().length < 5) {
@@ -558,7 +558,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // POST /withdrawals/reject
-    router.post('/withdrawals/reject', authenticateAdmin, async (req, res) => {
+    router.post('/withdrawals/reject', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, reason } = req.body;
 
       if (!id || !reason || reason.trim().length < 4) {
@@ -591,7 +591,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // POST /withdrawals/reject_new (new with balance and ledger updates)
-    router.post('/withdrawals/reject_new', authenticateAdmin, async (req, res) => {
+    router.post('/withdrawals/reject_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, reason } = req.body;
 
       if (!id || !reason || reason.trim().length < 4) {

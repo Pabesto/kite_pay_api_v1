@@ -28,7 +28,7 @@ const razorpay = new Razorpay({
 // console.log(process.env.RAZORPAY_KEY_SECRET);
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId, emitTxnNew, authenticateToken, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole) => {
     const router = express.Router();
 
     async function getUserName(userId) {
@@ -89,18 +89,17 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // GET all QR codes
     // This is a public endpoint
-    router.get('/qr-codes', authenticateAdmin, async (req, res) => {
+    router.get('/qr-codes', authenticateAdminOrLabel('all_transactions'), async (req, res) => {
         try {
-            // const result = await databases.listDocuments(databaseId, Qr_collectionId);
 
-            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
+            const resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
                 [
                     Query.orderDesc('createdAt'), // Add this line to sort descending by date
                     Query.limit(100) // Limits the results to 10 documents
                 ]
             );
 
-            const qrCodes = result.documents.map(doc => ({
+            const qrCodes = resultAllQr.documents.map(doc => ({
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -115,7 +114,38 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 amountOnHold : doc.amountOnHold || 0,
             }));
 
-            res.status(200).json(qrCodes.reverse());// Reverse the order to show the most recent first
+            const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+
+            // Fetch the daily aggregate doc for today (only one document)
+            const dailySummaryDocs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', todayISO),
+                Query.limit(1),
+            ]
+            );
+
+            let totalsObj = {};
+            if (dailySummaryDocs.total > 0) {
+            try {
+                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                totalsObj = {};
+            }
+            }
+
+            // Map today totals to each QR code
+            const qrCodesWithTodayTotal = qrCodes.map(qr => {
+                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+
+                return {
+                    ...qr,
+                    todayTotalPayIn,
+                };
+            });
+
+            res.status(200).json(qrCodesWithTodayTotal.reverse());// Reverse the order to show the most recent first
 
         } catch (error) {
             console.error('Error fetching QR codes:', error);
@@ -289,6 +319,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     });
     
+    // GET QR codes for a specific user
+    // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
 
@@ -345,13 +377,47 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 amountOnHold : doc.amountOnHold || 0,
             }));
 
-            res.status(200).json(userQrCodes);
+            const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+
+            // Fetch the daily aggregate doc for today (only one document)
+            const dailySummaryDocs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', todayISO),
+                Query.limit(1),
+            ]
+            );
+
+            let totalsObj = {};
+            if (dailySummaryDocs.total > 0) {
+            try {
+                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                totalsObj = {};
+            }
+            }
+
+            // Map today totals to each QR code
+            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
+                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+
+                return {
+                    ...qr,
+                    todayTotalPayIn,
+                };
+            });
+
+
+            res.status(200).json(userQrCodesWithTodayTotal);
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
             res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
         }
     });
 
+    // GET QR codes assigned to a specific user (only those assigned, not created)
+    // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
 
@@ -394,7 +460,39 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 amountOnHold : doc.amountOnHold || 0,
             }));
 
-            res.status(200).json(userQrCodes);
+            const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+
+            // Fetch the daily aggregate doc for today (only one document)
+            const dailySummaryDocs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', todayISO),
+                Query.limit(1),
+            ]
+            );
+
+            let totalsObj = {};
+            if (dailySummaryDocs.total > 0) {
+            try {
+                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                totalsObj = {};
+            }
+            }
+
+            // Map today totals to each QR code
+            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
+                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+
+                return {
+                    ...qr,
+                    todayTotalPayIn,
+                };
+            });
+
+
+            res.status(200).json(userQrCodesWithTodayTotal);
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
             res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
