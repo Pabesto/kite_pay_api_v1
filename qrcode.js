@@ -9,6 +9,8 @@ const fs = require("fs");
 const axios = require("axios");
 const { File } = require('buffer');
 const path = require('path');
+const moment = require('moment-timezone');
+
 
 // --------------------
 // Razorpay Setup
@@ -28,7 +30,7 @@ const razorpay = new Razorpay({
 // console.log(process.env.RAZORPAY_KEY_SECRET);
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, roleAuth, requireRole) => {
     const router = express.Router();
 
     async function getUserName(userId) {
@@ -112,6 +114,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
                 amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
                 amountOnHold : doc.amountOnHold || 0,
+                commissionOnHold : doc.commissionOnHold || 0,
+                commissionPaid : doc.commissionPaid || 0,
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
@@ -375,6 +379,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 withdrawalApprovedAmount : doc.withdrawalApprovedAmount || 0,
                 amountAvailableForWithdrawal : doc.amountAvailableForWithdrawal || 0,
                 amountOnHold : doc.amountOnHold || 0,
+                commissionOnHold : doc.commissionOnHold || 0,
+                commissionPaid : doc.commissionPaid || 0,
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });

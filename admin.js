@@ -11,7 +11,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -82,6 +82,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 parentId: doc.parentId,
                 status: doc.status,
                 labels: doc.labels,
+                commission : doc.commission || 0,
             }));
 
             const docs = simplifiedUsers;
@@ -136,6 +137,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             parentId: doc.parentId,
             status: doc.status,
             labels: doc.labels,
+            commission : doc.commission || 0,
             }));
 
             return res.json(simplifiedUsers);
@@ -218,6 +220,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 role,
                 parentId: creatorId,
                 status: true,
+                commission: 0,
             };
 
             // 3) Idempotent metadata write: use 1:1 docId = userId
@@ -309,69 +312,77 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // ✏️ Edit user endpoint ( admin/sub-admin or employee with all_users allowed )
     router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
-        const userIdtoEdit = req.params.id;
-        const { name, email, labels } = req.body;
+    const userIdtoEdit = req.params.id;
+    const { name, email, labels, commission } = req.body;
+    const userRequested = req.user;
 
-        const userRequested = req.user; // set by your JWT middleware
+    if (!userIdtoEdit) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
 
-        if (!userIdtoEdit || (!name && !email && !labels)) {
-            return res.status(400).json({ error: 'User ID and at least one field (name or email or labels) are required' });
+    if (
+        name === undefined &&
+        email === undefined &&
+        labels === undefined &&
+        commission === undefined
+    ) {
+        return res.status(400).json({ error: 'At least one field must be provided to update' });
+    }
+
+    try {
+        const user = await users.get(userIdtoEdit);
+
+        if (user.labels?.includes('admin')) {
+        return res.status(403).json({ error: 'Cannot edit admin users' });
         }
 
-        try {
-            const user = await users.get(userIdtoEdit);
-
-            if (user.labels?.includes('admin')) {
-                return res.status(403).json({ error: 'Cannot edit admin users' });
-            }
-
-            if (name) await users.updateName(userIdtoEdit, name);
-            if (email) await users.updateEmail(userIdtoEdit, email);
-            // if (labels) {
-            //     if (!Array.isArray(labels)) {
-            //         return res.status(400).json({ error: 'Labels must be an array' });
-            //     }
-            //     await users.updateLabels(userId, labels);
-            // }
-
-            // Find document in users_mets collection matching userId
-            const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('userId', userIdtoEdit)
-                ]
-            );
-            if (list.documents.length === 0) {
-                return res.status(404).json({ error: 'User metadata document not found in users_mets' });
-            }
-
-            if(userRequested.role === 'subadmin'){
-                if(list.documents[0].parentId !== userRequested.userId){
-                    return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
-                }   
-            } else {    
-                // sub-admins can only edit users they created
-            }
-
-            const doc = list.documents[0];
-            const docId = doc.$id;
-
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                docId,
-                {
-                    ...(name && { name }),
-                    ...(email && { email }),
-                    ...(labels && { labels }),
-                }
-            );
-
-            return res.json({ message: 'User updated successfully' });
-        } catch (err) {
-            return res.status(500).json({ error: err.message || 'Failed to update user' });
+        const list = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_USERS_META_COLLECTION_ID,
+        [Query.equal('userId', userIdtoEdit)]
+        );
+        if (list.documents.length === 0) {
+        return res.status(404).json({ error: 'User metadata document not found in users_mets' });
         }
+
+        if (userRequested.role === 'subadmin') {
+        if (list.documents[0].parentId !== userRequested.userId) {
+            return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
+        }
+        }
+
+        const doc = list.documents[0];
+        const docId = doc.$id;
+
+        const updatePayload = {};
+
+        if (name !== undefined) updatePayload.name = name;
+        if (email !== undefined) updatePayload.email = email;
+        if (labels !== undefined) updatePayload.labels = labels;
+        if (commission !== undefined) {
+        const commissionNum = Number(commission);
+        if (isNaN(commissionNum)) {
+            return res.status(400).json({ error: 'Commission must be a valid number' });
+        }
+        updatePayload.commission = commissionNum;
+        }
+
+        // Update specialized user data (name/email) if present 
+        if (name !== undefined) await users.updateName(userIdtoEdit, name);
+        if (email !== undefined) await users.updateEmail(userIdtoEdit, email);
+
+        // Update metadata document with labels or commission or other fields
+        await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_USERS_META_COLLECTION_ID,
+        docId,
+        updatePayload
+        );
+
+        return res.json({ message: 'User updated successfully' });
+    } catch (err) {
+        return res.status(500).json({ error: err.message || 'Failed to update user' });
+    }
     });
 
     // 🔐 Reset user password ( admin/sub-admin or employee with all_users allowed )
@@ -932,7 +943,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 doc.$id,
                 {
-                totalsJson: JSON.stringify(totalsObj),
+                    totalsJson: JSON.stringify(totalsObj),
                 }
             );
             }
@@ -1244,7 +1255,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // Recompute available from updated total
                 const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
                 const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                const newAvailable = Math.max(0, newTotal - approved - requested);
+
+                const onHold = Number(qrDoc.amountOnHold || 0);
+                const commissionOnHold = Number(qr.commissionOnHold || 0);
+                const commissionPaid = Number(qr.commissionPaid || 0);
+                const newAvailable = Math.max(0, newTotal - approved - requested - onHold - commissionOnHold - commissionPaid);
 
                 await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
@@ -1433,6 +1448,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             parentId: doc.parentId,
             status: doc.status,
             labels: doc.labels,
+            commission: doc.commission || 0,
             // childrenCount: doc.childrenCount, // if you added counter cache
             };
 

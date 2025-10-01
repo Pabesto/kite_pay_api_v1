@@ -4,12 +4,14 @@
 
 const express = require('express');
 const multer = require('multer');
+const moment = require('moment-timezone');
+
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -17,6 +19,267 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const random = Math.floor(100 + Math.random() * 900); // 3-digit random number
     return `${prefix}${timestamp}${random}`;
   }
+
+  // Helper to get user by userId
+  async function getUserMeta(userId) {
+    const users = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_USERS_META_COLLECTION_ID,
+      [Query.equal("userId", userId), Query.limit(1)]
+    );
+    return users.documents[0];
+  }
+
+  // Helper to get user by userId
+  async function getadminMeta(userId) {
+    const users = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_USERS_META_COLLECTION_ID,
+      [Query.equal("role", "admin"), Query.limit(1)]
+    );
+    return users.documents[0];
+  }
+
+    // Helper to calculate commission
+    function calculateCommission(preAmount, commissionRatePercent) {
+      return Math.ceil(preAmount * commissionRatePercent / 100);
+    }
+
+    router.post('/withdraw_commission_preview', async (req, res) => {
+      const { userId, qrId, preAmount } = req.body;
+
+      console.log('Withdraw commission preview request received:', req.body);
+
+      if (!userId || !preAmount) {
+        return res.status(400).json({ error: 'userId and name are required' });
+      }
+
+      // Normalize preAmount
+      const preAmountPaise = preAmount * 100;
+
+      const usrDet = await getUserMeta(userId);
+      let commissionRate = Number(usrDet.commission || 0);
+
+      if (usrDet.parentId) {
+        const parentDet = await getUserMeta(usrDet.parentId);
+        commissionRate += Number(parentDet.commission || 0);
+      }
+
+      const commissionRs = calculateCommission(preAmount, commissionRate);
+      const totalAmount = Number(preAmount) + Number(commissionRs);
+
+      // Load QR document
+      const qrList = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        Qr_collectionId,
+        [Query.equal('qrId', qrId), Query.limit(1)]
+      );
+      if (!qrList.documents.length) {
+        return res.status(404).json({ error: 'QR not found for withdrawal' });
+      }
+      const qr = qrList.documents[0];
+      const amountAvailableForWithdrawal = Number(qr.amountAvailableForWithdrawal || 0);
+
+      console.log(`Preview Withdrawal - PreAmountPaise: ${preAmountPaise}, CommissionRs: ${commissionRs}, Available: ${amountAvailableForWithdrawal}`);
+
+      if ((preAmountPaise + commissionRs * 100) > amountAvailableForWithdrawal) {
+        return res.status(400).json({
+          error: 'Requested amount including commission exceeds available balance',
+          preAmountPaise,
+          commissionPaise: commissionRs * 100,
+          amountAvailableForWithdrawal
+        });
+      }
+
+      const config_docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
+      const overheadDoc = config_docs.documents.find(doc => doc.key === 'overhead_balance_required');
+
+      if (overheadDoc) {
+        const overheadValue = overheadDoc.value;
+        console.log('Overhead Balance Required:', overheadValue);
+
+        const withdrawalToCheck = preAmountPaise + commissionRs * 100 + overheadValue * 100;
+
+        console.log(`Total Withdrawal To Check (including overhead): ${withdrawalToCheck}`);
+
+        if (withdrawalToCheck > amountAvailableForWithdrawal) {
+          return res.status(400).json({
+            error: 'Requested amount including commission and overhead exceeds available balance',
+            preAmountPaise,
+            commissionRate,
+            commissionPaise: commissionRs * 100,
+            overheadPaise: overheadValue * 100,
+            amountAvailableForWithdrawal,
+            withdrawalToCheck
+          });
+        }
+      } else {
+        console.log('No overhead_balance_required key found');
+      }
+
+      // Return breakdown
+      return res.json({
+        commissionRs,
+        commissionRate,
+        preAmount,
+        totalAmount,
+      });
+    });
+
+
+
+    // Users can post a withdrawal request (new version with validations and balance checks)
+    router.post('/withdraw_new', async (req, res) => {
+      const { userId, qrId, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+
+      // console.log('Withdraw request received:', req.body);
+
+      // return res.status(503).json({ error: 'Withdrawals are temporarily disabled for maintenance' });
+
+      // basic validations
+      if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
+      if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
+      if (mode === 'upi' && !upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
+      if (mode === 'bank' && (!bankName || !accountNumber || !ifscCode)) {
+        return res.status(400).json({ error: 'Bank details are incomplete' });
+      }
+
+      // normalize money to paise
+      const toPaise = (val) => {
+        const n = Number(val);
+        if (!isFinite(n) || n <= 0) return null;
+        return Math.round(n * 100);
+      };
+      const amountPaise = toPaise(amount);
+      if (amountPaise == null) return res.status(400).json({ error: 'Invalid amount' });
+
+      const wdh_id = generateWithdrawalId();
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const istTime = new Date(Date.now() + istOffset).toISOString();
+
+      try {
+        // Enforce max 2 pending per user
+        const pendingRequests = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [Query.equal('userId', userId), Query.equal('status', 'pending')]
+        );
+        if (pendingRequests.total >= 2) {
+          return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
+        }
+
+          const usrDet = await getUserMeta(userId);
+
+          // Inside the try block, after fetching usrDet and parentDet
+
+          const preAmountPaise = Math.round(preAmount * 100);
+
+          const userCommissionRate = Number(usrDet.commission || 0);
+          const parentCommissionRate = usrDet.parentId ? Number((await getUserMeta(usrDet.parentId)).commission || 0) : 0;
+          let totalCommissionRate = userCommissionRate + parentCommissionRate;
+
+          // if (usrDet.parentId) {
+          //   const parentDet = await getUserMeta(usrDet.parentId);
+          //   commissionRate += Number(parentDet.commission || 0);
+          // }
+
+          const recalculatedCommissionRs = calculateCommission(preAmount, totalCommissionRate);
+
+          const recalculatedTotalAmount = Number(preAmount) + recalculatedCommissionRs;
+
+          // Validation check
+          if (Number(amount) !== recalculatedTotalAmount) {
+            return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.' });
+          }
+
+          if (Number(commission) !== recalculatedCommissionRs) {
+            return res.status(400).json({ error: 'Commission mismatch. Please check the commission and try again.' });
+          }
+
+          // return res.status(400).json({
+          //     error: "Testing error ",
+          //     recalculatedTotalAmount,
+          //     recalculatedCommissionRs,
+          //     commissionRate,
+          //     preAmount,
+          // });
+
+        // Load QR and validate available balance
+        const qrList = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          [Query.equal('qrId', qrId), Query.limit(1)]
+        );
+        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' });
+        const qr = qrList.documents[0]; // has totals in paise
+
+        const total = Number(qr.totalPayInAmount || 0);
+        const approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requested = Number(qr.withdrawalRequestedAmount || 0);
+        const onHold = Number(qr.amountOnHold || 0);
+        const commissionOnHold = Number(qr.commissionOnHold || 0);
+        const commissionPaid = Number(qr.commissionPaid || 0);
+        const available = Math.max(0, total - approved - requested - onHold - commissionOnHold - commissionPaid);
+
+        // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
+
+        // if (amountPaise > available) {
+        //   return res.status(400).json({ error: 'Requested amount exceeds available balance' });
+        // }
+
+        console.log(`PreAmountPaise: ${preAmountPaise}, RecalculatedCommissionRs: ${recalculatedCommissionRs}, Available: ${available}`);
+
+        if ((preAmountPaise + (recalculatedCommissionRs * 100) ) > available) {
+          return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
+        }
+
+        const newRequested = requested + preAmountPaise;
+        const newCommissionOnHold = commissionOnHold + (recalculatedCommissionRs * 100);
+        const newAvailable = Math.max(0, total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid); // recompute available
+
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          qr.$id,
+          {
+            withdrawalRequestedAmount: newRequested,
+            commissionOnHold: newCommissionOnHold,
+            amountAvailableForWithdrawal: newAvailable,
+          }
+        );
+
+        // Create withdrawal document
+        const response = await databases.createDocument(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          ID.unique(),
+          {
+            id: wdh_id,
+            userId,
+            qrId: qrId || null,
+            holderName,
+            amount: amount, // store in Rs Not paise
+            preAmount: preAmount, // Rs
+            commission: recalculatedCommissionRs, // Rs
+            userCommissionRate: userCommissionRate,
+            parentCommissionRate: parentCommissionRate,
+            totalCommissionRate: totalCommissionRate,
+            mode,
+            upiId: upiId || null,
+            bankName: bankName || null,
+            accountNumber: accountNumber || null,
+            ifscCode: ifscCode || null,
+            status: 'pending',
+            createdAt: istTime,
+          }
+        ); [1]
+
+        return res.json({ success: true, data: response });
+      } catch (err) {
+        console.error('Error saving withdraw request:', err);
+        return res.status(500).json({ error: 'Failed to save withdrawal request' });
+      }
+    });
 
     // Users can post a withdrawal request
     router.post('/withdraw', async (req, res) => {
@@ -63,6 +326,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           });
         }
 
+        // 🔹 Check existing pending requests
+        // const userDetails = await databases.listDocuments(
+        //   APPWRITE_DATABASE_ID,
+        //   Withdrawal_request_collectionId,
+        //   [
+        //     Query.equal("userId", userId),
+        //     Query.equal("status", "pending"),
+        //   ]
+        // );
+
+        const userDetails = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [
+              Query.equal("userId", userId),
+              Query.limit(1), 
+            ]
+        );
+
+        print(userDetails);
+
+        return res.status(400).json({
+            error: "Testing error"
+        });
+
         const response = await databases.createDocument(
           APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId, // <-- collection ID
@@ -82,108 +370,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             createdAt: istTime
           }
         );
-
-        return res.json({ success: true, data: response });
-      } catch (err) {
-        console.error('Error saving withdraw request:', err);
-        return res.status(500).json({ error: 'Failed to save withdrawal request' });
-      }
-    });
-
-    // Users can post a withdrawal request (new version with validations and balance checks)
-    router.post('/withdraw_new', async (req, res) => {
-      const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
-
-      // console.log('Withdraw request received:', req.body);
-
-      // return res.status(503).json({ error: 'Withdrawals are temporarily disabled for maintenance' });
-
-      // basic validations
-      if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
-      if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
-      if (mode === 'upi' && !upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
-      if (mode === 'bank' && (!bankName || !accountNumber || !ifscCode)) {
-        return res.status(400).json({ error: 'Bank details are incomplete' });
-      }
-
-      // normalize money to paise
-      const toPaise = (val) => {
-        const n = Number(val);
-        if (!isFinite(n) || n <= 0) return null;
-        return Math.round(n * 100);
-      };
-      const amountPaise = toPaise(amount);
-      if (amountPaise == null) return res.status(400).json({ error: 'Invalid amount' });
-
-      const wdh_id = generateWithdrawalId();
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(Date.now() + istOffset).toISOString();
-
-      try {
-        // Enforce max 2 pending per user
-        const pendingRequests = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          [Query.equal('userId', userId), Query.equal('status', 'pending')]
-        );
-        if (pendingRequests.total >= 2) {
-          return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
-        }
-
-        // Load QR and validate available balance
-        const qrList = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          [Query.equal('qrId', qrId), Query.limit(1)]
-        );
-        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' });
-        const qr = qrList.documents[0]; // has totals in paise
-
-        const total = Number(qr.totalPayInAmount || 0);
-        const approved = Number(qr.withdrawalApprovedAmount || 0);
-        const requested = Number(qr.withdrawalRequestedAmount || 0);
-        const onHold = Number(qr.amountOnHold || 0);
-        const available = Math.max(0, total - approved - requested - onHold);
-
-        // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
-
-        if (amountPaise > available) {
-          return res.status(400).json({ error: 'Requested amount exceeds available balance' });
-        }
-
-        // Update QR ledger: bump requested, recompute available
-        const newRequested = requested + amountPaise;
-        const newAvailable = Math.max(0, total - approved - newRequested);
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          qr.$id,
-          {
-            withdrawalRequestedAmount: newRequested,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-        // Create withdrawal document
-        const response = await databases.createDocument(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          ID.unique(),
-          {
-            id: wdh_id,
-            userId,
-            qrId: qrId || null,
-            holderName,
-            amount: amount, // store in Rs Not paise
-            mode,
-            upiId: upiId || null,
-            bankName: bankName || null,
-            accountNumber: accountNumber || null,
-            ifscCode: ifscCode || null,
-            status: 'pending',
-            createdAt: istTime,
-          }
-        ); [1]
 
         return res.json({ success: true, data: response });
       } catch (err) {
@@ -233,23 +419,29 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // 4) Prepare response: map documents, compute nextCursor
         const docs = result.documents || [];
 
-        // Keep $id for pagination cursor
         const withdrawals = docs.map((doc) => {
-          const {
-            $id,
-            // $collectionId,
-            // $databaseId,
-            // $createdAt,
-            // $updatedAt,
-            // $permissions,
-            ...customFields
-          } = doc;
-
-          // Optionally include these for debugging/admin needs:
-          // customFields._id = $id;
-          // customFields._createdAt = $createdAt;
-
-          return customFields;
+          return {
+            $id: doc.$id,
+            id: doc.id,
+            userId: doc.userId,
+            qrId: doc.qrId,
+            holderName: doc.holderName,
+            amount: doc.amount,
+            preAmount: doc.preAmount || 0,
+            commission: doc.commission || 0,
+            mode: doc.mode,
+            upiId: doc.upiId,
+            bankName: doc.bankName,
+            accountNumber: doc.accountNumber,
+            ifscCode: doc.ifscCode,
+            status: doc.status,
+            createdAt: doc.createdAt,
+            processed_at: doc.processed_at || null,
+            utrNumber: doc.utrNumber || null,
+            rejectionReason: doc.rejectionReason || null,
+            // Include other metadata if needed
+            // add any other fields you need
+          };
         });
 
         // When full page returned, expose the nextCursor as last doc $id
@@ -312,16 +504,28 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Map documents while computing nextCursor from the last doc's $id
         const docs = result.documents || [];
         const withdrawals = docs.map((doc) => {
-          const {
-            $id,
-            $collectionId,
-            $databaseId,
-            $createdAt,
-            $updatedAt,
-            $permissions,
-            ...customFields
-          } = doc;
-          return customFields;
+          return {
+            $id: doc.$id,
+            id: doc.id,
+            userId: doc.userId,
+            qrId: doc.qrId,
+            holderName: doc.holderName,
+            amount: doc.amount,
+            preAmount: doc.preAmount || 0,
+            commission: doc.commission || 0,
+            mode: doc.mode,
+            upiId: doc.upiId,
+            bankName: doc.bankName,
+            accountNumber: doc.accountNumber,
+            ifscCode: doc.ifscCode,
+            status: doc.status,
+            createdAt: doc.createdAt,
+            processed_at: doc.processed_at || null,
+            utrNumber: doc.utrNumber || null,
+            rejectionReason: doc.rejectionReason || null,
+            // Include other metadata if needed
+            // add any other fields you need
+          };
         });
 
         const lastDoc = docs.length ? docs[docs.length - 1] : null;
@@ -425,39 +629,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
-    // POST /withdrawals/approve
-    router.post('/withdrawals/approve', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
-      const { id, utrNumber } = req.body;
-
-      if (!id || !utrNumber || utrNumber.trim().length < 5) {
-        return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
-      }
-
-      try {
-        const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, [
-          Query.equal('id', id),
-          Query.limit(1),
-        ]);
-
-        if (result.total === 0) {
-          return res.status(404).json({ error: 'Withdrawal request not found' });
-        }
-
-        const doc = result.documents[0];
-
-        await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, doc.$id, {
-          status: 'approved',
-          utrNumber: utrNumber.trim(),
-          rejectionReason: null, // clear if any
-        });
-
-        return res.json({ success: true, message: 'Withdrawal approved' });
-      } catch (err) {
-        console.error('❌ Approve error:', err);
-        return res.status(500).json({ error: 'Failed to approve withdrawal' });
-      }
-    });
-
     // POST /withdrawals/approve_new (with balance and ledger updates)
     router.post('/withdrawals/approve_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, utrNumber } = req.body;
@@ -515,16 +686,41 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
         const onHold = Number(qr.amountOnHold || 0);
+        const commissionOnHold = Number(qr.commissionOnHold || 0);
+        const commissionPaid = Number(qr.commissionPaid || 0);
 
-        if (requested < amountPaise) {
-          // Defensive: don’t go negative if pending bucket is lower than request
-          return res.status(409).json({ error: 'Pending requested amount is lower than approval amount' });
+        console.log(`Approving Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
+
+        // Separate commission and withdrawal amounts
+        const commissionPaise = Math.round((w.commission || 0) * 100);
+        const withdrawalPaise = amountPaise - commissionPaise;
+
+        // Validate that requested and commissionOnHold have enough funds
+        if (requested < withdrawalPaise) {
+          return res.status(409).json({ error: 'Pending requested withdrawal amount is lower than approval amount' });
+        }
+        if (commissionOnHold < commissionPaise) {
+          return res.status(409).json({ error: 'Commission on hold is lower than approval commission amount' });
         }
 
-        const newRequested = requested - amountPaise;
-        const newApproved = approved + amountPaise;
-        const newAvailable = Math.max(0, total - newApproved - newRequested - onHold);
+        // Compute new ledger values
+        const newRequested = requested - withdrawalPaise;
+        const newApproved = approved + withdrawalPaise;
 
+        const newCommissionOnHold = commissionOnHold - commissionPaise;
+        const newCommissionPaid = commissionPaid + commissionPaise;
+
+        const newAvailable = Math.max(
+          0,
+          total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid
+        );
+
+        // Prevent negative ledger fields
+        if (newRequested < 0 || newCommissionOnHold < 0) {
+          return res.status(500).json({ error: 'Ledger computation error: negative balance' });
+        }
+
+        // Continue with database updates...
         // 4) Update QR ledger first
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
@@ -534,6 +730,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             withdrawalRequestedAmount: newRequested,
             withdrawalApprovedAmount: newApproved,
             amountAvailableForWithdrawal: newAvailable,
+            commissionOnHold: newCommissionOnHold,
+            commissionPaid: newCommissionPaid,
           }
         ); // update by $id [5][19]
 
@@ -550,43 +748,87 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           }
         ); // update by $id [5]
 
+        // After updating Withdrawal request doc and QR ledger:
+        const user = await getUserMeta(w.userId);
+        const admin = await getadminMeta(); // Implement this based on your user roles
+
+        if (!user) {
+          console.warn("User metadata not found for commission processing");
+        } else {
+          let commissionTxs = [];
+
+          if (user.parentId) {
+            const parent = await getUserMeta(user.parentId);
+            if (parent) {
+              // Subadmin commission
+              const subadminCommissionAmount = calculateCommission(
+                w.preAmount,
+                w.userCommissionRate
+              );
+
+              // Admin commission
+              const adminCommissionAmount = calculateCommission(
+                w.preAmount,
+                w.parentCommissionRate
+              );
+
+              commissionTxs.push({
+                userId: user.parentId,
+                sourceWithdrawalId: w.id,
+                amount: subadminCommissionAmount,
+                commissionRate: w.userCommissionRate,
+                earningType: 'subadmin',
+                createdAt: new Date().toISOString(),
+              });
+
+              commissionTxs.push({
+                userId: admin.userId,
+                sourceWithdrawalId: w.id,
+                amount: adminCommissionAmount,
+                commissionRate: w.parentCommissionRate,
+                earningType: 'admin',
+                createdAt: new Date().toISOString(),
+              });
+
+            }
+          } else {
+            // User has no parent, so admin earns commission only
+            if (admin) {
+              const adminCommissionAmount = calculateCommission(
+                w.preAmount,
+                w.userCommissionRate
+              );
+
+              commissionTxs.push({
+                userId: admin.userId,
+                sourceWithdrawalId: w.id,
+                amount: adminCommissionAmount,
+                commissionRate: w.userCommissionRate,
+                earningType: 'admin',
+                createdAt: new Date().toISOString(),
+              });
+
+            }
+          }
+
+          // Create commission transaction docs
+          for (const tx of commissionTxs) {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID,
+              ID.unique(),
+              tx
+            );
+          }
+
+          await updateDailyCommissionTotal(commissionTxs);
+
+        }
+
         return res.json({ success: true, message: 'Withdrawal approved' });
       } catch (err) {
         console.error('❌ Approve error:', err);
         return res.status(500).json({ error: 'Failed to approve withdrawal' });
-      }
-    });
-
-    // POST /withdrawals/reject
-    router.post('/withdrawals/reject', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
-      const { id, reason } = req.body;
-
-      if (!id || !reason || reason.trim().length < 4) {
-        return res.status(400).json({ error: 'Invalid ID or reason too short' });
-      }
-
-      try {
-        const result = await databases.listDocuments(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, [
-          Query.equal('id', id),
-          Query.limit(1),
-        ]);
-
-        if (result.total === 0) {
-          return res.status(404).json({ error: 'Withdrawal request not found' });
-        }
-
-        const doc = result.documents[0];
-
-        await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, doc.$id, {
-          status: 'rejected',
-          rejectionReason: reason.trim(),
-          utrNumber: null, // clear if any
-        });
-
-        return res.json({ success: true, message: 'Withdrawal rejected' });
-      } catch (err) {
-        console.error('❌ Reject error:', err);
-        return res.status(500).json({ error: 'Failed to reject withdrawal' });
       }
     });
 
@@ -644,14 +886,40 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const approved = Number(qr.withdrawalApprovedAmount || 0);
         const requested = Number(qr.withdrawalRequestedAmount || 0);
         const onHold = Number(qr.amountOnHold || 0);
+        const commissionOnHold = Number(qr.commissionOnHold || 0);
+        const commissionPaid = Number(qr.commissionPaid || 0);
 
-        if (requested < amountPaise) {
-          return res.status(409).json({ error: 'Pending requested amount is lower than rejection amount' });
+        console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
+
+        // Convert commission from rupees to paise safely
+        const commissionPaise = Math.round((w.commission || 0) * 100);
+
+        // Withdrawal amount portion excluding commission
+        const withdrawalPaise = amountPaise - commissionPaise;
+
+        // Validation: separate checks for withdrawal and commission amounts
+        if (requested < withdrawalPaise) {
+          return res.status(409).json({ error: 'Requested amount is lower than rejection withdrawal amount' });
+        }
+        if (commissionOnHold < commissionPaise) {
+          return res.status(409).json({ error: 'Commission on hold is lower than rejection commission amount' });
         }
 
-        const newRequested = requested - amountPaise;                 // return amount to availability
-        const newApproved = approved;                                  // unchanged
-        const newAvailable = Math.max(0, total - newApproved - newRequested - onHold);
+        // Adjust ledger amounts properly
+        const newRequested = requested - withdrawalPaise;
+        const newApproved = approved; // unchanged
+        const newCommissionOnHold = commissionOnHold - commissionPaise;
+        const newCommissionPaid = commissionPaid; // unchanged
+
+        // Recalculate available amount after adjustments
+        const newAvailable = Math.max(
+          0,
+          total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid
+        );
+
+        console.log(`requested: ${requested} - ${withdrawalPaise} = ${newRequested}`);
+        console.log(`Post-Reject Ledger - Total: ${total}, Approved: ${newApproved}, Requested: ${newRequested}, Available: ${newAvailable}, CommissionOnHold: ${newCommissionOnHold}`);
+        console.log(`Post-Reject Commission - CommissionOnHold: ${newCommissionOnHold}, CommissionPaid: ${newCommissionPaid}`);
 
         // 4) Update QR ledger
         await databases.updateDocument(
@@ -661,6 +929,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             withdrawalRequestedAmount: newRequested,
             amountAvailableForWithdrawal: newAvailable,
+            commissionOnHold: newCommissionOnHold,
+            commissionPaid: newCommissionPaid,
           }
         ); // by $id [18]
 
@@ -683,6 +953,49 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(500).json({ error: 'Failed to reject withdrawal' });
       }
     });
+
+    async function updateDailyCommissionTotal(commissionTxs) {
+      const dayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+
+      const existingDocs = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+        [
+          Query.equal('date', dayString),
+          Query.limit(1),
+        ]
+      );
+
+      let commissionsObj = {};
+      let docId = null;
+
+      if (existingDocs.total > 0) {
+        const doc = existingDocs.documents[0];
+        docId = doc.$id;
+        try {
+          commissionsObj = JSON.parse(doc.commissionsJson) || {};
+        } catch {
+          commissionsObj = {};
+        }
+      }
+
+      // Merge the array entries into the existing map
+      for (const { userId, amount } of commissionTxs) {
+        commissionsObj[userId] = (commissionsObj[userId] || 0) + amount;
+        if (commissionsObj[userId] < 0) {
+          throw new Error(`Commission total for user ${userId} cannot be negative`);
+        }
+      }
+
+      const payload = { date: dayString, commissionsJson: JSON.stringify(commissionsObj) };
+
+      if (docId) {
+        await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, docId, payload);
+      } else {
+        await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, ID.unique(), payload);
+      }
+    }
+
 
     // GET all config
     router.get("/config", async (req, res) => {

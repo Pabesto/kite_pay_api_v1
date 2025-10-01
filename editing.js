@@ -1,22 +1,80 @@
-            const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+async function handleWithdrawalApproval(withdrawal) {
+  // withdrawal includes userId, amount, commission, parentId (if any)
+  const userId = withdrawal.userId;
 
-            const dailySummariesPromises = qrCodes.map(qr =>
-                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
-                    Query.equal('qrId', qr.qrId),
-                    Query.equal('date', todayISO),
-                    Query.limit(1),
-                ])
-            );
+  // fetch userMeta
+  const user = await getUserMeta(userId);
 
-            const allSummaries = await Promise.all(dailySummariesPromises);
+  if (!user) throw new Error("User not found");
 
-            const qrCodesWithTodayTotal = qrCodes.map((qr, index) => {
-                const summaryDocs = allSummaries[index].documents;
-                
-                const todayTotalPayIn = summaryDocs.length > 0 ? summaryDocs[0].total_amount : 0;
+  // define commission transactions list to create
+  const commissionTxs = [];
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+  if (user.parentId) {
+    // user has a parent - user is subadmin under an admin
+
+    // fetch parent (admin) meta
+    const parent = await getUserMeta(user.parentId);
+
+    if (!parent) throw new Error("Parent (admin) user not found");
+
+    // Calculate commission for subadmin (= user)
+    const subadminCommissionAmount = calculateCommission(
+      withdrawal.preAmount * 100, // amount in paise
+      user.commission // as percentage, e.g. 1.5
+    ) / 100; // convert back to Rs
+
+    commissionTxs.push({
+      userId: user.userId,
+      sourceWithdrawalId: withdrawal.id,
+      amount: subadminCommissionAmount,
+      commissionRate: user.commission,
+      earningType: 'subadmin',
+      createdAt: new Date().toISOString(),
+    });
+
+    // Calculate commission for admin (parent)
+    const adminCommissionAmount = calculateCommission(
+      withdrawal.preAmount * 100,
+      parent.commission
+    ) / 100;
+
+    commissionTxs.push({
+      userId: parent.userId,
+      sourceWithdrawalId: withdrawal.id,
+      amount: adminCommissionAmount,
+      commissionRate: parent.commission,
+      earningType: 'admin',
+      createdAt: new Date().toISOString(),
+    });
+  } else {
+    // User has no parent - user is subadmin, admin earns commission only
+
+    // Fetch admin userMeta (you need a way to identify admin, e.g. user with role 'admin')
+    const admin = await findAdminUser(); // implement according to your logic
+
+    const adminCommissionAmount = calculateCommission(
+      withdrawal.preAmount * 100,
+      admin.commission
+    ) / 100;
+
+    commissionTxs.push({
+      userId: admin.userId,
+      sourceWithdrawalId: withdrawal.id,
+      amount: adminCommissionAmount,
+      commissionRate: admin.commission,
+      earningType: 'admin',
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  // Now create Commission Transactions in Appwrite DB
+  for (const tx of commissionTxs) {
+    await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      CommissionTransactions_collectionId,
+      ID.unique(),
+      tx
+    );
+  }
+}
