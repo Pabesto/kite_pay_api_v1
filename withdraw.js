@@ -11,7 +11,7 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -219,7 +219,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const onHold = Number(qr.amountOnHold || 0);
         const commissionOnHold = Number(qr.commissionOnHold || 0);
         const commissionPaid = Number(qr.commissionPaid || 0);
-        const available = Math.max(0, total - approved - requested - onHold - commissionOnHold - commissionPaid);
+        const available = total - approved - requested - onHold - commissionOnHold - commissionPaid;
 
         // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
 
@@ -235,7 +235,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const newRequested = requested + preAmountPaise;
         const newCommissionOnHold = commissionOnHold + (recalculatedCommissionRs * 100);
-        const newAvailable = Math.max(0, total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid); // recompute available
+        const newAvailable = total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid; // recompute available
 
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
@@ -710,10 +710,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const newCommissionOnHold = commissionOnHold - commissionPaise;
         const newCommissionPaid = commissionPaid + commissionPaise;
 
-        const newAvailable = Math.max(
-          0,
-          total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid
-        );
+        const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
 
         // Prevent negative ledger fields
         if (newRequested < 0 || newCommissionOnHold < 0) {
@@ -762,13 +759,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (parent) {
               // Subadmin commission
               const subadminCommissionAmount = calculateCommission(
-                w.preAmount,
+                w.preAmount * 100,
                 w.userCommissionRate
               );
 
               // Admin commission
               const adminCommissionAmount = calculateCommission(
-                w.preAmount,
+                w.preAmount * 100,
                 w.parentCommissionRate
               );
 
@@ -795,7 +792,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // User has no parent, so admin earns commission only
             if (admin) {
               const adminCommissionAmount = calculateCommission(
-                w.preAmount,
+                w.preAmount * 100,
                 w.userCommissionRate
               );
 
@@ -821,7 +818,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             );
           }
 
-          await updateDailyCommissionTotal(commissionTxs);
+          await recordCommissionRollups(commissionTxs).catch((err) => {
+            console.error('❌ Commission rollup error:', err);
+          });
 
         }
 
@@ -831,6 +830,214 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(500).json({ error: 'Failed to approve withdrawal' });
       }
     });
+
+    function istDayString(ts = new Date()) {
+      return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM-DD'); // TZ-safe day key [web:51]
+    }
+
+    function istMonthString(ts = new Date()) {
+      return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM'); // TZ-safe month key [web:51]
+    }
+
+    // One entrypoint after computing commissionTxs in your approval route
+    async function recordCommissionRollups(commissionTxs) {
+      await upsertDailyCommissionFromTxs(commissionTxs); // daily JSON map [web:52]
+      await upsertMonthlyTotalsFromTxs(commissionTxs); // monthly per-user with composite unique [web:39][web:40]
+      await upsertAllTimeTotalsFromTxs(commissionTxs); // all-time per-user unique [web:40]
+    }
+
+    // 1) Daily JSON map merge (one doc per date)
+    async function upsertDailyCommissionFromTxs(commissionTxs) {
+      const day = istDayString();
+
+      const existing = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+        [ Query.equal('date', day), Query.limit(1) ]
+      ); // list by equality [web:52][web:47]
+
+      let commissionsObj = {};
+      let docId = null;
+
+      if (existing.total > 0) {
+        const doc = existing.documents[0];
+        docId = doc.$id;
+        try {
+          commissionsObj = JSON.parse(doc.commissionsJson) || {};
+        } catch {
+          commissionsObj = {};
+        }
+      }
+
+      for (const { userId, amount } of commissionTxs) {
+        const amt = Number(amount || 0);
+        commissionsObj[userId] = (commissionsObj[userId] || 0) + amt;
+        if (commissionsObj[userId] < 0) {
+          throw new Error(`Negative daily total for ${userId}`);
+        }
+      }
+
+      const payload = { date: day, commissionsJson: JSON.stringify(commissionsObj) };
+
+      if (docId) {
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+          docId,
+          payload
+        ); // update by id [web:45]
+      } else {
+        try {
+          await databases.createDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+            ID.unique(),
+            payload
+          );
+        } catch (e) {
+          // race fallback: re-read then update
+          const again = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+            [ Query.equal('date', day), Query.limit(1) ]
+          );
+          if (again.total > 0) {
+            await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+              again.documents[0].$id,
+              payload
+            );
+          } else {
+            throw e;
+          }
+        }
+      }
+    }
+
+    // 2) Monthly per-user totals (one row per userId+month)
+    async function upsertMonthlyTotalsFromTxs(commissionTxs) {
+      const month = istMonthString();
+
+      // collapse to per-user to minimize writes
+      const perUser = {};
+      for (const { userId, amount } of commissionTxs) {
+        const amt = Number(amount || 0);
+        if (!perUser[userId]) perUser[userId] = 0;
+        perUser[userId] += amt;
+      }
+
+      for (const [userId, delta] of Object.entries(perUser)) {
+        if (delta === 0) continue;
+
+        const list = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+          [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
+        ); // composite query [web:50]
+
+        if (list.total > 0) {
+          const row = list.documents[0];
+          const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+          if (newTotal < 0) throw new Error(`Negative monthly total for ${userId}`);
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+            row.$id,
+            { totalCommissionPaise: newTotal }
+          );
+        } else {
+          try {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+              ID.unique(),
+              { userId, month, totalCommissionPaise: delta }
+            );
+          } catch (e) {
+            // retry path on unique collision
+            const again = await databases.listDocuments(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+              [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
+            );
+            if (again.total > 0) {
+              const row = again.documents[0];
+              const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+              await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                row.$id,
+                { totalCommissionPaise: newTotal }
+              );
+            } else {
+              throw e;
+            }
+          }
+        }
+      }
+    }
+
+    // 3) All-time per-user totals (one row per userId)
+    async function upsertAllTimeTotalsFromTxs(commissionTxs) {
+
+      const perUser = {};
+      for (const { userId, amount } of commissionTxs) {
+        const amt = Number(amount || 0);
+        if (!perUser[userId]) perUser[userId] = 0;
+        perUser[userId] += amt;
+      }
+
+      for (const [userId, delta] of Object.entries(perUser)) {
+        if (delta === 0) continue;
+
+        const list = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+          [ Query.equal('userId', userId), Query.limit(1) ]
+        );
+
+        if (list.total > 0) {
+          const row = list.documents[0];
+          const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+          if (newTotal < 0) throw new Error(`Negative all-time total for ${userId}`);
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+            row.$id,
+            { totalCommissionPaise: newTotal }
+          );
+        } else {
+          try {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+              ID.unique(),
+              { userId, totalCommissionPaise: delta }
+            );
+          } catch (e) {
+            const again = await databases.listDocuments(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+              [ Query.equal('userId', userId), Query.limit(1) ]
+            );
+            if (again.total > 0) {
+              const row = again.documents[0];
+              const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+              await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                row.$id,
+                { totalCommissionPaise: newTotal }
+              );
+            } else {
+              throw e;
+            }
+          }
+        }
+      }
+    }
+
 
     // POST /withdrawals/reject_new (new with balance and ledger updates)
     router.post('/withdrawals/reject_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
@@ -912,10 +1119,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const newCommissionPaid = commissionPaid; // unchanged
 
         // Recalculate available amount after adjustments
-        const newAvailable = Math.max(
-          0,
-          total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid
-        );
+        const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
 
         console.log(`requested: ${requested} - ${withdrawalPaise} = ${newRequested}`);
         console.log(`Post-Reject Ledger - Total: ${total}, Approved: ${newApproved}, Requested: ${newRequested}, Available: ${newAvailable}, CommissionOnHold: ${newCommissionOnHold}`);
@@ -953,49 +1157,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(500).json({ error: 'Failed to reject withdrawal' });
       }
     });
-
-    async function updateDailyCommissionTotal(commissionTxs) {
-      const dayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
-
-      const existingDocs = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-        [
-          Query.equal('date', dayString),
-          Query.limit(1),
-        ]
-      );
-
-      let commissionsObj = {};
-      let docId = null;
-
-      if (existingDocs.total > 0) {
-        const doc = existingDocs.documents[0];
-        docId = doc.$id;
-        try {
-          commissionsObj = JSON.parse(doc.commissionsJson) || {};
-        } catch {
-          commissionsObj = {};
-        }
-      }
-
-      // Merge the array entries into the existing map
-      for (const { userId, amount } of commissionTxs) {
-        commissionsObj[userId] = (commissionsObj[userId] || 0) + amount;
-        if (commissionsObj[userId] < 0) {
-          throw new Error(`Commission total for user ${userId} cannot be negative`);
-        }
-      }
-
-      const payload = { date: dayString, commissionsJson: JSON.stringify(commissionsObj) };
-
-      if (docId) {
-        await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, docId, payload);
-      } else {
-        await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, ID.unique(), payload);
-      }
-    }
-
 
     // GET all config
     router.get("/config", async (req, res) => {

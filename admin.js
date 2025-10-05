@@ -9,9 +9,18 @@ const moment = require('moment-timezone');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const tz = require('dayjs/plugin/timezone');
+
+dayjs.extend(utc);
+dayjs.extend(tz);
+// Optional: set default TZ once
+dayjs.tz.setDefault('Asia/Kolkata');
+
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -585,7 +594,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
-        const limitNum = Math.min(parseInt(limit) || 25, 50);
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         let filters = [];
 
@@ -771,7 +780,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 const total = Number(qr.totalPayInAmount || 0);
                 const approved = Number(qr.withdrawalApprovedAmount || 0);
                 const requested = Number(qr.withdrawalRequestedAmount || 0);
-                const nextAvailable = total - approved - requested - nextHold;
+                const commissionOnHold = Number(qr.commissionOnHold || 0);
+                const commissionPaid = Number(qr.commissionPaid || 0);
+                const nextAvailable = total - approved - requested - nextHold - (commissionOnHold + commissionPaid);
 
                 await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
                 amountOnHold: nextHold,
@@ -851,8 +862,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const total = Number(qrDocLike.totalPayInAmount || 0);
             const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
             const requested = Number(qrDocLike.withdrawalRequestedAmount || 0);
+            const commissionOnHold = Number(qrDocLike.commissionOnHold || 0);
+            const commissionPaid = Number(qrDocLike.commissionPaid || 0);
             const hold = Number(qrDocLike.amountOnHold || 0);
-            return total - approved - requested - hold;
+            return total - approved - requested - hold - (commissionOnHold + commissionPaid);
         }; // available is derived, not set arbitrarily [web:170][web:176]
 
         const hasAmountChange = typeof newAmountPaise === 'number' && newAmountPaise !== oldAmountPaise;
@@ -1078,7 +1091,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // Recompute available as a derived field (include holds)
                 const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
                 const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                const nextAvailable = nextTotal - approved - requested - nextHold; // can be negative if business allows
+                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+                const commissionPaid = Number(qrDoc.commissionPaid || 0);
+                const nextAvailable = nextTotal - approved - requested - nextHold - commissionOnHold - commissionPaid;
 
                 await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
@@ -1257,9 +1272,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
 
                 const onHold = Number(qrDoc.amountOnHold || 0);
-                const commissionOnHold = Number(qr.commissionOnHold || 0);
-                const commissionPaid = Number(qr.commissionPaid || 0);
-                const newAvailable = Math.max(0, newTotal - approved - requested - onHold - commissionOnHold - commissionPaid);
+                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+                const commissionPaid = Number(qrDoc.commissionPaid || 0);
+                const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
                 await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
@@ -1459,6 +1474,339 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             console.error('getMyMetaData error:', err);
             return res.status(500).json({ error: 'Failed to fetch metadata' });
         }
+    });
+
+    // GET /commissions
+    // Roles: admin and subadmin (optional narrowing by current user)
+    router.get('/commissions',authenticateAdminOrLabel('all_commissions', { isSubadminAllowed: true }),
+        async (req, res) => {
+            const {
+            userId,
+            earningType,           // 'admin' | 'subadmin'
+            sourceWithdrawalId,    // exact match
+            minAmount,             // paise or rupees? assume paise; see normalize below
+            maxAmount,
+            from,                  // 'YYYY-MM-DD' (IST day)
+            to,                    // 'YYYY-MM-DD' (IST day)
+            searchField,           // 'userId' | 'sourceWithdrawalId'
+            searchValue,
+            limit = 25,
+            cursor
+            } = req.query;
+
+            const limitNum = Math.min(parseInt(limit) || 25, 50);
+            const filters = [];
+
+            const requestorId = req.user.userId;
+            const role = req.user.role; // 'admin' | 'subadmin'
+
+            try {
+            // Access control example: subadmin can default to own commissions unless labels widen it
+            const requester = req.user;
+            const isSubadmin = requester.role === 'subadmin';
+            const isAdmin = requester.role === 'admin';
+
+            // Field filters
+            if (userId && isAdmin) {
+                filters.push(Query.equal('userId', userId));
+            }
+
+            if(isSubadmin) {
+                filters.push(Query.equal('userId', requester.userId));
+            }
+
+            if (earningType) {
+                const allowed = new Set(['admin', 'subadmin']);
+                const et = String(earningType).toLowerCase();
+                if (!allowed.has(et)) {
+                return res.status(400).json({ error: 'Invalid earningType' });
+                }
+                filters.push(Query.equal('earningType', et));
+            }
+
+            if (sourceWithdrawalId) {
+                filters.push(Query.equal('sourceWithdrawalId', sourceWithdrawalId));
+            }
+
+            // Search: allow search on userId or sourceWithdrawalId (text)
+            if (searchField && searchValue) {
+                const searchable = new Set(['userId', 'sourceWithdrawalId']);
+                if (!searchable.has(searchField)) {
+                return res.status(400).json({ error: 'Invalid searchField' });
+                }
+                filters.push(Query.search(searchField, String(searchValue)));
+            }
+
+            // Amount range (normalize to integer)
+            const toInt = (v) => {
+                const n = Number(v);
+                return Number.isFinite(n) ? Math.trunc(n) : null;
+            };
+            const minA = toInt(minAmount);
+            const maxA = toInt(maxAmount);
+            if (minA != null && maxA != null) {
+                filters.push(Query.between('amount', minA, maxA));
+            } else if (minA != null) {
+                filters.push(Query.greaterThanEqual('amount', minA));
+            } else if (maxA != null) {
+                filters.push(Query.lessThanEqual('amount', maxA));
+            }
+
+            // IST day range helper
+            function istDayRangeISO(dateStr) {
+                const d = new Date(dateStr);
+                const start = new Date(d);
+                start.setHours(0, 0, 0, 0);
+                // shift to UTC by subtracting 5h30m to represent IST day in UTC
+                start.setMinutes(start.getMinutes() - 330);
+                const end = new Date(d);
+                end.setHours(23, 59, 59, 999);
+                end.setMinutes(end.getMinutes() - 330);
+                return { startISO: start.toISOString(), endISO: end.toISOString() };
+            }
+
+            // Date filters (createdAt field is ISO string)
+            if (from && to) {
+                if (from === to) {
+                const { startISO, endISO } = istDayRangeISO(from);
+                filters.push(Query.between('createdAt', startISO, endISO));
+                } else {
+                const { startISO } = istDayRangeISO(from);
+                const { endISO } = istDayRangeISO(to);
+                filters.push(Query.between('createdAt', startISO, endISO));
+                }
+            } else if (from && !to) {
+                const { startISO, endISO } = istDayRangeISO(from);
+                filters.push(Query.between('createdAt', startISO, endISO));
+            } else if (!from && to) {
+                const { endISO } = istDayRangeISO(to);
+                filters.push(Query.lessThanEqual('createdAt', endISO));
+            }
+
+            // Build query list with ordering + pagination
+            const queries = [
+                ...filters,
+                Query.orderDesc('createdAt'),  // ensure index on createdAt
+                Query.limit(limitNum),
+            ];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            // Fetch
+            const resp = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID,
+                queries
+            ); // list with filters/order/cursor [web:50][web:91]
+
+            // Shape response
+            const pick = (d) => ({
+                $id: d.$id,
+                id: d.$id,
+                userId: d.userId,
+                sourceWithdrawalId: d.sourceWithdrawalId,
+                amount: d.amount,
+                commissionRate: d.commissionRate,
+                earningType: d.earningType,
+                createdAt: d.createdAt,
+            });
+
+            const docs = resp.documents.map(pick);
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+            return res.status(200).json({ commissions: docs, nextCursor });
+            } catch (err) {
+            console.error('Error fetching commissions:', err);
+            return res.status(500).json({ error: 'Failed to fetch commissions' });
+            }
+        }
+    );
+
+    function parseModeAndRange(q) {
+        const tz = 'Asia/Kolkata';
+        const mode = String(q.mode || 'today').toLowerCase();
+
+        const asISTStart = (ts) => dayjs(ts).tz(tz).startOf('day'); // IST midnight
+        const fmt = (d) => d.tz(tz).format('YYYY-MM-DD');           // IST day key
+
+        if (mode === 'today') {
+            const d = asISTStart(dayjs());
+            return { start: d, end: d, startStr: fmt(d), endStr: fmt(d) };
+        }
+
+        if (mode === 'date') {
+            const d = asISTStart(String(q.date));
+            if (!d.isValid()) throw new Error('Invalid date');
+            return { start: d, end: d, startStr: fmt(d), endStr: fmt(d) };
+        }
+
+        if (mode === 'range') {
+            const s = asISTStart(String(q.start));
+            const e = asISTStart(String(q.end));
+            if (!s.isValid() || !e.isValid()) throw new Error('Invalid range');
+            if (e.isBefore(s)) throw new Error('end < start');
+            return { start: s, end: e, startStr: fmt(s), endStr: fmt(e) };
+        }
+
+        if (mode === 'last') {
+            const n = Math.max(1, Math.min(366, parseInt(String(q.days || '7'), 10) || 7));
+            const end = asISTStart(dayjs());              // today (IST) start
+            const start = end.subtract(n - 1, 'day');     // n days inclusive
+            return { start, end, startStr: fmt(start), endStr: fmt(end) };
+        }
+
+        throw new Error('Invalid mode');
+    }
+
+    router.get('/commissions/summary', async (req, res) => {
+    try {
+        const userId = String(req.query.userId || '').trim();
+        if (!userId) return res.status(400).json({ success: false, message: 'userId is required' });
+
+        const { start, end } = parseModeAndRange(req.query);
+        const startStr = start.format('YYYY-MM-DD');
+        const endStr = end.format('YYYY-MM-DD');
+
+        // Pre-build day buckets
+        const days = [];
+        for (let d = start.clone(); !d.isAfter(end); d = d.add(1, 'day')) {
+        days.push({ date: d.format('YYYY-MM-DD'), commissionPaise: 0 });
+        }
+        const idx = new Map(days.map((x, i) => [x.date, i]));
+
+        // Fetch daily docs in range
+        const docs = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, [
+            Query.between('date', startStr, endStr),
+            Query.orderAsc('date'),
+            Query.limit(100),
+        ]);
+
+        for (const doc of docs.documents) {
+        const dateStr = String(doc.date);
+        const i = idx.get(dateStr);
+        if (i === undefined) continue;
+
+        const raw = doc.commissionsJson;
+        let paise = 0;
+        if (typeof raw === 'string') {
+            try {
+            const json = JSON.parse(raw);
+            paise = Number(json[userId] || 0);
+            } catch (e) {
+            // ignore malformed JSON
+            }
+        } else if (raw && typeof raw === 'object') {
+            paise = Number(raw[userId] || 0);
+        }
+        days[i].commissionPaise = paise;
+        }
+
+        const totalPaise = days.reduce((s, d) => s + d.commissionPaise, 0);
+
+        return res.json({
+        success: true,
+        userId,
+        range: { start: startStr, end: endStr },
+        totalPaise,
+        days, // [{ date, commissionPaise }]
+        });
+    } catch (e) {
+        return res.status(400).json({ success: false, message: e && e.message ? e.message : 'Bad request' });
+    }
+    });
+
+    router.get('/commissions/summary-all', async (req, res) => {
+    try {
+        const { start, end, startStr, endStr } = parseModeAndRange(req.query);
+        const includeUsers = String(req.query.includeUsers || 'false').toLowerCase() === 'true';
+
+        // Fetch N daily docs (1 per day)
+        const docs = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+        [
+            Query.between('date', startStr, endStr),
+            Query.orderAsc('date'),
+            Query.limit(100),
+        ]
+        );
+
+        // Pre-fill day buckets
+        const buckets = [];
+        for (let d = start.clone(); !d.isAfter(end); d = d.add(1, 'day')) {
+        buckets.push({ date: d.format('YYYY-MM-DD'), totalPaise: 0 });
+        }
+        const idx = new Map(buckets.map((x, i) => [x.date, i]));
+
+        // Optional per-user accumulators
+        const perUser = includeUsers ? new Map() : null;
+
+        for (const doc of docs.documents) {
+        const dateStr = String(doc.date);
+        const i = idx.get(dateStr);
+        if (i === undefined) continue;
+
+        const raw = doc.commissionsJson;
+        let daySum = 0;
+
+        const addUserVal = (uid, v) => {
+            if (!perUser) return;
+            if (!perUser.has(uid)) perUser.set(uid, { totalPaise: 0, days: new Map() });
+            const u = perUser.get(uid);
+            u.totalPaise += v;
+            u.days.set(dateStr, (u.days.get(dateStr) || 0) + v);
+        };
+
+        if (typeof raw === 'string') {
+            try {
+            const obj = JSON.parse(raw);
+            for (const uid in obj) {
+                const v = Number(obj[uid] || 0);
+                daySum += v;
+                addUserVal(uid, v);
+            }
+            } catch {
+            // ignore malformed
+            }
+        } else if (raw && typeof raw === 'object') {
+            for (const uid in raw) {
+            const v = Number(raw[uid] || 0);
+            daySum += v;
+            addUserVal(uid, v);
+            }
+        }
+
+        buckets[i].totalPaise = daySum;
+        }
+
+        const grandTotal = buckets.reduce((s, b) => s + b.totalPaise, 0);
+
+        // Materialize per-user output aligned to requested dates
+        let perUserOut = undefined;
+        if (perUser) {
+        perUserOut = {};
+        for (const [uid, data] of perUser.entries()) {
+            const daysArr = buckets.map((b) => ({
+            date: b.date,
+            paise: data.days.get(b.date) || 0,
+            }));
+            perUserOut[uid] = {
+                totalPaise: Number(data.totalPaise || 0),
+                days: daysArr,
+            };
+        }
+        }
+
+        return res.json({
+            success: true,
+            range: { start: startStr, end: endStr },
+            totalPaise: Number(grandTotal || 0),
+            days: buckets.map(b => ({ date: b.date, totalPaise: Number(b.totalPaise || 0) })),
+            perUser: perUserOut ?? undefined,
+        });
+
+    } catch (e) {
+        return res.status(400).json({ success: false, message: e?.message || 'Bad request' });
+    }
     });
 
     return router;
