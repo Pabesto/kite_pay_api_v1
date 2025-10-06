@@ -650,9 +650,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           }
         ); // update by $id
 
+        const preAmountPaise = toPaise(w.preAmount || 0);
         // update dashboard counters
-        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', amountPaise).catch(console.error);
-        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -amountPaise).catch(console.error);
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', preAmountPaise).catch(console.error);
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
         // After updating Withdrawal request doc and QR ledger:
         const user = await getUserMeta(w.userId);
