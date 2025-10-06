@@ -11,6 +11,9 @@ const { File } = require('buffer');
 const path = require('path');
 const moment = require('moment-timezone');
 
+const { updateDashboardCounter } = require('./dashboardCounters');
+const { type } = require('os');
+
 
 // --------------------
 // Razorpay Setup
@@ -159,18 +162,45 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     async function saveQrEntry({
         qrId,
+        qrType,
         fileId,
         imageUrl,
         createdByUserId,
         createdAt,
         assignedUserId = null,
         }) {
+
+            console.log('Saving QR Entry:', {
+                qrId,
+                qrType, 
+            });
+
+        // After successful creation:
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsUploaded', 1).catch(console.error);
+
+        // Increment type-specific counter
+        if (qrType === 'pinelabs') {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', 1).catch(console.error);
+        } else if (qrType === 'paytm') {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', 1).catch(console.error);
+        } else {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', 1).catch(console.error);
+        }
+
+        if (assignedUserId) {
+            // You may want to check if assignedUserId is a merchant
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+        }
+
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesActive', 1).catch(console.error);
+
         return await databases.createDocument(
             APPWRITE_DATABASE_ID,
             Qr_collectionId,
             ID.unique(),
             {
             qrId,
+            type: qrType,
             fileId,
             imageUrl,
             assignedUserId,
@@ -184,7 +214,9 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // POST a new QR code entry
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
-        const { qrId, fileId, imageUrl , createdAt } = req.body;
+        const { qrId, qrType, fileId, imageUrl , createdAt } = req.body;
+
+        console.log('Create QR Entry request body:', req.body);
 
         if (!qrId || !fileId || !imageUrl) {
             return res.status(400).json({ message: "Missing required fields: qrId, fileId, or imageUrl." });
@@ -196,7 +228,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             const existing = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             Qr_collectionId,
-            [Query.equal("qrId", qrId)]
+                [Query.equal("qrId", qrId)]
             );
 
             if (existing.total > 0) {
@@ -205,6 +237,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
             const newQrCode = await saveQrEntry({
                 qrId,
+                qrType,
                 fileId,
                 imageUrl,
                 createdByUserId: req.user.userId, // set by your JWT middleware
@@ -246,6 +279,30 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
             await storage.deleteFile(bucketId, fileId);
             await databases.deleteDocument(APPWRITE_DATABASE_ID, Qr_collectionId, docId);
+
+            // Decrement dashboard counters
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsUploaded', -1).catch(console.error);
+
+            // Decrement type-specific counter
+            if (doc.type === 'pinelabs') {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', -1).catch(console.error);
+            } else if (doc.type === 'paytm') {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', -1).catch(console.error);
+            } else {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', -1).catch(console.error);
+            }
+
+            // Decrement assigned counter if assigned
+            if (doc.assignedUserId) {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+            }
+
+            // Decrement active/disabled counters
+            if (doc.isActive === true) {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesActive', -1).catch(console.error);
+            } else {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesDisabled', -1).catch(console.error);
+            }
 
             res.status(200).json({ message: "QR Code and file deleted successfully." });
         } catch (error) {
@@ -295,6 +352,15 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 { isActive }
             );
 
+            // Update dashboard counters
+            if (isActive === true) {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesActive', 1).catch(console.error);
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesDisabled', -1).catch(console.error);
+            } else {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesActive', -1).catch(console.error);
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesDisabled', 1).catch(console.error);
+            }
+
             res.status(200).json({ message: "QR Code status updated successfully." });
         } catch (error) {
             console.error('Error toggling QR code status:', error);
@@ -310,17 +376,36 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         const { assignedUserId } = req.body; // assignedUserId can now be null or a string
 
         try {
+            // Fetch current assignment
+            const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('qrId', qrId)
+            ]);
+            if (docResult.documents.length === 0) {
+                return res.status(404).json({ message: "QR Code not found." });
+            }
+            const prevAssignedUserId = docResult.documents[0].assignedUserId;
+
+            // Update assignment
             const result = await assignQrToUser({
-            qrId,
-            assignedUserId
-        });
+                qrId,
+                assignedUserId
+            });
+
+            // Only increment if previously unassigned and now assigned
+            if (!prevAssignedUserId && assignedUserId) {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+            }
+            // Only decrement if previously assigned and now unassigned
+            else if (prevAssignedUserId && !assignedUserId) {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+            }
+            // No change if reassigned from one user to another
 
             res.status(200).json({ message: "User assignment updated successfully." });
         } catch (error) {
             console.error('Error updating user assignment for QR code:', error);
             res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
         }
-
     });
     
     // GET QR codes for a specific user
@@ -694,6 +779,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     }
 
+    // this was used for razorpay test account
     router.post("/create-qr/:userId",authenticateAdminOrSubAdmin, async (req, res) => {
         // console.log('Create QR request for userId:', req.params.userId);
         try {

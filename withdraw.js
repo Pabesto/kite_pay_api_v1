@@ -6,6 +6,7 @@ const express = require('express');
 const multer = require('multer');
 const moment = require('moment-timezone');
 
+const { updateDashboardCounter } = require('./dashboardCounters');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -48,7 +49,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdraw_commission_preview', async (req, res) => {
       const { userId, qrId, preAmount } = req.body;
 
-      console.log('Withdraw commission preview request received:', req.body);
+      // console.log('Withdraw commission preview request received:', req.body);
 
       if (!userId || !preAmount) {
         return res.status(400).json({ error: 'userId and name are required' });
@@ -80,7 +81,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const qr = qrList.documents[0];
       const amountAvailableForWithdrawal = Number(qr.amountAvailableForWithdrawal || 0);
 
-      console.log(`Preview Withdrawal - PreAmountPaise: ${preAmountPaise}, CommissionRs: ${commissionRs}, Available: ${amountAvailableForWithdrawal}`);
+      // console.log(`Preview Withdrawal - PreAmountPaise: ${preAmountPaise}, CommissionRs: ${commissionRs}, Available: ${amountAvailableForWithdrawal}`);
 
       if ((preAmountPaise + commissionRs * 100) > amountAvailableForWithdrawal) {
         return res.status(400).json({
@@ -96,11 +97,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
       if (overheadDoc) {
         const overheadValue = overheadDoc.value;
-        console.log('Overhead Balance Required:', overheadValue);
+        // console.log('Overhead Balance Required:', overheadValue);
 
         const withdrawalToCheck = preAmountPaise + commissionRs * 100 + overheadValue * 100;
 
-        console.log(`Total Withdrawal To Check (including overhead): ${withdrawalToCheck}`);
+        // console.log(`Total Withdrawal To Check (including overhead): ${withdrawalToCheck}`);
 
         if (withdrawalToCheck > amountAvailableForWithdrawal) {
           return res.status(400).json({
@@ -125,8 +126,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         totalAmount,
       });
     });
-
-
 
     // Users can post a withdrawal request (new version with validations and balance checks)
     router.post('/withdraw_new', async (req, res) => {
@@ -227,7 +226,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         //   return res.status(400).json({ error: 'Requested amount exceeds available balance' });
         // }
 
-        console.log(`PreAmountPaise: ${preAmountPaise}, RecalculatedCommissionRs: ${recalculatedCommissionRs}, Available: ${available}`);
+        // console.log(`PreAmountPaise: ${preAmountPaise}, RecalculatedCommissionRs: ${recalculatedCommissionRs}, Available: ${available}`);
 
         if ((preAmountPaise + (recalculatedCommissionRs * 100) ) > available) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
@@ -272,104 +271,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'pending',
             createdAt: istTime,
           }
-        ); [1]
+        ); // withdrawal request created
 
-        return res.json({ success: true, data: response });
-      } catch (err) {
-        console.error('Error saving withdraw request:', err);
-        return res.status(500).json({ error: 'Failed to save withdrawal request' });
-      }
-    });
-
-    // Users can post a withdrawal request
-    router.post('/withdraw', async (req, res) => {
-      const { userId, qrId, holderName, amount, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
-        // console.log('Withdraw request received:', req.body);
-      // Input validation
-      if (!['upi', 'bank'].includes(mode)) {
-        return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
-      }
-
-      if (!userId || !holderName) {
-        return res.status(400).json({ error: 'userId and name are required' });
-      }
-
-      if (mode === 'upi' && !upiId) {
-        return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
-      }
-
-      if (mode === 'bank' && (!bankName || !accountNumber || !ifscCode)) {
-        return res.status(400).json({ error: 'Bank details are incomplete' });
-      }
-
-      const wdh_id = generateWithdrawalId();
-      // console.log('Generated Withdrawal ID:', wdh_id);
-
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(Date.now() + istOffset).toISOString();
-
-      try {
-
-        // 🔹 Check existing pending requests
-        const pendingRequests = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          [
-            Query.equal("userId", userId),
-            Query.equal("status", "pending"),
-          ]
-        );
-
-        if (pendingRequests.total >= 2) {
-          return res.status(400).json({
-            error: "You already have the maximum number of pending withdrawal requests (2)."
-          });
-        }
-
-        // 🔹 Check existing pending requests
-        // const userDetails = await databases.listDocuments(
-        //   APPWRITE_DATABASE_ID,
-        //   Withdrawal_request_collectionId,
-        //   [
-        //     Query.equal("userId", userId),
-        //     Query.equal("status", "pending"),
-        //   ]
-        // );
-
-        const userDetails = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [
-              Query.equal("userId", userId),
-              Query.limit(1), 
-            ]
-        );
-
-        print(userDetails);
-
-        return res.status(400).json({
-            error: "Testing error"
-        });
-
-        const response = await databases.createDocument(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId, // <-- collection ID
-          ID.unique(),
-          {
-            id : wdh_id,
-            userId : userId,
-            qrId : qrId || null,
-            holderName : holderName,
-            amount  : amount,
-            mode : mode,
-            upiId: upiId || null,
-            bankName: bankName || null,
-            accountNumber: accountNumber || null,
-            ifscCode: ifscCode || null,
-            status: 'pending', // default
-            createdAt: istTime
-          }
-        );
+        // After creating a withdrawal request
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', preAmountPaise).catch(console.error);
 
         return res.json({ success: true, data: response });
       } catch (err) {
@@ -743,7 +648,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             processed_at: approvedAtIST,
             rejectionReason: null,
           }
-        ); // update by $id [5]
+        ); // update by $id
+
+        // update dashboard counters
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', amountPaise).catch(console.error);
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -amountPaise).catch(console.error);
 
         // After updating Withdrawal request doc and QR ledger:
         const user = await getUserMeta(w.userId);
@@ -786,6 +695,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 earningType: 'admin',
                 createdAt: new Date().toISOString(),
               });
+
+              // Update dashboard counters for merchant and admin profit
+              const merchantProfit = subadminCommissionAmount;
+              const adminCommission = adminCommissionAmount;
+              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', merchantProfit).catch(console.error);
+              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommission).catch(console.error);
 
             }
           } else {
@@ -1136,7 +1051,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             commissionOnHold: newCommissionOnHold,
             commissionPaid: newCommissionPaid,
           }
-        ); // by $id [18]
+        ); // by $id
 
         // 5) Update withdrawal document
         await databases.updateDocument(
@@ -1149,7 +1064,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             utrNumber: null,
             processed_at: new Date().toISOString(),
           }
-        ); // by $id [18]
+        ); // by $id
+
+        const preAmountPaise = toPaise(w.preAmount || 0);
+
+        // After rejecting a withdrawal
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
         return res.json({ success: true, message: 'Withdrawal rejected' });
       } catch (err) {
@@ -1190,7 +1110,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         res.status(500).json({ success: false, error: "Failed to fetch config" });
       }
     });
-
 
     return router;
     

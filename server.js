@@ -26,6 +26,8 @@ const PORT = process.env.PORT || 3000;
 
 const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
 
+const { updateDashboardCounter } = require('./dashboardCounters');
+
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
 });
@@ -497,6 +499,22 @@ app.post('/cashfree/webhook', async (req, res) => {
         qrCodeId,
         payload: eventPayload,
     }); // Socket.IO selective emit via rooms [1]
+
+    // 4️⃣ Update global counters (async, no await)
+    // totalTxCount
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
+
+    // totalApiTx
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
+
+    // totalAmountReceived
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
 
   } catch (e) {
     console.error('Persist webhook error:', e?.message || e);

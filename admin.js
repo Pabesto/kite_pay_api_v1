@@ -13,11 +13,12 @@ const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 
+const { updateDashboardCounter } = require('./dashboardCounters');
+
 dayjs.extend(utc);
 dayjs.extend(tz);
 // Optional: set default TZ once
 dayjs.tz.setDefault('Asia/Kolkata');
-
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
@@ -244,17 +245,27 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             } catch (e) {
             console.error('Error creating user metadata document:', e);
             if (e?.code === 409) {
-                // Either docId already exists or a unique index collided; update in place
-                await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                userId,
-                payload
-                );
-            } else {
-                throw e;
+                    // Either docId already exists or a unique index collided; update in place
+                    await databases.updateDocument(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    userId,
+                    payload
+                    );
+                } else {
+                    throw e;
+                }
             }
+
+            // Update dashboard counters
+            if(role === 'subadmin'){
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', 1).catch(console.error);
+            }else if(role === 'user'){
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', 1).catch(console.error);
             }
+
+            // Total users count (all roles)
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', 1).catch(console.error);
 
             return res.status(201).json({
             message: 'User created successfully',
@@ -479,7 +490,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // sub-admins can only edit users they created
             }
 
-            const docId = list.documents[0].$id;
+            const doc = list.documents[0];
+            const docId = doc.$id;
 
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
@@ -487,6 +499,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 docId,
                 { status }
             );
+
+            if(doc.role === 'subadmin'){
+                // Update dashboard counter for subadmin status change
+                const delta = status ? 1 : -1;
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', delta).catch(console.error);
+                // merchantDisabled
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantDisabled', -delta).catch(console.error);
+            }else if(doc.role === 'user'){
+                // Update dashboard counter for user status change
+                const delta = status ? 1 : -1;
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', delta).catch(console.error);
+                // disabledUsers
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'disabledUsers', -delta).catch(console.error);
+            }
 
             return res.json({ success: true, status: result.status });
         } catch (err) {
@@ -525,6 +551,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (list.documents.length > 0) {
                 const docId = list.documents[0].$id;
                 await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, docId);
+                // Update dashboard counters
+                const role = list.documents[0].role;
+                const status = list.documents[0].status;
+                if (role === 'subadmin') {
+                    if (status === true) {
+                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', -1).catch(console.error);
+                    } else {
+                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantDisabled', -1).catch(console.error);
+                    }
+                } else if (role === 'user') {
+                    if (status === true) {
+                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', -1).catch(console.error);
+                    } else {
+                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'disabledUsers', -1).catch(console.error);
+                    }
+                }
+                // Total users count (all roles)
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1).catch(console.error);
             }
 
             return res.status(200).json({ message: 'User deleted successfully' });
@@ -729,6 +773,79 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // GET /transactions/aggregate
+// Admin/Subadmin with all_transactions label
+// GET /transactions/aggregate-all
+    // router.get('/transactions/aggregate-all', async (req, res) => {
+    // const {
+    //     startCursor,
+    //     pageLimit = 100,
+    //     maxPages = 200, // scans up to 20,000 docs by default
+    // } = req.query;
+
+    // const limitNum = Math.min(parseInt(pageLimit) || 100, 100);
+    // const maxPagesNum = Math.min(parseInt(maxPages) || 200, 200);
+
+    // try {
+    //     let totalCount = 0;
+    //     let vpaNullCount = 0;
+    //     let vpaPresentCount = 0;
+    //     let totalAmountPaise = 0;
+
+    //     let cursor = startCursor || null;
+    //     let page = 0;
+    //     let hasMore = true;
+
+    //     while (hasMore && page < maxPagesNum) {
+    //     const queries = [Query.orderDesc('created_at'), Query.limit(limitNum)];
+    //     if (cursor) queries.push(Query.cursorAfter(cursor));
+
+    //     const resp = await databases.listDocuments(
+    //         APPWRITE_DATABASE_ID,
+    //         webhook_collectionId,
+    //         queries
+    //     );
+
+    //     const docs = resp.documents || [];
+
+    //     for (const d of docs) {
+    //         totalCount += 1;
+
+    //         const v = d.vpa;
+    //         const vpaEmpty = v == null || (typeof v === 'string' && v.trim() === '');
+    //         if (vpaEmpty) vpaNullCount += 1; else vpaPresentCount += 1;
+
+    //         const amt = Number.isFinite(d.amount) ? d.amount : parseInt(d.amount || 0, 10);
+    //         if (!isNaN(amt)) totalAmountPaise += amt;
+    //     }
+
+    //     if (docs.length === limitNum) {
+    //         cursor = docs[docs.length - 1].$id;
+    //         hasMore = true;
+    //     } else {
+    //         hasMore = false;
+    //         if (docs.length > 0) cursor = docs[docs.length - 1].$id;
+    //     }
+
+    //     page += 1;
+    //     }
+
+    //     return res.status(200).json({
+    //     totalCount,
+    //     vpaNullCount,
+    //     vpaPresentCount,
+    //     totalAmountPaise,
+    //     hasMore,
+    //     cursor,
+    //     pageSize: limitNum,
+    //     pagesScanned: page,
+    //     });
+    // } catch (err) {
+    //     console.error('Error aggregating all transactions:', err);
+    //     return res.status(500).json({ error: 'Failed to aggregate transactions' });
+    // }
+    // });
+
     // Helper: convert amount to paise
     const toPaise = (amt) => Math.round(amt * 100);
 
@@ -755,7 +872,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const prevStatus = ((tx.status || 'normal').trim().toLowerCase());
             if (prevStatus === nextStatus) {
-            return res.status(200).json({ message: 'No status change', transaction: tx });
+                return res.status(200).json({ message: 'No status change', transaction: tx });
             }
 
             // 3) Update status field on transaction
@@ -789,6 +906,84 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 amountAvailableForWithdrawal: nextAvailable,
                 });
             }
+            }
+
+            const toInt = (x) => (Number.isFinite(x) ? x : parseInt(x || 0, 10));
+            const amt = toInt(updated.amount);
+
+            const prev = (prevStatus || 'normal').toLowerCase();
+            const next = (nextStatus || 'normal').toLowerCase();
+
+            // Helpers
+            const inc = (key, delta) =>
+            updateDashboardCounter(databases, APPWRITE_DATABASE_ID, key, delta).catch((e) =>
+                console.error(`Error updating ${key}:`, e)
+            );
+
+            if (prev === next) {
+            console.log('Status unchanged:', prev, '->', next);
+            } else if (prev === 'normal' && next === 'cyber') {
+            console.log('normal -> cyber');
+            await inc('cyberCount', 1);
+            await inc('cyberAmount', amt);
+            } else if (prev === 'normal' && next === 'refund') {
+            console.log('normal -> refund');
+            await inc('refundCount', 1);
+            await inc('refundAmount', amt);
+            } else if (prev === 'normal' && next === 'chargeback') {
+            console.log('normal -> chargeback');
+            await inc('chargebackCount', 1);
+            await inc('chargebackAmount', amt);
+            } else if (prev === 'cyber' && next === 'normal') {
+            console.log('cyber -> normal');
+            await inc('cyberCount', -1);
+            await inc('cyberAmount', -amt);
+            } else if (prev === 'refund' && next === 'normal') {
+            console.log('refund -> normal');
+            await inc('refundCount', -1);
+            await inc('refundAmount', -amt);
+            } else if (prev === 'chargeback' && next === 'normal') {
+            console.log('chargeback -> normal');
+            await inc('chargebackCount', -1);
+            await inc('chargebackAmount', -amt);
+            } else if (prev === 'cyber' && next === 'refund') {
+            console.log('cyber -> refund');
+            await inc('cyberCount', -1);
+            await inc('cyberAmount', -amt);
+            await inc('refundCount', 1);
+            await inc('refundAmount', amt);
+            } else if (prev === 'cyber' && next === 'chargeback') {
+            console.log('cyber -> chargeback');
+            await inc('cyberCount', -1);
+            await inc('cyberAmount', -amt);
+            await inc('chargebackCount', 1);
+            await inc('chargebackAmount', amt);
+            } else if (prev === 'refund' && next === 'cyber') {
+            console.log('refund -> cyber');
+            await inc('refundCount', -1);
+            await inc('refundAmount', -amt);
+            await inc('cyberCount', 1);
+            await inc('cyberAmount', amt);
+            } else if (prev === 'refund' && next === 'chargeback') {
+            console.log('refund -> chargeback');
+            await inc('refundCount', -1);
+            await inc('refundAmount', -amt);
+            await inc('chargebackCount', 1);
+            await inc('chargebackAmount', amt);
+            } else if (prev === 'chargeback' && next === 'cyber') {
+            console.log('chargeback -> cyber');
+            await inc('chargebackCount', -1);
+            await inc('chargebackAmount', -amt);
+            await inc('cyberCount', 1);
+            await inc('cyberAmount', amt);
+            } else if (prev === 'chargeback' && next === 'refund') {
+            console.log('chargeback -> refund');
+            await inc('chargebackCount', -1);
+            await inc('chargebackAmount', -amt);
+            await inc('refundCount', 1);
+            await inc('refundAmount', amt);
+            } else {
+            console.log('Unhandled transition:', prev, '->', next, 'no counters changed');
             }
 
             return res.status(200).json({ message: 'Status updated', transaction: updated });
@@ -1099,12 +1294,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 APPWRITE_DATABASE_ID,
                 Qr_collectionId,
                 qrDoc.$id,
-                {
-                    totalPayInAmount: nextTotal,
-                    amountOnHold: nextHold,
-                    totalTransactions: Math.max(0, (qrDoc.totalTransactions || 0) - 1),
-                    amountAvailableForWithdrawal: nextAvailable,
-                }
+                    {
+                        totalPayInAmount: nextTotal,
+                        amountOnHold: nextHold,
+                        totalTransactions: Math.max(0, (qrDoc.totalTransactions || 0) - 1),
+                        amountAvailableForWithdrawal: nextAvailable,
+                    }
                 );
 
             const istDate = moment.tz(tx.created_at, 'Asia/Kolkata');
@@ -1152,7 +1347,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 doc.$id,
                 {
-                totalsJson: JSON.stringify(totalsObj),
+                    totalsJson: JSON.stringify(totalsObj),
                 }
             );
             } 
@@ -1166,10 +1361,29 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // 3) Delete the transaction
             await databases.deleteDocument(
-            APPWRITE_DATABASE_ID,
-            webhook_collectionId,
-            id
+                APPWRITE_DATABASE_ID,
+                webhook_collectionId,
+                id
             );
+
+            // After successful deletion
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', -1).catch((e) => {
+                console.error('Error updating dashboard counter:', e);
+            });
+
+            if (tx.provider === 'manual') {
+                    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1).catch((e) => {
+                    console.error('Error updating dashboard counter:', e);
+                });
+            } else {
+                    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', -1).catch((e) => {
+                    console.error('Error updating dashboard counter:', e);
+                });
+            }
+
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', -amountPaise).catch((e) => {
+                console.error('Error updating dashboard counter:', e);
+            });
 
             return res.status(200).json({ message: 'Transaction deleted', id });
         } catch (err) {
@@ -1261,38 +1475,55 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 [Query.equal('qrId', qrCodeId), Query.limit(1)]
             );
 
-            if (qrResult.documents.length) {
-                const qrDoc = qrResult.documents[0];
+                if (qrResult.documents.length) {
+                    const qrDoc = qrResult.documents[0];
 
-                const newTransactions = (qrDoc.totalTransactions || 0) + 1;
-                const newTotal = (qrDoc.totalPayInAmount || 0) + finalAmount;
+                    const newTransactions = (qrDoc.totalTransactions || 0) + 1;
+                    const newTotal = (qrDoc.totalPayInAmount || 0) + finalAmount;
 
-                // Recompute available from updated total
-                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                    // Recompute available from updated total
+                    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
 
-                const onHold = Number(qrDoc.amountOnHold || 0);
-                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-                const commissionPaid = Number(qrDoc.commissionPaid || 0);
-                const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+                    const onHold = Number(qrDoc.amountOnHold || 0);
+                    const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+                    const commissionPaid = Number(qrDoc.commissionPaid || 0);
+                    const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-                await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                qrDoc.$id,
-                {
-                    totalTransactions: newTransactions,
-                    totalPayInAmount: newTotal,
-                    amountAvailableForWithdrawal: newAvailable, // <-- add this
+                    await databases.updateDocument(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    qrDoc.$id,
+                    {
+                        totalTransactions: newTransactions,
+                        totalPayInAmount: newTotal,
+                        amountAvailableForWithdrawal: newAvailable, // <-- add this
+                    }
+                    );
                 }
-                );
             }
-            }
+
+            // 4️⃣ Update global counters (async, no await)
+            // totalTxCount
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+                console.error('Error updating dashboard counter:', e);
+            });
+
+            // totalManualTx
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1).catch((e) => {
+                console.error('Error updating dashboard counter:', e);
+            });
+
+            // totalAmountReceived
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
+                console.error('Error updating dashboard counter:', e);
+            });
 
             return res.status(201).json({
                 message: "Transaction uploaded successfully",
                 transaction: result,
             });
+
         } catch (err) {
             console.error("❌ Manual transaction error:", err.message || err);
             return res.status(500).json({ error: err.message || "Transaction upload failed" });
