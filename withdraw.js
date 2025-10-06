@@ -594,7 +594,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const commissionOnHold = Number(qr.commissionOnHold || 0);
         const commissionPaid = Number(qr.commissionPaid || 0);
 
-        console.log(`Approving Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
+        // console.log(`Approving Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
 
         // Separate commission and withdrawal amounts
         const commissionPaise = Math.round((w.commission || 0) * 100);
