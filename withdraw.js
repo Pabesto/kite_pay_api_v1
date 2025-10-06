@@ -1011,7 +1011,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const commissionOnHold = Number(qr.commissionOnHold || 0);
         const commissionPaid = Number(qr.commissionPaid || 0);
 
-        console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
+        // console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
 
         // Convert commission from rupees to paise safely
         const commissionPaise = Math.round((w.commission || 0) * 100);
@@ -1036,9 +1036,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Recalculate available amount after adjustments
         const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
 
-        console.log(`requested: ${requested} - ${withdrawalPaise} = ${newRequested}`);
-        console.log(`Post-Reject Ledger - Total: ${total}, Approved: ${newApproved}, Requested: ${newRequested}, Available: ${newAvailable}, CommissionOnHold: ${newCommissionOnHold}`);
-        console.log(`Post-Reject Commission - CommissionOnHold: ${newCommissionOnHold}, CommissionPaid: ${newCommissionPaid}`);
+        // console.log(`requested: ${requested} - ${withdrawalPaise} = ${newRequested}`);
+        // console.log(`Post-Reject Ledger - Total: ${total}, Approved: ${newApproved}, Requested: ${newRequested}, Available: ${newAvailable}, CommissionOnHold: ${newCommissionOnHold}`);
+        // console.log(`Post-Reject Commission - CommissionOnHold: ${newCommissionOnHold}, CommissionPaid: ${newCommissionPaid}`);
 
         // 4) Update QR ledger
         await databases.updateDocument(

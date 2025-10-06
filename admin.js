@@ -2040,6 +2040,103 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
     });
 
+    // GET /dashboard/counters
+    router.get('/dashboard/counters', authenticateAdmin, async (req, res) => {
+        try {
+            const pageLimit = 100; // Appwrite max per page
+            let cursor = null;
+            let hasMore = true;
+
+            // Accumulator map: id -> totals
+            const map = new Map();
+
+            while (hasMore) {
+            const queries = [Query.limit(pageLimit)];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const resp = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                'dashboard_counters', // e.g., 'dashboard_counters'
+                queries
+            );
+
+            const docs = resp.documents || [];
+
+            for (const d of docs) {
+                const key = d.id || d.$id; // prefer your 'id' field if present
+                const valRaw = d.totals;
+                const val = Number.isFinite(valRaw) ? valRaw : parseInt(valRaw || 0, 10);
+                if (!map.has(key)) {
+                map.set(key, isNaN(val) ? 0 : val);
+                } else {
+                // In case of duplicates, last-write-wins (or sum if preferred)
+                map.set(key, isNaN(val) ? map.get(key) : val);
+                }
+            }
+
+            if (docs.length === pageLimit) {
+                cursor = docs[docs.length - 1].$id;
+                hasMore = true;
+            } else {
+                hasMore = false;
+            }
+            }
+
+            // Helper to get value or 0
+            const get = (k) => (map.has(k) ? map.get(k) : 0);
+
+            // Build the structured response
+            const payload = {
+            // Totals
+            totalTxCount: get('totalTxCount'),
+            totalAmountReceived: get('totalAmountReceived'),
+            totalAdminProfit: get('totalAdminProfit'),
+            totalMerchantProfit: get('totalMerchantProfit'),
+            totalQrsUploaded: get('totalQrsUploaded'),
+            totalQrsAssignedToMerchant: get('totalQrsAssignedToMerchant'),
+
+            // QR breakdown
+            totalPinelabsQrs: get('totalPinelabsQrs'),
+            totalPaytmQrs: get('totalPaytmQrs'),
+            totalOtherQrs: get('totalOtherQrs'),
+            qrCodesActive: get('qrCodesActive'),
+            qrCodesDisabled: get('qrCodesDisabled'),
+
+            // Transaction types
+            totalManualTx: get('totalManualTx'),
+            totalApiTx: get('totalApiTx'),
+            chargebackCount: get('chargebackCount'),
+            chargebackAmount: get('chargebackAmount'),
+            cyberCount: get('cyberCount'),
+            cyberAmount: get('cyberAmount'),
+            refundCount: get('refundCount'),
+            refundAmount: get('refundAmount'),
+
+            // Payouts
+            totalAmountPaid: get('totalAmountPaid'),
+            totalWithdrawalPendingAmount: get('totalWithdrawalPendingAmount'),
+
+            // Users/Merchants
+            activeUsers: get('activeUsers'),
+            disabledUsers: get('disabledUsers'),
+            merchantActive: get('merchantActive'),
+            merchantPending: get('merchantPending'),
+            merchantDisabled: get('merchantDisabled'),
+            totalUsers: get('totalUsers'),
+
+            // Memberships
+            totalMembershipPurchased: get('totalMembershipPurchased'),
+            pendingMembershipUsers: get('pendingMembershipUsers'),
+            };
+
+            return res.status(200).json(payload);
+        } catch (err) {
+            console.error('Error reading dashboard counters:', err);
+            return res.status(500).json({ error: 'Failed to fetch dashboard counters' });
+        }
+    });
+
+
     return router;
     
 };

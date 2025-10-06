@@ -5,7 +5,7 @@ async function updateDashboardCounter(databases, APPWRITE_DATABASE_ID, counterNa
     if (typeof delta !== 'number' || isNaN(delta)) {
         throw new Error(`Delta must be a valid number. Received: ${delta}`);
     }
-    console.log(`Updating counter ${counterName} by ${delta}`);
+    // console.log(`Updating counter ${counterName} by ${delta}`);
     // Fetch the current value
     const list = await databases.listDocuments(APPWRITE_DATABASE_ID, 'dashboard_counters', [
         Query.equal('id', counterName),
