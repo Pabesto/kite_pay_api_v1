@@ -274,6 +274,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }
 
             const doc = docResult.documents[0];
+
+            if(doc.assignedUserId !== null){
+                return res.status(400).json({ message: "Cannot delete a QR code assigned to a user. Please unassign it first." });
+            }
+
             const fileId = doc.fileId;
             const docId = doc.$id;
 

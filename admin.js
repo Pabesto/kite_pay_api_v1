@@ -536,9 +536,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(403).json({ error: 'Cannot delete admin users' });
             }
 
-            // Delete user in Appwrite users service
-            await users.delete(userId);
-
             // Find and delete corresponding document in users_mets collection
             const list = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
@@ -550,7 +547,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             if (list.documents.length > 0) {
                 const docId = list.documents[0].$id;
+
+                const response = await databases.listDocuments(APPWRITE_DATABASE_ID,Qr_collectionId, // Ensure this matches your actual QR codes collection ID
+                    [Query.equal('assignedUserId', docId.userId)]
+                );
+
+                if (response.total > 0) {
+                    return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
+                }
+
                 await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, docId);
+
+                // Delete user in Appwrite users service
+                await users.delete(userId);
+
                 // Update dashboard counters
                 const role = list.documents[0].role;
                 const status = list.documents[0].status;
