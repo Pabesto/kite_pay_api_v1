@@ -2258,6 +2258,103 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // GET /dashboard/user/:userId
+    router.get('/dashboard/user/:userId', authenticateToken, async (req, res) => {
+        const { userId } = req.params;
+        const actor = req.user;
+
+        try {
+            // Authorization: allow admin, the same user, or that user's manager/subadmin if policy allows
+            const isSelf = actor.userId === userId;
+            const isAdmin = actor.role === 'admin';
+            if (!isAdmin && !isSelf) {
+            // Optional: allow parent/manager
+            // if (actor.role === 'subadmin' && await isUserUnderMerchant(userId, actor.userId)) { /* allow */ }
+            // else
+            return res.status(403).json({ message: 'Forbidden' });
+            }
+
+            // 1) Fetch all QRs assigned to this user
+            const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            Query.equal('assignedUserId', userId),
+            Query.limit(100),
+            Query.orderAsc('$id'),
+            ]);
+
+            // 2) Aggregate QR-derived counters
+            let totalQrs = qrs.length;
+            let qrCodesActive = 0;
+            let qrCodesDisabled = 0;
+
+            let totalTxCount = 0;           // sum of qr.totalTransactions (count)
+            let totalAmountPayIn = 0;       // sum of qr.totalPayInAmount (paise)
+
+            let totalWithdrawalApprovedAmount = 0; // sum of qr.withdrawalApprovedAmount (paise)
+            let totalWithdrawalPendingAmount = 0;  // sum of qr.withdrawalRequestedAmount (paise)
+            let totalAvailableAmount = 0;          // sum of qr.amountAvailableForWithdrawal (paise)
+            let totalAmountOnHold = 0;             // sum of qr.amountOnHold (paise)
+
+            let totalCommissionOnHold = 0;         // sum of qr.commissionOnHold (paise)
+            let totalCommissionPaid = 0;           // sum of qr.commissionPaid (paise)
+
+            for (const qr of qrs) {
+            const isActive = !!qr.isActive;
+
+            // Adjust field names to your actual schema
+            const txCount = parseInt(qr.totalTransactions || 0, 10);
+            const payIn = parseInt(qr.totalPayInAmount || 0, 10);
+
+            const wApproved = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+            const wPending = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+            const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+            const onHold = parseInt(qr.amountOnHold || 0, 10);
+
+            const commHold = parseInt(qr.commissionOnHold || 0, 10);
+            const commPaid = parseInt(qr.commissionPaid || 0, 10);
+
+            if (isActive) qrCodesActive++; else qrCodesDisabled++;
+
+            totalTxCount += txCount;
+            totalAmountPayIn += payIn;
+
+            totalWithdrawalApprovedAmount += wApproved;
+            totalWithdrawalPendingAmount += wPending;
+            totalAvailableAmount += avail;
+            totalAmountOnHold += onHold;
+
+            totalCommissionOnHold += commHold;
+            totalCommissionPaid += commPaid;
+            }
+
+            // 3) Respond
+            return res.json({
+            userId,
+            // QR breakdown
+            totalQrs,
+            qrCodesActive,
+            qrCodesDisabled,
+
+            // Transactions
+            totalTxCount,
+            totalAmountPayIn,
+
+            // Payouts
+            totalWithdrawalApprovedAmount,
+            totalWithdrawalPendingAmount,
+            totalAvailableAmount,
+            totalAmountOnHold,
+
+            // Commission
+            totalCommissionOnHold,
+            totalCommissionPaid,
+            });
+        } catch (e) {
+            console.error('User dashboard error:', e);
+            return res.status(500).json({ message: 'Failed to build user dashboard', error: e.message });
+        }
+    });
+
+
     async function listAllDocuments(dbId, colId, baseQueries, pageSize = 100) {
         let out = [];
         let cursor = null;
