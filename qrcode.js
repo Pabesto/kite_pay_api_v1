@@ -69,7 +69,24 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     }
 
-    async function assignQrToUser({qrId, assignedUserId }) {
+    async function getUser(userId) {
+        try {
+            const User = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [Query.equal('userId', userId)]
+            );
+            if (User.documents.length === 0) {
+                return null;
+            }
+            return User.documents[0];
+        } catch (err) {
+            console.error("Error fetching getUser:", err.message);
+            return null;
+        }
+    }
+
+    async function assignQrToUser({qrId, assignedUserId, managedByUserId = null}) {
         // Find the QR document by qrId
         const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
             Query.equal('qrId', qrId)
@@ -82,17 +99,65 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         const docId = docResult.documents[0].$id;
 
         // Update assignment
-        await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            docId,
-            { assignedUserId: assignedUserId === '' ? null : assignedUserId }
-        );
+        if(managedByUserId){
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                docId,
+                { assignedUserId: assignedUserId === '' ? null : assignedUserId }
+            );
+        }else{
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                docId,
+                { assignedUserId: assignedUserId === '' ? null : assignedUserId }
+            );
+        }
+        
 
         return { success: true, docId };
     }
 
-    // GET all QR codes
+    async function assignQrToUserNew({ qrId, assignedUserId, managedByUserId = null }) {
+        // 1) Lookup QR by qrId
+        const qrDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            Query.equal('qrId', qrId)
+        ]);
+        if (!qrDocs.documents.length) throw new Error('QR Code not found');
+
+        const qr = qrDocs.documents[0];
+
+        // 2) Build update payload
+        const payload = {};
+        // normalize empty string -> null
+        const normalizedAssigned = (assignedUserId === '' ? null : assignedUserId) ?? null;
+
+        if (managedByUserId) {
+            // transfer or first assignment by admin to merchant
+            payload.managedByUserId = managedByUserId;
+            payload.assignedUserId = normalizedAssigned ?? managedByUserId; // choose policy
+            // Option: if merchant-level assignment, default assignment to merchant
+        } else {
+            // internal reassignment within same merchant
+            payload.assignedUserId = normalizedAssigned;
+        }
+
+        // 5) Update once
+        const updated = await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            qr.$id,
+            payload
+        );
+
+        // 6) Emit audit log (optional)
+        // await logAssignmentEvent({ actorId, qrId: qr.$id, old: qr, new: updated });
+
+        return { success: true, docId: updated.$id };
+    }
+
+    // GET all QR codes For Admin and Employees
     // This is a public endpoint
     router.get('/qr-codes', authenticateAdminOrLabel('all_transactions'), async (req, res) => {
         try {
@@ -109,6 +174,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
+                managedByUserId: doc.managedByUserId || null,
                 createdAt: doc.createdAt,
                 isActive: doc.isActive,
                 totalTransactions : doc.totalTransactions || 0,
@@ -376,43 +442,206 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // PUT to assign a user to a QR code
     // This is an admin-only endpoint
     // MODIFIED: Endpoint to assign or unlink a user from a QR code
-    router.put('/assign-qr/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    // router.put('/assign-qr/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    //     const { qrId } = req.params;
+    //     const { assignedUserId , managedByUserId } = req.body; // assignedUserId can now be null or a string
+
+    //     try {
+    //         // Fetch current assignment
+    //         const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+    //             Query.equal('qrId', qrId)
+    //         ]);
+    //         if (docResult.documents.length === 0) {
+    //             return res.status(404).json({ message: "QR Code not found." });
+    //         }
+    //         const prevAssignedUserId = docResult.documents[0].assignedUserId;
+    //         // Update assignment
+    //         if(managedByUserId){
+    //             const result = await assignQrToUserNew({
+    //                 qrId,
+    //                 assignedUserId,
+    //                 managedByUserId : managedByUserId,
+    //             });
+    //         }else{
+    //             const result = await assignQrToUserNew({
+    //                 qrId,
+    //                 assignedUserId
+    //             });
+    //         }
+            
+    //         // Only increment if previously unassigned and now assigned
+    //         if (!prevAssignedUserId && assignedUserId) {
+    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+    //         }
+    //         // Only decrement if previously assigned and now unassigned
+    //         else if (prevAssignedUserId && !assignedUserId) {
+    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+    //         }
+    //         // No change if reassigned from one user to another
+    //         res.status(200).json({ message: "User assignment updated successfully." });
+    //     } catch (error) {
+    //         console.error('Error updating user assignment for QR code:', error);
+    //         res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
+    //     }
+    // });
+
+    // PUT to assign a user to a QR code
+    router.put('/assign-qr-user/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
         const { qrId } = req.params;
-        const { assignedUserId } = req.body; // assignedUserId can now be null or a string
+        const { assignedUserId } = req.body; // may be null (unassign)
+        const actor = req.user;
 
         try {
-            // Fetch current assignment
-            const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-                Query.equal('qrId', qrId)
+            const qrDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('qrId', qrId),
+                Query.limit(1),
             ]);
-            if (docResult.documents.length === 0) {
-                return res.status(404).json({ message: "QR Code not found." });
-            }
-            const prevAssignedUserId = docResult.documents[0].assignedUserId;
 
-            // Update assignment
-            const result = await assignQrToUser({
-                qrId,
-                assignedUserId
+            if (!qrDocs.documents.length) return res.status(404).json({ message: 'QR Code not found.' });
+
+            const qr = qrDocs.documents[0];
+            const prevAssigned = qr.assignedUserId || null;
+
+            // Normalize input
+            const normalizedAssigned = assignedUserId === '' ? null : assignedUserId ?? null;
+
+            // Validate assignee (if not unassign)
+            if (normalizedAssigned) {
+                    const assignee = await getUser(normalizedAssigned); // implement
+                if (!assignee) return res.status(400).json({ message: 'Assignee not found.' });
+
+                // If QR has an owner, assignee must be under that owner
+                if (qr.managedByUserId && assignee.parentId !== qr.managedByUserId) {
+                    return res.status(409).json({ message: 'Assignee not under QR’s manager.' });
+                }
+                // Optional: if MANAGED is null and your rule treats it as subadmin-owned, validate against ownerSubadminId
+                // if (!qr.managedByUserId && assignee.parentId !== qr.ownerSubadminId) { ... }
+            }
+
+            // Update only assignedUserId
+            const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                assignedUserId: normalizedAssigned,
             });
 
-            // Only increment if previously unassigned and now assigned
-            if (!prevAssignedUserId && assignedUserId) {
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+            // Counters for "assigned" state
+            const newAssigned = updated.assignedUserId || null;
+            if (!prevAssigned && newAssigned) {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+            } else if (prevAssigned && !newAssigned) {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
             }
-            // Only decrement if previously assigned and now unassigned
-            else if (prevAssignedUserId && !assignedUserId) {
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
-            }
-            // No change if reassigned from one user to another
 
-            res.status(200).json({ message: "User assignment updated successfully." });
-        } catch (error) {
-            console.error('Error updating user assignment for QR code:', error);
-            res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
+            return res.status(200).json({ message: 'Assignee updated.' });
+        } catch (e) {
+            console.error(e);
+            return res.status(500).json({ message: 'Failed to update assignee.', error: e.message });
         }
     });
-    
+
+    // PUT /assign-qr-manager/:qrId
+    // Body: { managedByUserId: string | '' | null }
+    // Behavior:
+    // - managedByUserId === null or '' => unlink_block: allowed only if assignedUserId is null
+    // - managedByUserId is a valid id => transfer with strict block:
+    //     - if assignedUser exists and assignee.parentId !== managedByUserId => 409 block
+    //     - if assignedUser missing and was expected => 409 block
+    //     - if assignedUser null or in-scope => proceed
+    router.put('/assign-qr-manager/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+        const { qrId } = req.params;
+        const { managedByUserId: rawManaged } = req.body;
+        const actor = req.user;
+
+        try {
+            // Admin-only
+            if (actor.role !== 'admin') {
+            return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
+            }
+
+            // Normalize: '' -> null
+            const normalizedManaged = (rawManaged === '' ? null : (rawManaged ?? null));
+
+            // Load QR
+            const qrDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            Query.equal('qrId', qrId),
+            Query.limit(1),
+            ]);
+            if (!qrDocs.documents.length) return res.status(404).json({ message: 'QR Code not found.' });
+            const qr = qrDocs.documents[0];
+
+            const prevAssigned = qr.assignedUserId || null;
+
+            // UNLINK (unlink_block)
+            if (normalizedManaged === null) {
+            if (qr.assignedUserId) {
+                return res.status(409).json({
+                code: 'UNLINK_BLOCKED_ASSIGNED',
+                message: 'Cannot clear manager while QR is assigned; unassign first.',
+                });
+            }
+            const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                managedByUserId: null
+            });
+            return res.status(200).json({ message: 'Manager unlinked.', updated });
+            }
+
+            // TRANSFER (block strategy)
+            // Validate target manager
+            const manager = await getUser(normalizedManaged);
+            if (!manager) return res.status(400).json({ message: 'Manager not found.' });
+
+            // If currently assigned, the assignee must be under the new manager
+            if (qr.assignedUserId) {
+            const assignee = await getUser(qr.assignedUserId);
+            if (!assignee) {
+                return res.status(409).json({
+                code: 'ASSIGNEE_NOT_FOUND',
+                message: 'Existing assignee not found; reassign or unassign first.',
+                });
+            }
+            if (assignee.parentId !== normalizedManaged) {
+                return res.status(409).json({
+                code: 'ASSIGNEE_OUT_OF_SCOPE',
+                message: 'Assignee not under new manager; reassign or unassign first.',
+                details: {
+                    qrId,
+                    assigneeId: assignee.$id,
+                    assigneeParentId: assignee.parentId ?? null,
+                    targetManagerId: normalizedManaged,
+                },
+                });
+            }
+            }
+
+            // Normal policy:
+            // - Set managedByUserId to the new manager.
+            // - If currently unassigned, default-assign to the manager (optional; keep if desired).
+            const payload = {
+            managedByUserId: normalizedManaged,
+            ...(qr.assignedUserId ? {} : { assignedUserId: normalizedManaged }),
+            };
+
+            const updated = await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            qr.$id,
+            payload
+            );
+
+            // Counters only on null <-> non-null transitions
+            const newAssigned = updated.assignedUserId || null;
+            if (!prevAssigned && newAssigned) {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+            } else if (prevAssigned && !newAssigned) {
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+            }
+
+            return res.status(200).json({ message: 'Manager updated.', updated });
+        } catch (e) {
+            console.error(e);
+            return res.status(500).json({ message: 'Failed to update manager.', error: e.message });
+        }
+    });
+
     // GET QR codes for a specific user
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user/:userId', authenticateToken, async (req, res) => {
@@ -431,25 +660,32 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
             if (isSubadmin) {
                 // Fetch only QR IDs allowed for this subadmin
-                const qrIds = await getQrIdsForSubadmin(userRequested.userId);
-
-                if (qrIds.length > 0) {
-                    const response = await databases.listDocuments(
+                // const qrIds = await getQrIdsForSubadmin(userRequested.userId);
+                // if (qrIds.length > 0) {
+                //     const response = await databases.listDocuments(
+                //         APPWRITE_DATABASE_ID,
+                //         Qr_collectionId,
+                //         [Query.contains('qrId', qrIds)]
+                //     );
+                //     documents = response.documents;
+                // }
+                const response = await databases.listDocuments(
                         APPWRITE_DATABASE_ID,
                         Qr_collectionId,
-                        [Query.contains('qrId', qrIds)]
+                        [Query.contains('managedByUserId', userRequested.userId)]
                     );
                     documents = response.documents;
-                }
+
             } else {
                 const response = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
                     Qr_collectionId,
                     [
-                        Query.or([
-                            Query.equal('assignedUserId', userId),
-                            Query.equal('createdByUserId', userId),
-                        ]),
+                        // Query.or([
+                        //     Query.equal('assignedUserId', userId),
+                        //     Query.equal('createdByUserId', userId),
+                        // ]),
+                        Query.equal('assignedUserId', userId),
                         // Query.limit(50),
                     ]
                 );
@@ -461,6 +697,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
+                managedByUserId: doc.managedByUserId || null,
                 createdAt: doc.createdAt,
                 isActive: doc.isActive,
                 totalTransactions: doc.totalTransactions || 0,
@@ -546,6 +783,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
+                managedByUserId: doc.managedByUserId || null,
                 createdAt: doc.createdAt,
                 isActive: doc.isActive,
                 totalTransactions: doc.totalTransactions || 0,
@@ -595,63 +833,63 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     });
 
-    // Helper to fetch QR IDs a subadmin can access
-    async function getQrIdsForSubadmin(subadminId) {
-        const qrIds = new Set();
+    // // Helper to fetch QR IDs a subadmin can access
+    // async function getQrIdsForSubadmin(subadminId) {
+    //     const qrIds = new Set();
 
-        try {
-            // QRs created by the subadmin
-            const createdQrs = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId,
-            [Query.equal("createdByUserId", subadminId)]
-            );
+    //     try {
+    //         // QRs created by the subadmin
+    //         const createdQrs = await databases.listDocuments(
+    //         APPWRITE_DATABASE_ID,
+    //         Qr_collectionId,
+    //         [Query.equal("createdByUserId", subadminId)]
+    //         );
 
-            createdQrs.documents.forEach(q => qrIds.add(q.qrId));
+    //         createdQrs.documents.forEach(q => qrIds.add(q.qrId));
 
-            // QRs assigned directly to the subadmin
-            const subadminAssignedQrs = await getQrIdsForUser(subadminId);
-            subadminAssignedQrs.forEach(id => qrIds.add(id));
+    //         // QRs assigned directly to the subadmin
+    //         const subadminAssignedQrs = await getQrIdsForUser(subadminId);
+    //         subadminAssignedQrs.forEach(id => qrIds.add(id));
 
-            // Users under the subadmin
-            const managedUsers = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [Query.equal("parentId", subadminId)]
-            );
-            const managedUserIds = managedUsers.documents.map(u => u.userId);
+    //         // Users under the subadmin
+    //         const managedUsers = await databases.listDocuments(
+    //         APPWRITE_DATABASE_ID,
+    //         APPWRITE_USERS_META_COLLECTION_ID,
+    //         [Query.equal("parentId", subadminId)]
+    //         );
+    //         const managedUserIds = managedUsers.documents.map(u => u.userId);
 
-            // QRs assigned to those managed users
-            if (managedUserIds.length > 0) {
-            const qrDocs = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                [Query.equal("assignedUserId", managedUserIds)]
-            );
-            qrDocs.documents.forEach(q => qrIds.add(q.qrId));
-            }
+    //         // QRs assigned to those managed users
+    //         if (managedUserIds.length > 0) {
+    //         const qrDocs = await databases.listDocuments(
+    //             APPWRITE_DATABASE_ID,
+    //             Qr_collectionId,
+    //             [Query.equal("assignedUserId", managedUserIds)]
+    //         );
+    //         qrDocs.documents.forEach(q => qrIds.add(q.qrId));
+    //         }
 
-            return Array.from(qrIds);
-        } catch (err) {
-            console.error(`❌ Error in getQrIdsForSubadmin(${subadminId}):`, err);
-            return [];
-        }
-    }
+    //         return Array.from(qrIds);
+    //     } catch (err) {
+    //         console.error(`❌ Error in getQrIdsForSubadmin(${subadminId}):`, err);
+    //         return [];
+    //     }
+    // }
 
-    // Helper to get QR IDs for a user
-    async function getQrIdsForUser(userId) {
-        try {
-            const response = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            Qr_collectionId, // Ensure this matches your actual QR codes collection ID
-            [Query.equal('assignedUserId', userId)]
-            );
-            return response.documents.map(doc => doc.qrId);
-        } catch (error) {
-            console.error('Error fetching QR codes for user:', error);
-            return [];
-        }
-    }
+    // // Helper to get QR IDs for a user
+    // async function getQrIdsForUser(userId) {
+    //     try {
+    //         const response = await databases.listDocuments(
+    //         APPWRITE_DATABASE_ID,
+    //         Qr_collectionId, // Ensure this matches your actual QR codes collection ID
+    //         [Query.equal('assignedUserId', userId)]
+    //         );
+    //         return response.documents.map(doc => doc.qrId);
+    //     } catch (error) {
+    //         console.error('Error fetching QR codes for user:', error);
+    //         return [];
+    //     }
+    // }
 
     async function createRazorpayQr(userId) {
 
@@ -784,99 +1022,99 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     }
 
-    // this was used for razorpay test account
-    router.post("/create-qr/:userId",authenticateAdminOrSubAdmin, async (req, res) => {
-        // console.log('Create QR request for userId:', req.params.userId);
-        try {
-            // const { userId } = req.params;
-            const userId = req.user.userId; // set by your JWT middleware
+    // // this was used for razorpay test account
+    // router.post("/create-qr/:userId",authenticateAdminOrSubAdmin, async (req, res) => {
+    //     // console.log('Create QR request for userId:', req.params.userId);
+    //     try {
+    //         // const { userId } = req.params;
+    //         const userId = req.user.userId; // set by your JWT middleware
             
-            // console.log('Creating QR for userId:', userId);
+    //         // console.log('Creating QR for userId:', userId);
 
-            // Check limit before assigning
-            const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
+    //         // Check limit before assigning
+    //         const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
 
-            if (hasFiveActive) {
-                // console.log(`User already has ${activeCount} active QR codes. Cannot assign more.`);
-                return res.status(400).json({
-                    message: `User already has ${activeCount} active QR codes. Cannot assign more.`
-                });
-            }
+    //         if (hasFiveActive) {
+    //             // console.log(`User already has ${activeCount} active QR codes. Cannot assign more.`);
+    //             return res.status(400).json({
+    //                 message: `User already has ${activeCount} active QR codes. Cannot assign more.`
+    //             });
+    //         }
 
-            // 1. Create QR in Razorpay
-            const qr = await createRazorpayQr(userId);
+    //         // 1. Create QR in Razorpay
+    //         const qr = await createRazorpayQr(userId);
 
-            // 2. Download QR image
-            const localPath = `/tmp/${qr.id}.png`;
-            await downloadQrImage(qr.image_url, localPath);
+    //         // 2. Download QR image
+    //         const localPath = `/tmp/${qr.id}.png`;
+    //         await downloadQrImage(qr.image_url, localPath);
 
-            // 3. Save QR metadata in Appwrite (DB + Storage)
-            await uploadQrToAppwrite(localPath, userId, qr);
+    //         // 3. Save QR metadata in Appwrite (DB + Storage)
+    //         await uploadQrToAppwrite(localPath, userId, qr);
 
-            // 4. Assign QR to user using extracted method
-            await assignQrToUser({
-                qrId: qr.id,
-                assignedUserId: userId
-            });
+    //         // 4. Assign QR to user using extracted method
+    //         await assignQrToUser({
+    //             qrId: qr.id,
+    //             assignedUserId: userId
+    //         });
 
-            res.json({
-                success: true,
-                razorpayQrId: qr.id,
-                // appwriteFileId: file.$id,
-                // appwriteDocId: doc.$id,
-                qrImageUrl: qr.image_url,
-            });
-        } catch (err) {
-            console.error("Error creating QR:", err);
-            res.status(500).json({ success: false, error: err.message });
-        }
-    });
+    //         res.json({
+    //             success: true,
+    //             razorpayQrId: qr.id,
+    //             // appwriteFileId: file.$id,
+    //             // appwriteDocId: doc.$id,
+    //             qrImageUrl: qr.image_url,
+    //         });
+    //     } catch (err) {
+    //         console.error("Error creating QR:", err);
+    //         res.status(500).json({ success: false, error: err.message });
+    //     }
+    // });
 
-    router.post("/create-admin-qr/:userId", authenticateAdmin, async (req, res) => {
-        // console.log('Create QR request for userId:', req.params.userId);
-        try {
-            const { userId } = req.params;
+    // router.post("/create-admin-qr/:userId", authenticateAdmin, async (req, res) => {
+    //     // console.log('Create QR request for userId:', req.params.userId);
+    //     try {
+    //         const { userId } = req.params;
 
-            // console.log('Creating QR for userId:', userId);
+    //         // console.log('Creating QR for userId:', userId);
 
-            // Check limit before assigning
-            const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
+    //         // Check limit before assigning
+    //         const { hasFiveActive, activeCount } = await hasFiveActiveQRCodes(userId);
 
-            if (hasFiveActive) {
-                // console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
-                return res.status(400).json({
-                    message: `User already has ${activeCount} active QR codes. Cannot assign more.`
-                });
-            }
+    //         if (hasFiveActive) {
+    //             // console.log("User already has ${activeCount} active QR codes. Cannot assign more.");
+    //             return res.status(400).json({
+    //                 message: `User already has ${activeCount} active QR codes. Cannot assign more.`
+    //             });
+    //         }
 
-            // 1. Create QR in Razorpay
-            const qr = await createRazorpayQr(userId);
+    //         // 1. Create QR in Razorpay
+    //         const qr = await createRazorpayQr(userId);
 
-            // 2. Download QR image
-            const localPath = `/tmp/${qr.id}.png`;
-            await downloadQrImage(qr.image_url, localPath);
+    //         // 2. Download QR image
+    //         const localPath = `/tmp/${qr.id}.png`;
+    //         await downloadQrImage(qr.image_url, localPath);
 
-            // 3. Save QR metadata in Appwrite (DB + Storage)
-            await uploadQrToAppwrite(localPath, userId, qr);
+    //         // 3. Save QR metadata in Appwrite (DB + Storage)
+    //         await uploadQrToAppwrite(localPath, userId, qr);
 
-            // 4. Assign QR to user using extracted method
-            await assignQrToUser({
-                qrId: qr.id,
-                assignedUserId: userId
-            });
+    //         // 4. Assign QR to user using extracted method
+    //         await assignQrToUser({
+    //             qrId: qr.id,
+    //             assignedUserId: userId
+    //         });
 
-            res.json({
-                success: true,
-                razorpayQrId: qr.id,
-                // appwriteFileId: file.$id,
-                // appwriteDocId: doc.$id,
-                qrImageUrl: qr.image_url,
-            });
-        } catch (err) {
-            console.error("Error creating QR:", err);
-            res.status(500).json({ success: false, error: err.message });
-        }
-    });
+    //         res.json({
+    //             success: true,
+    //             razorpayQrId: qr.id,
+    //             // appwriteFileId: file.$id,
+    //             // appwriteDocId: doc.$id,
+    //             qrImageUrl: qr.image_url,
+    //         });
+    //     } catch (err) {
+    //         console.error("Error creating QR:", err);
+    //         res.status(500).json({ success: false, error: err.message });
+    //     }
+    // });
 
     return router;
 

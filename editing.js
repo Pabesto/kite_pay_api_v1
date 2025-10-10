@@ -1,80 +1,74 @@
-async function handleWithdrawalApproval(withdrawal) {
-  // withdrawal includes userId, amount, commission, parentId (if any)
-  const userId = withdrawal.userId;
+// PUT /assign-qr-manager/:qrId
+router.put('/assign-qr-manager/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+  const { qrId } = req.params;
+  const { managedByUserId, assignedUserId } = req.body; // assignedUserId optional
+  const actor = req.user;
 
-  // fetch userMeta
-  const user = await getUserMeta(userId);
+  try {
+    // Admin-only ownership change
+    if (actor.role !== 'admin') {
+      return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
+    }
 
-  if (!user) throw new Error("User not found");
+    const qrDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+      Query.equal('qrId', qrId),
+      Query.limit(1),
+    ]);
+    if (!qrDocs.documents.length) return res.status(404).json({ message: 'QR Code not found.' });
 
-  // define commission transactions list to create
-  const commissionTxs = [];
+    const qr = qrDocs.documents[0];
+    const prevAssigned = qr.assignedUserId || null;
 
-  if (user.parentId) {
-    // user has a parent - user is subadmin under an admin
+    if (!managedByUserId) {
+      return res.status(400).json({ message: 'managedByUserId is required.' });
+    }
 
-    // fetch parent (admin) meta
-    const parent = await getUserMeta(user.parentId);
+    // Validate manager exists and role if needed
+    const manager = await getUser(managedByUserId);
+    if (!manager) return res.status(400).json({ message: 'Manager not found.' });
+    // Optional: enforce manager.role in { 'merchant', 'subadmin' }
 
-    if (!parent) throw new Error("Parent (admin) user not found");
+    // Normalize optional assignee
+    const normalizedAssigned = assignedUserId === '' ? null : assignedUserId ?? null;
 
-    // Calculate commission for subadmin (= user)
-    const subadminCommissionAmount = calculateCommission(
-      withdrawal.preAmount * 100, // amount in paise
-      user.commission // as percentage, e.g. 1.5
-    ) / 100; // convert back to Rs
+    // Build payload with policy:
+    // - If an explicit assignee is provided, use it (must be under the new manager)
+    // - Else if current ASSIGNED is null, default-assign to the manager
+    // - Else leave ASSIGNED as-is
+    const payload = {
+      managedByUserId,
+      ...(normalizedAssigned !== null
+        ? { assignedUserId: normalizedAssigned }
+        : (!qr.assignedUserId ? { assignedUserId: managedByUserId } : {})),
+    };
 
-    commissionTxs.push({
-      userId: user.userId,
-      sourceWithdrawalId: withdrawal.id,
-      amount: subadminCommissionAmount,
-      commissionRate: user.commission,
-      earningType: 'subadmin',
-      createdAt: new Date().toISOString(),
-    });
+    // If an explicit user assignee is set, validate hierarchy with new manager
+    if (payload.assignedUserId && payload.assignedUserId !== managedByUserId) {
+      const assignee = await getUser(payload.assignedUserId);
+      if (!assignee) return res.status(400).json({ message: 'Assignee not found.' });
+      if (assignee.parentId !== managedByUserId) {
+        return res.status(409).json({ message: 'Assignee not under new manager.' });
+      }
+    }
 
-    // Calculate commission for admin (parent)
-    const adminCommissionAmount = calculateCommission(
-      withdrawal.preAmount * 100,
-      parent.commission
-    ) / 100;
-
-    commissionTxs.push({
-      userId: parent.userId,
-      sourceWithdrawalId: withdrawal.id,
-      amount: adminCommissionAmount,
-      commissionRate: parent.commission,
-      earningType: 'admin',
-      createdAt: new Date().toISOString(),
-    });
-  } else {
-    // User has no parent - user is subadmin, admin earns commission only
-
-    // Fetch admin userMeta (you need a way to identify admin, e.g. user with role 'admin')
-    const admin = await findAdminUser(); // implement according to your logic
-
-    const adminCommissionAmount = calculateCommission(
-      withdrawal.preAmount * 100,
-      admin.commission
-    ) / 100;
-
-    commissionTxs.push({
-      userId: admin.userId,
-      sourceWithdrawalId: withdrawal.id,
-      amount: adminCommissionAmount,
-      commissionRate: admin.commission,
-      earningType: 'admin',
-      createdAt: new Date().toISOString(),
-    });
-  }
-
-  // Now create Commission Transactions in Appwrite DB
-  for (const tx of commissionTxs) {
-    await databases.createDocument(
+    const updated = await databases.updateDocument(
       APPWRITE_DATABASE_ID,
-      CommissionTransactions_collectionId,
-      ID.unique(),
-      tx
+      Qr_collectionId,
+      qr.$id,
+      payload
     );
+
+    // Counters: adjust on assigned state changes only
+    const newAssigned = updated.assignedUserId || null;
+    if (!prevAssigned && newAssigned) {
+      await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+    } else if (prevAssigned && !newAssigned) {
+      await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+    }
+
+    return res.status(200).json({ message: 'Manager updated.' });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ message: 'Failed to update manager.', error: e.message });
   }
-}
+});

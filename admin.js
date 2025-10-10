@@ -2147,6 +2147,132 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
 
+    // GET /dashboard/subadmin/:merchantId
+    router.get('/dashboard/subadmin/:merchantId', authenticateAdminOrSubAdmin, async (req, res) => {
+        const { merchantId } = req.params;
+        const actor = req.user;
+
+        try {
+            // Authorization: allow admin or the merchant owner
+            if (actor.role !== 'admin' && actor.userId !== merchantId) {
+            return res.status(403).json({ message: 'Forbidden' });
+            }
+
+            // 1) Fetch all QRs managed by merchantId (paginate)
+            const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('managedByUserId', merchantId),
+                Query.limit(100),
+                Query.orderAsc('$id'),
+            ]);
+
+            // 2) Aggregate QR-derived counters
+            let totalTxCount = 0;
+            let totalAmountReceived = 0;         // sum of qr.totalTransactions (if that is amount); if it's count, rename accordingly
+            let totalAvailableAmount = 0;        // sum of qr.amountAvailableForWithdrawal
+            let totalWithdrawalPendingAmount = 0;// sum of qr.withdrawalRequestedAmount
+            let totalAmountPaid = 0;             // sum of qr.withdrawalApprovedAmount
+            let totalAmountOnHold = 0;             // sum of qr.amountOnHold
+
+            let totalQrsAssignedToMerchant = qrs.length;
+            let qrCodesActive = 0;
+            let qrCodesDisabled = 0;
+
+            let totalMerchantProfit = 0;      // compute if you have commission rules per qr/txn
+
+            for (const qr of qrs) {
+            // Adjust these field names to your schema
+            const isActive = !!qr.isActive;
+            const txAmount = parseInt(qr.totalPayInAmount || 0, 10); // if this is count, rename to totalTxCount and keep amount separate
+            const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+            const paid = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+            const pendingW = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+            const onHold = parseInt(qr.amountOnHold || 0, 10);
+
+            if (isActive) qrCodesActive++; else qrCodesDisabled++;
+                totalAmountReceived += txAmount;
+                totalTxCount += parseInt(qr.totalTransactions || 0, 10); // if you store counts separately
+                totalAvailableAmount += avail;
+                totalAmountPaid += paid;
+                totalWithdrawalPendingAmount += pendingW;
+                totalAmountOnHold += onHold;
+            }
+
+            // 3) Users under this merchant
+            const usersAll = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, [
+                Query.equal('parentId', merchantId),
+                Query.limit(100),
+                Query.orderAsc('$id'),
+            ]);
+
+            const commission_list = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                [ Query.equal('userId', merchantId), Query.limit(1) ]
+            );
+
+             if (commission_list.total > 0) {
+                const row = commission_list.documents[0];
+                totalMerchantProfit = Number(row.totalCommissionPaise || 0)
+             }
+
+            const activeUsers = usersAll.filter(u => u.status === true && u.role === 'user').length;
+            const disabledUsers = usersAll.filter(u => u.status !== true && u.role === 'user').length;
+            const totalUsers = usersAll.filter(u => u.role === 'user').length;
+
+            // 4) Membership rollups (optional; set 0 if unmanaged here)
+            // Implement if you track memberships per user under merchant
+            const totalMembershipPurchased = 0;
+            const pendingMembershipUsers = 0;
+
+            // Response
+            return res.json({
+                merchantId,
+                // Overview
+                totalTxCount,
+                totalAmountReceived,
+                totalAvailableAmount,
+                totalMerchantProfit, // compute if you have commission rules per qr/txn
+                totalQrsAssignedToMerchant,
+
+                // QR breakdown
+                qrCodesActive,
+                qrCodesDisabled,
+
+                // Payouts
+                totalAmountPaid,
+                totalWithdrawalPendingAmount,
+                totalAmountOnHold,
+
+                // Users
+                activeUsers,
+                disabledUsers,
+                totalUsers,
+
+                // Memberships
+                totalMembershipPurchased,
+                pendingMembershipUsers,
+            });
+        } catch (e) {
+            console.error('Subadmin dashboard error:', e);
+            return res.status(500).json({ message: 'Failed to build dashboard', error: e.message });
+        }
+    });
+
+    async function listAllDocuments(dbId, colId, baseQueries, pageSize = 100) {
+        let out = [];
+        let cursor = null;
+        while (true) {
+            const queries = [...baseQueries];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+            const page = await databases.listDocuments(dbId, colId, queries);
+            out = out.concat(page.documents);
+            if (!page.documents.length) break;
+            cursor = page.documents[page.documents.length - 1].$id;
+            if (page.documents.length < pageSize) break;
+        }
+        return out;
+    }
+
     return router;
     
 };
