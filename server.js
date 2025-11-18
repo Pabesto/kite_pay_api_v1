@@ -84,6 +84,13 @@ app.use(
   })
 );
 
+// 1. Define the parser with your verify logic (Scoped ONLY to this variable)
+const webhookParser = express.json({
+    verify: (req, res, buf, encoding) => {
+        req.rawBody = buf.toString(encoding || 'utf8'); // keep exact raw text
+    },
+});
+
 // --- Authentication Middleware ---
 // This middleware verifies the user's JWT token via Appwrite's server-side API.
 const authenticateToken = async (req, res, next) => {
@@ -307,7 +314,7 @@ app.get('/health', (req, res) => {
 });
 
 // This is the route you provide to the Razorpay/Ezetap team
-app.post('/razorpay-webhook', async (req, res) => {
+app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const data = req.body;
 
     console.log("📩 Webhook Received:", data);
