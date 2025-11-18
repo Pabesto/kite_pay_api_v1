@@ -306,6 +306,41 @@ app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// This is the route you provide to the Razorpay/Ezetap team
+app.post('/razorpay-webhook', async (req, res) => {
+    const data = req.body;
+
+    console.log("📩 Webhook Received:", data);
+
+    const payloadString = JSON.stringify(req.body);
+  try {
+    const created = await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      'razorpay_webhook',
+      ID.unique(),
+      {
+        payload: payloadString, // avoid storing full payload for Cashfree to save space
+      }
+    );
+  } catch (e){
+
+  }
+
+    // LOGIC: Check for 'status' field [cite: 897]
+    if (data.status === "AUTHORIZED") {
+        // [cite: 898] "Authorized" means transaction successfully executed
+        console.log("✅ Payment Success:", data.txnId);
+        
+        // Perform your database updates here
+    } else if (data.status === "FAILED") {
+        // [cite: 898] "Failed" means money won't be deducted
+        console.log("❌ Payment Failed");
+    }
+
+    // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
+    res.status(200).send("OK");
+});
+
 // http://localhost:3000/test_qralert
 app.get('/test_qralert', (req, res) => {
     const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // [1] 
