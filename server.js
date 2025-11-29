@@ -313,6 +313,32 @@ app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Endpoint to receive Paytm transaction
+app.post("/paytm/payment-sync", (req, res) => {
+  try {
+    const data = req.body;
+
+    // Basic validation
+    if (!data.amount || !data.orderId) {
+      return res.status(400).json({ error: "Missing amount or orderId" });
+    }
+
+    // Process / store the transaction
+    // transactions.push({
+    //   ...data,
+    //   receivedAt: new Date().toISOString()
+    // });
+
+    console.log("Received Paytm transaction:", data);
+
+    // Respond success
+    res.json({ message: "Transaction processed successfully" });
+  } catch (err) {
+    console.error("Error processing transaction:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const data = req.body;
