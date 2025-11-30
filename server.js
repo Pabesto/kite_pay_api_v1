@@ -339,6 +339,12 @@ app.post("/paytm/payment-sync", (req, res) => {
   }
 });
 
+// Endpoint to receive Paytm transaction
+app.get("/paytm/last-timestamp", (req, res) => {
+  // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
+    res.json({ last_mail_timestamp: "1764272304" });
+});
+
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const data = req.body;
