@@ -417,7 +417,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
     });
 
     // totalAmountReceived
-    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
         console.error('Error updating dashboard counter:', e);
     });
 
