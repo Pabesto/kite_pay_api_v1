@@ -380,13 +380,16 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
         const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
 
         if (timestampDoc) {
+            // FIX: Ensure it is an Integer, not a String
+            const timestampInt = parseInt(last_mail_timestamp, 10);
+
             // 3. UPDATE the document using its ID
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 COLLECTION_ID,
                 timestampDoc.$id, // The unique ID of the document we found
                 {
-                    value: String(last_mail_timestamp) // Assuming the field name is 'value'
+                    value: timestampInt // <--- Sending Integer now
                 }
             );
 
