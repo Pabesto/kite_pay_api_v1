@@ -323,171 +323,150 @@ app.post("/paytm/payment-sync", async (req, res) => {
       return res.status(400).json({ error: "Missing amount or orderId" });
     }
 
-  const amount = data?.amount || {};
-  const paymentId = data?.orderId || {};
-  const qrCodeId = data?.accountOf || {};
-  const fromUpi = data?.fromUpi || {};
-  const timestamp = data?.timestamp || {};
-  const txn_time = data?.txn_time || {};
+    const amount = data?.amount || {};
+    const paymentId = data?.orderId || {};
+    const qrCodeId = data?.accountOf || {};
+    const fromUpi = data?.fromUpi || {};
+    const timestamp = data?.timestamp || {};
+    const txn_time = data?.txn_time || {};
 
-  const amountRupees = amount; // e.g., "10.01" or 10.01
-  const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+    const amountRupees = amount;
+    const amountPaise = rupeesToPaiseStrict(amountRupees);
 
-  // 1. Convert to Date Object (Multiply by 1000)
-  const dateObj = new Date(txn_time * 1000);
+    // 1. Convert to Date Object (Multiply by 1000)
+    const dateObj = new Date(txn_time * 1000);
 
-  // 2. Convert to ISO String (Standard for APIs/Databases)
-  // NOTE: This will output UTC time (IST - 5:30)
-  const isoString = dateObj.toISOString();
+    // 2. Convert to ISO String
+    const isoString = dateObj.toISOString();
     
-  if (!qrCodeId) return res.status(400).send('QR Code ID not found');
+    if (!qrCodeId) return res.status(400).json({ error: 'QR Code ID not found' });
 
-  // 5) Idempotency guard (process each cf_payment_id once)
-  // Idempotency guard: skip if this paymentId is already recorded
+    // Idempotency guard
     const existing = await databases.listDocuments(
-    APPWRITE_DATABASE_ID,
-    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-        [Query.equal('paymentId', paymentId), Query.limit(1)]
-    ); // requires an index on paymentId for performance
-
-    if (existing.documents.length) {
-        return res.status(200).send('Duplicate webhook ignored'); // already processed
-    }
-
-    // 6) Persist raw webhook payload + mapped fields
-  const payloadString = JSON.stringify(req.body);
-  try {
-    const created = await databases.createDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-      ID.unique(),
-      {
-        payload: '', // avoid storing full payload for Cashfree to save space
-        qrCodeId: qrCodeId,
-        paymentId: paymentId,
-        rrnNumber: '',
-        amount: amountPaise,
-        vpa: fromUpi,
-        provider: 'paytm',
-        created_at: isoString,
-        status: 'normal',
-      }
+      [Query.equal('paymentId', paymentId), Query.limit(1)]
     );
 
-    (async () => {
-    try {
-        await updateDailyQrTotal(
-        qrCodeId,
-        isoString,
-        amountPaise
-        );
-        console.log('Daily QR total updated successfully.');
-    } catch (error) {
-        console.error('Error updating daily QR total:', error);
+    if (existing.documents.length) {
+      return res.status(200).json({ message: 'Duplicate webhook ignored' });
     }
+
+    // Persist webhook
+    const payloadString = JSON.stringify(req.body);
+    let created;
+    try {
+      created = await databases.createDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        ID.unique(),
+        {
+          payload: '',
+          qrCodeId: qrCodeId,
+          paymentId: paymentId,
+          rrnNumber: '',
+          amount: amountPaise,
+          vpa: fromUpi,
+          provider: 'paytm',
+          created_at: isoString,
+          status: 'normal',
+        }
+      );
+    } catch (e) {
+      console.error('❌ Persist webhook error:', e?.message || e);
+      return res.status(500).json({ error: 'Error saving webhook', details: e?.message });
+    }
+
+    // Update daily QR total (async, no await)
+    (async () => {
+      try {
+        await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
+        console.log('✅ Daily QR total updated successfully.');
+      } catch (error) {
+        console.error('❌ Error updating daily QR total:', error?.message || error);
+      }
     })();
 
     const eventPayload = {
-        $id: created.$id,                                    // document id
-        qrCodeId,
-        paymentId,                                           // string
-        amount: amountPaise,                           // exact integer
-        rrnNumber: '' || null,
-        vpa: fromUpi || null,
-        provider: 'paytm',
-        created_at: new Date(isoString).toISOString(),    // normalize to ISO
-    }; // normalized event payload for clients [2]
+      $id: created.$id,
+      qrCodeId,
+      paymentId,
+      amount: amountPaise,
+      rrnNumber: '' || null,
+      vpa: fromUpi || null,
+      provider: 'paytm',
+      created_at: new Date(isoString).toISOString(),
+    };
 
-    // 5) Emit only to intended audiences (user + QR rooms)
+    // Emit transaction
     emitTxnNew({
-        assignedUserId : '',      // may be null if QR not found
-        qrCodeId,
-        payload: eventPayload,
-    }); // Socket.IO selective emit via rooms [1]
+      assignedUserId: '',
+      qrCodeId,
+      payload: eventPayload,
+    });
 
-    // 4️⃣ Update global counters (async, no await)
-    // totalTxCount
+    // Update dashboard counters
     await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
-        console.error('Error updating dashboard counter:', e);
+      console.error('❌ Error updating totalTxCount:', e?.message || e);
     });
 
-    // totalApiTx
     await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
-        console.error('Error updating dashboard counter:', e);
+      console.error('❌ Error updating totalApiTx:', e?.message || e);
     });
 
-    // totalAmountReceived
     await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
-        console.error('Error updating dashboard counter:', e);
+      console.error('❌ Error updating totalAmountReceived:', e?.message || e);
     });
 
-  } catch (e) {
-    console.error('Persist webhook error:', e?.message || e);
-    return res.status(500).send('Error saving webhook');
-  }
-
-    // 7) Update QR totals atomically
+    // Update QR totals
     try {
-    const qrResult = await databases.listDocuments(
+      const qrResult = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
         [Query.equal('qrId', qrCodeId), Query.limit(1)]
-    );
+      );
 
-    if (!qrResult.documents.length) {
-        // console.log(`QR Code with qrId ${qrCodeId} not found`);
-        return res.status(200).send('OK'); // or handle not-found differently
-    }
+      if (!qrResult.documents.length) {
+        console.log(`⚠️ QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).json({ message: 'Transaction processed but QR not found' });
+      }
 
-    const qrDoc = qrResult.documents[0];            // <- take first doc
-    // const qrDoc = qrResult.documents;           
-    const qrDocId = qrDoc.$id;                     // <- required documentId
-    const newCount = (qrDoc.totalTransactions || 0) + 1;
-    const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+      const qrDoc = qrResult.documents[0];
+      const qrDocId = qrDoc.$id;
+      const newCount = (qrDoc.totalTransactions || 0) + 1;
+      const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
 
-    // Recompute available after changing total
-    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-    const onHold = Number(qrDoc.amountOnHold || 0);
-    const commissionOnHold = Number(qr.commissionOnHold || 0);
-    const commissionPaid = Number(qr.commissionPaid || 0);
-    const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+      // Recompute available
+      const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+      const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+      const onHold = Number(qrDoc.amountOnHold || 0);
+      const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+      const commissionPaid = Number(qrDoc.commissionPaid || 0);
+      const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-    await databases.updateDocument(
+      await databases.updateDocument(
         APPWRITE_DATABASE_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
-        qrDocId,                                     // <- pass $id here
+        qrDocId,
         {
-            totalTransactions: newCount,
-            totalPayInAmount: newTotal ,
-            amountAvailableForWithdrawal: newAvailable, // <-- add this
+          totalTransactions: newCount,
+          totalPayInAmount: newTotal,
+          amountAvailableForWithdrawal: newAvailable,
         }
-    );
+      );
 
-
-    // console.log(`QR totals updated for qrId ${qrCodeId}`);
-    return; // continue flow as needed
+      console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
     } catch (e) {
-    // console.error('QR totals update error:', e?.message || e);
-    return res.status(500).send('Error updating QR totals');
+      console.error('❌ QR totals update error:', e?.message || e);
+      return res.status(500).json({ error: 'Error updating QR totals', details: e?.message });
     }
 
-    // Received Paytm transaction: {
-    //   amount: '199',
-    //   orderId: 'PTM5ca3a2d6dcb94ff9ad252924ab29e526',
-    //   accountOf: 'PABESTO TECH PVT LTD 15',
-    //   fromUpi: 'BHIM',
-    //   timestamp: 1764684239,
-    //   txn_time: 1764684180
-    // }
+    console.log("✅ Received Paytm transaction:", data);
+    res.status(200).json({ message: "Transaction processed successfully" });
 
-    console.log("Received Paytm transaction:", data);
-
-    // Respond success
-    res.json({ message: "Transaction processed successfully" });
   } catch (err) {
-    console.error("Error processing transaction:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("❌ Error processing transaction:", err?.message || err);
+    res.status(500).json({ error: "Internal server error", details: err?.message });
   }
 });
 
