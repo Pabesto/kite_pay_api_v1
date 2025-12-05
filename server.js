@@ -332,6 +332,13 @@ app.post("/paytm/payment-sync", async (req, res) => {
 
   const amountRupees = amount; // e.g., "10.01" or 10.01
   const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+
+  // 1. Convert to Date Object (Multiply by 1000)
+  const dateObj = new Date(txn_time * 1000);
+
+  // 2. Convert to ISO String (Standard for APIs/Databases)
+  // NOTE: This will output UTC time (IST - 5:30)
+  const isoString = dateObj.toISOString();
     
   if (!qrCodeId) return res.status(400).send('QR Code ID not found');
 
@@ -362,7 +369,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
         amount: amountPaise,
         vpa: fromUpi,
         provider: 'paytm',
-        created_at: txn_time,
+        created_at: isoString,
         status: 'normal',
       }
     );
@@ -371,7 +378,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
     try {
         await updateDailyQrTotal(
         qrCodeId,
-        txn_time,
+        isoString,
         amountPaise
         );
         console.log('Daily QR total updated successfully.');
@@ -388,7 +395,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
         rrnNumber: '' || null,
         vpa: fromUpi || null,
         provider: 'paytm',
-        created_at: new Date(txn_time).toISOString(),    // normalize to ISO
+        created_at: new Date(isoString).toISOString(),    // normalize to ISO
     }; // normalized event payload for clients [2]
 
     // 5) Emit only to intended audiences (user + QR rooms)
@@ -456,6 +463,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
             amountAvailableForWithdrawal: newAvailable, // <-- add this
         }
     );
+
 
     // console.log(`QR totals updated for qrId ${qrCodeId}`);
     return; // continue flow as needed
@@ -715,13 +723,6 @@ app.post('/cashfree/webhook', async (req, res) => {
   const vpa = upi?.upi_id;
   const createdAt = req.body?.event_time || payment?.payment_time;
 
-  // 1. Convert to Date Object (Multiply by 1000)
-  const dateObj = new Date(createdAt * 1000);
-
-  // 2. Convert to ISO String (Standard for APIs/Databases)
-  // NOTE: This will output UTC time (IST - 5:30)
-  const isoString = dateObj.toISOString();
-
   if (!qrCodeId) return res.status(400).send('QR Code ID not found');
   if (!paymentId) return res.status(400).send('Payment ID not found');
 
@@ -752,7 +753,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         amount: amountPaise,
         vpa: vpa,
         provider: 'cashfree',
-        created_at: isoString,
+        created_at: createdAt,
         status: 'normal',
       }
     );
@@ -761,7 +762,7 @@ app.post('/cashfree/webhook', async (req, res) => {
     try {
         await updateDailyQrTotal(
         qrCodeId,
-        isoString,
+        createdAt,
         amountPaise
         );
         console.log('Daily QR total updated successfully.');
@@ -778,7 +779,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         rrnNumber: rrnNumber || null,
         vpa: vpa || null,
         provider: 'cashfree',
-        created_at: new Date(isoString).toISOString(),    // normalize to ISO
+        created_at: new Date(createdAt).toISOString(),    // normalize to ISO
     }; // normalized event payload for clients [2]
 
     // 5) Emit only to intended audiences (user + QR rooms)
