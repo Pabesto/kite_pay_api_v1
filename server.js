@@ -339,7 +339,7 @@ app.post("/paytm/payment-sync", (req, res) => {
   }
 });
 
-// Endpoint to receive Paytm transaction
+// Endpoint to Send Paytm transaction last timestamp
 app.get("/paytm/last-timestamp", async (req, res) => {
   // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
 
@@ -355,6 +355,53 @@ app.get("/paytm/last-timestamp", async (req, res) => {
       }
 
     res.json({ last_mail_timestamp: "1764272304" });
+});
+
+// Endpoint to UPDATE the Paytm transaction timestamp
+app.post("/paytm/update-last-timestamp", async (req, res) => {
+    try {
+        // 1. Get the new timestamp from the request body
+        const { last_mail_timestamp } = req.body;
+
+        if (!last_mail_timestamp) {
+            return res.status(400).json({ error: "Missing last_mail_timestamp in body" });
+        }
+
+        const COLLECTION_ID = '68a73217002ed987b246'; // Your config collection ID
+
+        // 2. Find the document (Same logic as your GET request)
+        // Note: Using Query.equal is better performance if you have the Query object imported,
+        // but here is your original logic using JS find():
+        const config_docs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, 
+            COLLECTION_ID
+        );
+        
+        const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
+
+        if (timestampDoc) {
+            // 3. UPDATE the document using its ID
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                COLLECTION_ID,
+                timestampDoc.$id, // The unique ID of the document we found
+                {
+                    value: String(last_mail_timestamp) // Assuming the field name is 'value'
+                }
+            );
+
+            console.log(`Updated timestamp to: ${last_mail_timestamp}`);
+            return res.json({ success: true, message: "Timestamp updated" });
+
+        } else {
+            console.log('No timestampDoc key found');
+            return res.status(404).json({ error: "Config document not found" });
+        }
+
+    } catch (error) {
+        console.error("Database Update Failed:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // This is the route you provide to the Razorpay/Ezetap team
