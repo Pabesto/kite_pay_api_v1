@@ -314,7 +314,7 @@ app.get('/health', (req, res) => {
 });
 
 // Endpoint to receive Paytm transaction
-app.post("/paytm/payment-sync", (req, res) => {
+app.post("/paytm/payment-sync", async (req, res) => {
   try {
     const data = req.body;
 
@@ -323,11 +323,155 @@ app.post("/paytm/payment-sync", (req, res) => {
       return res.status(400).json({ error: "Missing amount or orderId" });
     }
 
-    // Process / store the transaction
-    // transactions.push({
-    //   ...data,
-    //   receivedAt: new Date().toISOString()
-    // });
+  const amount = data?.amount || {};
+  const paymentId = data?.orderId || {};
+  const qrCodeId = data?.accountOf || {};
+  const fromUpi = data?.fromUpi || {};
+  const timestamp = data?.timestamp || {};
+  const txn_time = data?.txn_time || {};
+
+  const amountRupees = amount; // e.g., "10.01" or 10.01
+  const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+    
+  if (!qrCodeId) return res.status(400).send('QR Code ID not found');
+
+  // 5) Idempotency guard (process each cf_payment_id once)
+  // Idempotency guard: skip if this paymentId is already recorded
+    const existing = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        [Query.equal('paymentId', paymentId), Query.limit(1)]
+    ); // requires an index on paymentId for performance
+
+    if (existing.documents.length) {
+        return res.status(200).send('Duplicate webhook ignored'); // already processed
+    }
+
+    // 6) Persist raw webhook payload + mapped fields
+  const payloadString = JSON.stringify(req.body);
+  try {
+    const created = await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+      ID.unique(),
+      {
+        payload: '', // avoid storing full payload for Cashfree to save space
+        qrCodeId: qrCodeId,
+        paymentId: paymentId,
+        rrnNumber: '',
+        amount: amountPaise,
+        vpa: fromUpi,
+        provider: 'paytm',
+        created_at: txn_time,
+        status: 'normal',
+      }
+    );
+
+    (async () => {
+    try {
+        await updateDailyQrTotal(
+        qrCodeId,
+        txn_time,
+        amountPaise
+        );
+        console.log('Daily QR total updated successfully.');
+    } catch (error) {
+        console.error('Error updating daily QR total:', error);
+    }
+    })();
+
+    const eventPayload = {
+        $id: created.$id,                                    // document id
+        qrCodeId,
+        paymentId,                                           // string
+        amount: amountPaise,                           // exact integer
+        rrnNumber: '' || null,
+        vpa: fromUpi || null,
+        provider: 'paytm',
+        created_at: new Date(txn_time).toISOString(),    // normalize to ISO
+    }; // normalized event payload for clients [2]
+
+    // 5) Emit only to intended audiences (user + QR rooms)
+    emitTxnNew({
+        assignedUserId : '',      // may be null if QR not found
+        qrCodeId,
+        payload: eventPayload,
+    }); // Socket.IO selective emit via rooms [1]
+
+    // 4️⃣ Update global counters (async, no await)
+    // totalTxCount
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
+
+    // totalApiTx
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
+
+    // totalAmountReceived
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
+
+  } catch (e) {
+    console.error('Persist webhook error:', e?.message || e);
+    return res.status(500).send('Error saving webhook');
+  }
+
+    // 7) Update QR totals atomically
+    try {
+    const qrResult = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        [Query.equal('qrId', qrCodeId), Query.limit(1)]
+    );
+
+    if (!qrResult.documents.length) {
+        // console.log(`QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).send('OK'); // or handle not-found differently
+    }
+
+    const qrDoc = qrResult.documents[0];            // <- take first doc
+    // const qrDoc = qrResult.documents;           
+    const qrDocId = qrDoc.$id;                     // <- required documentId
+    const newCount = (qrDoc.totalTransactions || 0) + 1;
+    const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+    // Recompute available after changing total
+    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+    const onHold = Number(qrDoc.amountOnHold || 0);
+    const commissionOnHold = Number(qr.commissionOnHold || 0);
+    const commissionPaid = Number(qr.commissionPaid || 0);
+    const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+    await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDocId,                                     // <- pass $id here
+        {
+            totalTransactions: newCount,
+            totalPayInAmount: newTotal ,
+            amountAvailableForWithdrawal: newAvailable, // <-- add this
+        }
+    );
+
+    // console.log(`QR totals updated for qrId ${qrCodeId}`);
+    return; // continue flow as needed
+    } catch (e) {
+    // console.error('QR totals update error:', e?.message || e);
+    return res.status(500).send('Error updating QR totals');
+    }
+
+    // Received Paytm transaction: {
+    //   amount: '199',
+    //   orderId: 'PTM5ca3a2d6dcb94ff9ad252924ab29e526',
+    //   accountOf: 'PABESTO TECH PVT LTD 15',
+    //   fromUpi: 'BHIM',
+    //   timestamp: 1764684239,
+    //   txn_time: 1764684180
+    // }
 
     console.log("Received Paytm transaction:", data);
 
