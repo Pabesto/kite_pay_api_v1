@@ -340,8 +340,20 @@ app.post("/paytm/payment-sync", (req, res) => {
 });
 
 // Endpoint to receive Paytm transaction
-app.get("/paytm/last-timestamp", (req, res) => {
+app.get("/paytm/last-timestamp", async (req, res) => {
   // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
+
+      const config_docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
+      const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
+
+      if (overheadDoc) {
+        const timestampValue = timestampDoc.value;
+        console.log('Found timestamp:', timestampValue);
+        res.json({ last_mail_timestamp: timestampValue });
+      } else {
+        console.log('No timestampDoc key found');
+      }
+
     res.json({ last_mail_timestamp: "1764272304" });
 });
 
