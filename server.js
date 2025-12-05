@@ -346,7 +346,7 @@ app.get("/paytm/last-timestamp", async (req, res) => {
       const config_docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
       const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
 
-      if (overheadDoc) {
+      if (timestampDoc) {
         const timestampValue = timestampDoc.value;
         console.log('Found timestamp:', timestampValue);
         res.json({ last_mail_timestamp: timestampValue });
