@@ -350,6 +350,7 @@ app.get("/paytm/last-timestamp", async (req, res) => {
         const timestampValue = timestampDoc.value;
         console.log('Found timestamp:', timestampValue);
         res.json({ last_mail_timestamp: timestampValue });
+        return
       } else {
         console.log('No timestampDoc key found');
       }
