@@ -715,6 +715,13 @@ app.post('/cashfree/webhook', async (req, res) => {
   const vpa = upi?.upi_id;
   const createdAt = req.body?.event_time || payment?.payment_time;
 
+  // 1. Convert to Date Object (Multiply by 1000)
+  const dateObj = new Date(createdAt * 1000);
+
+  // 2. Convert to ISO String (Standard for APIs/Databases)
+  // NOTE: This will output UTC time (IST - 5:30)
+  const isoString = dateObj.toISOString();
+
   if (!qrCodeId) return res.status(400).send('QR Code ID not found');
   if (!paymentId) return res.status(400).send('Payment ID not found');
 
@@ -745,7 +752,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         amount: amountPaise,
         vpa: vpa,
         provider: 'cashfree',
-        created_at: createdAt,
+        created_at: isoString,
         status: 'normal',
       }
     );
@@ -754,7 +761,7 @@ app.post('/cashfree/webhook', async (req, res) => {
     try {
         await updateDailyQrTotal(
         qrCodeId,
-        createdAt,
+        isoString,
         amountPaise
         );
         console.log('Daily QR total updated successfully.');
@@ -771,7 +778,7 @@ app.post('/cashfree/webhook', async (req, res) => {
         rrnNumber: rrnNumber || null,
         vpa: vpa || null,
         provider: 'cashfree',
-        created_at: new Date(createdAt).toISOString(),    // normalize to ISO
+        created_at: new Date(isoString).toISOString(),    // normalize to ISO
     }; // normalized event payload for clients [2]
 
     // 5) Emit only to intended audiences (user + QR rooms)
