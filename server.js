@@ -18,6 +18,9 @@ const qrCodeRoutes = require('./qrcode');
 const adminRoutes = require('./admin');
 const withdrawRoutes = require('./withdraw');
 
+// 🔥 PINELEABS FILE IMPORT
+const digiqrRoutes = require('./pinelabs_digiqr.routes');
+
 const { initSocket } = require('./socketServer');
 
 // --- Configuration & Initialization ---
@@ -302,6 +305,9 @@ app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
+
+// Pinelabs QR routes
+app.use('/pinelabs', digiqrRoutes);
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');

@@ -382,6 +382,96 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
     });
 
+    // PATCH a QR code entry  
+    // This is an admin-only endpoint
+    router.patch('/edit-qr/:qrId', authenticateAdmin, async (req, res) => {
+        const { qrId } = req.params;
+        const { qrType, fileId, imageUrl } = req.body;
+
+        console.log('Edit QR Entry request:', { qrId, qrType, fileId, imageUrl });
+
+        // Validate at least one field is provided for update
+        if (!qrType && !fileId && !imageUrl) {
+            return res.status(400).json({ message: "At least one field (qrType, fileId, or imageUrl) must be provided for update." });
+        }
+
+        try {
+            // 1. Find the QR document by qrId
+            const docResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal('qrId', qrId)]
+            );
+
+            if (docResult.documents.length === 0) {
+                return res.status(404).json({ message: `QR Code ID "${qrId}" not found.` });
+            }
+
+            const doc = docResult.documents[0];
+            const docId = doc.$id;
+            const oldFileId = doc.fileId;
+
+            // 2. Build update payload with only provided fields
+            const updatePayload = {};
+            if (qrType !== undefined) updatePayload.qrType = qrType;
+            if (fileId !== undefined) updatePayload.fileId = fileId;
+            if (imageUrl !== undefined) updatePayload.imageUrl = imageUrl;
+
+            // 4. Update the QR document
+            const updatedQr = await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                docId,
+                updatePayload
+            );
+
+            // 3. If fileId changed, delete old file (if different)
+            if (fileId && fileId !== oldFileId) {
+                try {
+                    await storage.deleteFile(bucketId, oldFileId);
+                    console.log(`Deleted old file: ${oldFileId}`);
+                } catch (fileError) {
+                    if (fileError.code === 404) {
+                        console.log(`Old file ${oldFileId} not found, continuing...`);
+                    } else {
+                        throw fileError;
+                    }
+                }
+            }
+
+            // // 5. Update dashboard counters if type changed
+            // if (qrType && qrType !== doc.qrType) {
+            //     // Decrement old type counter
+            //     if (doc.qrType === 'pinelabs') {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', -1).catch(console.error);
+            //     } else if (doc.qrType === 'paytm') {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', -1).catch(console.error);
+            //     } else {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', -1).catch(console.error);
+            //     }
+
+            //     // Increment new type counter
+            //     if (qrType === 'pinelabs') {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', +1).catch(console.error);
+            //     } else if (qrType === 'paytm') {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', +1).catch(console.error);
+            //     } else {
+            //         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', +1).catch(console.error);
+            //     }
+            // }
+
+            res.status(200).json({ 
+                message: "QR Code updated successfully.", 
+                qrCode: updatedQr 
+            });
+
+        } catch (error) {
+            console.error('Error editing QR code entry:', error);
+            res.status(500).json({ message: "Failed to update QR code entry.", error: error.message });
+        }
+    });
+
+
     // PUT to toggle the isActive status
     // This is an admin-only endpoint
     router.put('/toggle-qr-status/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
@@ -907,6 +997,29 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         });
 
         return qr; // contains id, image_url, etc.
+    }
+
+    async function createRazorpayQrSingle(userId, amountInPaise) {
+        const { name, email } = await getUserDetails(userId);
+
+        // Current time + 4 minutes (in seconds)
+        const closeBy = Math.floor(Date.now() / 1000) + (4 * 60);
+
+        const qr = await razorpay.qrCode.create({
+            type: "upi_qr",
+            name: email || "Kite User",
+            usage: "single_use",
+            fixed_amount: true,
+            payment_amount: amountInPaise,
+            customer_id: email,
+            close_by: closeBy,
+            description: `${name || "Kite User"} : ${email || ""}`,
+            notes: {
+                userId,
+            },
+        });
+
+        return qr;
     }
 
     // --------------------
