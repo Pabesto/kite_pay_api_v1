@@ -641,12 +641,12 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
 
     const vpa = data.customerName;
-    const unixTimestamp = data.postingDate;
+    const postingDate = data.postingDate;
 
-    const isoDate = new Date(unixTimestamp * 1000).toISOString();
+    // const isoDate = new Date(unixTimestamp * 1000).toISOString();
+    const isoDate = new Date(postingDate).toISOString();
 
     const payloadString = JSON.stringify(req.body);
-
     try {
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
