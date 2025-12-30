@@ -583,28 +583,28 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
 
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-  console.log('Webhook Event Received');
+  console.log('Webhook Event Received new');
 
-    // Verify the webhook signature
-    const razorpaySignature = req.headers['x-razorpay-signature'];
+    // // Verify the webhook signature
+    // const razorpaySignature = req.headers['x-razorpay-signature'];
 
-    if (!razorpaySignature) {
-        return res.status(400).send('Missing Razorpay signature');
-    }
+    // if (!razorpaySignature) {
+    //     return res.status(400).send('Missing Razorpay signature');
+    // }
 
-    // Create HMAC SHA256 with your webhook secret
-    const expectedSignature = crypto
-        .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
-        .update(req.rawBody)
-        .digest('hex');
+    // // Create HMAC SHA256 with your webhook secret
+    // const expectedSignature = crypto
+    //     .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
+    //     .update(req.rawBody)
+    //     .digest('hex');
 
-    // Compare signatures
-    if (expectedSignature === razorpaySignature) {
-        console.log('✅ Webhook verified successfully');
-    } else {
-        console.warn('❌ Webhook signature mismatch!');
-        return res.status(400).send('Invalid signature');
-    }  
+    // // Compare signatures
+    // if (expectedSignature === razorpaySignature) {
+    //     console.log('✅ Webhook verified successfully');
+    // } else {
+    //     console.warn('❌ Webhook signature mismatch!');
+    //     return res.status(400).send('Invalid signature');
+    // }  
   
     const data = req.body;
 
