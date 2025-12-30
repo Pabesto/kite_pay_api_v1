@@ -546,43 +546,43 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
 });
 
 // This is the route you provide to the Razorpay/Ezetap team
-app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-    const data = req.body;
+// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
+//     const data = req.body;
 
-    console.log("📩 Webhook Received:", data);
+//     console.log("📩 Webhook Received:", data);
 
-    const payloadString = JSON.stringify(req.body);
+//     const payloadString = JSON.stringify(req.body);
 
-  try {
-    const created = await databases.createDocument(
-      APPWRITE_DATABASE_ID,
-      'razorpay_webhook',
-      ID.unique(),
-      {
-        payload: payloadString, // avoid storing full payload for Cashfree to save space
-      }
-    );
-  } catch (e){
+//   try {
+//     const created = await databases.createDocument(
+//       APPWRITE_DATABASE_ID,
+//       'razorpay_webhook',
+//       ID.unique(),
+//       {
+//         payload: payloadString, // avoid storing full payload for Cashfree to save space
+//       }
+//     );
+//   } catch (e){
 
-  }
+//   }
 
-    // LOGIC: Check for 'status' field [cite: 897]
-    if (data.status === "AUTHORIZED") {
-        // [cite: 898] "Authorized" means transaction successfully executed
-        console.log("✅ Payment Success:", data.txnId);
+//     // LOGIC: Check for 'status' field [cite: 897]
+//     if (data.status === "AUTHORIZED") {
+//         // [cite: 898] "Authorized" means transaction successfully executed
+//         console.log("✅ Payment Success:", data.txnId);
         
-        // Perform your database updates here
-    } else if (data.status === "FAILED") {
-        // [cite: 898] "Failed" means money won't be deducted
-        console.log("❌ Payment Failed");
-    }
+//         // Perform your database updates here
+//     } else if (data.status === "FAILED") {
+//         // [cite: 898] "Failed" means money won't be deducted
+//         console.log("❌ Payment Failed");
+//     }
 
-    // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
-    res.status(200).send("OK");
-});
+//     // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
+//     res.status(200).send("OK");
+// });
 
 // This is the route you provide to the Razorpay/Ezetap team
-app.post('/razorpay-webhook-prod', webhookParser, async (req, res) => {
+app.post('/razorpay-webhook', webhookParser, async (req, res) => {
   console.log('Webhook Event Received');
 
     // Verify the webhook signature
