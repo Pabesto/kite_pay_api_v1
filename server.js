@@ -727,7 +727,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             // console.log(`QR Code with qrId ${qrCodeId} not found`);
             return res.status(200).send('OK'); // or handle not-found differently
         }
-
+// 
         const qrDoc = qrResult.documents[0];            // <- take first doc
         // const qrDoc = qrResult.documents;           
         const qrDocId = qrDoc.$id;                     // <- required documentId
@@ -738,8 +738,8 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
         const onHold = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qr.commissionOnHold || 0);
-        const commissionPaid = Number(qr.commissionPaid || 0);
+        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+        const commissionPaid = Number(qrDoc.commissionPaid || 0);
         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
         await databases.updateDocument(
