@@ -637,7 +637,7 @@ app.post('/razorpay-webhook-prod', webhookParser, async (req, res) => {
     }
 
     const rrnNumber = data.rrNumber;
-    const amount = data.amount;
+    const amountRupees = data.amount;
     const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
 
     const vpa = data.customerName;
