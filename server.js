@@ -608,7 +608,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
   
     const data = req.body;
 
-    console.log("📩 Webhook Received:", data);
+    // console.log("📩 Webhook Received:", data);
 
     // LOGIC: Check for 'status' field [cite: 897]
     if (data.status === "AUTHORIZED") {
@@ -634,6 +634,18 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
     if (!paymentId) {
         return res.status(400).send('Payment ID not found');
+    }
+
+    // 5) Idempotency guard (process each cf_payment_id once)
+  // Idempotency guard: skip if this paymentId is already recorded
+    const existing = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        [Query.equal('paymentId', paymentId), Query.limit(1)]
+    ); // requires an index on paymentId for performance
+
+    if (existing.documents.length) {
+        return res.status(200).send('Duplicate webhook ignored'); // already processed
     }
 
     const rrnNumber = data.rrNumber;
