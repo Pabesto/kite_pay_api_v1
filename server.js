@@ -319,6 +319,70 @@ app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+function toInt(value) {
+  return value ? parseInt(value, 10) : 0;
+}
+
+app.get('/get_app_config', async (req, res) => {
+
+    // const result = await databases.listDocuments(
+    //       APPWRITE_DATABASE_ID,
+    //       '68a73217002ed987b246',
+    //     );
+
+    // console.log('Config documents:', result);
+
+    // const docs = result.documents;  // direct access
+
+    // const config = docs.reduce((acc, doc) => {
+    //   acc[doc.key] = doc.value;
+    //   return acc;
+    // }, {});
+
+    // console.log('✅ Config JSON:', config);
+
+    // console.log('Max Withdrawal Amount:', config.max_withdrawal_amount);
+
+    // const maxAmount = toInt(config.max_withdrawal_amount);  // 200000 or fallback 0
+
+    // console.log('Max Withdrawal Amount Value:', maxAmount);
+
+
+    /////////////////////////////////////////////////////////
+
+    // const result = await databases.listDocuments(
+    //         APPWRITE_DATABASE_ID,
+    //         '68a73217002ed987b246',
+    //         [
+    //           Query.equal('key', 'max_withdrawal_requests'),  // ← Add this!
+    //           Query.limit(1)  // Just one result
+    //         ]
+    //       );
+
+    //       const max_withdrawal_requests = result.documents[0];  // Your single document
+
+    //       console.log('Max Withdrawal Requests Config:', max_withdrawal_requests.value);
+
+    // Example: get value for "overhead_balance_required"
+    // const docs = result.data.documents;
+
+    // const overheadDoc = docs.find(d => d.key === 'overhead_balance_required');
+
+    // if (overheadDoc) {
+    //   const overheadValue = overheadDoc.value; // 5000
+    //   console.log('overhead_balance_required:', overheadValue);
+    // }
+
+    // Usage:
+    // const maxWithdrawal = getConfigValue(result, 'max_withdrawal_amount');
+    // const minWithdrawal = getConfigValue(result, 'min_withdrawal_amount');
+
+    // console.log('Max Withdrawal:', maxWithdrawal);
+    // console.log('Min Withdrawal:', minWithdrawal);
+
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Endpoint to receive Paytm transaction
 app.post("/paytm/payment-sync", async (req, res) => {
   try {

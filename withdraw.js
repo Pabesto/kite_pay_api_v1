@@ -46,6 +46,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       return Math.ceil(preAmount * commissionRatePercent / 100);
     }
 
+    function toInt(value) {
+      return value ? parseInt(value, 10) : 0;
+    }
+
     router.post('/withdraw_commission_preview', async (req, res) => {
       const { userId, qrId, preAmount } = req.body;
 
@@ -156,16 +160,37 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const istOffset = 5.5 * 60 * 60 * 1000;
       const istTime = new Date(Date.now() + istOffset).toISOString();
 
-      try {
-        // Enforce max 2 pending per user
-        const pendingRequests = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          [Query.equal('userId', userId), Query.equal('status', 'pending')]
+        try {
+          // Enforce max 2 pending per user
+          const pendingRequests = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Withdrawal_request_collectionId,
+            [Query.equal('userId', userId), Query.equal('status', 'pending')]
         );
-        if (pendingRequests.total >= 2) {
-          return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
-        }
+
+        //  Added Config Check for max withdrawal requests per user
+          // const result = await databases.listDocuments(
+          //   APPWRITE_DATABASE_ID,
+          //   '68a73217002ed987b246',
+          //   [
+          //     Query.equal('key', 'max_withdrawal_requests'),  // ← Add this!
+          //     Query.limit(1)  // Just one result
+          //   ]
+          // );
+
+          // const max_withdrawal_requests = result.documents[0];  // Your single document
+
+          // console.log('Max Withdrawal Requests Config:', max_withdrawal_requests.value);
+
+          // const max_withdrawal_requests_value = toInt(max_withdrawal_requests.value);
+
+          // if (pendingRequests.total >= max_withdrawal_requests_value) {
+          //   return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
+          // }
+
+          if (pendingRequests.total >= 2) {
+            return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
+          }
 
           const usrDet = await getUserMeta(userId);
 
@@ -219,14 +244,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const commissionOnHold = Number(qr.commissionOnHold || 0);
         const commissionPaid = Number(qr.commissionPaid || 0);
         const available = total - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-        // console.log(`QR Ledger - Total: ${total}, Approved: ${approved}, Requested: ${requested}, Available: ${available}, Requested Withdrawal: ${amountPaise}`);
-
-        // if (amountPaise > available) {
-        //   return res.status(400).json({ error: 'Requested amount exceeds available balance' });
-        // }
-
-        // console.log(`PreAmountPaise: ${preAmountPaise}, RecalculatedCommissionRs: ${recalculatedCommissionRs}, Available: ${available}`);
 
         if ((preAmountPaise + (recalculatedCommissionRs * 100) ) > available) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });

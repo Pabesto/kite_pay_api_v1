@@ -784,8 +784,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // GET /transactions/aggregate
-// Admin/Subadmin with all_transactions label
-// GET /transactions/aggregate-all
+    // Admin/Subadmin with all_transactions label
+    // GET /transactions/aggregate-all
     // router.get('/transactions/aggregate-all', async (req, res) => {
     // const {
     //     startCursor,
@@ -1675,6 +1675,162 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    router.get('/user/transactions/export', authenticateToken, async (req, res) => {
+        const { userId, qrId, from, to, status, searchField, searchValue, maxTxns = 50 } = req.query;
+        const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 500);  // safety limit
+
+        console.log('Export transaction query params:', req.query);
+
+        const userRequested = req.user;
+        const isSubadmin = userRequested.role === 'subadmin';
+        const isAdmin = userRequested.role === 'admin';
+
+        if(!isAdmin){
+
+            if (!isSubadmin && userRequested.userId !== userId) {
+                return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+            }
+
+            if (!userId) {
+                return res.status(400).json({ error: 'userId is required' });
+            }
+
+        }
+
+        let allTxns = [];
+        let cursor = null;
+
+        do {
+            const filters = [];
+
+            try {
+            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+            
+            if (qrId) {
+                if (userQrIds.includes(qrId) || isAdmin) {
+                filters.push(Query.equal('qrCodeId', qrId));
+                } else {
+                return res.status(200).json({ transactions: [] });
+                }
+            } else {
+                if (userQrIds.length === 0) {
+                return res.status(200).json({ transactions: [] });
+                }
+                filters.push(Query.equal('qrCodeId', userQrIds));
+            }
+
+            // Date filter helper (copied exactly)
+            function toISTRange(dateStr) {
+                const d = new Date(dateStr);
+                const start = new Date(d);
+                start.setHours(0, 0, 0, 0);
+                start.setMinutes(start.getMinutes() - 330);
+                const end = new Date(d);
+                end.setHours(23, 59, 59, 999);
+                end.setMinutes(end.getMinutes() - 330);
+                return { start, end };
+            }
+
+            if (from && to) {
+                if (from === to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+                } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+                }
+            } else if (from && !to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+            } else if (!from && to) {
+                const { end } = toISTRange(to);
+                filters.push(Query.lessThanEqual('created_at', end.toISOString()));
+            }
+
+            // Single field search (copied exactly)
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                const exactMatchFields = ['amount', 'rrnNumber'];
+
+                if (fulltextFields.includes(searchField)) {
+                filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                const amountValue = parseInt(searchValue, 10);
+                if (isNaN(amountValue)) {
+                    return res.status(400).json({ error: 'Amount must be an integer value' });
+                }
+                filters.push(Query.equal('amount', amountValue * 100));
+                } else if (searchField === 'rrnNumber') {
+                filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+            if (status) {
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']);
+                if (!allowedStatuses.has(status.toLowerCase())) {
+                return res.status(400).json({ error: 'Invalid status filter' });
+                }
+                if (status.toLowerCase() === 'normal') {
+                filters.push(
+                    Query.or([
+                    Query.equal('status', 'normal'),
+                    Query.equal('status', ''),
+                    Query.isNull('status'),
+                    ])
+                );
+                } else {
+                filters.push(Query.equal('status', status.toLowerCase()));
+                }
+            }
+
+            const queries = [
+                ...filters,
+                Query.orderDesc('created_at'),
+                Query.limit(100),
+                ...(cursor ? [Query.cursorAfter(cursor)] : [])
+            ];
+
+            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+            allTxns.push(...result.documents);
+            cursor = result.documents[99]?.$id;
+
+            } catch (error) {
+            console.error('❌ Export pagination error:', error);
+            break;
+            }
+
+        } while (allTxns.length < maxTxnsNum && cursor);
+
+        // Limit to requested max
+        allTxns = allTxns.slice(0, maxTxnsNum);
+
+        const pickTxn = (d) => ({
+            $id: d.$id,
+            id: d.$id,
+            qrCodeId: d.qrCodeId,
+            paymentId: d.paymentId,
+            rrnNumber: d.rrnNumber,
+            amount: d.amount,
+            vpa: d.vpa,
+            created_at: d.created_at,
+            status: d.status,
+        });
+
+        const docs = allTxns.map(pickTxn);
+
+        res.json({
+            success: true,
+            count: docs.length,
+            transactions: docs,
+            filters: { userId, qrId, from, to, status, searchField, searchValue }
+        });
+
+    });
+
+
     router.get('/getMyMetaData', authenticateToken, async (req, res) => {
         try {
             const userId = req.user.userId; // set by your JWT middleware
@@ -2145,7 +2301,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(500).json({ error: 'Failed to fetch dashboard counters' });
         }
     });
-
 
     // GET /dashboard/subadmin/:merchantId
     router.get('/dashboard/subadmin/:merchantId', authenticateAdminOrSubAdmin, async (req, res) => {
