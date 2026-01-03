@@ -7,6 +7,7 @@ const moment = require('moment-timezone');
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
 const cors = require('cors');
 const { Client, Databases, Storage, Users, Account, ID, Query, InputFile } = require('node-appwrite');
 
@@ -17,6 +18,7 @@ const { Server } = require('socket.io');
 const qrCodeRoutes = require('./qrcode');
 const adminRoutes = require('./admin');
 const withdrawRoutes = require('./withdraw');
+const apiMerchantRoutes = require('./apiMerchants.js');
 
 // 🔥 PINELEABS FILE IMPORT
 const digiqrRoutes = require('./pinelabs_digiqr.routes');
@@ -305,6 +307,9 @@ app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
+
+// Merchant API routes
+app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole));
 
 // Pinelabs QR routes
 app.use('/pinelabs', digiqrRoutes);

@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "axios": "^1.11.0",
+    "bcrypt": "^6.0.0",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
@@ -22,7 +23,10 @@
     "multer": "^2.0.2",
     "node-appwrite": "^17.2.0",
     "paytmchecksum": "^1.5.1",
+    "qrcode": "^1.5.4",
     "razorpay": "^2.9.6",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "upiqrcode": "^1.0.5",
+    "uuid": "^13.0.0"
   }
 }

@@ -1,74 +1,116 @@
-// PUT /assign-qr-manager/:qrId
-router.put('/assign-qr-manager/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
-  const { qrId } = req.params;
-  const { managedByUserId, assignedUserId } = req.body; // assignedUserId optional
-  const actor = req.user;
+const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+
+async function generateMerchantCredentials() {
+  const merchantId = 'mid_' + ID.unique().slice(-8).toUpperCase();
+  const apiSecret = crypto.randomBytes(32).toString('hex');
+  const hash = await bcrypt.hash(apiSecret, 12);
+  return { merchantId, apiSecret, hash };
+}
+
+// Admin endpoint snippet
+router.post('/admin/merchants', authenticateAdmin, async (req, res) => {
+  const { name, email} = req.body;
+  const creds = await generateMerchantCredentials();
+  await databases.createDocument(DB_ID, MERCHANTS_ID, ID.unique(), {
+    merchantId: creds.merchantId,
+    apiSecretHash: creds.hash,
+    name,
+    email,
+    status: false,
+    createdAt: new Date().toISOString()
+  });
+  res.json({ success: true, merchantId: creds.merchantId, apiSecret: creds.apiSecret });
+});
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+async function authenticateMerchant(req, res, next) {
+  const auth = req.headers.authorization?.split(' ')[1];
+  const { merchantId } = req.body || req.params;
+  if (!auth || !merchantId) return res.status(401).json({ error: 'Missing credentials' });
 
   try {
-    // Admin-only ownership change
-    if (actor.role !== 'admin') {
-      return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
+    const merchant = await databases.listDocuments(DB_ID, MERCHANTS_ID, [Query.equal('merchantId', merchantId), Query.limit(1)]);
+    if (!merchant.documents.length || !(await bcrypt.compare(auth, merchant.documents[0].apiSecretHash))) {
+      return res.status(401).json({ error: 'Invalid merchant credentials' });
     }
+    // Check limits, status
+    req.merchant = merchant.documents[0];
+    next();
+  } catch (e) {
+    res.status(500).json({ error: 'Auth failed' });
+  }
+}
 
-    const qrDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-      Query.equal('qrId', qrId),
-      Query.limit(1),
-    ]);
-    if (!qrDocs.documents.length) return res.status(404).json({ message: 'QR Code not found.' });
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    const qr = qrDocs.documents[0];
-    const prevAssigned = qr.assignedUserId || null;
+const QRCode = require('qrcode');
+const { generateUPIQR } = require('@sk-py/upi-qr');  // or 'upiqrcode'
 
-    if (!managedByUserId) {
-      return res.status(400).json({ message: 'managedByUserId is required.' });
-    }
+router.post('/qr_generate', authenticateMerchant, async (req, res) => {
+  try {
+    const { amount = '500.00' } = req.body;  // Fixed ₹500 default
+    const merchantId = req.merchant.merchantId;
+    const vpa = process.env.RAZORPAY_VPA;  // yourvpa@razorpay
+    const orderId = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const txnNumber = `txn_${Date.now()}`;
 
-    // Validate manager exists and role if needed
-    const manager = await getUser(managedByUserId);
-    if (!manager) return res.status(400).json({ message: 'Manager not found.' });
-    // Optional: enforce manager.role in { 'merchant', 'subadmin' }
-
-    // Normalize optional assignee
-    const normalizedAssigned = assignedUserId === '' ? null : assignedUserId ?? null;
-
-    // Build payload with policy:
-    // - If an explicit assignee is provided, use it (must be under the new manager)
-    // - Else if current ASSIGNED is null, default-assign to the manager
-    // - Else leave ASSIGNED as-is
-    const payload = {
-      managedByUserId,
-      ...(normalizedAssigned !== null
-        ? { assignedUserId: normalizedAssigned }
-        : (!qr.assignedUserId ? { assignedUserId: managedByUserId } : {})),
-    };
-
-    // If an explicit user assignee is set, validate hierarchy with new manager
-    if (payload.assignedUserId && payload.assignedUserId !== managedByUserId) {
-      const assignee = await getUser(payload.assignedUserId);
-      if (!assignee) return res.status(400).json({ message: 'Assignee not found.' });
-      if (assignee.parentId !== managedByUserId) {
-        return res.status(409).json({ message: 'Assignee not under new manager.' });
-      }
-    }
-
-    const updated = await databases.updateDocument(
+    // 1. Save pending request to DB
+    const requestDoc = await databases.createDocument(
       APPWRITE_DATABASE_ID,
-      Qr_collectionId,
-      qr.$id,
-      payload
+      TRANSACTIONS_COLLECTION_ID,  // Reuse or new qr_requests
+      ID.unique(),
+      {
+        merchantId,
+        orderId,
+        txnNumber,
+        amount: parseFloat(amount) * 100,  // Paise for Razorpay
+        status: 'pending',
+        vpa,
+        createdAt: new Date().toISOString(),
+        qrGenerated: false
+      }
     );
 
-    // Counters: adjust on assigned state changes only
-    const newAssigned = updated.assignedUserId || null;
-    if (!prevAssigned && newAssigned) {
-      await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
-    } else if (prevAssigned && !newAssigned) {
-      await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
-    }
+    // 2. Generate UPI QR payload (NPCI compliant)
+    const upiData = await generateUPIQR({
+      payeeVPA: vpa,
+      payeeName: 'KitePay',  // Your brand
+      amount,
+      currency: 'INR',
+      transactionId: orderId,
+      transactionNote: `Payment via KitePay MID:${merchantId.slice(-6)}`,
+      transactionRef: txnNumber,
+      minimumAmount: amount  // Enforce exact
+    });
 
-    return res.status(200).json({ message: 'Manager updated.' });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ message: 'Failed to update manager.', error: e.message });
+    // 3. Create base64 QR image from intent URL
+    const qrBase64 = await QRCode.toDataURL(upiData.intent, {
+      width: 300,
+      margin: 1,
+      color: { dark: '#000', light: '#FFF' }
+    });
+
+    // 4. Update DB with QR
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      TRANSACTIONS_COLLECTION_ID,
+      requestDoc.$id,
+      { qrBase64, qrGenerated: true }
+    );
+
+    res.json({
+      success: true,
+      qr_base64: qrBase64,
+      order_id: orderId,
+      txn_number: txnNumber,
+      time: new Date().toISOString(),
+      vpa
+    });
+  } catch (error) {
+    console.error('QR Generate error:', error);
+    res.status(500).json({ error: 'Failed to generate QR' });
   }
 });
+
