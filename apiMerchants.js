@@ -189,21 +189,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const qrRequest = qrRequests.documents[0];
             const qrRequestId = qrRequest.$id;
 
-            // ✅ 3. Check status FIRST (before webhook lookup)
-            if (qrRequest.status === 'success' && qrRequest.rrnNumber === rrnNumber) {
-                return res.status(409).json({
-                    success: false,
-                    message: 'Payment already verified',
-                    transaction: {
-                        orderId: qrRequest.orderId,
-                        merchantId: merchantId,
-                        amount: amount,
-                        rrnNumber: qrRequest.rrnNumber,
-                        status: qrRequest.status,
-                        verifiedAt: qrRequest.verifiedAt
-                    }
-                });
-            }
+            // // ✅ 3. Check status FIRST (before webhook lookup)
+            // if (qrRequest.status === 'success' && qrRequest.rrnNumber === rrnNumber) {
+            //     return res.status(409).json({
+            //         success: false,
+            //         message: 'Payment already verified',
+            //         transaction: {
+            //             orderId: qrRequest.orderId,
+            //             merchantId: merchantId,
+            //             amount: amount,
+            //             rrnNumber: qrRequest.rrnNumber,
+            //             status: qrRequest.status,
+            //             verifiedAt: qrRequest.verifiedAt
+            //         }
+            //     });
+            // }
 
             // ✅ 3. Find webhook transaction by rrnNumber + amount (same merchant)
             const webhookTxns = await databases.listDocuments(
@@ -213,6 +213,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     Query.equal('rrnNumber', rrnNumber),
                     Query.equal('amount', amountPaise),
                     Query.equal('status', 'normal'),  // Captured
+                    // Query.equal('alreadyVerified', merchantId),
                     Query.limit(1)
                 ]
             );
@@ -225,6 +226,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             const webhookTxn = webhookTxns.documents[0];
+            const webhookTxnId = webhookTxn.$id;
+
+            // ✅ 3. Check status FIRST (before webhook lookup)
+            if (webhookTxn.alreadyVerified) {
+                return res.status(409).json({
+                    success: false,
+                    message: 'Payment already verified WEBHOOK',
+                    transaction: {
+                        orderId: qrRequest.orderId,
+                        merchantId: merchantId,
+                        amount: amount,
+                        rrnNumber: qrRequest.rrnNumber,
+                        status: qrRequest.status,
+                        verifiedAt: qrRequest.verifiedAt
+                    }
+                });
+            }
 
             // ✅ 4. Cross-verify orderIds match (extra safety)
             if (webhookTxn.rrnNumber !== rrnNumber) {
@@ -233,6 +251,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     qrOrderId: qrRequest.orderId,
                 });
             }
+
+            // ✅ 5. Atomic update Webhook request → VERIFIED
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                '688cf5920023475022df',  // Webhook payments table
+                webhookTxnId,
+                {
+                    alreadyVerified: true,
+                }
+            );
 
             // ✅ 5. Atomic update QR request → VERIFIED
             await databases.updateDocument(
