@@ -22,10 +22,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     async function authenticateMerchant(req, res, next) {
         const auth = req.headers.authorization?.split(' ')[1];
         const { merchantId } = req.body || req.params;
-        
+
         // console.log('Authenticating merchant:', merchantId);
         // console.log('Auth token:', auth);
-        
+
         if (!auth || !merchantId) {
             return res.status(401).json({ error: 'Missing credentials' });
         }
@@ -33,17 +33,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             // ✅ Find by correct schema field
             const merchantDocs = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 
-                'api_merchants', 
+                APPWRITE_DATABASE_ID,
+                'api_merchants',
                 [Query.equal('merchantId', merchantId), Query.limit(1)]  // ✅ merchantId
             );
-            
+
             const merchant = merchantDocs.documents[0];
-            
+
             if (!merchant) {
                 return res.status(401).json({ error: 'Merchant not found' });
             }
-            
+
             // ✅ Simple string comparison (plain apiSecret)
             if (merchant.apiSecret !== auth) {  // ✅ === merchant.apiSecret (plain text)
                 console.log('Secret mismatch:', {
@@ -52,12 +52,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 });
                 return res.status(401).json({ error: 'Invalid API secret' });
             }
-            
+
             // ✅ Additional checks
             if (!merchant.status) {
                 return res.status(403).json({ error: 'Merchant account suspended' });
             }
-            
+
             // ✅ Rate limit check (daily QR count)
             // const today = new Date().toISOString().split('T')[0];
             // const todayRequests = await databases.listDocuments(
@@ -69,7 +69,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             //         Query.limit(1)
             //     ]
             // );
-            
+
             // if (todayRequests.total >= merchant.daily_limit) {
             //     return res.status(429).json({ 
             //         error: 'Daily QR limit exceeded', 
@@ -77,237 +77,319 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             //         used: todayRequests.total 
             //     });
             // }
-            
+
+            // console.log(merchant.vpa);
+
             req.merchant = merchant;
+            req.vpa = merchant.vpa;
             next();
-            
+
         } catch (e) {
             console.error('Merchant auth error:', e);
             res.status(500).json({ error: 'Authentication failed' });
         }
+
     }
 
+    // ✅ /qr_generate endpoint
     router.post('/qr_generate', authenticateMerchant, async (req, res) => {
-      try {
-        const { amount = '500.00' } = req.body;  // Fixed ₹500 default
-        const merchantId = req.merchant.merchantId;
-        // const vpa = process.env.RAZORPAY_VPA;  // yourvpa@razorpay
-        const vpa = 'pabestotechprivateli.96194569@hdfcbank';  // yourvpa@razorpay
-        const orderId = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        // const txnNumber = `txn_${Date.now()}`;
-    
-        // 1. Save pending request to DB
-        const requestDoc = await databases.createDocument(
-          APPWRITE_DATABASE_ID,
-          'api_merchants_requests',  // Reuse or new qr_requests
-          ID.unique(),
-          {
-            merchantId,
-            orderId,
-            amount: parseFloat(amount) * 100,  // Paise for Razorpay
-            status: 'pending',
-            vpa,
-            $createdAt: new Date().toISOString(),
-            qrGenerated: false
-          }
-        );
-    
-        const COMPANY_NAME = "Pabesto Tech";
+        try {
+            // 1. Extract & validate inputs
+            const { amount } = req.body || {};
+            const merchantId = req.merchant?.merchantId;
 
-        const txnId = uuidv4();
-        const expiry = Date.now() + 5 * 60 * 1000; // 5 min
+            if (!merchantId) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Unauthorized: merchantId missing',
+                });
+            }
 
-        const upiLink = `upi://pay?pa=${vpa}&pn=${encodeURIComponent(COMPANY_NAME)}&am=${amount}&cu=INR&tn=Order-${txnId}`;
-        const qrImage = await QRCode.toDataURL(upiLink);
-    
-        // 3. Create base64 QR image from intent URL
-        const qrBase64 = await QRCode.toDataURL(upiLink, {
-          width: 300,
-          margin: 1,
-          color: { dark: '#000', light: '#FFF' }
-        });
-    
-        // 4. Update DB with QR
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          'api_merchants_requests',
-          requestDoc.$id,
-          { qrBase64, qrGenerated: true }
-        );
-    
-        res.json({
-          success: true,
-          qrBase64: qrBase64,
-          orderId: orderId,
-        //   txn_number: txnNumber,
-          time: new Date().toISOString(),
-          expiry
-        });
+            if (!amount) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Error: amount missing',
+                });
+            }
 
-      } catch (error) {
-        console.error('QR Generate error:', error);
-        res.status(500).json({ error: 'Failed to generate QR' });
-      }
+            // Validate amount
+            const amountNumber = parseFloat(amount);
+            if (isNaN(amountNumber) || amountNumber <= 0 || amountNumber > 100000) { // ₹1L max
+                return res.status(400).json({
+                    success: false,
+                    error: 'Invalid amount: must be positive number ≤ ₹100,000',
+                });
+            }
+
+            const amountPaise = Math.round(amountNumber * 100);
+            const orderId = `order_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            // const vpa = 'pabestotechprivateli.96194569@hdfcbank'; // Move to env later
+            const vpa = req.vpa;
+            const COMPANY_NAME = 'Pabesto Tech';
+            const txnId = uuidv4();
+            const expiry = Date.now() + 5 * 60 * 1000; // 5 min
+
+            // 2. Create pending request in DB
+            const requestDoc = await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                'api_merchants_requests',
+                ID.unique(),
+                {
+                    merchantId,
+                    orderId,
+                    amount: amountPaise, // Store in paise
+                    status: 'pending',
+                    vpa,
+                    qrGenerated: false,
+                }
+            );
+
+            // 3. Generate UPI deep link
+            const upiLink = `upi://pay?pa=${encodeURIComponent(vpa)}&pn=${encodeURIComponent(COMPANY_NAME)}&am=${amountNumber.toFixed(2)}&cu=INR&tn=Order-${encodeURIComponent(txnId)}`;
+
+            // 4. Generate QR code
+            const qrBase64 = await QRCode.toDataURL(upiLink, {
+                width: 300,
+                margin: 1,
+                color: {
+                    dark: '#000000',
+                    light: '#FFFFFF',
+                },
+            });
+
+            // 5. Update DB with QR
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                'api_merchants_requests',
+                requestDoc.$id,
+                {
+                    qrBase64,
+                    qrGenerated: true,
+                    qrLink: upiLink,
+                }
+            );
+
+            // 6. Success response
+            res.status(201).json({
+                success: true,
+                message: 'QR code generated successfully',
+                data: {
+                    orderId,
+                    amount: amount, // Same as input
+                    qrBase64,
+                    qrLink: upiLink,
+                    expiry: new Date(expiry).toISOString(),
+                    // requestId: requestDoc.$id,
+                },
+            });
+
+        } catch (error) {
+            console.error('QR Generate error:', error);
+
+            // Specific error handling
+            if (error.code === 409) { // Document conflict
+                return res.status(409).json({
+                    success: false,
+                    error: 'Order ID conflict - retry requested',
+                });
+            }
+
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to generate QR code',
+            });
+        }
     });
+
 
     // ✅ /verify-payment endpoint
     router.post('/verify-payment', authenticateMerchant, async (req, res) => {
         try {
-            const { orderId, amount, rrnNumber } = req.body;  // Client sends
-            const { merchantId } = req.body || req.params;      // From auth
-            
-            // console.log('Received data:', { orderId, amount, rrnNumber, merchantId });
+            // 1. Extract + basic validation
+            const { orderId, amount, rrnNumber } = req.body || {};
+            const merchantId = req.merchantId || req.body?.merchantId || req.params?.merchantId;
 
-            // ✅ 1. Validate inputs
-            if (!orderId || !amount || !rrnNumber) {
-                return res.status(400).json({ error: 'orderId, amount, and rrnNumber required' });
+            // If you always set merchant on req in authenticateMerchant, prefer ONLY that
+            if (!merchantId) {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Unauthorized: merchantId missing',
+                });
             }
 
-            const amountPaise = parseInt(amount) * 100;
-            // const amountPaise = parseInt(amount);
+            if (!orderId || !amount || !rrnNumber) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'orderId, amount, and rrnNumber are required',
+                });
+            }
 
-            // ✅ 2. Find QR Request by orderId + merchant + amount + pending
+            // amount numeric check
+            const amountNumber = Number(amount);
+            if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'amount must be a positive number',
+                });
+            }
+
+            const amountPaise = Math.round(amountNumber * 100);
+
+            // 2. Find QR request
             const qrRequests = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants_requests',  // Your transactions table
+                'api_merchants_requests',
                 [
                     Query.equal('orderId', orderId),
                     Query.equal('merchantId', merchantId),
                     Query.equal('amount', amountPaise),
-                    // Query.equal('status', 'pending'),  // Only unverified
-                    Query.limit(1)
+                    // Query.equal('status', 'pending'),
+                    Query.limit(1),
                 ]
             );
 
             if (!qrRequests.documents.length) {
-                return res.status(404).json({ 
-                    error: 'No matching pending QR request found',
-                    details: { orderId, merchantId, amount }
+                return res.status(404).json({
+                    success: false,
+                    error: 'No matching QR request found',
+                    details: { orderId, merchantId, amount: amountNumber },
                 });
             }
 
             const qrRequest = qrRequests.documents[0];
             const qrRequestId = qrRequest.$id;
 
-            // // ✅ 3. Check status FIRST (before webhook lookup)
-            // if (qrRequest.status === 'success' && qrRequest.rrnNumber === rrnNumber) {
-            //     return res.status(409).json({
-            //         success: false,
-            //         message: 'Payment already verified',
-            //         transaction: {
-            //             orderId: qrRequest.orderId,
-            //             merchantId: merchantId,
-            //             amount: amount,
-            //             rrnNumber: qrRequest.rrnNumber,
-            //             status: qrRequest.status,
-            //             verifiedAt: qrRequest.verifiedAt
-            //         }
-            //     });
-            // }
+            // 3. If already verified for this rrn, treat as idempotent
+            if (qrRequest.status === 'success' && qrRequest.rrnNumber === rrnNumber) {
+                return res.status(200).json({
+                    success: true,
+                    message: 'Payment already verified',
+                    transaction: {
+                        orderId: qrRequest.orderId,
+                        merchantId,
+                        amount: amount, // original input
+                        rrnNumber: qrRequest.rrnNumber,
+                        status: qrRequest.status,
+                        paymentId: qrRequest.paymentId,
+                        txnId: qrRequest.txnId,
+                        verifiedAt: qrRequest.verifiedAt,
+                        receivedAt: qrRequest.webhookReceivedAt,
+                    },
+                });
+            }
 
-            // ✅ 3. Find webhook transaction by rrnNumber + amount (same merchant)
+            // 4. Find webhook transaction
             const webhookTxns = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                '688cf5920023475022df',  // Webhook payments table
+                '688cf5920023475022df', // webhook payments
                 [
                     Query.equal('rrnNumber', rrnNumber),
                     Query.equal('amount', amountPaise),
-                    Query.equal('status', 'normal'),  // Captured
-                    // Query.equal('alreadyVerified', merchantId),
-                    Query.limit(1)
+                    Query.equal('status', 'normal'),
+                    Query.limit(1),
                 ]
             );
 
             if (!webhookTxns.documents.length) {
-                return res.status(404).json({ 
-                    error: 'No matching webhook transaction found for UTR',
-                    details: { orderId, rrnNumber, amount, merchantId }
+                return res.status(404).json({
+                    success: false,
+                    error: 'No matching webhook transaction found for rrnNumber',
+                    details: { orderId, rrnNumber, amount: amountNumber, merchantId },
                 });
             }
 
             const webhookTxn = webhookTxns.documents[0];
             const webhookTxnId = webhookTxn.$id;
 
-            // ✅ 3. Check status FIRST (before webhook lookup)
+            // 5. Prevent double verification (idempotency)
             if (webhookTxn.alreadyVerified) {
-                return res.status(409).json({
-                    success: false,
-                    message: 'Payment already verified WEBHOOK',
+                // 200 because the resource is already in the desired state
+                return res.status(200).json({
+                    success: true,
+                    message: 'Payment already verified',
                     transaction: {
                         orderId: qrRequest.orderId,
-                        merchantId: merchantId,
-                        amount: amount,
-                        rrnNumber: qrRequest.rrnNumber,
-                        status: qrRequest.status,
-                        verifiedAt: qrRequest.verifiedAt
-                    }
+                        merchantId,
+                        amount: amount, // original input
+                        rrnNumber: qrRequest.rrnNumber ?? rrnNumber,
+                        status: qrRequest.status ?? 'success',
+                        paymentId: webhookTxn.paymentId,
+                        txnId: webhookTxn.$id,
+                        vpa: webhookTxn.vpa,
+                        receivedAt: webhookTxn.$createdAt,
+                        verifiedAt: qrRequest.verifiedAt,
+                    },
                 });
             }
 
-            // ✅ 4. Cross-verify orderIds match (extra safety)
+            // 6. Extra rrn safety (technically redundant but ok)
             if (webhookTxn.rrnNumber !== rrnNumber) {
-                return res.status(409).json({ 
-                    error: 'UTR payment mismatch: orderId conflict',
+                return res.status(409).json({
+                    success: false,
+                    error: 'UTR payment mismatch',
                     qrOrderId: qrRequest.orderId,
                 });
             }
 
-            // ✅ 5. Atomic update Webhook request → VERIFIED
+            // 7. Mark webhook as verified
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                '688cf5920023475022df',  // Webhook payments table
+                '688cf5920023475022df',
                 webhookTxnId,
                 {
+                    api_merchants_request_id: qrRequestId,
                     alreadyVerified: true,
                 }
             );
 
-            // ✅ 5. Atomic update QR request → VERIFIED
+            // 8. Mark QR request as success
+            const verifiedAt = new Date().toISOString().replace('Z', '+00:00');
+
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 'api_merchants_requests',
                 qrRequestId,
                 {
-                    status: 'success',                    // ✅ Verified
+                    status: 'success',
                     paymentId: webhookTxn.paymentId,
                     txnId: webhookTxn.$id,
-                    rrnNumber: rrnNumber,
-                    verifiedAt: new Date().toISOString().replace('Z', '+00:00'),
-                    webhookReceivedAt: webhookTxn.$createdAt
+                    rrnNumber,
+                    verifiedAt,
+                    webhookReceivedAt: webhookTxn.$createdAt,
                 }
             );
 
-            // ✅ 6. Response with full verified transaction
-            res.json({
+            // 9. Success response
+            return res.status(200).json({
                 success: true,
                 message: 'Payment verified successfully',
                 transaction: {
                     orderId: qrRequest.orderId,
-                    merchantId: merchantId,
-                    amount: amount,  // ₹ format
-                    rrnNumber: rrnNumber,
+                    merchantId,
+                    amount: amount, // original input
+                    rrnNumber,
                     paymentId: webhookTxn.paymentId,
                     txnId: webhookTxn.$id,
                     vpa: webhookTxn.vpa,
                     status: 'success',
-                    ReceivedAt: webhookTxn.$createdAt,
-                    verifiedAt: new Date().toISOString().replace('Z', '+00:00'),
-                    // qrBase64: qrRequest.qrBase64  // For reference
-                }
+                    receivedAt: webhookTxn.$createdAt,
+                    verifiedAt,
+                },
             });
-
         } catch (error) {
             console.error('Verify payment error:', error);
-            res.status(500).json({ error: 'Verification failed' });
+            return res.status(500).json({
+                success: false,
+                error: 'Verification failed',
+            });
         }
     });
-
 
     // Create Merchant Endpoint
     router.post('/admin/merchants', authenticateAdmin, async (req, res) => {
         const { name, email, vpa, dailyLimit = 100 } = req.body;
         const creds = await generateMerchantCredentials();
-        console.log('Creating merchant:', name, email, creds.merchantId, vpa , dailyLimit , creds.apiSecret, creds.hash , new Date().toISOString());
+        console.log('Creating merchant:', name, email, creds.merchantId, vpa, dailyLimit, creds.apiSecret, creds.hash, new Date().toISOString());
         await databases.createDocument(APPWRITE_DATABASE_ID, 'api_merchants', ID.unique(), {
             merchantId: creds.merchantId,
             apiSecret: creds.apiSecret,
@@ -316,7 +398,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             dailyLimit,
             $createdAt: new Date().toISOString()
         });
-        res.json({ success: true, name, email , vpa , status : true, merchantId: creds.merchantId, apiSecret: creds.apiSecret });
+        res.json({ success: true, name, email, vpa, status: true, merchantId: creds.merchantId, apiSecret: creds.apiSecret });
     });
 
     // List Merchants Endpoint
@@ -324,25 +406,25 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             const { search = '', status, limit = 25, cursor } = req.query;
             const queries = [
-            limit ? Query.limit(parseInt(limit)) : [],
-            cursor ? Query.cursorAfter(cursor) : [],
-            // search ? Query.search('name', search) : [],
-            // search ? Query.search('email', search) : [],
-            // status ? Query.equal('status', status) : [],
-            Query.orderDesc('$createdAt')
+                limit ? Query.limit(parseInt(limit)) : [],
+                cursor ? Query.cursorAfter(cursor) : [],
+                // search ? Query.search('name', search) : [],
+                // search ? Query.search('email', search) : [],
+                // status ? Query.equal('status', status) : [],
+                Query.orderDesc('$createdAt')
             ].flat();
 
             const merchants = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            'api_merchants',
-            queries
+                APPWRITE_DATABASE_ID,
+                'api_merchants',
+                queries
             );
 
             res.json({
-            success: true,
-            merchants: merchants.documents,
-            total: merchants.total,
-            cursor: merchants.documents.length ? merchants.documents[merchants.documents.length - 1].$id : null
+                success: true,
+                merchants: merchants.documents,
+                total: merchants.total,
+                cursor: merchants.documents.length ? merchants.documents[merchants.documents.length - 1].$id : null
             });
         } catch (error) {
             console.error('List merchants error:', error);
@@ -354,7 +436,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.put('/admin/merchants/:merchantId', authenticateAdmin, async (req, res) => {
         try {
             const { merchantId } = req.params;
-            
+
             // ✅ Step 1: Find document by merchant_id
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
@@ -412,7 +494,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.put('/admin/merchants/:merchantId/toggle', authenticateAdmin, async (req, res) => {
         try {
             const { merchantId } = req.params;
-            
+
             // ✅ Find document by merchant_id (indexed field)
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
@@ -442,8 +524,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             );
 
-            res.json({ 
-                success: true, 
+            res.json({
+                success: true,
                 merchantId: merchant.merchant_id,
                 previousStatus: merchant.status,
                 newStatus: newStatus,
@@ -459,6 +541,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
 
     return router;
-    
+
 };
 
