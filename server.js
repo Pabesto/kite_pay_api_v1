@@ -545,6 +545,101 @@ app.post("/paytm/payment-sync", async (req, res) => {
   }
 });
 
+// GET last timestamp (per company)
+app.get("/paytm/last-timestamp-company", async (req, res) => {
+  try {
+    const { company } = req.query;
+
+    if (!company) {
+      return res.status(400).json({ error: "Missing company parameter" });
+    }
+
+    const keyName = `gmail_paytm_sync_timestamp_${company}`;
+
+    const config_docs = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      '68a73217002ed987b246'
+    );
+
+    const timestampDoc = config_docs.documents.find(
+      doc => doc.key === keyName
+    );
+
+    if (timestampDoc) {
+      console.log(`[${company}] Found timestamp:`, timestampDoc.value);
+      return res.json({ last_mail_timestamp: timestampDoc.value });
+    }
+
+    console.log(`[${company}] No timestamp found, sending default`);
+    return res.json({ last_mail_timestamp: 1764272304 });
+
+  } catch (err) {
+    console.error("GET timestamp error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// UPDATE last timestamp (per company)
+app.post("/paytm/update-last-timestamp-company", async (req, res) => {
+  try {
+    const { company, last_mail_timestamp } = req.body;
+
+    if (!company) {
+      return res.status(400).json({ error: "Missing company in body" });
+    }
+
+    if (!last_mail_timestamp) {
+      return res.status(400).json({ error: "Missing last_mail_timestamp in body" });
+    }
+
+    const keyName = `gmail_paytm_sync_timestamp_${company}`;
+    const COLLECTION_ID = '68a73217002ed987b246';
+
+    const config_docs = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      COLLECTION_ID
+    );
+
+    const timestampDoc = config_docs.documents.find(
+      doc => doc.key === keyName
+    );
+
+    const timestampInt = parseInt(last_mail_timestamp, 10);
+
+    if (timestampDoc) {
+      // UPDATE existing
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        COLLECTION_ID,
+        timestampDoc.$id,
+        { value: timestampInt }
+      );
+
+      console.log(`[${company}] Timestamp updated → ${timestampInt}`);
+      return res.json({ success: true, message: "Timestamp updated" });
+
+    } else {
+      // CREATE new doc if not exists (recommended)
+      await databases.createDocument(
+        APPWRITE_DATABASE_ID,
+        COLLECTION_ID,
+        'unique()',
+        {
+          key: keyName,
+          value: timestampInt
+        }
+      );
+
+      console.log(`[${company}] Timestamp created → ${timestampInt}`);
+      return res.json({ success: true, message: "Timestamp created" });
+    }
+
+  } catch (error) {
+    console.error("POST timestamp error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Endpoint to Send Paytm transaction last timestamp
 app.get("/paytm/last-timestamp", async (req, res) => {
   // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
