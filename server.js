@@ -548,7 +548,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
 // GET last timestamp (per company)
 app.get("/paytm/last-timestamp-company", async (req, res) => {
   try {
-    const { company } = req.body;
+    const { company } = req.query;
 
     if (!company) {
       return res.status(400).json({ error: "Missing company parameter" });
