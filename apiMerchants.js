@@ -385,6 +385,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    async function generateMerchantCredentials() {
+        const merchantId = 'mid_' + ID.unique().slice(-8).toUpperCase();
+        const apiSecret = crypto.randomBytes(32).toString('hex');
+        const hash = await bcrypt.hash(apiSecret, 12);
+        return { merchantId, apiSecret, hash };
+    }
+
     // Create Merchant Endpoint
     router.post('/admin/merchants', authenticateAdmin, async (req, res) => {
         const { name, email, vpa, dailyLimit = 100 } = req.body;
