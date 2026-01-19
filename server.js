@@ -1266,6 +1266,8 @@ app.post('/webhook', async (req, res) => {
 
     const rrnNumber = req.body?.payload?.payment?.entity?.acquirer_data?.rrn;
     const amount = req.body?.payload?.payment?.entity?.amount;
+    const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+
     const vpa = req.body?.payload?.payment?.entity?.vpa;
     const unixTimestamp = req.body?.payload?.payment?.entity?.created_at;
 
@@ -1274,7 +1276,7 @@ app.post('/webhook', async (req, res) => {
     const payloadString = JSON.stringify(req.body);
 
     try {
-        const result = await databases.createDocument(
+        const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             ID.unique(),
@@ -1283,41 +1285,104 @@ app.post('/webhook', async (req, res) => {
                 qrCodeId: qrCodeId,
                 paymentId: paymentId,
                 rrnNumber: rrnNumber,
-                amount: amount,
+                amount: amountPaise,
                 vpa: vpa,
-                created_at: isoDate
+                provider: 'razorpay',
+                created_at: isoDate,
+                status: 'normal',
             }
         );
 
+    // Update Daily QR Total
+        (async () => {
+        try {
+            await updateDailyQrTotal(
+            qrCodeId,
+            isoDate,
+            amountPaise
+            );
+            console.log('Daily QR total updated successfully.');
+        } catch (error) {
+            console.error('Error updating daily QR total:', error);
+        }
+        })();
+
+        const eventPayload = {
+          $id: created.$id,                                    // document id
+          qrCodeId,
+          paymentId,                                           // string
+          amount: amountPaise,                           // exact integer
+          rrnNumber: rrnNumber || null,
+          vpa: vpa || null,
+          provider: 'razorpay',
+          created_at: new Date(isoDate).toISOString(),    // normalize to ISO
+        }; // normalized event payload for clients [2]
+
+        // 5) Emit only to intended audiences (user + QR rooms)
+        emitTxnNew({
+            assignedUserId : '',      // may be null if QR not found
+            qrCodeId,
+            payload: eventPayload,
+        }); // Socket.IO selective emit via rooms [1]
+
+        // 4️⃣ Update global counters (async, no await)
+        // totalTxCount
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalApiTx
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalAmountReceived
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
         /////////////////////////////////////////////////////////////////////////////////////////////////
 
-        // 3️⃣ Update the corresponding QR code totals
-        if (qrCodeId && paymentsAmount != null && paymentsCount != null) {
-            const qrResult = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_QRCODE_COLLECTION_ID,
-                [
-                    Query.equal('qrId', qrCodeId),
-                    Query.limit(1)
-                ]
-            );
+        // 7) Update QR totals atomically
+        try {
+        const qrResult = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal('qrId', qrCodeId), Query.limit(1)]
+        );
 
-            if (qrResult.documents.length) {
-                const qrDoc = qrResult.documents[0];
-                await databases.updateDocument(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_QRCODE_COLLECTION_ID,
-                    qrDoc.$id,
-                    {
-                        totalTransactions: paymentsCount,
-                        totalPayInAmount: paymentsAmount
-                    }
-                );
-                // console.log(`QR totals updated for qrId ${qrCodeId}`);
-            } else {
-                // console.log(`QR Code with qrId ${qrCodeId} not found`);
-            }
+        if (!qrResult.documents.length) {
+            // console.log(`QR Code with qrId ${qrCodeId} not found`);
+            return res.status(200).send('OK'); // or handle not-found differently
         }
+// 
+        const qrDoc = qrResult.documents[0];            // <- take first doc
+        // const qrDoc = qrResult.documents;           
+        const qrDocId = qrDoc.$id;                     // <- required documentId
+        const newCount = (qrDoc.totalTransactions || 0) + 1;
+        const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+        // Recompute available after changing total
+        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+        const onHold = Number(qrDoc.amountOnHold || 0);
+        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+        const commissionPaid = Number(qrDoc.commissionPaid || 0);
+        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+        await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            qrDocId,                                     // <- pass $id here
+            {
+                totalTransactions: newCount,
+                totalPayInAmount: newTotal ,
+                amountAvailableForWithdrawal: newAvailable, // <-- add this
+            }
+        );
+      } catch (e) {
+        console.error('Error updating QR totals:', e);
+      }
 
         // console.log('✅ Webhook data saved to Appwrite:', result.$id);
         res.status(200).send('Webhook received and saved');
