@@ -1265,8 +1265,8 @@ app.post('/webhook', async (req, res) => {
     }
 
     const rrnNumber = req.body?.payload?.payment?.entity?.acquirer_data?.rrn;
-    const amountRupees = req.body?.payload?.payment?.entity?.amount;
-    const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+    const amountPaise = req.body?.payload?.payment?.entity?.amount;
+    // const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
 
     const vpa = req.body?.payload?.payment?.entity?.vpa;
     const unixTimestamp = req.body?.payload?.payment?.entity?.created_at;
