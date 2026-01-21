@@ -753,6 +753,13 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
 //     res.status(200).send("OK");
 // });
 
+app.post('/razorpay-webhook-test', webhookParser, async (req, res) => {
+  console.log('Webhook Pabesto');
+    const data = req.body;
+    console.log(data);
+    return res.status(200).send('Duplicate webhook ignored'); // already processed
+});
+
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
   console.log('Webhook Event Received new');
