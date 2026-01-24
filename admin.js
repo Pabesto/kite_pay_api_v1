@@ -56,7 +56,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const requestorId = req.user.userId;
         const role = req.user.role; // 'admin' | 'subadmin'
 
-        const limitNum = Math.min(parseInt(limit) || 25, 50);
+        const limitNum = Math.min(parseInt(limit) || 25, 200);
         // limitNum = limit;
 
         try {
