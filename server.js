@@ -9,10 +9,14 @@ const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const cors = require('cors');
+const compression = require('compression'); // Added compression middleware
 const { Client, Databases, Storage, Users, Account, ID, Query, InputFile } = require('node-appwrite');
 
 const { createServer } = require('http');
 const { Server } = require('socket.io');
+
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 
 // Import the route files
 const qrCodeRoutes = require('./qrcode');
@@ -37,6 +41,17 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
 });
+
+// Global error handlers
+process.on('unhandledRejection', err => {
+  console.error('Unhandled Rejection:', err);
+});
+
+// Catch uncaught exceptions
+process.on('uncaughtException', err => {
+  console.error('Uncaught Exception:', err);
+});
+
 
 // Appwrite Configuration from your provided webhook file
 const APPWRITE_ENDPOINT = 'https://fra.cloud.appwrite.io/v1';
@@ -71,6 +86,20 @@ const users = new Users(client);
 
 // console.log(process.env.RAZORPAY_KEY_ID);
 
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Rate limiter specifically for webhook endpoints
+// This is used for the webhook routes to prevent abuse
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+});
+
 // Middleware
 app.use(cors()); // Enables cross-origin requests
 // Parse raw body for signature verification
@@ -81,6 +110,11 @@ app.use(cors()); // Enables cross-origin requests
 //     },
 //   })
 // );
+
+app.use(compression());  // Add after CORS, before body-parser
+
+app.use(globalLimiter);
+// app.use(helmet()); // Set security headers
 
 app.use(
   bodyParser.json({
@@ -175,15 +209,6 @@ const authenticateAdmin = (req, res, next) => {
 
 const authenticateAdminOrSubAdmin = (req, res, next) => {
     authenticateToken(req, res, () => {
-        // After successful token verification, check the user's labels
-        // if (!req.user || !(req.user.labels?.includes('admin') || req.user.labels?.includes('subadmin'))) {
-        //     return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
-        // }
-
-        // if (!req.user || !(req.user.labels?.includes('admin') || req.user.labels?.includes('subadmin'))) {
-        //     return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
-        // }
-
         if (!req.user || !['admin', 'subadmin'].includes(req.user.role)) {
             return res.status(403).json({ error: 'Not authorized: Admin or SubAdmin required.' });
         }
@@ -191,53 +216,6 @@ const authenticateAdminOrSubAdmin = (req, res, next) => {
         next();
     });
 };
-
-// async function authenticateAdminOrSubAdmin(req, res, next) {
-//     try {
-//         const jwt = req.headers.authorization?.split(" ")[1]; // Bearer <token>
-//         if (!jwt) {
-//             return res.status(401).json({ error: "Missing token" });
-//         }
-
-//         // 🔑 Get user from Appwrite Account API
-//         const appwriteUser = await account.get();
-
-//         // 📦 Fetch role from your `users_meta` collection
-//         const userMeta = await databases.listDocuments(
-//             APPWRITE_DATABASE_ID,
-//             APPWRITE_USERS_META_COLLECTION_ID,
-//             [Query.equal("userId", appwriteUser.$id)]
-//         );
-
-//         console.log("User role data:", userMeta);
-
-//         if (userMeta.total === 0) {
-//             return res.status(403).json({ error: "User metadata not found" });
-//         }
-
-//         const meta = userMeta.documents[0];
-
-//         // Attach full user info for later use
-//         req.user = {
-//             $id: appwriteUser.$id,
-//             email: appwriteUser.email,
-//             name: appwriteUser.name,
-//             role: meta.role,
-//             parentId: meta.parentId || null,
-//         };
-
-//         // ✅ Allow only admin or sub-admin
-//         if (meta.role === "admin" || meta.role === "sub-admin") {
-//             return next();
-//         }
-
-//         return res.status(403).json({ error: "Not allowed" });
-//     } catch (err) {
-//         console.error("❌ Auth error:", err.message || err);
-//         return res.status(401).json({ error: "Invalid or expired token" });
-//     }
-// }
-
 
 // Middleware to load user role & meta info
 
@@ -392,6 +370,8 @@ app.get('/get_app_config', async (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Rate limiter specifically for webhook endpoints
+app.use('/paytm/payment-sync', webhookLimiter);
 // Endpoint to receive Paytm transaction
 app.post("/paytm/payment-sync", async (req, res) => {
   try {
@@ -457,14 +437,18 @@ app.post("/paytm/payment-sync", async (req, res) => {
     }
 
     // Update daily QR total (async, no await)
-    (async () => {
-      try {
-        await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-        console.log('✅ Daily QR total updated successfully.');
-      } catch (error) {
-        console.error('❌ Error updating daily QR total:', error?.message || error);
-      }
-    })();
+    // (async () => {
+    //   try {
+    //     await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
+    //     console.log('✅ Daily QR total updated successfully.');
+    //   } catch (error) {
+    //     console.error('❌ Error updating daily QR total:', error?.message || error);
+    //   }
+    // })();
+
+    await updateDailyQrTotal(qrCodeId, isoString, amountPaise).catch((e) => {
+      console.error('❌ Error updating daily QR total:', error?.message || error);
+    });
 
     const eventPayload = {
       $id: created.$id,
@@ -713,42 +697,8 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
     }
 });
 
-// This is the route you provide to the Razorpay/Ezetap team
-// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-//     const data = req.body;
 
-//     console.log("📩 Webhook Received:", data);
-
-//     const payloadString = JSON.stringify(req.body);
-
-//   try {
-//     const created = await databases.createDocument(
-//       APPWRITE_DATABASE_ID,
-//       'razorpay_webhook',
-//       ID.unique(),
-//       {
-//         payload: payloadString, // avoid storing full payload for Cashfree to save space
-//       }
-//     );
-//   } catch (e){
-
-//   }
-
-//     // LOGIC: Check for 'status' field [cite: 897]
-//     if (data.status === "AUTHORIZED") {
-//         // [cite: 898] "Authorized" means transaction successfully executed
-//         console.log("✅ Payment Success:", data.txnId);
-        
-//         // Perform your database updates here
-//     } else if (data.status === "FAILED") {
-//         // [cite: 898] "Failed" means money won't be deducted
-//         console.log("❌ Payment Failed");
-//     }
-
-//     // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
-//     res.status(200).send("OK");
-// });
-
+app.use('/razorpay-webhook', webhookLimiter);
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
   console.log('Webhook Event Received new');
@@ -846,18 +796,22 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         );
 
     // Update Daily QR Total
-        (async () => {
-        try {
-            await updateDailyQrTotal(
-            qrCodeId,
-            isoDate,
-            amountPaise
-            );
-            console.log('Daily QR total updated successfully.');
-        } catch (error) {
-            console.error('Error updating daily QR total:', error);
-        }
-        })();
+        // (async () => {
+        // try {
+        //     await updateDailyQrTotal(
+        //     qrCodeId,
+        //     isoDate,
+        //     amountPaise
+        //     );
+        //     console.log('Daily QR total updated successfully.');
+        // } catch (error) {
+        //     console.error('Error updating daily QR total:', error);
+        // }
+        // })();
+
+        await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
+          console.error('❌ Error updating daily QR total:', error?.message || error);
+        });
 
         const eventPayload = {
           $id: created.$id,                                    // document id
@@ -895,46 +849,106 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
         /////////////////////////////////////////////////////////////////////////////////////////////////
 
-        // 7) Update QR totals atomically
-        try {
-        const qrResult = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_QRCODE_COLLECTION_ID,
-            [Query.equal('qrId', qrCodeId), Query.limit(1)]
-        );
+        // 7) Update QR totals atomically // OLD LOGIC
+//         try {
+//         const qrResult = await databases.listDocuments(
+//             APPWRITE_DATABASE_ID,
+//             APPWRITE_QRCODE_COLLECTION_ID,
+//             [Query.equal('qrId', qrCodeId), Query.limit(1)]
+//         );
 
-        if (!qrResult.documents.length) {
-            // console.log(`QR Code with qrId ${qrCodeId} not found`);
-            return res.status(200).send('OK'); // or handle not-found differently
-        }
-// 
-        const qrDoc = qrResult.documents[0];            // <- take first doc
-        // const qrDoc = qrResult.documents;           
-        const qrDocId = qrDoc.$id;                     // <- required documentId
-        const newCount = (qrDoc.totalTransactions || 0) + 1;
-        const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+//         if (!qrResult.documents.length) {
+//             // console.log(`QR Code with qrId ${qrCodeId} not found`);
+//             return res.status(200).send('OK'); // or handle not-found differently
+//         }
+// // 
+//         const qrDoc = qrResult.documents[0];            // <- take first doc
+//         // const qrDoc = qrResult.documents;           
+//         const qrDocId = qrDoc.$id;                     // <- required documentId
+//         const newCount = (qrDoc.totalTransactions || 0) + 1;
+//         const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
 
-        // Recompute available after changing total
-        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-        const onHold = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-        const commissionPaid = Number(qrDoc.commissionPaid || 0);
-        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+//         // Recompute available after changing total
+//         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+//         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+//         const onHold = Number(qrDoc.amountOnHold || 0);
+//         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+//         const commissionPaid = Number(qrDoc.commissionPaid || 0);
+//         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-        await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_QRCODE_COLLECTION_ID,
-            qrDocId,                                     // <- pass $id here
-            {
-                totalTransactions: newCount,
-                totalPayInAmount: newTotal ,
-                amountAvailableForWithdrawal: newAvailable, // <-- add this
-            }
-        );
-      } catch (e) {
-        console.error('Error updating QR totals:', e);
+//         await databases.updateDocument(
+//             APPWRITE_DATABASE_ID,
+//             APPWRITE_QRCODE_COLLECTION_ID,
+//             qrDocId,                                     // <- pass $id here
+//             {
+//                 totalTransactions: newCount,
+//                 totalPayInAmount: newTotal ,
+//                 amountAvailableForWithdrawal: newAvailable, // <-- add this
+//             }
+//         );
+//       } catch (e) {
+//         console.error('Error updating QR totals:', e);
+//       }
+
+
+      // 7) Update QR totals ATOMICALLY with retry (fixes race condition)
+      let attempts = 0;
+      const maxAttempts = 5;
+
+      while (attempts < maxAttempts) {
+          try {
+              const qrResult = await databases.listDocuments(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_QRCODE_COLLECTION_ID,
+                  [Query.equal('qrId', qrCodeId), Query.limit(1)]
+              );
+
+              if (!qrResult.documents.length) {
+                  console.log(`QR Code with qrId ${qrCodeId} not found`);
+                  break; // Exit loop, send OK later
+              }
+
+              const qrDoc = qrResult.documents[0];
+              const currentUpdatedAt = qrDoc.$updatedAt; // Optimistic lock version
+
+              const newCount = (qrDoc.totalTransactions || 0) + 1;
+              const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+              // Recompute available
+              const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+              const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+              const onHold = Number(qrDoc.amountOnHold || 0);
+              const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+              const commissionPaid = Number(qrDoc.commissionPaid || 0);
+              const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+              // Update with conditional query on $updatedAt to detect conflicts
+              await databases.updateDocument(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_QRCODE_COLLECTION_ID,
+                  qrDoc.$id,
+                  {
+                      totalTransactions: newCount,
+                      totalPayInAmount: newTotal,
+                      amountAvailableForWithdrawal: newAvailable,
+                  },
+                  [Query.equal('$updatedAt', currentUpdatedAt)] // Only succeeds if unchanged
+              );
+
+              console.log(`✅ QR ${qrCodeId} updated successfully (attempt ${attempts + 1})`);
+              break; // Success, exit loop
+
+          } catch (error) {
+              attempts++;
+              if (attempts >= maxAttempts || !error.message.includes('not found') && !error.message.includes('updatedAt')) {
+                  console.error(`❌ Failed to update QR ${qrCodeId} after ${attempts} attempts:`, error.message);
+                  break; // Give up or handle (e.g., queue for retry)
+              }
+              console.warn(`⚠️ QR update conflict (attempt ${attempts}), retrying...`);
+              // Short delay optional: await new Promise(r => setTimeout(r, 50));
+          }
       }
+
 
         // console.log('✅ Webhook data saved to Appwrite:', result.$id);
         res.status(200).send('Webhook received and saved');
@@ -1018,6 +1032,8 @@ app.get('/test_websocket', (req, res) => {
   return res.status(200).json({ ok: true, payload: eventPayload });
 });
 
+app.use('/cashfree/webhook', webhookLimiter);
+// This is the route you provide to the Cashfree team
 app.post('/cashfree/webhook', async (req, res) => {
   console.log('Webhook Event Received: Cashfree');
 
@@ -1107,18 +1123,22 @@ app.post('/cashfree/webhook', async (req, res) => {
       }
     );
 
-    (async () => {
-    try {
-        await updateDailyQrTotal(
-        qrCodeId,
-        createdAt,
-        amountPaise
-        );
-        console.log('Daily QR total updated successfully.');
-    } catch (error) {
-        console.error('Error updating daily QR total:', error);
-    }
-    })();
+    // (async () => {
+    // try {
+    //     await updateDailyQrTotal(
+    //     qrCodeId,
+    //     createdAt,
+    //     amountPaise
+    //     );
+    //     console.log('Daily QR total updated successfully.');
+    // } catch (error) {
+    //     console.error('Error updating daily QR total:', error);
+    // }
+    // })();
+
+    await updateDailyQrTotal(qrCodeId, createdAt, amountPaise).catch((e) => {
+          console.error('❌ Error updating daily QR total:', error?.message || error);
+    });
 
     const eventPayload = {
         $id: created.$id,                                    // document id
@@ -1394,7 +1414,7 @@ app.get('/', (req, res) => {
     res.send('QR Code Admin API is running!');
 });
 
-// Start the server
-app.listen(PORT, () => {
-    console.log(`🚀 Server is running on port ${PORT}`);
-});
+// // Start the server
+// app.listen(PORT, () => {
+//     console.log(`🚀 Server is running on port ${PORT}`);
+// });

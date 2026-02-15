@@ -1445,18 +1445,22 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     }
             );
 
-            (async () => {
-            try {
-                await updateDailyQrTotal(
-                    qrCodeId,
-                    isoDate,
-                    finalAmount
-                );
-                console.log('Daily QR total updated successfully.');
-            } catch (error) {
-                console.error('Error updating daily QR total:', error);
-            }
-            })();
+            // (async () => {
+            // try {
+            //     await updateDailyQrTotal(
+            //         qrCodeId,
+            //         isoDate,
+            //         finalAmount
+            //     );
+            //     console.log('Daily QR total updated successfully.');
+            // } catch (error) {
+            //     console.error('Error updating daily QR total:', error);
+            // }
+            // })();
+
+            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
+                console.error('❌ Error updating daily QR total:', error?.message || error);
+            });
 
             const eventPayload = {
                 $id: result.$id,                                    // document id
