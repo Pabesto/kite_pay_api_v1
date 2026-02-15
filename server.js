@@ -930,61 +930,65 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
 
         // 7) Update QR totals with optimistic retry (no query locking)
-        let attempts = 0;
-        const maxAttempts = 5;
 
-        while (attempts < maxAttempts) {
-            try {
-                const qrResult = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_QRCODE_COLLECTION_ID,
-                    [Query.equal('qrId', qrCodeId), Query.limit(1)]
-                );
+        // Replace your QR update block with:
+        await updateQrTotalAtomic(qrCodeId, amountPaise);
 
-                if (!qrResult.documents.length) {
-                    console.log(`QR Code ${qrCodeId} not found`);
-                    break;
-                }
+        // let attempts = 0;
+        // const maxAttempts = 5;
 
-                const qrDoc = qrResult.documents[0];
+        // while (attempts < maxAttempts) {
+        //     try {
+        //         const qrResult = await databases.listDocuments(
+        //             APPWRITE_DATABASE_ID,
+        //             APPWRITE_QRCODE_COLLECTION_ID,
+        //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
+        //         );
 
-                // Always use FRESH fetched values for calculation
-                const newCount = (qrDoc.totalTransactions || 0) + 1;
-                const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+        //         if (!qrResult.documents.length) {
+        //             console.log(`QR Code ${qrCodeId} not found`);
+        //             break;
+        //         }
 
-                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                const onHold = Number(qrDoc.amountOnHold || 0);
-                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-                const commissionPaid = Number(qrDoc.commissionPaid || 0);
-                const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+        //         const qrDoc = qrResult.documents[0];
 
-                await databases.updateDocument(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_QRCODE_COLLECTION_ID,
-                    qrDoc.$id,
-                    {
-                        totalTransactions: newCount,
-                        totalPayInAmount: newTotal,
-                        amountAvailableForWithdrawal: newAvailable,
-                    }
-                    // NO 5th param - uses collection-level permissions
-                );
+        //         // Always use FRESH fetched values for calculation
+        //         const newCount = (qrDoc.totalTransactions || 0) + 1;
+        //         const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
 
-                console.log(`✅ QR ${qrCodeId} updated (attempt ${attempts + 1})`);
-                break; // Success!
+        //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+        //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+        //         const onHold = Number(qrDoc.amountOnHold || 0);
+        //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+        //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
+        //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-            } catch (error) {
-                attempts++;
-                if (attempts >= maxAttempts) {
-                    console.error(`❌ QR ${qrCodeId} failed after ${maxAttempts} attempts:`, error.message);
-                    break;
-                }
-                console.warn(`⚠️ QR ${qrCodeId} conflict (attempt ${attempts}/${maxAttempts}), retrying...`);
-                // Tiny delay prevents thrashing
-                await new Promise(resolve => setTimeout(resolve, 10 * attempts));
-            }
-        }
+        //         await databases.updateDocument(
+        //             APPWRITE_DATABASE_ID,
+        //             APPWRITE_QRCODE_COLLECTION_ID,
+        //             qrDoc.$id,
+        //             {
+        //                 totalTransactions: newCount,
+        //                 totalPayInAmount: newTotal,
+        //                 amountAvailableForWithdrawal: newAvailable,
+        //             }
+        //             // NO 5th param - uses collection-level permissions
+        //         );
+
+        //         console.log(`✅ QR ${qrCodeId} updated (attempt ${attempts + 1})`);
+        //         break; // Success!
+
+        //     } catch (error) {
+        //         attempts++;
+        //         if (attempts >= maxAttempts) {
+        //             console.error(`❌ QR ${qrCodeId} failed after ${maxAttempts} attempts:`, error.message);
+        //             break;
+        //         }
+        //         console.warn(`⚠️ QR ${qrCodeId} conflict (attempt ${attempts}/${maxAttempts}), retrying...`);
+        //         // Tiny delay prevents thrashing
+        //         await new Promise(resolve => setTimeout(resolve, 10 * attempts));
+        //     }
+        // }
 
 
         // console.log('✅ Webhook data saved to Appwrite:', result.$id);
@@ -994,6 +998,63 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         res.status(500).send('Error saving webhook');
     }
 });
+
+async function updateQrTotalAtomic(qrCodeId, amountPaise) {
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+        try {
+            // EXACT SAME QUERY as daily totals ✅
+            const qrResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                [Query.equal('qrId', qrCodeId), Query.limit(1)]
+            );
+
+            if (!qrResult.documents.length) {
+                console.log(`QR ${qrCodeId} not found`);
+                return;
+            }
+
+            const qrDoc = qrResult.documents[0];
+
+            // FRESH calculations every time (like daily)
+            const newCount = (qrDoc.totalTransactions || 0) + 1;
+            const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+            const newAvailable = newTotal 
+                - Number(qrDoc.withdrawalApprovedAmount || 0)
+                - Number(qrDoc.withdrawalRequestedAmount || 0)
+                - Number(qrDoc.amountOnHold || 0)
+                - Number(qrDoc.commissionOnHold || 0)
+                - Number(qrDoc.commissionPaid || 0);
+
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                qrDoc.$id,
+                {
+                    totalTransactions: newCount,
+                    totalPayInAmount: newTotal,
+                    amountAvailableForWithdrawal: newAvailable,
+                }
+            );
+
+            console.log(`✅ QR ${qrCodeId} → ${newTotal} (attempt ${attempts + 1})`);
+            return; // SUCCESS
+
+        } catch (error) {
+            attempts++;
+            if (attempts >= maxAttempts) {
+                console.error(`❌ QR ${qrCodeId} failed after ${attempts} attempts`);
+                return;
+            }
+            // 50ms backoff (proven safe)
+            await new Promise(r => setTimeout(r, 50));
+        }
+    }
+}
+
 
 // http://localhost:3000/test_qralert
 app.get('/test_qralert', (req, res) => {
