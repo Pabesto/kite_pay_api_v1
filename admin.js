@@ -91,15 +91,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // const mainQueries = [];
             if (cursor) queries.push(Query.cursorAfter(cursor));
             queries.push(Query.orderAsc('$id'));
+
+            queries.push(Query.equal('assigned_to', requestorId));
             
             if (merchantIds.length > 0) {
-                // Appwrite 1.5+ supports array-like with multiple Query.equal
-                merchantIds.slice(0, 20).forEach(id => {  // Limit to avoid query explosion
+                merchantIds.forEach(id => {
                     queries.push(Query.equal('parentId', id));
                 });
-                // queries.push(Query.equal('assigned_to', requestorId));  // Direct too
-            } else {
-                queries.push(Query.equal('assigned_to', requestorId));
             }
             
             // ... proceed
