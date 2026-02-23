@@ -98,18 +98,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const merchantIds = merchantsRes.documents.map(d => d.$id);
             
             // 2. Main paginated query: direct assigned OR under merchants
-            const mainQueries = [];
+            // const mainQueries = [];
             if (cursor) mainQueries.push(Query.cursorAfter(cursor));
-            mainQueries.push(Query.orderAsc('$id'));
+            queries.push(Query.orderAsc('$id'));
             
             if (merchantIds.length > 0) {
                 // Appwrite 1.5+ supports array-like with multiple Query.equal
                 merchantIds.slice(0, 20).forEach(id => {  // Limit to avoid query explosion
-                    mainQueries.push(Query.equal('parentId', id));
+                    queries.push(Query.equal('parentId', id));
                 });
-                mainQueries.push(Query.equal('assigned_to', requestorId));  // Direct too
+                queries.push(Query.equal('assigned_to', requestorId));  // Direct too
             } else {
-                mainQueries.push(Query.equal('assigned_to', requestorId));
+                queries.push(Query.equal('assigned_to', requestorId));
             }
             
             // ... proceed
