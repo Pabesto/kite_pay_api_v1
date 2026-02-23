@@ -96,6 +96,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             
             if (merchantIds.length > 0) {
                 merchantIds.forEach(id => {
+                    console.log('Adding filter for merchantId:', id);
                     queries.push(Query.equal('parentId', id));
                 });
             }
