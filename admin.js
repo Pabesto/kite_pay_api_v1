@@ -75,16 +75,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 queries.push(Query.equal('parentId', requestorId));
             } else if (role === 'employee') {
                 // NEW: Employees see direct assigned + users under their merchants
-                queries.push(Query.or([
-                    Query.equal('assigned_to', requestorId),
-                    Query.equal('role', 'merchant', Query.equal('assigned_to', requestorId))  // Wait, nested no
-                ]));
-                // Better: Two passes or relation; for now, fetch merchants first then users
-                // See optimized version below
-            }
-
-
-            if (role === 'employee') {
             // 1. Get employee's merchants (small set)
             const merchantsRes = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
@@ -99,7 +89,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             
             // 2. Main paginated query: direct assigned OR under merchants
             // const mainQueries = [];
-            if (cursor) mainQueries.push(Query.cursorAfter(cursor));
+            if (cursor) queries.push(Query.cursorAfter(cursor));
             queries.push(Query.orderAsc('$id'));
             
             if (merchantIds.length > 0) {
