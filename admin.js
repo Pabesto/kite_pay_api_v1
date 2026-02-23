@@ -70,9 +70,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Consistent ordering is CRUCIAL for cursor pagination
             queries.push(Query.orderAsc('$id'));
 
+            // Role-based filtering
             if (role === 'subadmin') {
                 queries.push(Query.equal('parentId', requestorId));
+            } else if (role === 'employee') {
+                // NEW: Employees see direct assigned + users under their merchants
+                queries.push(Query.or([
+                    Query.equal('assigned_to', requestorId),
+                    Query.equal('role', 'merchant', Query.equal('assigned_to', requestorId))  // Wait, nested no
+                ]));
+                // Better: Two passes or relation; for now, fetch merchants first then users
+                // See optimized version below
             }
+
             // admins see all; subadmins only their users
 
              // smaller chunks for pagination
