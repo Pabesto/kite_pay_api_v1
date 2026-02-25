@@ -300,10 +300,68 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
+        // Helper to get QR IDs for a user
+    async function getQrIdsForUser(userId) {
+        try {
+            const response = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId, // Ensure this matches your actual QR codes collection ID
+            [Query.equal('assignedUserId', userId)]
+            );
+            return response.documents.map(doc => doc.qrId);
+        } catch (error) {
+            console.error('Error fetching QR codes for user:', error);
+            return [];
+        }
+    }
+
+    // Helper to fetch QR IDs a subadmin can access
+    async function getQrIdsForSubadmin(subadminId) {
+        const qrIds = new Set();
+
+        try {
+            // QRs created by the subadmin
+            const createdQrs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            [Query.equal("createdByUserId", subadminId)]
+            );
+
+            createdQrs.documents.forEach(q => qrIds.add(q.qrId));
+
+            // QRs assigned directly to the subadmin
+            const subadminAssignedQrs = await getQrIdsForUser(subadminId);
+            subadminAssignedQrs.forEach(id => qrIds.add(id));
+
+            // Users under the subadmin
+            const managedUsers = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [Query.equal("parentId", subadminId)]
+            );
+            const managedUserIds = managedUsers.documents.map(u => u.userId);
+
+            // QRs assigned to those managed users
+            if (managedUserIds.length > 0) {
+            const qrDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal("assignedUserId", managedUserIds)]
+            );
+            qrDocs.documents.forEach(q => qrIds.add(q.qrId));
+            }
+
+            return Array.from(qrIds);
+        } catch (err) {
+            console.error(`❌ Error in getQrIdsForSubadmin(${subadminId}):`, err);
+            return [];
+        }
+    }
+
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdminOrLabel('all_withdrawals'), async (req, res) => {
       try {
-        const { status, limit: limitStr, cursor } = req.query;
+        const {userId, qrId, status, limit: limitStr, cursor } = req.query;
 
         // 1) Parse limit with sane default + cap
         const DEFAULT_LIMIT = 25;
@@ -315,6 +373,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // 2) Build Appwrite queries
         const queries = [];
+
+        if (userId && qrId) {
+                const userQrIds = await getQrIdsForUser(userId);
+                if (userQrIds.includes(qrId)) { 
+                    queries.push(Query.equal('qrId', qrId));
+                } else {
+                    return res.status(200).json({ transactions: [] });
+                }
+            } else if (qrId) {
+                queries.push(Query.equal('qrId', qrId));
+            } else if (userId) {
+                const userQrIds = await getQrIdsForUser(userId);
+                if (userQrIds.length > 0) {
+                    queries.push(Query.equal('qrId', userQrIds));
+                } else {
+                    return res.status(200).json({ transactions: [] });
+                }
+            }
 
         if (status) {
           queries.push(Query.equal('status', status));

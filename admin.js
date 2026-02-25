@@ -74,38 +74,37 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (role === 'subadmin') {
                 queries.push(Query.equal('parentId', requestorId));
             } else if (role === 'employee') {
-                // NEW: Employees see direct assigned + users under their merchants
-            // 1. Get employee's merchants (small set)
-            const merchantsRes = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('assigned_to', requestorId),
-                    Query.equal('role', 'merchant'),
-                    Query.limit(100)  // Merchants rarely >100/emp
-                ]
-            );
-            const merchantIds = merchantsRes.documents.map(d => d.$id);
-            
-            // 2. Main paginated query: direct assigned OR under merchants
-            // const mainQueries = [];
-            if (cursor) queries.push(Query.cursorAfter(cursor));
-            queries.push(Query.orderAsc('$id'));
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('assigned_to', requestorId),
+                        Query.equal('role', 'subadmin'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
 
-            queries.push(Query.equal('assigned_to', requestorId));
-            
-            if (merchantIds.length > 0) {
-                merchantIds.forEach(id => {
-                    console.log('Adding filter for merchantId:', id);
-                    queries.push(Query.equal('parentId', id));
-                });
-            }
-            
-            // ... proceed
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+
+                if (cursor) queries.push(Query.cursorAfter(cursor));
+                queries.push(Query.orderAsc('$id'));
+
+                let orQueries = [Query.equal('assigned_to', requestorId)];
+                // let orQueries = [];
+                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                queries.push(Query.or(orQueries));
+
+                const result = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    queries // must be an array
+                );
+
+                console.log('Employee user list query result count:', result.total);
+
             }
 
             // admins see all; subadmins only their users
-
              // smaller chunks for pagination
             queries.push(Query.limit(limitNum));
 
@@ -694,51 +693,51 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         try {
             if (userId && qrId) {
-            const userQrIds = await getQrIdsForUser(userId);
-            if (userQrIds.includes(qrId)) {
-                filters.push(Query.equal('qrCodeId', qrId));
-            } else {
-                return res.status(200).json({ transactions: [] });
-            }
+                const userQrIds = await getQrIdsForUser(userId);
+                if (userQrIds.includes(qrId)) {
+                    filters.push(Query.equal('qrCodeId', qrId));
+                } else {
+                    return res.status(200).json({ transactions: [] });
+                }
             } else if (qrId) {
-            filters.push(Query.equal('qrCodeId', qrId));
+                filters.push(Query.equal('qrCodeId', qrId));
             } else if (userId) {
-            const userQrIds = await getQrIdsForUser(userId);
-            if (userQrIds.length > 0) {
-                filters.push(Query.equal('qrCodeId', userQrIds));
-            } else {
-                return res.status(200).json({ transactions: [] });
-            }
+                const userQrIds = await getQrIdsForUser(userId);
+                if (userQrIds.length > 0) {
+                    filters.push(Query.equal('qrCodeId', userQrIds));
+                } else {
+                    return res.status(200).json({ transactions: [] });
+                }
             }
 
             // Date filtering helper (unchanged)
             function toISTRange(dateStr) {
-            const d = new Date(dateStr);
-            const start = new Date(d);
-            start.setHours(0, 0, 0, 0);
-            start.setMinutes(start.getMinutes() - 330);
-            const end = new Date(d);
-            end.setHours(23, 59, 59, 999);
-            end.setMinutes(end.getMinutes() - 330);
-            return { start, end };
+                const d = new Date(dateStr);
+                const start = new Date(d);
+                start.setHours(0, 0, 0, 0);
+                start.setMinutes(start.getMinutes() - 330);
+                const end = new Date(d);
+                end.setHours(23, 59, 59, 999);
+                end.setMinutes(end.getMinutes() - 330);
+                return { start, end };
             }
 
             // Date filters
             if (from && to) {
-            if (from === to) {
+                if (from === to) {
+                    const { start, end } = toISTRange(from);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                } else {
+                    const { start } = toISTRange(from);
+                    const { end } = toISTRange(to);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                }
+            } else if (from && !to) {
                 const { start, end } = toISTRange(from);
                 filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-            } else {
-                const { start } = toISTRange(from);
-                const { end } = toISTRange(to);
-                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
-            }
-            } else if (from && !to) {
-            const { start, end } = toISTRange(from);
-            filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
             } else if (!from && to) {
-            const { end } = toISTRange(to);
-            filters.push(Query.lessThanEqual("created_at", end.toISOString()));
+                const { end } = toISTRange(to);
+                filters.push(Query.lessThanEqual("created_at", end.toISOString()));
             }
 
             // Add single-field search if both parameters provided
@@ -2342,6 +2341,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const { merchantId } = req.params;
         const actor = req.user;
 
+        const istDate = moment.tz('Asia/Kolkata');
+        const dayString = istDate.format('YYYY-MM-DD');
+
         try {
             // Authorization: allow admin or the merchant owner
             if (actor.role !== 'admin' && actor.userId !== merchantId) {
@@ -2354,6 +2356,50 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 Query.limit(100),
                 Query.orderAsc('$id'),
             ]);
+
+            const userQrIds = qrs.map(q => q.qrId);
+
+            console.log(`Merchant ${merchantId} has ${qrs.length} QRs IDS [${userQrIds.join(', ')}]`);
+
+            const existingDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [
+                Query.equal('date', dayString),
+                Query.limit(1),
+                ]
+            );
+
+            let todayPayInAllQrs = 0;
+
+            if (existingDocs.total > 0) {
+                // Document exists - parse JSON string and update totals object
+                const doc = existingDocs.documents[0];
+                const totalsJsonStr = doc.totalsJson || '{}';
+
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(totalsJsonStr);
+                } catch (e) {
+                    // fallback if corrupted JSON
+                    totalsObj = {};
+                }
+
+                // ✅ SUM ALL QR totals from stored JSON (today's complete aggregate)
+                // todayPayInAllQrs = Object.values(totalsObj).reduce((sum, value) => {
+                //     return sum + parseInt(value || 0, 10);
+                // }, 0);
+
+                console.log('📊 Raw totalsObj from DB:', totalsObj);
+
+                // OPTIONAL: If you need user-specific subset (instead of all)
+                todayPayInAllQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => userQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+            }
+
 
             // 2) Aggregate QR-derived counters
             let totalTxCount = 0;
@@ -2419,6 +2465,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 merchantId,
                 // Overview
                 totalTxCount,
+                todayPayInAllQrs,
                 totalAmountReceived,
                 totalAvailableAmount,
                 totalMerchantProfit, // compute if you have commission rules per qr/txn
@@ -2453,6 +2500,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const { userId } = req.params;
         const actor = req.user;
 
+        const istDate = moment.tz('Asia/Kolkata');
+        const dayString = istDate.format('YYYY-MM-DD');
+
         try {
             // Authorization: allow admin, the same user, or that user's manager/subadmin if policy allows
             const isSelf = actor.userId === userId;
@@ -2466,10 +2516,46 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // 1) Fetch all QRs assigned to this user
             const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-            Query.equal('assignedUserId', userId),
-            Query.limit(100),
-            Query.orderAsc('$id'),
+                Query.equal('assignedUserId', userId),
+                Query.limit(100),
+                Query.orderAsc('$id'),
             ]);
+
+            const userQrIds = qrs.map(q => q.qrId);
+
+            const existingDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [
+                Query.equal('date', dayString),
+                Query.limit(1),
+                ]
+            );
+
+            let todayPayInAllQrs = 0;
+
+            if (existingDocs.total > 0) {
+                // Document exists - parse JSON string and update totals object
+                const doc = existingDocs.documents[0];
+                const totalsJsonStr = doc.totalsJson || '{}';
+
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(totalsJsonStr);
+                } catch (e) {
+                    // fallback if corrupted JSON
+                    totalsObj = {};
+                }
+
+                console.log('📊 Raw totalsObj from DB:', totalsObj);
+
+                // OPTIONAL: If you need user-specific subset (instead of all)
+                todayPayInAllQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => userQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+            }
 
             // 2) Aggregate QR-derived counters
             let totalQrs = qrs.length;
@@ -2521,6 +2607,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             userId,
             // QR breakdown
             totalQrs,
+            todayPayInAllQrs,
             qrCodesActive,
             qrCodesDisabled,
 

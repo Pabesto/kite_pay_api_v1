@@ -162,12 +162,72 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     router.get('/qr-codes', authenticateAdminOrLabel('all_transactions'), async (req, res) => {
         try {
 
-            const resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
-                [
-                    Query.orderDesc('createdAt'), // Add this line to sort descending by date
-                    Query.limit(100) // Limits the results to 10 documents
-                ]
-            );
+            let resultAllQr = [];
+
+            if (req.user.role === 'employee') {
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('assigned_to', req.user.$id),
+                        Query.equal('role', 'subadmin'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
+
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+
+                let queries = [];
+
+                let orQueries = [];
+                // let orQueries = [];
+                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                queries.push(Query.or(orQueries));
+
+                const usersRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    queries // must be an array
+                );
+
+                queries = [];
+
+                const userIds = usersRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${userIds.length} assigned users:`, userIds);
+
+                let orQueries2 = [];
+
+                merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
+                userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
+                queries.push(Query.or(orQueries2));
+
+                // console.log('Employee user list query result count:', usersRes.total);
+
+                resultAllQr = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    queries,
+                );
+
+                // console.log('Employee QR code query result count:', resultAllQr.total);
+
+                // documents = response.documents;
+
+            } else {
+
+                resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
+                    [
+                        Query.orderDesc('createdAt'), // Add this line to sort descending by date
+                        Query.limit(100) // Limits the results to 10 documents
+                    ]
+                );
+
+            }
+
+             
 
             const qrCodes = resultAllQr.documents.map(doc => ({
                 qrId: doc.qrId,
@@ -744,28 +804,19 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         const userRequested = req.user;
         const isSubadmin = userRequested.role === 'subadmin';
         const isAdmin = userRequested.role === 'admin';
+        const isEmployee = userRequested.role === 'employee';
+        const requestorId = userRequested.userId;
 
         try {
             let documents = [];
 
             if (isSubadmin) {
-                // Fetch only QR IDs allowed for this subadmin
-                // const qrIds = await getQrIdsForSubadmin(userRequested.userId);
-                // if (qrIds.length > 0) {
-                //     const response = await databases.listDocuments(
-                //         APPWRITE_DATABASE_ID,
-                //         Qr_collectionId,
-                //         [Query.contains('qrId', qrIds)]
-                //     );
-                //     documents = response.documents;
-                // }
                 const response = await databases.listDocuments(
                         APPWRITE_DATABASE_ID,
                         Qr_collectionId,
                         [Query.contains('managedByUserId', userRequested.userId)]
                     );
                     documents = response.documents;
-
             } else {
                 const response = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
