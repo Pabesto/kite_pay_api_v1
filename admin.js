@@ -2282,6 +2282,42 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
             }
 
+            const istDate = moment.tz('Asia/Kolkata');
+            const dayString = istDate.format('YYYY-MM-DD');
+
+            const existingDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [
+                Query.equal('date', dayString),
+                Query.limit(1),
+                ]
+            );
+
+            let todayPayInAllQrs = 0;
+
+            if (existingDocs.total > 0) {
+                // Document exists - parse JSON string and update totals object
+                const doc = existingDocs.documents[0];
+                const totalsJsonStr = doc.totalsJson || '{}';
+
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(totalsJsonStr);
+                } catch (e) {
+                    // fallback if corrupted JSON
+                    totalsObj = {};
+                }
+
+                todayPayInAllQrs = Object.values(totalsObj).reduce((sum, value) => {
+                    return sum + parseInt(value || 0, 10);
+                }, 0);
+
+                console.log('📊 Raw totalsObj from DB:', totalsObj);
+
+                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs')    ;
+            }
+
             // Helper to get value or 0
             const get = (k) => (map.has(k) ? map.get(k) : 0);
 
@@ -2290,6 +2326,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Totals
             totalTxCount: get('totalTxCount'),
             totalAmountReceived: get('totalAmountReceived'),
+            todayPayInAllQrs: todayPayInAllQrs, // from daily summary
             totalAdminProfit: get('totalAdminProfit'),
             totalMerchantProfit: get('totalMerchantProfit'),
             totalQrsUploaded: get('totalQrsUploaded'),
@@ -2390,16 +2427,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 //     return sum + parseInt(value || 0, 10);
                 // }, 0);
 
-                console.log('📊 Raw totalsObj from DB:', totalsObj);
+                // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
                 // OPTIONAL: If you need user-specific subset (instead of all)
                 todayPayInAllQrs = Object.entries(totalsObj)
                     .filter(([qrid]) => userQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
 
-                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+                // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
             }
-
 
             // 2) Aggregate QR-derived counters
             let totalTxCount = 0;
