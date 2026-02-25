@@ -2313,9 +2313,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     return sum + parseInt(value || 0, 10);
                 }, 0);
 
-                console.log('📊 Raw totalsObj from DB:', totalsObj);
+                // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
-                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs')    ;
+                // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs')    ;
             }
 
             // Helper to get value or 0
@@ -2326,7 +2326,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Totals
             totalTxCount: get('totalTxCount'),
             totalAmountReceived: get('totalAmountReceived'),
-            todayPayInAllQrs: todayPayInAllQrs, // from daily summary
+            todayPayInAllQrs: todayPayInAllQrs,
             totalAdminProfit: get('totalAdminProfit'),
             totalMerchantProfit: get('totalMerchantProfit'),
             totalQrsUploaded: get('totalQrsUploaded'),
@@ -2396,7 +2396,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const userQrIds = qrs.map(q => q.qrId);
 
-            console.log(`Merchant ${merchantId} has ${qrs.length} QRs IDS [${userQrIds.join(', ')}]`);
+            // console.log(`Merchant ${merchantId} has ${qrs.length} QRs IDS [${userQrIds.join(', ')}]`);
 
             const existingDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
@@ -2583,14 +2583,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     totalsObj = {};
                 }
 
-                console.log('📊 Raw totalsObj from DB:', totalsObj);
+                // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
                 // OPTIONAL: If you need user-specific subset (instead of all)
                 todayPayInAllQrs = Object.entries(totalsObj)
                     .filter(([qrid]) => userQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
 
-                console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+                // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
             }
 
             // 2) Aggregate QR-derived counters
