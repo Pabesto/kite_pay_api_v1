@@ -3,11 +3,13 @@ const http = require('http');
 const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 
+let io; // Declare io in outer scope for access in emit functions
+
 function initSocket(app) {
   // reuse the same HTTP server as Express
   const httpServer = http.createServer(app);
 
-  const io = new Server(httpServer, {
+  io = new Server(httpServer, {
     cors: {
       origin: process.env.CORS_ORIGIN || '*',
       methods: ['GET', 'POST'],
@@ -77,7 +79,10 @@ function initSocket(app) {
     });
   });
 
-  // Helper: emit a new transaction event to intended audiences
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit };
+}
+
+// Helper: emit a new transaction event to intended audiences
   function emitTxnNew({ assignedUserId, qrCodeId, payload }) {
     if (assignedUserId) {
       io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
@@ -95,7 +100,16 @@ function initSocket(app) {
     }
   }
 
-  return { httpServer, io, emitTxnNew, emitQrAlert };
-}
+  function emitQrLimit({ assignedUserId, qrCodeId, payload }) {
+    // if (assignedUserId) {
+    //   io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
+    // }
+    console.log('Emitting QR limit alert with payload:', payload);
+    if (qrCodeId) {
+      io.to(`room:qr:${qrCodeId}`).emit('qrLimitAlert', payload);
+    }
+  }
 
-module.exports = { initSocket };
+// module.exports = { initSocket };
+module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit }; // ✅ Export functions
+

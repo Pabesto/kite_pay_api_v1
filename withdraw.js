@@ -7,6 +7,7 @@ const multer = require('multer');
 const moment = require('moment-timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
+const ConfigManager = require('./configManager');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -1174,35 +1175,47 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // GET all config
     router.get("/config", async (req, res) => {
+
       try {
-        const docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
-
-        // convert docs into a key:value map
-        const config = {};
-        for (let doc of docs.documents) {
-          let parsedValue = doc.value;
-
-          // auto-type parsing
-          if (doc.type === "integer") {
-            parsedValue = parseInt(doc.value);
-          } else if (doc.type === "double") {
-            parsedValue = parseFloat(doc.value);
-          } else if (doc.type === "boolean") {
-            parsedValue = (doc.value === "true");
-          } else if (doc.type === "json") {
-            parsedValue = JSON.parse(doc.value);
-          } else {
-            parsedValue = doc.value;
-          }
-
-          config[doc.key] = parsedValue;
+            await ConfigManager.refresh(); // Ensure we have the latest config
+            const config = await ConfigManager.getConfig(databases);
+            res.json({ success: true, config });
+        } catch (err) {
+          console.error("❌ Error fetching config:", err);
+            res.status(500).json({ success: false, error: "Failed to fetch config" });
         }
 
-        res.json({ success: true, config });
-      } catch (err) {
-        console.error("Error fetching config:", err);
-        res.status(500).json({ success: false, error: "Failed to fetch config" });
-      }
+      // try {
+
+      //   const docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
+
+      //   // convert docs into a key:value map
+      //   const config = {};
+      //   for (let doc of docs.documents) {
+      //     let parsedValue = doc.value;
+
+      //     // auto-type parsing
+      //     if (doc.type === "integer") {
+      //       parsedValue = parseInt(doc.value);
+      //     } else if (doc.type === "double") {
+      //       parsedValue = parseFloat(doc.value);
+      //     } else if (doc.type === "boolean") {
+      //       parsedValue = (doc.value === "true");
+      //     } else if (doc.type === "json") {
+      //       parsedValue = JSON.parse(doc.value);
+      //     } else {
+      //       parsedValue = doc.value;
+      //     }
+
+      //     config[doc.key] = parsedValue;
+      //   }
+
+      //   res.json({ success: true, config });
+      // } catch (err) {
+      //   console.error("Error fetching config:", err);
+      //   res.status(500).json({ success: false, error: "Failed to fetch config" });
+      // }
+
     });
 
     return router;

@@ -9,11 +9,15 @@ const moment = require('moment-timezone');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+const { emitQrLimit } = require('./socketServer');
+
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
+
+const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -2242,6 +2246,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // GET /dashboard/counters
     router.get('/dashboard/counters', authenticateAdmin, async (req, res) => {
+
+        // console.log('Max limit:', ConfigManager.get('max_withdrawal_amount', 0));
+        // console.log('QR limit:', ConfigManager.get('qr_limit_today_pay_in', 0));
+
+        const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
+
+        const actor = req.user;
+
         try {
             const pageLimit = 100; // Appwrite max per page
             let cursor = null;
@@ -2313,6 +2325,30 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     return sum + parseInt(value || 0, 10);
                 }, 0);
 
+                // 1) Fetch all QRs assigned to this user
+                const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                    Query.equal('assignedUserId', actor.userId),
+                    Query.limit(100),
+                    Query.orderAsc('$id'),
+                ]);
+
+                const userQrIds = qrs.map(q => q.qrId);
+
+                 // ✅ Separate logic: Check each user QR individually for 10000 limit
+                const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
+
+                userQrEntries.forEach(([qrid, valueStr]) => {
+                    const value = parseInt(valueStr || 0, 10);
+                    if (value >= Qr_today_pay_in_limit) {
+                        // Execute function for this specific QR that crossed limit
+                        // handleQrLimitCrossed(qrid, value);
+                        const payload = { userid: actor.userId, qrCodeId: qrid, todayPayIn: value };
+                        emitQrLimit({ qrCodeId: qrid, payload: payload });
+                    }
+                });
+
+                // console.log('User QRs totals:', todayPayInAllQrs, 'Crossed limit:', userQrEntries.filter(([, v]) => parseInt(v || 0, 10) >= 10000).map(([qrid]) => qrid));
+
                 // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
                 // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs')    ;
@@ -2381,6 +2417,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const istDate = moment.tz('Asia/Kolkata');
         const dayString = istDate.format('YYYY-MM-DD');
 
+        const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
+
         try {
             // Authorization: allow admin or the merchant owner
             if (actor.role !== 'admin' && actor.userId !== merchantId) {
@@ -2433,6 +2471,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 todayPayInAllQrs = Object.entries(totalsObj)
                     .filter(([qrid]) => userQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                // ✅ Separate logic: Check each user QR individually for 10000 limit
+                const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
+
+                userQrEntries.forEach(([qrid, valueStr]) => {
+                        const value = parseInt(valueStr || 0, 10);
+                        if (value >= Qr_today_pay_in_limit) {
+                            // Execute function for this specific QR that crossed limit
+                            // handleQrLimitCrossed(qrid, value);
+                            const payload = { userid: actor.userId, qrCodeId: qrid, todayPayIn: value };
+                            emitQrLimit({ qrCodeId: qrid, payload: payload });
+                        }
+                });
 
                 // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
             }
@@ -2536,6 +2587,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const { userId } = req.params;
         const actor = req.user;
 
+        const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
+
         const istDate = moment.tz('Asia/Kolkata');
         const dayString = istDate.format('YYYY-MM-DD');
 
@@ -2590,6 +2643,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     .filter(([qrid]) => userQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
 
+                // ✅ Separate logic: Check each user QR individually for 10000 limit
+                const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
+
+                userQrEntries.forEach(([qrid, valueStr]) => {
+                        const value = parseInt(valueStr || 0, 10);
+                        if (value >= Qr_today_pay_in_limit) {
+                            // Execute function for this specific QR that crossed limit
+                            // handleQrLimitCrossed(qrid, value);
+                            const payload = { userid: actor.userId, qrCodeId: qrid, todayPayIn: value };
+                            emitQrLimit({ qrCodeId: qrid, payload: payload });
+                        }
+                });
+
+                // console.log('User QRs totals:', todayPayInAllQrs, 'Crossed limit:', userQrEntries.filter(([, v]) => parseInt(v || 0, 10) >= 10000).map(([qrid]) => qrid));
                 // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
             }
 

@@ -31,6 +31,8 @@ const digiqrRoutes = require('./pinelabs_digiqr.routes');
 
 const { initSocket } = require('./socketServer');
 
+const ConfigManager = require('./configManager'); 
+
 // --- Configuration & Initialization ---
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -84,6 +86,13 @@ const databases = new Databases(client);
 const account = new Account(client);
 const storage = new Storage(client);
 const users = new Users(client);
+
+// 🔥 Initialize ConfigManager with your databases instance
+ConfigManager.init(databases);
+
+
+// Now available everywhere!
+// console.log('Max limit:', ConfigManager.get('maxWithdrawalLimit', 10000));
 
 // console.log(process.env.RAZORPAY_KEY_ID);
 
