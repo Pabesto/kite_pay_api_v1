@@ -13,7 +13,7 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -374,6 +374,47 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // 2) Build Appwrite queries
         const queries = [];
+
+            if (req.user.role === 'employee' && !userId && !qrId) {
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('assigned_to', req.user.$id),
+                        Query.equal('role', 'subadmin'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
+
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+
+                let queriesUser = [];
+
+                let orQueries = [];
+                // let orQueries = [];
+                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                queriesUser.push(Query.or(orQueries));
+
+                const usersRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    queriesUser // must be an array
+                );
+
+                const userIds = usersRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${userIds.length} assigned users:`, userIds);
+
+                let orQueries2 = [];
+
+                merchantIds.forEach(id => orQueries2.push(Query.equal('userId', id)));
+                userIds.forEach(id => orQueries2.push(Query.equal('userId', id)));
+                queries.push(Query.or(orQueries2));
+
+            }
+
 
         if (userId && qrId) {
                 const userQrIds = await getQrIdsForUser(userId);

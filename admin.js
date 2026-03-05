@@ -25,7 +25,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -104,7 +104,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     queries // must be an array
                 );
 
-                console.log('Employee user list query result count:', result.total);
+                // console.log('Employee user list query result count:', result.total);
 
             }
 
@@ -691,11 +691,85 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const isAdmin = userRequested.role === 'admin';
 
         // userRequested.labels;
-        console.log('User role and labels:', userRequested.role, userRequested.labels);
+        // console.log('User role and labels:', userRequested.role, userRequested.labels);
 
         // console.log('Transaction query params:', req.query);
 
+
+            let resultAllQr = [];
+            let resultAllQrId = [];
+
+            if (req.user.role === 'employee' && !userId && !qrId) {
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('assigned_to', req.user.$id),
+                        Query.equal('role', 'subadmin'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
+
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+
+                let queries = [];
+
+                let orQueries = [];
+                // let orQueries = [];
+                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                queries.push(Query.or(orQueries));
+
+                const usersRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    queries // must be an array
+                );
+
+                queries = [];
+
+                const userIds = usersRes.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${userIds.length} assigned users:`, userIds);
+
+                let orQueries2 = [];
+
+                merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
+                userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
+                queries.push(Query.or(orQueries2));
+
+                // console.log('Employee user list query result count:', usersRes.total);
+
+                resultAllQr = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    queries,
+                );
+
+                resultAllQrId = resultAllQr.documents.map(q => q.qrId);
+                // console.log('Employee QR code query result count:', resultAllQr.total);
+
+                // console.log(`Employee ${req.user.$id} has access to QR codes:`, resultAllQrId);
+                // documents = response.documents;
+            }
+
         try {
+            if (req.user.role === 'employee' && !userId && !qrId) {
+                // console.log(`Employee ${req.user.$id} is fetching transactions without userId or qrId filters, applying access control based on assigned QR codes.`);
+                if (resultAllQrId.length == 0) {
+                    // console.log(`Employee ${req.user.$id} has no assigned QR codes, returning empty transactions list.`);
+                    return res.status(200).json({ transactions: [] });
+                }else{
+                    // console.log(`Employee ${req.user.$id} has access to QR codes:`, resultAllQrId);
+                    let employeeAssignedQrs = [];
+                    resultAllQrId.forEach(id => employeeAssignedQrs.push(Query.equal('qrCodeId', id)));
+                    filters.push(Query.or(employeeAssignedQrs));
+                }
+            }else{
+                // console.log(`User ${req.user.$id} with role ${req.user.role} is fetching transactions with filters - userId: ${userId}, qrId: ${qrId}`);
+            }
+            
             if (userId && qrId) {
                 const userQrIds = await getQrIdsForUser(userId);
                 if (userQrIds.includes(qrId)) {
@@ -2410,19 +2484,27 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // GET /dashboard/subadmin/:merchantId
-    router.get('/dashboard/subadmin/:merchantId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.get('/dashboard/subadmin/:merchantId', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
         const { merchantId } = req.params;
         const actor = req.user;
 
         const istDate = moment.tz('Asia/Kolkata');
         const dayString = istDate.format('YYYY-MM-DD');
 
+        const isSelf = actor.userId === merchantId;
+        const isAdmin = actor.role === 'admin';
+        const isEmployee = actor.role === 'employee';
+
+        // console.log(`Dashboard for merchantId: ${merchantId} requested by userId: ${actor.userId} with role: ${actor.role}`);
+
         const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
 
         try {
             // Authorization: allow admin or the merchant owner
-            if (actor.role !== 'admin' && actor.userId !== merchantId) {
-            return res.status(403).json({ message: 'Forbidden' });
+            // if (actor.role !== 'admin' && actor.userId !== merchantId && actor.role !== 'employee') 
+            if(!isAdmin && !isSelf && !isEmployee) {
+                // console.log(`User ${actor.userId} with role ${actor.role} is not authorized to view dashboard for merchant ${merchantId}`);
+                return res.status(403).json({ message: 'Forbidden' });
             }
 
             // 1) Fetch all QRs managed by merchantId (paginate)
@@ -2596,7 +2678,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Authorization: allow admin, the same user, or that user's manager/subadmin if policy allows
             const isSelf = actor.userId === userId;
             const isAdmin = actor.role === 'admin';
-            if (!isAdmin && !isSelf) {
+            const isEmployee = actor.role === 'employee';
+
+            if (!isAdmin && !isSelf && !isEmployee) {
             // Optional: allow parent/manager
             // if (actor.role === 'subadmin' && await isUserUnderMerchant(userId, actor.userId)) { /* allow */ }
             // else
@@ -2733,7 +2817,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(500).json({ message: 'Failed to build user dashboard', error: e.message });
         }
     });
-
 
     async function listAllDocuments(dbId, colId, baseQueries, pageSize = 100) {
         let out = [];
