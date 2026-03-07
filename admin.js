@@ -124,6 +124,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 name: doc.name,
                 role: doc.role,
                 parentId: doc.parentId,
+                assigned_to: doc.assigned_to || null,
                 status: doc.status,
                 labels: doc.labels,
                 commission : doc.commission || 0,
@@ -179,6 +180,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             name: doc.name,
             role: doc.role,
             parentId: doc.parentId,
+            assigned_to: doc.assigned_to || null,
             status: doc.status,
             labels: doc.labels,
             commission : doc.commission || 0,
@@ -191,6 +193,53 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
     
+    router.get('/employees', authenticateAdmin, async (req, res) => {
+    const requestorId = req.user.userId;
+    const role = req.user.role; // 'admin' | 'subadmin'
+
+    try {
+        const queries = [];
+
+        if (role !== 'admin') {
+            return res.status(403).json({ error: 'only admins can see employees' });
+        }
+
+        queries.push(Query.equal('role', 'employee'));
+        // admins see all subadmins; subadmins see none
+
+        const search = req.query.search; // ?search=John or ?search=email@host
+        if (search !== undefined && search.trim().length > 0) {
+            // For partial matches (Appwrite >= v1.0.0), use Query.search:
+            queries.push(Query.search('name', search));
+            // queries.push(Query.search('email', search));
+            // For exact, use Query.equal('email', search) or Query.equal('name', search)
+        }
+
+        const result = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_USERS_META_COLLECTION_ID,
+        queries // must be an array
+        );
+
+        const simplifiedUsers = result.documents.map(doc => ({
+        $id: doc.userId,
+        email: doc.email,
+        name: doc.name,
+        role: doc.role,
+        parentId: doc.parentId,
+        assigned_to: doc.assigned_to || null,
+        status: doc.status,
+        labels: doc.labels,
+        commission : doc.commission || 0,
+        }));
+
+        return res.json(simplifiedUsers);
+    } catch (err) {
+        console.error('List employees error:', err);
+        return res.status(500).json({ error: 'Failed to fetch employees' });
+    }
+    });
+
     //     } catch (err) {
     //         console.error('List users error:', err);
     //         return res.status(500).json({ error: 'Failed to fetch users' });
@@ -314,6 +363,59 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } catch (err) {
             console.error('❌ Create user error:', err.message || err);
             return res.status(500).json({ error: err.message || 'User creation failed' });
+        }
+    });
+
+    // 🔐 Assign employee to employee (admin-only or employee with all_users)
+    router.put('/assign-subadmin/:employeeId', authenticateAdmin, async (req, res) => {
+        const { employeeId } = req.params;
+        const { userId, unassign = false } = req.body; // userId can be string; unassign=true clears parentId
+
+        try {
+
+            if (!userId) {
+                return res.status(400).json({ message: 'userId is required' });
+            }
+
+            const requester = req.user; // { id, role }
+            const isAdmin = requester.role === 'admin';
+            // const isSubadmin = requester.role === 'subadmin';
+
+            if (!isAdmin) {
+                return res.status(403).json({ message: 'Forbidden only admins can assign users to Employees' });
+            }
+        
+            if(unassign == false){
+                // Validate target is an EMPLOYEE
+                const targetEmployee = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, employeeId);
+                if (targetEmployee.role !== 'employee') {
+                    return res.status(400).json({ message: 'Target is not an EMPLOYEE' });
+                }
+            }
+
+            // Step 1: Find document where userId matches
+            const documents = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            [Query.equal('userId', userId)] // your provided userId value
+            );
+
+            if (documents.documents.length === 0) {
+            throw new Error('User document not found');
+            }
+
+            const documentId = documents.documents[0].$id; // Get the actual document ID
+
+            const update = { assigned_to: unassign ? null : employeeId };
+
+            console.log(`Updating user ${userId} assignment to employee ${employeeId}, unassign: ${unassign}`);
+
+            await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, documentId, update);
+
+            return res.status(200).json({ message: 'Assignment updated.' });
+        } catch (err) {
+            console.error('Assign user error:', err);
+            return res.status(500).json({ message: 'Failed to update assignment', error: err.message });
         }
     });
 
