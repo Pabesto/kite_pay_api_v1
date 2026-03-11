@@ -1274,6 +1274,9 @@ app.get('/test_websocket', (req, res) => {
 // ##### Mainly Used in Pabesto Tech Pvt Ltd Kitpay for Razorpay QR code payments. #####
 
 app.post('/webhook', async (req, res) => {
+
+  console.log('Webhook Event Received');
+
     const wdbg = (step, msg, extra) => {
         const ts = new Date().toISOString();
         if (extra !== undefined) console.log(`[WEBHOOK][${ts}] STEP ${step}: ${msg}`, extra);

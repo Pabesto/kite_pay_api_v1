@@ -1074,7 +1074,6 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
     }
 }
 
-
 // http://localhost:3000/test_qralert
 app.get('/test_qralert', (req, res) => {
     const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min; // [1] 
