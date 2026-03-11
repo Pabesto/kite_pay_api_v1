@@ -41,8 +41,6 @@ const PORT = process.env.PORT || 3000;
 
 const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
 
-
-
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
 });
@@ -94,7 +92,7 @@ ConfigManager.init(databases);
 
 // ─── Redis Client ────────────────────────────────────────────────────────────
 const redisClient = createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    url: process.env.REDIS_URL || 'redis://red-d6osqip4tr6s73d1ba50:6379',
     socket: {
         reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
     },
