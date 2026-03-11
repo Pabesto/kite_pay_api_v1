@@ -1339,21 +1339,21 @@ app.post('/webhook', async (req, res) => {
     if (!paymentId) { wdbg('3', 'BLOCKED — paymentId missing from payload'); return res.status(400).send('Payment ID not found'); }
     if (!amountPaise) { wdbg('3', 'BLOCKED — amount missing from payload'); return res.status(400).send('Amount not found'); }
 
-    // 4. Idempotency check — reject duplicate paymentId before any writes
-    wdbg('4', 'Checking duplicate paymentId in DB…', { paymentId });
-    const existing = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-        [Query.equal('paymentId', paymentId), Query.limit(1)]
-    );
-    if (existing.total > 0) {
-        wdbg('4', 'BLOCKED — duplicate paymentId already in DB', { existingDocId: existing.documents[0].$id });
-        console.log('Duplicate webhook, ignoring:', paymentId);
-        return res.status(200).send('Already processed');
-    }
-    wdbg('4', 'No duplicate found — proceeding ✅');
-
     try {
+        // 4. Idempotency check — reject duplicate paymentId before any writes
+        wdbg('4', 'Checking duplicate paymentId in DB…', { paymentId });
+        const existing = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            [Query.equal('paymentId', paymentId), Query.limit(1)]
+        );
+        if (existing.total > 0) {
+            wdbg('4', 'BLOCKED — duplicate paymentId already in DB', { existingDocId: existing.documents[0].$id });
+            console.log('Duplicate webhook, ignoring:', paymentId);
+            return res.status(200).send('Already processed');
+        }
+        wdbg('4', 'No duplicate found — proceeding ✅');
+
         // 5. Save raw webhook record (source of truth)
         wdbg('5', 'Creating transaction document in Appwrite…');
         const created = await databases.createDocument(
