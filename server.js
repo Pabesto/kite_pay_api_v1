@@ -45,32 +45,6 @@ httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
 });
 
-// Startup health check — verify critical Appwrite collection IDs are reachable
-(async () => {
-  const collectionsToCheck = [
-    { name: 'QR codes',                  id: APPWRITE_QRCODE_COLLECTION_ID },
-    { name: 'Webhook data',              id: APPWRITE_WEBHOOK_DATA_COLLECTION_ID },
-    { name: 'Users meta',                id: APPWRITE_USERS_META_COLLECTION_ID },
-    { name: 'Withdrawal requests',       id: APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID },
-    { name: 'Daily QR summaries',        id: APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID },
-    { name: 'Commission transactions',   id: APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID },
-  ];
-  const failed = [];
-  for (const col of collectionsToCheck) {
-    try {
-      await databases.listDocuments(APPWRITE_DATABASE_ID, col.id, [Query.limit(1)]);
-    } catch (e) {
-      failed.push(`${col.name} (${col.id}): ${e?.message || e}`);
-    }
-  }
-  if (failed.length) {
-    console.error('⚠️  Startup health check FAILED for the following collections:');
-    failed.forEach(f => console.error('   •', f));
-  } else {
-    console.log('✅ Startup health check passed — all collections reachable');
-  }
-})();
-
 // Global error handlers
 process.on('unhandledRejection', err => {
   console.error('Unhandled Rejection:', err);
@@ -100,7 +74,7 @@ const APPWRITE_BUCKET_ID = '688d2517002810ac532b'; // This was not in your webho
 
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
 const RAZORPAY_WEBHOOK_SECRET = '4@cQVD6GBGa2G7j';
-//
+
 // Initialize Appwrite SDK with the server key for backend operations
 const client = new Client();
 client
@@ -116,6 +90,32 @@ const users = new Users(client);
 // 🔥 Initialize ConfigManager with your databases instance
 ConfigManager.init(databases);
 
+// Startup health check — verify critical Appwrite collection IDs are reachable
+(async () => {
+  const collectionsToCheck = [
+    { name: 'QR codes',                  id: APPWRITE_QRCODE_COLLECTION_ID },
+    { name: 'Webhook data',              id: APPWRITE_WEBHOOK_DATA_COLLECTION_ID },
+    { name: 'Users meta',                id: APPWRITE_USERS_META_COLLECTION_ID },
+    { name: 'Withdrawal requests',       id: APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID },
+    { name: 'Daily QR summaries',        id: APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID },
+    { name: 'Commission transactions',   id: APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID },
+  ];
+  const failed = [];
+  for (const col of collectionsToCheck) {
+    try {
+      await databases.listDocuments(APPWRITE_DATABASE_ID, col.id, [Query.limit(1)]);
+    } catch (e) {
+      failed.push(`${col.name} (${col.id}): ${e?.message || e}`);
+    }
+  }
+  if (failed.length) {
+    console.error('⚠️  Startup health check FAILED for the following collections:');
+    failed.forEach(f => console.error('   •', f));
+  } else {
+    console.log('✅ Startup health check passed — all collections reachable');
+  }
+})();
+
 // ─── Redis Client ────────────────────────────────────────────────────────────
 const redisClient = createClient({
     url: process.env.REDIS_URL || 'redis://red-d6osqip4tr6s73d1ba50:6379',
@@ -126,6 +126,7 @@ const redisClient = createClient({
 redisClient.on('error', (e) => console.error('Redis error:', e));
 redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
 redisClient.on('ready', () => console.log('Redis connected'));
+
 
 // Acquire a distributed lock. Returns true if lock was acquired.
 // Uses SET NX EX which is atomic in Redis — safe under concurrency.
