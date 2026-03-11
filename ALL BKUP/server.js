@@ -41,7 +41,7 @@ const PORT = process.env.PORT || 3000;
 
 const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
 
-
+const { updateDashboardCounter } = require('./dashboardCounters');
 
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
@@ -388,7 +388,7 @@ function requireRole(...roles) {
 app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,InputFile, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -555,88 +555,83 @@ app.post("/paytm/payment-sync", async (req, res) => {
     //   }
     // })();
 
+    await updateDailyQrTotal(qrCodeId, isoString, amountPaise).catch((e) => {
+      console.error('❌ Error updating daily QR total:', error?.message || error);
+    });
+
     const eventPayload = {
       $id: created.$id,
       qrCodeId,
       paymentId,
       amount: amountPaise,
-      rrnNumber: null,
+      rrnNumber: '' || null,
       vpa: fromUpi || null,
       provider: 'paytm',
       created_at: new Date(isoString).toISOString(),
     };
 
-    // Acquire per-QR distributed lock — same pattern as Razorpay webhook
-    const lockKey = `lock:qr:${qrCodeId}`;
-    const acquired = await acquireLock(lockKey, paymentId, 15);
-    if (!acquired) {
-      console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — will retry`);
-      return res.status(503).json({ message: 'Processing conflict, retry' });
-    }
+    // Emit transaction
+    emitTxnNew({
+      assignedUserId: '',
+      qrCodeId,
+      payload: eventPayload,
+    });
 
+    // Update dashboard counters
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+      console.error('❌ Error updating totalTxCount:', e?.message || e);
+    });
+
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+      console.error('❌ Error updating totalApiTx:', e?.message || e);
+    });
+
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
+      console.error('❌ Error updating totalAmountReceived:', e?.message || e);
+    });
+
+    // Update QR totals
     try {
-      // Update daily QR summary under lock (no race on same-day same-QR)
-      try {
-        await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-        console.log('✅ Daily QR total updated successfully.');
-      } catch (e) {
-        console.error('❌ Error updating daily QR total:', e?.message || e);
-      }
-
-      // Fetch fresh QR doc under lock
       const qrResult = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
         [Query.equal('qrId', qrCodeId), Query.limit(1)]
       );
 
-      if (qrResult.documents.length > 0) {
-        const qrDoc = qrResult.documents[0];
-        const qrDocId = qrDoc.$id;
-        const newCount = (qrDoc.totalTransactions || 0) + 1;
-        const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-        // Recompute amountAvailableForWithdrawal from fresh fields under lock — no race possible
-        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-        const onHold = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-        const commissionPaid = Number(qrDoc.commissionPaid || 0);
-        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_QRCODE_COLLECTION_ID,
-          qrDocId,
-          {
-            totalTransactions: newCount,
-            totalPayInAmount: newTotal,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-        console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
-
-        // Emit with real assignedUserId from QR doc
-        emitTxnNew({
-          assignedUserId: qrDoc.assignedUserId || '',
-          qrCodeId,
-          payload: eventPayload,
-        });
-      } else {
-        console.warn(`⚠️ QR Code with qrId ${qrCodeId} not found — skipping QR totals`);
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+      if (!qrResult.documents.length) {
+        console.log(`⚠️ QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).json({ message: 'Transaction processed but QR not found' });
       }
-    } finally {
-      await releaseLock(lockKey, paymentId);
-    }
 
-    // Atomic dashboard counter increments via Redis INCRBY
-    await Promise.all([
-      redisClient.incrBy('counter:totalTxCount', 1),
-      redisClient.incrBy('counter:totalApiTx', 1),
-      redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-    ]).catch((e) => console.error('Redis counter update failed:', e?.message || e));
+      const qrDoc = qrResult.documents[0];
+      const qrDocId = qrDoc.$id;
+      const newCount = (qrDoc.totalTransactions || 0) + 1;
+      const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+      // Recompute available
+      const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+      const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+      const onHold = Number(qrDoc.amountOnHold || 0);
+      const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+      const commissionPaid = Number(qrDoc.commissionPaid || 0);
+      const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDocId,
+        {
+          totalTransactions: newCount,
+          totalPayInAmount: newTotal,
+          amountAvailableForWithdrawal: newAvailable,
+        }
+      );
+
+      console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
+    } catch (e) {
+      console.error('❌ QR totals update error:', e?.message || e);
+      return res.status(500).json({ error: 'Error updating QR totals', details: e?.message });
+    }
 
     console.log("✅ Received Paytm transaction:", data);
     res.status(200).json({ message: "Transaction processed successfully" });
@@ -1338,15 +1333,10 @@ app.post('/webhook', async (req, res) => {
                 const newCount = (qrDoc.totalTransactions || 0) + 1;
                 const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
 
-                // Recompute amountAvailableForWithdrawal from the fresh qrDoc fields.
-                // Safe to store because we are under the Redis lock — no concurrent write can race us.
-                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                const onHold = Number(qrDoc.amountOnHold || 0);
-                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-                const commissionPaid = Number(qrDoc.commissionPaid || 0);
-                const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
+                // Update raw counters only.
+                // amountAvailableForWithdrawal is NOT stored here — it is computed on-read
+                // as: totalPayInAmount - approved - requested - onHold - commissionOnHold - commissionPaid
+                // Storing a derived field here would require another read-modify-write and re-introduce races.
                 await databases.updateDocument(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_QRCODE_COLLECTION_ID,
@@ -1354,7 +1344,6 @@ app.post('/webhook', async (req, res) => {
                     {
                         totalTransactions: newCount,
                         totalPayInAmount: newTotal,
-                        amountAvailableForWithdrawal: newAvailable,
                     }
                 );
 

@@ -25,7 +25,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -2532,24 +2532,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // Helper to get value or 0
             const get = (k) => (map.has(k) ? map.get(k) : 0);
-
-            // Override the 3 counters that are now maintained atomically in Redis.
-            // Appwrite values lag up to 5 minutes behind due to the periodic flush.
-            // Redis is the source of truth for these 3.
-            if (redisClient?.isReady) {
-                try {
-                    const [rTxCount, rApiTx, rAmountReceived] = await Promise.all([
-                        redisClient.get('counter:totalTxCount'),
-                        redisClient.get('counter:totalApiTx'),
-                        redisClient.get('counter:totalAmountReceived'),
-                    ]);
-                    if (rTxCount !== null) map.set('totalTxCount', Number(rTxCount));
-                    if (rApiTx !== null) map.set('totalApiTx', Number(rApiTx));
-                    if (rAmountReceived !== null) map.set('totalAmountReceived', Number(rAmountReceived));
-                } catch (e) {
-                    console.error('Redis counter read failed, using Appwrite values:', e?.message);
-                }
-            }
 
             // Build the structured response
             const payload = {

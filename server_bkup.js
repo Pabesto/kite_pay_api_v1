@@ -31,9 +31,7 @@ const digiqrRoutes = require('./pinelabs_digiqr.routes');
 
 const { initSocket } = require('./socketServer');
 
-const ConfigManager = require('./configManager');
-
-const { createClient } = require('redis');
+const ConfigManager = require('./configManager'); 
 
 // --- Configuration & Initialization ---
 const app = express();
@@ -41,7 +39,7 @@ const PORT = process.env.PORT || 3000;
 
 const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
 
-
+const { updateDashboardCounter } = require('./dashboardCounters');
 
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
@@ -92,95 +90,11 @@ const users = new Users(client);
 // 🔥 Initialize ConfigManager with your databases instance
 ConfigManager.init(databases);
 
-// ─── Redis Client ────────────────────────────────────────────────────────────
-const redisClient = createClient({
-    url: process.env.REDIS_URL || 'redis://localhost:6379',
-    socket: {
-        reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
-    },
-});
-redisClient.on('error', (e) => console.error('Redis error:', e));
-redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
-redisClient.on('ready', () => console.log('Redis connected'));
 
-// Acquire a distributed lock. Returns true if lock was acquired.
-// Uses SET NX EX which is atomic in Redis — safe under concurrency.
-async function acquireLock(key, value, ttlSeconds = 15) {
-    try {
-        const result = await redisClient.set(key, value, { NX: true, EX: ttlSeconds });
-        return result === 'OK';
-    } catch (e) {
-        console.error('acquireLock error:', e);
-        return true; // degrade gracefully if Redis is down — idempotency check is still the first defence
-    }
-}
+// Now available everywhere!
+// console.log('Max limit:', ConfigManager.get('maxWithdrawalLimit', 10000));
 
-// Release lock only if we are the owner (prevents releasing another process's lock)
-async function releaseLock(key, value) {
-    try {
-        const current = await redisClient.get(key);
-        if (current === value) await redisClient.del(key);
-    } catch (e) {
-        console.error('releaseLock error:', e);
-    }
-}
-
-// On startup: seed Redis counters from Appwrite if Redis is empty (e.g. after a restart)
-async function syncCountersFromAppwrite() {
-    const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
-    for (const name of counterNames) {
-        try {
-            const exists = await redisClient.exists(`counter:${name}`);
-            if (!exists) {
-                const list = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID, 'dashboard_counters',
-                    [Query.equal('id', name), Query.limit(1)]
-                );
-                const val = Number(list.documents[0]?.totals || 0);
-                await redisClient.set(`counter:${name}`, val);
-                console.log(`Seeded counter ${name} = ${val} from Appwrite`);
-            }
-        } catch (e) {
-            console.error(`Failed to seed counter ${name}:`, e);
-        }
-    }
-}
-
-// Every 5 minutes: flush Redis counter values back to Appwrite as a backup
-async function flushCountersToAppwrite() {
-    const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
-    for (const name of counterNames) {
-        try {
-            const val = await redisClient.get(`counter:${name}`);
-            if (val === null) continue;
-            const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 'dashboard_counters',
-                [Query.equal('id', name), Query.limit(1)]
-            );
-            if (list.documents.length > 0) {
-                await databases.updateDocument(
-                    APPWRITE_DATABASE_ID, 'dashboard_counters', list.documents[0].$id,
-                    { totals: Number(val) }
-                );
-            }
-        } catch (e) {
-            console.error(`Failed to flush counter ${name} to Appwrite:`, e);
-        }
-    }
-}
-
-// Connect Redis, seed counters, start periodic flush
-(async () => {
-    try {
-        await redisClient.connect();
-        await syncCountersFromAppwrite();
-        setInterval(flushCountersToAppwrite, 5 * 60 * 1000);
-        console.log('Redis setup complete');
-    } catch (e) {
-        console.error('Redis connect failed — continuing without Redis:', e);
-    }
-})();
-// ─────────────────────────────────────────────────────────────────────────────
+// console.log(process.env.RAZORPAY_KEY_ID);
 
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -388,7 +302,7 @@ function requireRole(...roles) {
 app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,InputFile, roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -555,88 +469,83 @@ app.post("/paytm/payment-sync", async (req, res) => {
     //   }
     // })();
 
+    await updateDailyQrTotal(qrCodeId, isoString, amountPaise).catch((e) => {
+      console.error('❌ Error updating daily QR total:', error?.message || error);
+    });
+
     const eventPayload = {
       $id: created.$id,
       qrCodeId,
       paymentId,
       amount: amountPaise,
-      rrnNumber: null,
+      rrnNumber: '' || null,
       vpa: fromUpi || null,
       provider: 'paytm',
       created_at: new Date(isoString).toISOString(),
     };
 
-    // Acquire per-QR distributed lock — same pattern as Razorpay webhook
-    const lockKey = `lock:qr:${qrCodeId}`;
-    const acquired = await acquireLock(lockKey, paymentId, 15);
-    if (!acquired) {
-      console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — will retry`);
-      return res.status(503).json({ message: 'Processing conflict, retry' });
-    }
+    // Emit transaction
+    emitTxnNew({
+      assignedUserId: '',
+      qrCodeId,
+      payload: eventPayload,
+    });
 
+    // Update dashboard counters
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+      console.error('❌ Error updating totalTxCount:', e?.message || e);
+    });
+
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+      console.error('❌ Error updating totalApiTx:', e?.message || e);
+    });
+
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
+      console.error('❌ Error updating totalAmountReceived:', e?.message || e);
+    });
+
+    // Update QR totals
     try {
-      // Update daily QR summary under lock (no race on same-day same-QR)
-      try {
-        await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-        console.log('✅ Daily QR total updated successfully.');
-      } catch (e) {
-        console.error('❌ Error updating daily QR total:', e?.message || e);
-      }
-
-      // Fetch fresh QR doc under lock
       const qrResult = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
         [Query.equal('qrId', qrCodeId), Query.limit(1)]
       );
 
-      if (qrResult.documents.length > 0) {
-        const qrDoc = qrResult.documents[0];
-        const qrDocId = qrDoc.$id;
-        const newCount = (qrDoc.totalTransactions || 0) + 1;
-        const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-        // Recompute amountAvailableForWithdrawal from fresh fields under lock — no race possible
-        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-        const onHold = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-        const commissionPaid = Number(qrDoc.commissionPaid || 0);
-        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_QRCODE_COLLECTION_ID,
-          qrDocId,
-          {
-            totalTransactions: newCount,
-            totalPayInAmount: newTotal,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-        console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
-
-        // Emit with real assignedUserId from QR doc
-        emitTxnNew({
-          assignedUserId: qrDoc.assignedUserId || '',
-          qrCodeId,
-          payload: eventPayload,
-        });
-      } else {
-        console.warn(`⚠️ QR Code with qrId ${qrCodeId} not found — skipping QR totals`);
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+      if (!qrResult.documents.length) {
+        console.log(`⚠️ QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).json({ message: 'Transaction processed but QR not found' });
       }
-    } finally {
-      await releaseLock(lockKey, paymentId);
-    }
 
-    // Atomic dashboard counter increments via Redis INCRBY
-    await Promise.all([
-      redisClient.incrBy('counter:totalTxCount', 1),
-      redisClient.incrBy('counter:totalApiTx', 1),
-      redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-    ]).catch((e) => console.error('Redis counter update failed:', e?.message || e));
+      const qrDoc = qrResult.documents[0];
+      const qrDocId = qrDoc.$id;
+      const newCount = (qrDoc.totalTransactions || 0) + 1;
+      const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+      // Recompute available
+      const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+      const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+      const onHold = Number(qrDoc.amountOnHold || 0);
+      const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+      const commissionPaid = Number(qrDoc.commissionPaid || 0);
+      const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDocId,
+        {
+          totalTransactions: newCount,
+          totalPayInAmount: newTotal,
+          amountAvailableForWithdrawal: newAvailable,
+        }
+      );
+
+      console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
+    } catch (e) {
+      console.error('❌ QR totals update error:', e?.message || e);
+      return res.status(500).json({ error: 'Error updating QR totals', details: e?.message });
+    }
 
     console.log("✅ Received Paytm transaction:", data);
     res.status(200).json({ message: "Transaction processed successfully" });
@@ -811,6 +720,304 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
     }
 });
 
+// This is the route you provide to the Razorpay/Ezetap team
+// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
+//     const data = req.body;
+
+//     console.log("📩 Webhook Received:", data);
+
+//     const payloadString = JSON.stringify(req.body);
+
+//   try {
+//     const created = await databases.createDocument(
+//       APPWRITE_DATABASE_ID,
+//       'razorpay_webhook',
+//       ID.unique(),
+//       {
+//         payload: payloadString, // avoid storing full payload for Cashfree to save space
+//       }
+//     );
+//   } catch (e){
+
+//   }
+
+//     // LOGIC: Check for 'status' field [cite: 897]
+//     if (data.status === "AUTHORIZED") {
+//         // [cite: 898] "Authorized" means transaction successfully executed
+//         console.log("✅ Payment Success:", data.txnId);
+        
+//         // Perform your database updates here
+//     } else if (data.status === "FAILED") {
+//         // [cite: 898] "Failed" means money won't be deducted
+//         console.log("❌ Payment Failed");
+//     }
+
+//     // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
+//     res.status(200).send("OK");
+// });
+
+// This is the route you provide to the Razorpay/Ezetap team
+app.post('/razorpay-webhook', webhookParser, async (req, res) => {
+  console.log('Webhook Event Received new');
+
+    // // Verify the webhook signature
+    // const razorpaySignature = req.headers['x-razorpay-signature'];
+
+    // if (!razorpaySignature) {
+    //     return res.status(400).send('Missing Razorpay signature');
+    // }
+
+    // // Create HMAC SHA256 with your webhook secret
+    // const expectedSignature = crypto
+    //     .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
+    //     .update(req.rawBody)
+    //     .digest('hex');
+
+    // // Compare signatures
+    // if (expectedSignature === razorpaySignature) {
+    //     console.log('✅ Webhook verified successfully');
+    // } else {
+    //     console.warn('❌ Webhook signature mismatch!');
+    //     return res.status(400).send('Invalid signature');
+    // }  
+  
+    const data = req.body;
+
+    // console.log("📩 Webhook Received:", data);
+
+    // LOGIC: Check for 'status' field [cite: 897]
+    if (data.status === "AUTHORIZED") {
+        console.log("✅ Payment Success:", data.txnId);
+        // Perform your database updates here
+    } else if (data.status === "FAILED") {
+        console.log("❌ Payment Failed");
+        return res.status(400).send('Failed Payment');
+        // [cite: 898] "Failed" means money won't be deducted
+    } else {
+        return res.status(400).send('Error '+ data.status);
+    }
+
+    const qrCodeId = data.tid;
+    // const paymentsAmount = data.amount;
+    // const paymentsCount = req.body?.payload?.qr_code?.entity?.payments_count_received;
+
+    if (!qrCodeId) {
+        return res.status(400).send('QR Code ID not found');
+    }
+
+    const paymentId = data.Id;
+
+    if (!paymentId) {
+        return res.status(400).send('Payment ID not found');
+    }
+
+    // 5) Idempotency guard (process each cf_payment_id once)
+  // Idempotency guard: skip if this paymentId is already recorded
+    const existing = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        [Query.equal('paymentId', paymentId), Query.limit(1)]
+    ); // requires an index on paymentId for performance
+
+    if (existing.documents.length) {
+        return res.status(200).send('Duplicate webhook ignored'); // already processed
+    }
+
+    const rrnNumber = data.rrNumber;
+    const amountRupees = data.amount;
+    const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+
+    const vpa = data.customerName;
+    const postingDate = data.postingDate;
+
+    // const isoDate = new Date(unixTimestamp * 1000).toISOString();
+    const isoDate = new Date(postingDate).toISOString();
+
+    const payloadString = JSON.stringify(req.body);
+    try {
+        const created = await databases.createDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            ID.unique(),
+            {
+                payload: payloadString,
+                qrCodeId: qrCodeId,
+                paymentId: paymentId,
+                rrnNumber: rrnNumber,
+                amount: amountPaise,
+                vpa: vpa,
+                provider: 'razorpay',
+                created_at: isoDate,
+                status: 'normal',
+            }
+        );
+
+    // Update Daily QR Total
+        // (async () => {
+        // try {
+        //     await updateDailyQrTotal(
+        //     qrCodeId,
+        //     isoDate,
+        //     amountPaise
+        //     );
+        //     console.log('Daily QR total updated successfully.');
+        // } catch (error) {
+        //     console.error('Error updating daily QR total:', error);
+        // }
+        // })();
+
+        await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
+          console.error('❌ Error updating daily QR total:', error?.message || error);
+        });
+
+        const eventPayload = {
+          $id: created.$id,                                    // document id
+          qrCodeId,
+          paymentId,                                           // string
+          amount: amountPaise,                           // exact integer
+          rrnNumber: rrnNumber || null,
+          vpa: vpa || null,
+          provider: 'razorpay',
+          created_at: new Date(isoDate).toISOString(),    // normalize to ISO
+        }; // normalized event payload for clients [2]
+
+        // 5) Emit only to intended audiences (user + QR rooms)
+        emitTxnNew({
+            assignedUserId : '',      // may be null if QR not found
+            qrCodeId,
+            payload: eventPayload,
+        }); // Socket.IO selective emit via rooms [1]
+
+        // 4️⃣ Update global counters (async, no await)
+        // totalTxCount
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalApiTx
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalAmountReceived
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        /////////////////////////////////////////////////////////////////////////////////////////////////
+
+//         // 7) Update QR totals atomically // OLD LOGIC
+//         try {
+//         const qrResult = await databases.listDocuments(
+//             APPWRITE_DATABASE_ID,
+//             APPWRITE_QRCODE_COLLECTION_ID,
+//             [Query.equal('qrId', qrCodeId), Query.limit(1)]
+//         );
+
+//         if (!qrResult.documents.length) {
+//             // console.log(`QR Code with qrId ${qrCodeId} not found`);
+//             return res.status(200).send('OK'); // or handle not-found differently
+//         }
+// // 
+//         const qrDoc = qrResult.documents[0];            // <- take first doc
+//         // const qrDoc = qrResult.documents;           
+//         const qrDocId = qrDoc.$id;                     // <- required documentId
+//         const newCount = (qrDoc.totalTransactions || 0) + 1;
+//         const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+//         // Recompute available after changing total
+//         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+//         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+//         const onHold = Number(qrDoc.amountOnHold || 0);
+//         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+//         const commissionPaid = Number(qrDoc.commissionPaid || 0);
+//         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+//         await databases.updateDocument(
+//             APPWRITE_DATABASE_ID,
+//             APPWRITE_QRCODE_COLLECTION_ID,
+//             qrDocId,                                     // <- pass $id here
+//             {
+//                 totalTransactions: newCount,
+//                 totalPayInAmount: newTotal ,
+//                 amountAvailableForWithdrawal: newAvailable, // <-- add this
+//             }
+//         );
+//       } catch (e) {
+//         console.error('Error updating QR totals:', e);
+//       }
+
+
+        // 7) Update QR totals with optimistic retry (no query locking)
+
+        // Replace your QR update block with:
+        await updateQrTotalAtomic(qrCodeId, amountPaise);
+
+        // let attempts = 0;
+        // const maxAttempts = 5;
+
+        // while (attempts < maxAttempts) {
+        //     try {
+        //         const qrResult = await databases.listDocuments(
+        //             APPWRITE_DATABASE_ID,
+        //             APPWRITE_QRCODE_COLLECTION_ID,
+        //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
+        //         );
+
+        //         if (!qrResult.documents.length) {
+        //             console.log(`QR Code ${qrCodeId} not found`);
+        //             break;
+        //         }
+
+        //         const qrDoc = qrResult.documents[0];
+
+        //         // Always use FRESH fetched values for calculation
+        //         const newCount = (qrDoc.totalTransactions || 0) + 1;
+        //         const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+        //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+        //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+        //         const onHold = Number(qrDoc.amountOnHold || 0);
+        //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+        //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
+        //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+        //         await databases.updateDocument(
+        //             APPWRITE_DATABASE_ID,
+        //             APPWRITE_QRCODE_COLLECTION_ID,
+        //             qrDoc.$id,
+        //             {
+        //                 totalTransactions: newCount,
+        //                 totalPayInAmount: newTotal,
+        //                 amountAvailableForWithdrawal: newAvailable,
+        //             }
+        //             // NO 5th param - uses collection-level permissions
+        //         );
+
+        //         console.log(`✅ QR ${qrCodeId} updated (attempt ${attempts + 1})`);
+        //         break; // Success!
+
+        //     } catch (error) {
+        //         attempts++;
+        //         if (attempts >= maxAttempts) {
+        //             console.error(`❌ QR ${qrCodeId} failed after ${maxAttempts} attempts:`, error.message);
+        //             break;
+        //         }
+        //         console.warn(`⚠️ QR ${qrCodeId} conflict (attempt ${attempts}/${maxAttempts}), retrying...`);
+        //         // Tiny delay prevents thrashing
+        //         await new Promise(resolve => setTimeout(resolve, 10 * attempts));
+        //     }
+        // }
+
+
+        // console.log('✅ Webhook data saved to Appwrite:', result.$id);
+        res.status(200).send('Webhook received and saved');
+    } catch (error) {
+        console.error('❌ Failed to save webhook:', error.message);
+        res.status(500).send('Error saving webhook');
+    }
+});
+
 async function updateQrTotalAtomic(qrCodeId, amountPaise) {
     let attempts = 0;
     const maxAttempts = 3;
@@ -866,6 +1073,7 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
         }
     }
 }
+
 
 // http://localhost:3000/test_qralert
 app.get('/test_qralert', (req, res) => {
@@ -941,464 +1149,380 @@ app.get('/test_websocket', (req, res) => {
   return res.status(200).json({ ok: true, payload: eventPayload });
 });
 
-// This is the route you provide to the Razorpay/Ezetap team
-// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-//     const data = req.body;
+app.use('/cashfree/webhook', webhookLimiter);
+// This is the route you provide to the Cashfree team
+app.post('/cashfree/webhook', async (req, res) => {
+  console.log('Webhook Event Received: Cashfree');
 
-//     console.log("📩 Webhook Received:", data);
+  // 1) Signature headers (required)
+  const cfSignature = req.headers['x-webhook-signature'];
+  const cfTimestamp = req.headers['x-webhook-timestamp'];
+  if (!cfSignature || !cfTimestamp) {
+    return res.status(400).send('Missing Cashfree signature headers');
+  }
 
-//     const payloadString = JSON.stringify(req.body);
+  // 2) Verify signature: Base64(HMACSHA256(timestamp + rawBody, Client Secret))
+  try {
+    const signedPayload = `${cfTimestamp}${req.rawBody}`;
+    const expectedSig = crypto
+      .createHmac('sha256', process.env.CASHFREE_CLIENT_SECRET)
+      .update(signedPayload)
+      .digest('base64');
 
-//   try {
-//     const created = await databases.createDocument(
-//       APPWRITE_DATABASE_ID,
-//       'razorpay_webhook',
-//       ID.unique(),
-//       {
-//         payload: payloadString, // avoid storing full payload for Cashfree to save space
-//       }
-//     );
-//   } catch (e){
+    // Alternatively, via SDK:
+    // Cashfree.PGVerifyWebhookSignature(cfSignature, req.rawBody, cfTimestamp);
 
-//   }
+    if (expectedSig !== cfSignature) {
+      console.warn('❌ Cashfree webhook signature mismatch');
+      return res.status(400).send('Invalid signature');
+    }
+  } catch (err) {
+    console.error('Signature verification error:', err.message);
+    return res.status(400).send('Signature verification failed');
+  }
+  console.log('✅ Cashfree webhook verified'); // [verified]
 
-//     // LOGIC: Check for 'status' field [cite: 897]
-//     if (data.status === "AUTHORIZED") {
-//         // [cite: 898] "Authorized" means transaction successfully executed
-//         console.log("✅ Payment Success:", data.txnId);
-        
-//         // Perform your database updates here
-//     } else if (data.status === "FAILED") {
-//         // [cite: 898] "Failed" means money won't be deducted
-//         console.log("❌ Payment Failed");
-//     }
+  // 3) Event filter (Payments)
+  const cfEventType = req.body?.type;
+  if (cfEventType !== 'PAYMENT_SUCCESS_WEBHOOK') {
+    console.log('❌ Unsupported event type:', cfEventType);
+    return res.status(400).send('Unsupported event type');
+  }
 
-//     // IMPORTANT: You must return HTTP 200, otherwise they will retry 3 times 
-//     res.status(200).send("OK");
-// });
+  // 4) Extract and map fields from the provided sample JSON
+  const payload = req.body?.data || {};
+  const order = payload?.order || {};
+  const payment = payload?.payment || {};
+  const upi = payment?.payment_method?.upi || {};
 
-// this was being used for beast arena not using now
-// This is the route you provide to the Razorpay/Ezetap team
-// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-//   console.log('Webhook Event Received new');
+  // Prefer the custom QR code tag as the identifier
+  const qrCodeId = order?.order_tags?.cf_form_id || order?.order_id;
+  const paymentId = payment?.cf_payment_id; // unique per attempt
+  const rrnNumber = payment?.bank_reference;
+//   const amount = Number(payment?.payment_amount || 0);
+  const amountRupees = payment?.payment_amount; // e.g., "10.01" or 10.01
+  const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+  const vpa = upi?.upi_id;
+  const createdAt = req.body?.event_time || payment?.payment_time;
 
-//     // // Verify the webhook signature
-//     // const razorpaySignature = req.headers['x-razorpay-signature'];
+  if (!qrCodeId) return res.status(400).send('QR Code ID not found');
+  if (!paymentId) return res.status(400).send('Payment ID not found');
 
-//     // if (!razorpaySignature) {
-//     //     return res.status(400).send('Missing Razorpay signature');
-//     // }
+  // 5) Idempotency guard (process each cf_payment_id once)
+  // Idempotency guard: skip if this paymentId is already recorded
+    const existing = await databases.listDocuments(
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        [Query.equal('paymentId', paymentId), Query.limit(1)]
+    ); // requires an index on paymentId for performance
 
-//     // // Create HMAC SHA256 with your webhook secret
-//     // const expectedSignature = crypto
-//     //     .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
-//     //     .update(req.rawBody)
-//     //     .digest('hex');
+    if (existing.documents.length) {
+        return res.status(200).send('Duplicate webhook ignored'); // already processed
+    }
 
-//     // // Compare signatures
-//     // if (expectedSignature === razorpaySignature) {
-//     //     console.log('✅ Webhook verified successfully');
-//     // } else {
-//     //     console.warn('❌ Webhook signature mismatch!');
-//     //     return res.status(400).send('Invalid signature');
-//     // }  
-  
-//     const data = req.body;
+  // 6) Persist raw webhook payload + mapped fields
+  const payloadString = JSON.stringify(req.body);
+  try {
+    const created = await databases.createDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+      ID.unique(),
+      {
+        payload: '', // avoid storing full payload for Cashfree to save space
+        qrCodeId: qrCodeId,
+        paymentId: paymentId,
+        rrnNumber: rrnNumber,
+        amount: amountPaise,
+        vpa: vpa,
+        provider: 'cashfree',
+        created_at: createdAt,
+        status: 'normal',
+      }
+    );
 
-//     // console.log("📩 Webhook Received:", data);
+    // (async () => {
+    // try {
+    //     await updateDailyQrTotal(
+    //     qrCodeId,
+    //     createdAt,
+    //     amountPaise
+    //     );
+    //     console.log('Daily QR total updated successfully.');
+    // } catch (error) {
+    //     console.error('Error updating daily QR total:', error);
+    // }
+    // })();
 
-//     // LOGIC: Check for 'status' field [cite: 897]
-//     if (data.status === "AUTHORIZED") {
-//         console.log("✅ Payment Success:", data.txnId);
-//         // Perform your database updates here
-//     } else if (data.status === "FAILED") {
-//         console.log("❌ Payment Failed");
-//         return res.status(400).send('Failed Payment');
-//         // [cite: 898] "Failed" means money won't be deducted
-//     } else {
-//         return res.status(400).send('Error '+ data.status);
-//     }
+    await updateDailyQrTotal(qrCodeId, createdAt, amountPaise).catch((e) => {
+          console.error('❌ Error updating daily QR total:', error?.message || error);
+    });
 
-//     const qrCodeId = data.tid;
-//     // const paymentsAmount = data.amount;
-//     // const paymentsCount = req.body?.payload?.qr_code?.entity?.payments_count_received;
+    const eventPayload = {
+        $id: created.$id,                                    // document id
+        qrCodeId,
+        paymentId,                                           // string
+        amount: amountPaise,                           // exact integer
+        rrnNumber: rrnNumber || null,
+        vpa: vpa || null,
+        provider: 'cashfree',
+        created_at: new Date(createdAt).toISOString(),    // normalize to ISO
+    }; // normalized event payload for clients [2]
 
-//     if (!qrCodeId) {
-//         return res.status(400).send('QR Code ID not found');
-//     }
+    // 5) Emit only to intended audiences (user + QR rooms)
+    emitTxnNew({
+        assignedUserId : '',      // may be null if QR not found
+        qrCodeId,
+        payload: eventPayload,
+    }); // Socket.IO selective emit via rooms [1]
 
-//     const paymentId = data.Id;
+    // 4️⃣ Update global counters (async, no await)
+    // totalTxCount
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
 
-//     if (!paymentId) {
-//         return res.status(400).send('Payment ID not found');
-//     }
+    // totalApiTx
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
 
-//     // 5) Idempotency guard (process each cf_payment_id once)
-//   // Idempotency guard: skip if this paymentId is already recorded
-//     const existing = await databases.listDocuments(
-//     APPWRITE_DATABASE_ID,
-//     APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//         [Query.equal('paymentId', paymentId), Query.limit(1)]
-//     ); // requires an index on paymentId for performance
+    // totalAmountReceived
+    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
+        console.error('Error updating dashboard counter:', e);
+    });
 
-//     if (existing.documents.length) {
-//         return res.status(200).send('Duplicate webhook ignored'); // already processed
-//     }
+  } catch (e) {
+    console.error('Persist webhook error:', e?.message || e);
+    return res.status(500).send('Error saving webhook');
+  }
 
-//     const rrnNumber = data.rrNumber;
-//     const amountRupees = data.amount;
-//     const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+    // 7) Update QR totals atomically
+    try {
+    const qrResult = await databases.listDocuments(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        [Query.equal('qrId', qrCodeId), Query.limit(1)]
+    );
 
-//     const vpa = data.customerName;
-//     const postingDate = data.postingDate;
+    if (!qrResult.documents.length) {
+        // console.log(`QR Code with qrId ${qrCodeId} not found`);
+        return res.status(200).send('OK'); // or handle not-found differently
+    }
 
-//     // const isoDate = new Date(unixTimestamp * 1000).toISOString();
-//     const isoDate = new Date(postingDate).toISOString();
+    const qrDoc = qrResult.documents[0];            // <- take first doc
+    // const qrDoc = qrResult.documents;           
+    const qrDocId = qrDoc.$id;                     // <- required documentId
+    const newCount = (qrDoc.totalTransactions || 0) + 1;
+    const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
 
-//     const payloadString = JSON.stringify(req.body);
-//     try {
-//         const created = await databases.createDocument(
-//             APPWRITE_DATABASE_ID,
-//             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//             ID.unique(),
-//             {
-//                 payload: payloadString,
-//                 qrCodeId: qrCodeId,
-//                 paymentId: paymentId,
-//                 rrnNumber: rrnNumber,
-//                 amount: amountPaise,
-//                 vpa: vpa,
-//                 provider: 'razorpay',
-//                 created_at: isoDate,
-//                 status: 'normal',
-//             }
-//         );
+    // Recompute available after changing total
+    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+    const onHold = Number(qrDoc.amountOnHold || 0);
+    const commissionOnHold = Number(qr.commissionOnHold || 0);
+    const commissionPaid = Number(qr.commissionPaid || 0);
+    const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-//     // Update Daily QR Total
-//         // (async () => {
-//         // try {
-//         //     await updateDailyQrTotal(
-//         //     qrCodeId,
-//         //     isoDate,
-//         //     amountPaise
-//         //     );
-//         //     console.log('Daily QR total updated successfully.');
-//         // } catch (error) {
-//         //     console.error('Error updating daily QR total:', error);
-//         // }
-//         // })();
+    await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        qrDocId,                                     // <- pass $id here
+        {
+            totalTransactions: newCount,
+            totalPayInAmount: newTotal ,
+            amountAvailableForWithdrawal: newAvailable, // <-- add this
+        }
+    );
 
-//         await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
-//           console.error('❌ Error updating daily QR total:', error?.message || error);
-//         });
+    // emitTxnNew({
+    //     assignedUserId: qrDoc.assignedUserId,
+    //     qrCodeId,
+    //     payload,
+    // });
 
-//         const eventPayload = {
-//           $id: created.$id,                                    // document id
-//           qrCodeId,
-//           paymentId,                                           // string
-//           amount: amountPaise,                           // exact integer
-//           rrnNumber: rrnNumber || null,
-//           vpa: vpa || null,
-//           provider: 'razorpay',
-//           created_at: new Date(isoDate).toISOString(),    // normalize to ISO
-//         }; // normalized event payload for clients [2]
-
-//         // 5) Emit only to intended audiences (user + QR rooms)
-//         emitTxnNew({
-//             assignedUserId : '',      // may be null if QR not found
-//             qrCodeId,
-//             payload: eventPayload,
-//         }); // Socket.IO selective emit via rooms [1]
-
-//         // 4️⃣ Update global counters (async, no await)
-//         // totalTxCount
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         // totalApiTx
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         // totalAmountReceived
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         /////////////////////////////////////////////////////////////////////////////////////////////////
-
-// //         // 7) Update QR totals atomically // OLD LOGIC
-// //         try {
-// //         const qrResult = await databases.listDocuments(
-// //             APPWRITE_DATABASE_ID,
-// //             APPWRITE_QRCODE_COLLECTION_ID,
-// //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
-// //         );
-
-// //         if (!qrResult.documents.length) {
-// //             // console.log(`QR Code with qrId ${qrCodeId} not found`);
-// //             return res.status(200).send('OK'); // or handle not-found differently
-// //         }
-// // // 
-// //         const qrDoc = qrResult.documents[0];            // <- take first doc
-// //         // const qrDoc = qrResult.documents;           
-// //         const qrDocId = qrDoc.$id;                     // <- required documentId
-// //         const newCount = (qrDoc.totalTransactions || 0) + 1;
-// //         const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-// //         // Recompute available after changing total
-// //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-// //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-// //         const onHold = Number(qrDoc.amountOnHold || 0);
-// //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-// //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
-// //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-// //         await databases.updateDocument(
-// //             APPWRITE_DATABASE_ID,
-// //             APPWRITE_QRCODE_COLLECTION_ID,
-// //             qrDocId,                                     // <- pass $id here
-// //             {
-// //                 totalTransactions: newCount,
-// //                 totalPayInAmount: newTotal ,
-// //                 amountAvailableForWithdrawal: newAvailable, // <-- add this
-// //             }
-// //         );
-// //       } catch (e) {
-// //         console.error('Error updating QR totals:', e);
-// //       }
+    // console.log(`QR totals updated for qrId ${qrCodeId}`);
+    return; // continue flow as needed
+    } catch (e) {
+    // console.error('QR totals update error:', e?.message || e);
+    return res.status(500).send('Error updating QR totals');
+    }
 
 
-//         // 7) Update QR totals with optimistic retry (no query locking)
-
-//         // Replace your QR update block with:
-//         await updateQrTotalAtomic(qrCodeId, amountPaise);
-
-//         // let attempts = 0;
-//         // const maxAttempts = 5;
-
-//         // while (attempts < maxAttempts) {
-//         //     try {
-//         //         const qrResult = await databases.listDocuments(
-//         //             APPWRITE_DATABASE_ID,
-//         //             APPWRITE_QRCODE_COLLECTION_ID,
-//         //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
-//         //         );
-
-//         //         if (!qrResult.documents.length) {
-//         //             console.log(`QR Code ${qrCodeId} not found`);
-//         //             break;
-//         //         }
-
-//         //         const qrDoc = qrResult.documents[0];
-
-//         //         // Always use FRESH fetched values for calculation
-//         //         const newCount = (qrDoc.totalTransactions || 0) + 1;
-//         //         const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-//         //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-//         //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-//         //         const onHold = Number(qrDoc.amountOnHold || 0);
-//         //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-//         //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
-//         //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-//         //         await databases.updateDocument(
-//         //             APPWRITE_DATABASE_ID,
-//         //             APPWRITE_QRCODE_COLLECTION_ID,
-//         //             qrDoc.$id,
-//         //             {
-//         //                 totalTransactions: newCount,
-//         //                 totalPayInAmount: newTotal,
-//         //                 amountAvailableForWithdrawal: newAvailable,
-//         //             }
-//         //             // NO 5th param - uses collection-level permissions
-//         //         );
-
-//         //         console.log(`✅ QR ${qrCodeId} updated (attempt ${attempts + 1})`);
-//         //         break; // Success!
-
-//         //     } catch (error) {
-//         //         attempts++;
-//         //         if (attempts >= maxAttempts) {
-//         //             console.error(`❌ QR ${qrCodeId} failed after ${maxAttempts} attempts:`, error.message);
-//         //             break;
-//         //         }
-//         //         console.warn(`⚠️ QR ${qrCodeId} conflict (attempt ${attempts}/${maxAttempts}), retrying...`);
-//         //         // Tiny delay prevents thrashing
-//         //         await new Promise(resolve => setTimeout(resolve, 10 * attempts));
-//         //     }
-//         // }
-
-
-//         // console.log('✅ Webhook data saved to Appwrite:', result.$id);
-//         res.status(200).send('Webhook received and saved');
-//     } catch (error) {
-//         console.error('❌ Failed to save webhook:', error.message);
-//         res.status(500).send('Error saving webhook');
-//     }
-// });
+  // 8) Final response
+  return res.status(200).send('Webhook received and processed');
+});
 
 // --- Webhook Endpoint ---
 // Secret:   4@cQVD6GBGa2G7j
 // ##### Mainly Used in Pabesto Tech Pvt Ltd Kitpay for Razorpay QR code payments. #####
-
 app.post('/webhook', async (req, res) => {
     console.log('Webhook Event Received');
 
-    // 1. Verify Razorpay signature
+    // Verify the webhook signature
     const razorpaySignature = req.headers['x-razorpay-signature'];
-    if (!razorpaySignature) return res.status(400).send('Missing Razorpay signature');
 
+    if (!razorpaySignature) {
+        return res.status(400).send('Missing Razorpay signature');
+    }
+
+    // Create HMAC SHA256 with your webhook secret
     const expectedSignature = crypto
         .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
         .update(req.rawBody)
         .digest('hex');
 
-    if (expectedSignature !== razorpaySignature) {
+    // Compare signatures
+    if (expectedSignature === razorpaySignature) {
+        console.log('✅ Webhook verified successfully');
+    } else {
         console.warn('❌ Webhook signature mismatch!');
         return res.status(400).send('Invalid signature');
     }
-    console.log('✅ Webhook verified successfully');
 
-    // 2. Filter event type
     const eventType = req.body?.event;
+
     if (eventType !== 'qr_code.credited') {
         return res.status(400).send('Unsupported event type');
     }
 
-    // 3. Parse required fields
     const qrCodeId = req.body?.payload?.qr_code?.entity?.id;
-    if (!qrCodeId) return res.status(400).send('QR Code ID not found');
+    const paymentsAmount = req.body?.payload?.qr_code?.entity?.payments_amount_received;
+    const paymentsCount = req.body?.payload?.qr_code?.entity?.payments_count_received;
+
+    if (!qrCodeId) {
+        return res.status(400).send('QR Code ID not found');
+    }
 
     const paymentId = req.body?.payload?.payment?.entity?.id;
-    if (!paymentId) return res.status(400).send('Payment ID not found');
+    if (!paymentId) {
+        return res.status(400).send('Payment ID not found');
+    }
 
     const rrnNumber = req.body?.payload?.payment?.entity?.acquirer_data?.rrn;
     const amountPaise = req.body?.payload?.payment?.entity?.amount;
+    // const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
+
     const vpa = req.body?.payload?.payment?.entity?.vpa;
     const unixTimestamp = req.body?.payload?.payment?.entity?.created_at;
+
     const isoDate = new Date(unixTimestamp * 1000).toISOString();
+
     const payloadString = JSON.stringify(req.body);
 
-    // 4. Idempotency check — reject duplicate paymentId before any writes
-    const existing = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-        [Query.equal('paymentId', paymentId), Query.limit(1)]
-    );
-    if (existing.total > 0) {
-        console.log('Duplicate webhook, ignoring:', paymentId);
-        return res.status(200).send('Already processed');
-    }
-
     try {
-        // 5. Save raw webhook record (source of truth)
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             ID.unique(),
             {
                 payload: payloadString,
-                qrCodeId,
-                paymentId,
-                rrnNumber,
+                qrCodeId: qrCodeId,
+                paymentId: paymentId,
+                rrnNumber: rrnNumber,
                 amount: amountPaise,
-                vpa,
+                vpa: vpa,
                 provider: 'razorpay',
                 created_at: isoDate,
                 status: 'normal',
             }
         );
 
-        // 6. Acquire per-QR distributed lock
-        // Prevents race conditions when two different payments for the same QR arrive simultaneously.
-        // Redis SET NX EX is atomic — only one process wins the lock at a time.
-        const lockKey = `lock:qr:${qrCodeId}`;
-        const acquired = await acquireLock(lockKey, paymentId, 15);
-        if (!acquired) {
-            // Another payment for this QR is mid-process. Webhook doc is already saved,
-            // so the idempotency check above will catch any Razorpay retry.
-            console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — Razorpay will retry`);
-            return res.status(503).send('Processing conflict, retry');
-        }
-
+    // Update Daily QR Total
+        (async () => {
         try {
-            // 7. Fetch fresh QR doc under lock (guaranteed no stale read from another concurrent write)
-            const qrResult = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_QRCODE_COLLECTION_ID,
-                [Query.equal('qrId', qrCodeId), Query.limit(1)]
+            await updateDailyQrTotal(
+            qrCodeId,
+            isoDate,
+            amountPaise
             );
-
-            if (qrResult.documents.length > 0) {
-                const qrDoc = qrResult.documents[0];
-                const qrDocId = qrDoc.$id;
-                const newCount = (qrDoc.totalTransactions || 0) + 1;
-                const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-                // Recompute amountAvailableForWithdrawal from the fresh qrDoc fields.
-                // Safe to store because we are under the Redis lock — no concurrent write can race us.
-                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-                const onHold = Number(qrDoc.amountOnHold || 0);
-                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-                const commissionPaid = Number(qrDoc.commissionPaid || 0);
-                const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-                await databases.updateDocument(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_QRCODE_COLLECTION_ID,
-                    qrDocId,
-                    {
-                        totalTransactions: newCount,
-                        totalPayInAmount: newTotal,
-                        amountAvailableForWithdrawal: newAvailable,
-                    }
-                );
-
-                // 8. Update daily QR summary — awaited and under lock, so no race on same-day same-QR
-                try {
-                    await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-                    console.log('Daily QR total updated successfully.');
-                } catch (e) {
-                    console.error('Error updating daily QR total:', e);
-                }
-
-                // 9. Emit real-time event to the assigned user's room and the QR room
-                const assignedUserId = qrDoc.assignedUserId || '';
-                const eventPayload = {
-                    $id: created.$id,
-                    qrCodeId,
-                    paymentId,
-                    amount: amountPaise,
-                    rrnNumber: rrnNumber || null,
-                    vpa: vpa || null,
-                    provider: 'razorpay',
-                    created_at: isoDate,
-                };
-                emitTxnNew({ assignedUserId, qrCodeId, payload: eventPayload });
-
-            } else {
-                console.warn(`QR ${qrCodeId} not found in DB — skipping QR totals and daily summary`);
-            }
-        } finally {
-            // Always release the lock, even if something threw above
-            await releaseLock(lockKey, paymentId);
+            console.log('Daily QR total updated successfully.');
+        } catch (error) {
+            console.error('Error updating daily QR total:', error);
         }
+        })();
 
-        // 10. Atomic dashboard counter increments via Redis INCRBY (no read-modify-write, no race)
-        await Promise.all([
-            redisClient.incrBy('counter:totalTxCount', 1),
-            redisClient.incrBy('counter:totalApiTx', 1),
-            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]).catch((e) => console.error('Redis counter update failed:', e));
+        const eventPayload = {
+          $id: created.$id,                                    // document id
+          qrCodeId,
+          paymentId,                                           // string
+          amount: amountPaise,                           // exact integer
+          rrnNumber: rrnNumber || null,
+          vpa: vpa || null,
+          provider: 'razorpay',
+          created_at: new Date(isoDate).toISOString(),    // normalize to ISO
+        }; // normalized event payload for clients [2]
 
+        // 5) Emit only to intended audiences (user + QR rooms)
+        emitTxnNew({
+            assignedUserId : '',      // may be null if QR not found
+            qrCodeId,
+            payload: eventPayload,
+        }); // Socket.IO selective emit via rooms [1]
+
+        // 4️⃣ Update global counters (async, no await)
+        // totalTxCount
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalApiTx
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        // totalAmountReceived
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
+            console.error('Error updating dashboard counter:', e);
+        });
+
+        /////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // 7) Update QR totals atomically
+        try {
+        const qrResult = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal('qrId', qrCodeId), Query.limit(1)]
+        );
+
+        if (!qrResult.documents.length) {
+            // console.log(`QR Code with qrId ${qrCodeId} not found`);
+            return res.status(200).send('OK'); // or handle not-found differently
+        }
+// 
+        const qrDoc = qrResult.documents[0];            // <- take first doc
+        // const qrDoc = qrResult.documents;           
+        const qrDocId = qrDoc.$id;                     // <- required documentId
+        const newCount = (qrDoc.totalTransactions || 0) + 1;
+        const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
+
+        // Recompute available after changing total
+        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+        const onHold = Number(qrDoc.amountOnHold || 0);
+        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+        const commissionPaid = Number(qrDoc.commissionPaid || 0);
+        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+        await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            qrDocId,                                     // <- pass $id here
+            {
+                totalTransactions: newCount,
+                totalPayInAmount: newTotal ,
+                amountAvailableForWithdrawal: newAvailable, // <-- add this
+            }
+        );
+      } catch (e) {
+        console.error('Error updating QR totals:', e);
+      }
+
+        // console.log('✅ Webhook data saved to Appwrite:', result.$id);
         res.status(200).send('Webhook received and saved');
     } catch (error) {
-        console.error('❌ Failed to process webhook:', error.message);
-        res.status(500).send('Error processing webhook');
+        console.error('❌ Failed to save webhook:', error.message);
+        res.status(500).send('Error saving webhook');
     }
 });
 
