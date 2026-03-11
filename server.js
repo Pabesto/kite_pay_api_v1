@@ -1295,6 +1295,11 @@ app.post('/webhook', async (req, res) => {
         return res.status(400).send('Missing Razorpay signature');
     }
 
+    if (!req.rawBody) {
+        wdbg('1', 'BLOCKED — req.rawBody is undefined (bodyParser did not capture body; check Content-Type header)');
+        return res.status(400).send('Missing raw body for signature verification');
+    }
+
     const expectedSignature = crypto
         .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
         .update(req.rawBody)
