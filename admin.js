@@ -33,6 +33,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return new Date(Date.now() + istOffset).toISOString();
     }
 
+    // Returns true when an Appwrite error is caused by an invalid/expired pagination cursor
+    function isCursorError(err) {
+        const msg = (err?.message || '').toLowerCase();
+        return err?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'));
+    }
+
     // 🔥 List all users AppWrite Users
     // router.get('/users', authenticateAdmin, async (req, res) => {
     //     try {
@@ -66,8 +72,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             const queries = [];
 
-            // If a cursor was sent, use it for pagination
+            // If a cursor was sent, validate and use it for pagination
             if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
                 queries.push(Query.cursorAfter(cursor));
             }
 
@@ -140,6 +149,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             });
 
         } catch (err) {
+            if (isCursorError(err)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('List users error:', err);
             return res.status(500).json({ error: 'Failed to fetch users' });
         }
@@ -960,9 +970,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) {
-            queries.push(Query.cursorAfter(cursor));
+                queries.push(Query.cursorAfter(cursor));
             }
 
             // console.log('Transaction query filters:', queries);
@@ -988,6 +1001,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             res.status(200).json({ transactions: docs, nextCursor });
 
         } catch (error) {
+            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching transactions:', error);
             res.status(500).json({ error: 'Failed to fetch transactions' });
         }
@@ -1264,15 +1278,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const oldAmountPaise = Number(tx.amount || 0);
         const prevStatus = ((tx.status && tx.status.trim()) || 'normal').toLowerCase(); // use existing status only [web:185]
 
-        // 5) Persist transaction updates
-        const updated = await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        webhook_collectionId,
-        TxnID,
-        updates
-        ); // apply partial update before aggregates [web:198]
-
-        // 6) Helpers
+        // 5) Helpers
         const recomputeAvailable = (qrDocLike) => {
             const total = Number(qrDocLike.totalPayInAmount || 0);
             const approved = Number(qrDocLike.withdrawalApprovedAmount || 0);
@@ -1289,6 +1295,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const isPrevNormal = prevStatus === 'normal'; // status snapshot used for reconciliation [web:185]
 
+        // Acquire per-QR lock(s) before any balance read-modify-write.
+        // Sort QR IDs for consistent acquisition order — prevents deadlock when two edits swap QRs.
+        const editLockVal = TxnID;
+        const editLocks = [];
+        const qrsToLock = [...new Set([oldQrId, newQrId].filter(Boolean))].sort();
+        for (const qId of qrsToLock) {
+            const lk = `lock:qr:${qId}`;
+            let lkAcquired = false;
+            try {
+                const r = await redisClient.set(lk, editLockVal, { NX: true, EX: 20 });
+                lkAcquired = r === 'OK';
+            } catch (e) {
+                console.error('Redis lock error in transaction edit:', e);
+                lkAcquired = true; // degrade gracefully if Redis is down
+            }
+            if (!lkAcquired) {
+                for (const { key, val } of editLocks) {
+                    try { const c = await redisClient.get(key); if (c === val) await redisClient.del(key); } catch {}
+                }
+                return res.status(409).json({ error: `QR ${qId} is currently being modified by another operation. Please try again in a moment.` });
+            }
+            editLocks.push({ key: lk, val: editLockVal });
+        }
+        try {
+
         // 5A) Same QR, amount changed: adjust based on existing status
         if (hasAmountChange && !movedQr) {
         const amountDiff = newAmountPaise - oldAmountPaise; // +/- delta [web:185]
@@ -1302,95 +1333,41 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
                 if (isPrevNormal) {
                     // Normal: adjust ledger total; available derives from totals
+                    // amountDiff is in paise (1 rupee = 100 paise) — can be negative if amount reduced
                     const newTotal = Number(qr.totalPayInAmount || 0) + amountDiff;
+                    const newAvailable = recomputeAvailable({ ...qr, totalPayInAmount: newTotal });
+                    // Block edit if it would push available below zero (pending/approved withdrawals exceed new total)
+                    if (newAvailable < 0) {
+                        return res.status(409).json({
+                            error: 'Cannot reduce this transaction amount: it would cause the available withdrawal balance to go negative. Cancel or reject any pending withdrawals on this QR first.',
+                            withdrawalRequested: Number(qr.withdrawalRequestedAmount || 0),
+                            withdrawalApproved: Number(qr.withdrawalApprovedAmount || 0),
+                        });
+                    }
                     await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
                         totalPayInAmount: newTotal,
-                        amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal }),
-                    }); // no hold change in normal edits [web:176][web:179]
+                        amountAvailableForWithdrawal: newAvailable,
+                    });
                 } else {
                     // Non-normal: adjust both ledger total and hold; available derives from both
-                    const delta = (newAmountPaise - oldAmountPaise);
+                    const delta = (newAmountPaise - oldAmountPaise); // paise delta
                     const newTotal = Number(qr.totalPayInAmount || 0) + delta;
                     const newHold = Number(qr.amountOnHold || 0) + delta;
+                    const newAvailable = recomputeAvailable({ ...qr, totalPayInAmount: newTotal, amountOnHold: newHold });
+                    if (newAvailable < 0) {
+                        return res.status(409).json({
+                            error: 'Cannot reduce this transaction amount: it would cause the available withdrawal balance to go negative. Cancel or reject any pending withdrawals on this QR first.',
+                            withdrawalRequested: Number(qr.withdrawalRequestedAmount || 0),
+                            withdrawalApproved: Number(qr.withdrawalApprovedAmount || 0),
+                        });
+                    }
                     await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
                         totalPayInAmount: newTotal,
                         amountOnHold: newHold,
-                        amountAvailableForWithdrawal: recomputeAvailable({ ...qr, totalPayInAmount: newTotal, amountOnHold: newHold }),
+                        amountAvailableForWithdrawal: newAvailable,
                     });
                 }
             }
-
-            // const iso = new Date(isoDate);
-
-            const istDate = moment.tz(tx.created_at, 'Asia/Kolkata');
-            const istDateFromIso = istDate.format('YYYY-MM-DD HH:mm:ss');
-            console.log('istDate:', istDateFromIso);
-
-            const dayString = istDate.format('YYYY-MM-DD'); // directly format date only
-
-            console.log('dayString:', dayString);
-            console.log('isoDate:', dayString);
-            console.log('qrId:', oldQrId);
-
-            // Query existing document by date only (no qrId filter, since totalsJson covers all)
-            const existingQrSummary = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-            [
-                Query.equal('date', dayString),
-                Query.limit(1),
-            ]
-            );
-
-            const delta = newAmountPaise - oldAmountPaise;
-
-            if (existingQrSummary.total > 0) {
-            // Document exists - parse JSON string and update totals object
-            const doc = existingQrSummary.documents[0];
-            const totalsJsonStr = doc.totalsJson || '{}';
-
-            let totalsObj;
-            try {
-                totalsObj = JSON.parse(totalsJsonStr);
-            } catch (e) {
-                totalsObj = {};
-            }
-
-            const oldAmount = Number(totalsObj[oldQrId] || 0);
-            const newAmount = oldAmount + delta;
-
-            if (newAmount < 0) {
-                throw new Error('Total amount cannot be negative');
-            }
-
-            totalsObj[oldQrId] = newAmount;
-
-            // Serialize and update the document
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-                doc.$id,
-                {
-                    totalsJson: JSON.stringify(totalsObj),
-                }
-            );
-            }
-            // else {
-            // // No summary exists - create a new one if newAmount > 0
-            // if (newAmount > 0) {
-            //     await databases.createDocument(
-            //     APPWRITE_DATABASE_ID,
-            //     APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-            //     ID.unique(),
-            //     {
-            //         qrId: oldQrId,
-            //         date: dayString,
-            //         total_amount: newAmount,
-            //         last_updated: new Date().toISOString(),
-            //     }
-            //     );
-            // }
-            // }
 
         }
 
@@ -1406,17 +1383,33 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const oldQr = oldQrList.documents[0];
             if (isPrevNormal) {
                 const newTotal = Number(oldQr.totalPayInAmount || 0) - oldAmountPaise;
+                const newAvailableOldQr = recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal });
+                if (newAvailableOldQr < 0) {
+                    return res.status(409).json({
+                        error: 'Cannot move this transaction: removing it from the source QR would cause the available withdrawal balance to go negative. Cancel or reject any pending withdrawals on this QR first.',
+                        withdrawalRequested: Number(oldQr.withdrawalRequestedAmount || 0),
+                        withdrawalApproved: Number(oldQr.withdrawalApprovedAmount || 0),
+                    });
+                }
                 await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
                 totalPayInAmount: newTotal,
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
-                amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal }),
+                amountAvailableForWithdrawal: newAvailableOldQr,
                 }); // remove from totals for normal tx [web:176][web:179]
             } else {
                 const newHold = Number(oldQr.amountOnHold || 0) - oldAmountPaise;
+                const newAvailableOldQr = recomputeAvailable({ ...oldQr, amountOnHold: newHold });
+                if (newAvailableOldQr < 0) {
+                    return res.status(409).json({
+                        error: 'Cannot move this transaction: removing it from the source QR would cause the available withdrawal balance to go negative. Cancel or reject any pending withdrawals on this QR first.',
+                        withdrawalRequested: Number(oldQr.withdrawalRequestedAmount || 0),
+                        withdrawalApproved: Number(oldQr.withdrawalApprovedAmount || 0),
+                    });
+                }
                 await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
                 amountOnHold: newHold,
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
-                amountAvailableForWithdrawal: recomputeAvailable({ ...oldQr, amountOnHold: newHold }),
+                amountAvailableForWithdrawal: newAvailableOldQr,
                 }); // remove from hold for non-normal tx [web:170][web:176]
             }
             }
@@ -1430,7 +1423,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ]);
             if (newQrList.documents.length) {
             const newQr = newQrList.documents[0];
-            const postAmount = Number(updated.amount ?? oldAmountPaise); // use new amount if changed [web:185]
+            const postAmount = Number(newAmountPaise ?? oldAmountPaise); // use new amount if changed [web:185]
 
             if (isPrevNormal) {
                 const newTotal = Number(newQr.totalPayInAmount || 0) + postAmount;
@@ -1453,7 +1446,74 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
         }
 
+        // Daily summary reconciliation — handles all change combinations (amount, QR, or date)
+        {
+            const oldDateStr = moment.tz(tx.created_at, 'Asia/Kolkata').format('YYYY-MM-DD');
+            const newDateStr = updates.created_at
+                ? moment.tz(updates.created_at, 'Asia/Kolkata').format('YYYY-MM-DD')
+                : oldDateStr;
+            const effectiveNewAmount = newAmountPaise ?? oldAmountPaise;
+            const sameSlot = (oldDateStr === newDateStr) && (newQrId === oldQrId);
+
+            if (sameSlot && effectiveNewAmount !== oldAmountPaise) {
+                // Same QR + same date, only amount changed: apply delta in place
+                const summaryList = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                    [Query.equal('date', oldDateStr), Query.limit(1)]
+                );
+                if (summaryList.total > 0) {
+                    const doc = summaryList.documents[0];
+                    let totalsObj = {};
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    const slotDelta = effectiveNewAmount - oldAmountPaise;
+                    const slotNewAmt = Number(totalsObj[oldQrId] || 0) + slotDelta;
+                    if (slotNewAmt < 0) throw new Error('Daily summary total cannot go negative');
+                    totalsObj[oldQrId] = slotNewAmt;
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
+                }
+            } else if (!sameSlot) {
+                // QR or date changed: subtract old amount from old slot, add new amount to new slot
+                const oldSummaryList = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                    [Query.equal('date', oldDateStr), Query.limit(1)]
+                );
+                if (oldSummaryList.total > 0) {
+                    const doc = oldSummaryList.documents[0];
+                    let totalsObj = {};
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    totalsObj[oldQrId] = Math.max(0, Number(totalsObj[oldQrId] || 0) - oldAmountPaise);
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
+                }
+                const newSummaryList = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                    [Query.equal('date', newDateStr), Query.limit(1)]
+                );
+                if (newSummaryList.total > 0) {
+                    const doc = newSummaryList.documents[0];
+                    let totalsObj = {};
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    totalsObj[newQrId] = Number(totalsObj[newQrId] || 0) + effectiveNewAmount;
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
+                }
+            }
+            // else: sameSlot and no amount change → nothing to update in daily summaries
+        }
+
+        // All balance checks passed — now persist the transaction document
+        const updated = await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            webhook_collectionId,
+            TxnID,
+            updates
+        );
+
         return res.status(200).json({ message: 'Transaction updated', transaction: updated });
+        } finally {
+            // Release all QR locks acquired for this edit
+            for (const { key, val } of editLocks) {
+                try { const c = await redisClient.get(key); if (c === val) await redisClient.del(key); } catch {}
+            }
+        }
     } catch (err) {
         console.error('❌ Edit transaction error:', err.message || err);
         return res.status(500).json({ error: err.message || 'Update failed' });
@@ -1475,6 +1535,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const amountPaise = Number(tx.amount || 0); // paise
             const qrId = tx.qrCodeId;
+
+            // Acquire per-QR lock before balance read-modify-write
+            const deleteLockKey = `lock:qr:${qrId}`;
+            const deleteLockVal = id;
+            if (qrId) {
+                let deleteLockAcquired = false;
+                try {
+                    const r = await redisClient.set(deleteLockKey, deleteLockVal, { NX: true, EX: 20 });
+                    deleteLockAcquired = r === 'OK';
+                } catch (e) {
+                    console.error('Redis lock error in transaction delete:', e);
+                    deleteLockAcquired = true; // degrade gracefully
+                }
+                if (!deleteLockAcquired) {
+                    return res.status(409).json({ error: 'QR is currently being modified by another operation. Please try again in a moment.' });
+                }
+            }
+            try {
 
             // 2) Reconcile QR aggregates (if linked)
             if (qrId) {
@@ -1503,12 +1581,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 ? currentHold
                 : Math.max(0, currentHold - amountPaise); // remove from holds for non-normal
 
-                // Recompute available as a derived field (include holds)
+                // Recompute available as a derived field — all values in paise (1 rupee = 100 paise)
                 const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
                 const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
                 const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
                 const commissionPaid = Number(qrDoc.commissionPaid || 0);
                 const nextAvailable = nextTotal - approved - requested - nextHold - commissionOnHold - commissionPaid;
+
+                // Block deletion if it would make the available balance go negative.
+                // This means pending/approved withdrawals exceed what the QR actually received.
+                // Admin must reject/cancel those withdrawals before deleting this transaction.
+                if (nextAvailable < 0) {
+                    return res.status(409).json({
+                        error: 'Cannot delete this transaction: it would cause the available withdrawal balance to go negative. Cancel or reject any pending withdrawals on this QR first.',
+                        currentAvailable: nextTotal - approved - requested - nextHold - commissionOnHold - commissionPaid,
+                        withdrawalRequested: requested,
+                        withdrawalApproved: approved,
+                    });
+                }
 
                 await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
@@ -1579,33 +1669,39 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
-            // 3) Delete the transaction
+            // 3) Decrement counters BEFORE deleting the document.
+            // If Redis fails here, the transaction is still intact — admin can retry.
+            // If we deleted first and then Redis failed, the transaction is gone with no counter fix.
+            // amountPaise is in paise (1 rupee = 100 paise)
+            await Promise.all([
+                redisClient.incrBy('counter:totalTxCount', -1),
+                redisClient.incrBy('counter:totalAmountReceived', -amountPaise),
+            ]).catch((e) => console.error('Redis counter update failed (delete tx):', e));
+
+            if (tx.provider === 'manual') {
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1).catch((e) => {
+                    console.error('Error updating totalManualTx counter:', e);
+                });
+            } else {
+                await redisClient.incrBy('counter:totalApiTx', -1).catch((e) => {
+                    console.error('Error updating totalApiTx counter:', e);
+                });
+            }
+
+            // 4) Delete the transaction document — counters are already decremented
             await databases.deleteDocument(
                 APPWRITE_DATABASE_ID,
                 webhook_collectionId,
                 id
             );
 
-            // After successful deletion
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', -1).catch((e) => {
-                console.error('Error updating dashboard counter:', e);
-            });
-
-            if (tx.provider === 'manual') {
-                    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1).catch((e) => {
-                    console.error('Error updating dashboard counter:', e);
-                });
-            } else {
-                    await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', -1).catch((e) => {
-                    console.error('Error updating dashboard counter:', e);
-                });
-            }
-
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', -amountPaise).catch((e) => {
-                console.error('Error updating dashboard counter:', e);
-            });
-
             return res.status(200).json({ message: 'Transaction deleted', id });
+            } finally {
+                // Release the QR lock acquired for this delete
+                if (qrId) {
+                    try { const c = await redisClient.get(deleteLockKey); if (c === deleteLockVal) await redisClient.del(deleteLockKey); } catch {}
+                }
+            }
         } catch (err) {
             console.error('❌ Delete transaction error:', err.message || err);
             return res.status(500).json({ error: err.message || 'Delete failed' });
@@ -1623,37 +1719,59 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             });
             }
 
-            // ✅ Check for duplicate RRN
-            const duplicate = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                webhook_collectionId, // webhook_data collection ID
-                [Query.equal("rrnNumber", rrnNumber)]
-            );
-
-            if (duplicate.documents.length) {
-                return res.status(400).json({ error: "Duplicate RRN detected" });
+            // RRN idempotency lock — ensures only one request per RRN proceeds even under concurrent retries.
+            // Redis NX: only the first request acquires the lock; duplicates get 409.
+            // DB duplicate check below is the second line of defence after the lock expires.
+            const rrnLockKey = `rrnProcessing:${rrnNumber}`;
+            let rrnLockAcquired = false;
+            try {
+                const r = await redisClient.set(rrnLockKey, '1', { NX: true, EX: 30 });
+                rrnLockAcquired = r === 'OK';
+            } catch (e) {
+                console.error('Redis RRN lock error:', e);
+                rrnLockAcquired = true; // degrade gracefully if Redis is down
+            }
+            if (!rrnLockAcquired) {
+                return res.status(409).json({ error: 'A transaction with this RRN is already being processed. Please try again.' });
             }
 
-            // ✅ Convert values
-            const finalAmount = toPaise(amount);
+            let finalAmount, result;
+            try {
+                // ✅ Check for duplicate RRN (DB guard — catches retries after lock expires)
+                const duplicate = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    webhook_collectionId,
+                    [Query.equal("rrnNumber", rrnNumber)]
+                );
 
-            // Create document in webhook_data collection
-            const result = await databases.createDocument(
-                APPWRITE_DATABASE_ID,
-                webhook_collectionId, // webhook_data collection ID
-                ID.unique(),
+                if (duplicate.documents.length) {
+                    return res.status(400).json({ error: "Duplicate RRN detected" });
+                }
+
+                // ✅ Convert values
+                finalAmount = toPaise(amount);
+
+                // Create document in webhook_data collection
+                result = await databases.createDocument(
+                    APPWRITE_DATABASE_ID,
+                    webhook_collectionId,
+                    ID.unique(),
                     {
-                        payload: "", // optional, can be passed too
+                        payload: "",
                         qrCodeId: qrCodeId,
-                        paymentId: "", // optional
+                        paymentId: "",
                         rrnNumber: rrnNumber,
                         amount: finalAmount,
-                        vpa: "", // optional
+                        vpa: "",
                         provider: 'manual',
-                        created_at: isoDate, // current IST time
-                        status: 'normal', // default status
+                        created_at: isoDate,
+                        status: 'normal',
                     }
-            );
+                );
+            } finally {
+                // Release RRN lock once the document is created (or if it failed)
+                try { const c = await redisClient.get(rrnLockKey); if (c === '1') await redisClient.del(rrnLockKey); } catch {}
+            }
 
             // (async () => {
             // try {
@@ -1668,9 +1786,64 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // }
             // })();
 
-            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
-                console.error('❌ Error updating daily QR total:', error?.message || error);
-            });
+            // Acquire QR lock before updating daily summary and QR totals.
+            // Same lock key as webhooks — serializes manual transactions with live payment webhooks.
+            const manualLockKey = `lock:qr:${qrCodeId}`;
+            const manualLockVal = result.$id;
+            let manualLockAcquired = false;
+            try {
+                const r = await redisClient.set(manualLockKey, manualLockVal, { NX: true, EX: 20 });
+                manualLockAcquired = r === 'OK';
+            } catch (e) {
+                console.error('Redis lock error in manual transaction:', e);
+                manualLockAcquired = true; // degrade gracefully
+            }
+            if (!manualLockAcquired) {
+                console.warn(`QR ${qrCodeId} lock busy during manual transaction — QR totals may lag by one cycle`);
+            }
+            try {
+                // finalAmount is in paise (1 rupee = 100 paise)
+                await updateDailyQrTotal(qrCodeId, isoDate, finalAmount);
+
+                // Update QR code totals under the same lock
+                if (qrCodeId) {
+                const qrResult = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    Qr_collectionId,
+                    [Query.equal('qrId', qrCodeId), Query.limit(1)]
+                );
+
+                    if (qrResult.documents.length) {
+                        const qrDoc = qrResult.documents[0];
+
+                        const newTransactions = (qrDoc.totalTransactions || 0) + 1;
+                        const newTotal = (qrDoc.totalPayInAmount || 0) + finalAmount;
+
+                        // Recompute available from updated total
+                        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                        const onHold = Number(qrDoc.amountOnHold || 0);
+                        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+                        const commissionPaid = Number(qrDoc.commissionPaid || 0);
+                        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
+
+                        await databases.updateDocument(
+                        APPWRITE_DATABASE_ID,
+                        Qr_collectionId,
+                        qrDoc.$id,
+                        {
+                            totalTransactions: newTransactions,
+                            totalPayInAmount: newTotal,
+                            amountAvailableForWithdrawal: newAvailable,
+                        }
+                        );
+                    }
+                }
+            } finally {
+                if (manualLockAcquired) {
+                    try { const c = await redisClient.get(manualLockKey); if (c === manualLockVal) await redisClient.del(manualLockKey); } catch {}
+                }
+            }
 
             const eventPayload = {
                 $id: result.$id,                                    // document id
@@ -1691,56 +1864,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 payload: eventPayload,
             });
 
-            // 3️⃣ Update the corresponding QR code totals
-            if (qrCodeId) {
-            const qrResult = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                [Query.equal('qrId', qrCodeId), Query.limit(1)]
-            );
+            // Update global counters:
+            // totalTxCount and totalAmountReceived live in Redis (atomic INCRBY, no race)
+            // totalManualTx is low-frequency and stays in Appwrite
+            // finalAmount is in paise (1 rupee = 100 paise)
+            await Promise.all([
+                redisClient.incrBy('counter:totalTxCount', 1),
+                redisClient.incrBy('counter:totalAmountReceived', finalAmount),
+            ]).catch((e) => console.error('Redis counter update failed (manual tx):', e));
 
-                if (qrResult.documents.length) {
-                    const qrDoc = qrResult.documents[0];
-
-                    const newTransactions = (qrDoc.totalTransactions || 0) + 1;
-                    const newTotal = (qrDoc.totalPayInAmount || 0) + finalAmount;
-
-                    // Recompute available from updated total
-                    const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-                    const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-
-                    const onHold = Number(qrDoc.amountOnHold || 0);
-                    const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-                    const commissionPaid = Number(qrDoc.commissionPaid || 0);
-                    const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-                    await databases.updateDocument(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    qrDoc.$id,
-                    {
-                        totalTransactions: newTransactions,
-                        totalPayInAmount: newTotal,
-                        amountAvailableForWithdrawal: newAvailable, // <-- add this
-                    }
-                    );
-                }
-            }
-
-            // 4️⃣ Update global counters (async, no await)
-            // totalTxCount
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
-                console.error('Error updating dashboard counter:', e);
-            });
-
-            // totalManualTx
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1).catch((e) => {
-                console.error('Error updating dashboard counter:', e);
-            });
-
-            // totalAmountReceived
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', finalAmount).catch((e) => {
-                console.error('Error updating dashboard counter:', e);
+                console.error('Error updating totalManualTx counter:', e);
             });
 
             return res.status(201).json({
@@ -1860,13 +1994,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
 
             const pickTxn = (d) => ({
-                $id: d.$id,   
+                $id: d.$id,
                 id: d.$id,                // keep if needed
                 qrCodeId: d.qrCodeId,
                 paymentId: d.paymentId,
@@ -1884,6 +2021,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             res.status(200).json({ transactions: docs, nextCursor });
 
         } catch (error) {
+            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('❌ Error in /user/transactions:', error);
             res.status(500).json({ error: 'Failed to fetch user transactions' });
         }
@@ -2194,6 +2332,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 filters.push(Query.lessThanEqual('createdAt', endISO));
             }
 
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
             // Build query list with ordering + pagination
             const queries = [
                 ...filters,
@@ -2226,6 +2367,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             return res.status(200).json({ commissions: docs, nextCursor });
             } catch (err) {
+            if (isCursorError(err)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching commissions:', err);
             return res.status(500).json({ error: 'Failed to fetch commissions' });
             }

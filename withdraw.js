@@ -13,7 +13,13 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
+// ─── Constants ───────────────────────────────────────────────────────────────
+const MAX_PENDING_WITHDRAWALS = 2;   // max concurrent pending withdrawal requests per user
+const LOCK_TTL_APPROVE        = 30;  // Redis lock TTL (seconds) for approve/reject operations
+const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdrawal request
+// ─────────────────────────────────────────────────────────────────────────────
+
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
 
   function generateWithdrawalId() {
     const prefix = 'wdh_';
@@ -143,9 +149,25 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // basic validations
       if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
       if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
-      if (mode === 'upi' && !upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
-      if (mode === 'bank' && (!bankName || !accountNumber || !ifscCode)) {
-        return res.status(400).json({ error: 'Bank details are incomplete' });
+      if (mode === 'upi') {
+        if (!upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
+        // UPI ID must contain exactly one @ and have non-empty handle on both sides
+        if (!/^[a-zA-Z0-9.\-_+]+@[a-zA-Z0-9]+$/.test(upiId.trim())) {
+          return res.status(400).json({ error: 'Invalid UPI ID format (expected handle@provider)' });
+        }
+      }
+      if (mode === 'bank') {
+        if (!bankName || !accountNumber || !ifscCode) {
+          return res.status(400).json({ error: 'Bank details are incomplete' });
+        }
+        // IFSC: 4 alpha + 0 + 6 alphanumeric (RBI standard)
+        if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifscCode.trim().toUpperCase())) {
+          return res.status(400).json({ error: 'Invalid IFSC code format (e.g. SBIN0001234)' });
+        }
+        // Account number: 8–18 digits only
+        if (!/^\d{8,18}$/.test(accountNumber.toString().trim())) {
+          return res.status(400).json({ error: 'Invalid account number (must be 8–18 digits)' });
+        }
       }
 
       // normalize money to paise
@@ -189,7 +211,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           //   return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
           // }
 
-          if (pendingRequests.total >= 2) {
+          if (pendingRequests.total >= MAX_PENDING_WITHDRAWALS) {
             return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
           }
 
@@ -202,6 +224,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const userCommissionRate = Number(usrDet.commission || 0);
           const parentCommissionRate = usrDet.parentId ? Number((await getUserMeta(usrDet.parentId)).commission || 0) : 0;
           let totalCommissionRate = userCommissionRate + parentCommissionRate;
+
+          // Guard against misconfigured commission rates — prevent absurd deductions
+          if (!isFinite(userCommissionRate) || userCommissionRate < 0 || userCommissionRate > 100) {
+            return res.status(422).json({ error: 'Your account commission rate is invalid. Please contact support.' });
+          }
+          if (!isFinite(parentCommissionRate) || parentCommissionRate < 0 || parentCommissionRate > 100) {
+            return res.status(422).json({ error: 'Parent account commission rate is invalid. Please contact support.' });
+          }
+          if (totalCommissionRate > 100) {
+            return res.status(422).json({ error: 'Combined commission rate exceeds 100%. Please contact support.' });
+          }
 
           // if (usrDet.parentId) {
           //   const parentDet = await getUserMeta(usrDet.parentId);
@@ -229,43 +262,58 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           //     preAmount,
           // });
 
-        // Load QR and validate available balance
+        // Acquire per-QR lock before reading balance — prevents two simultaneous withdrawal
+        // requests from both passing the balance check on the same stale QR data.
+        // Same lock key pattern used in webhooks: lock:qr:{qrId}
+        const wdLockKey = `lock:qr:${qrId}`;
+        let wdLockAcquired = false;
+        try {
+            const lockResult = await redisClient.set(wdLockKey, wdh_id, { NX: true, EX: LOCK_TTL_WITHDRAW });
+            wdLockAcquired = lockResult === 'OK';
+        } catch (e) {
+            console.error('Redis lock error in withdraw_new, proceeding without lock:', e);
+            wdLockAcquired = true; // degrade gracefully if Redis is down
+        }
+        if (!wdLockAcquired) {
+            return res.status(409).json({ error: 'Another withdrawal for this QR is being processed. Please try again.' });
+        }
+
+        let qr;
+        try {
+        // Load QR and validate available balance under lock — fresh read, no stale data
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
           Qr_collectionId,
           [Query.equal('qrId', qrId), Query.limit(1)]
         );
         if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' });
-        const qr = qrList.documents[0]; // has totals in paise
+        qr = qrList.documents[0]; // totals in paise
 
-        const total = Number(qr.totalPayInAmount || 0);
-        const approved = Number(qr.withdrawalApprovedAmount || 0);
-        const requested = Number(qr.withdrawalRequestedAmount || 0);
-        const onHold = Number(qr.amountOnHold || 0);
-        const commissionOnHold = Number(qr.commissionOnHold || 0);
-        const commissionPaid = Number(qr.commissionPaid || 0);
+        // All amounts below are in PAISE (1 rupee = 100 paise)
+        const total = Number(qr.totalPayInAmount || 0);           // paise
+        const approved = Number(qr.withdrawalApprovedAmount || 0); // paise
+        const requested = Number(qr.withdrawalRequestedAmount || 0); // paise
+        const onHold = Number(qr.amountOnHold || 0);             // paise
+        const commissionOnHold = Number(qr.commissionOnHold || 0); // paise
+        const commissionPaid = Number(qr.commissionPaid || 0);    // paise
+        // available = what the user can actually withdraw right now (paise)
         const available = total - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-        if ((preAmountPaise + (recalculatedCommissionRs * 100) ) > available) {
+        // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
+        // recalculatedCommissionRs = commission in RUPEES → multiply by 100 to get paise
+        const commissionPaiseRequired = recalculatedCommissionRs * 100; // rupees → paise
+        if ((preAmountPaise + commissionPaiseRequired) > available) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
         }
 
-        const newRequested = requested + preAmountPaise;
-        const newCommissionOnHold = commissionOnHold + (recalculatedCommissionRs * 100);
-        const newAvailable = total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid; // recompute available
+        const newRequested = requested + preAmountPaise;                        // paise
+        const newCommissionOnHold = commissionOnHold + commissionPaiseRequired; // paise
+        // recompute available after deducting this request
+        const newAvailable = total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid; // paise
 
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          qr.$id,
-          {
-            withdrawalRequestedAmount: newRequested,
-            commissionOnHold: newCommissionOnHold,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-        // Create withdrawal document
+        // Create withdrawal document FIRST (under lock), then update QR.
+        // Order matters: if QR update fails we can delete the doc (rollback).
+        // If doc creation fails the QR is untouched — no inconsistency.
         const response = await databases.createDocument(
           APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId,
@@ -275,7 +323,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             userId,
             qrId: qrId || null,
             holderName,
-            amount: amount, // store in Rs Not paise
+            amount: amount, // Rs
             preAmount: preAmount, // Rs
             commission: recalculatedCommissionRs, // Rs
             userCommissionRate: userCommissionRate,
@@ -289,7 +337,33 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'pending',
             createdAt: istTime,
           }
-        ); // withdrawal request created
+        );
+
+        // Now update QR balance; if this fails, roll back by deleting the withdrawal doc
+        try {
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            Qr_collectionId,
+            qr.$id,
+            {
+              withdrawalRequestedAmount: newRequested,
+              commissionOnHold: newCommissionOnHold,
+              amountAvailableForWithdrawal: newAvailable,
+            }
+          );
+        } catch (qrUpdateErr) {
+          // Rollback: delete the withdrawal doc so balance and records stay in sync
+          await databases.deleteDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, response.$id)
+            .catch(e => console.error(`CRITICAL: QR update failed and rollback also failed. Orphaned withdrawal id=${response.$id} for qrId=${qrId}`, e));
+          throw qrUpdateErr;
+        }
+        } finally {
+            // Always release the lock — whether the balance check passed, failed, or threw
+            try {
+                const current = await redisClient.get(wdLockKey);
+                if (current === wdh_id) await redisClient.del(wdLockKey);
+            } catch (e) { console.error('Redis releaseLock error in withdraw_new:', e); }
+        }
 
         // After creating a withdrawal request
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', preAmountPaise).catch(console.error);
@@ -443,6 +517,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // Apply cursor if provided (keyset pagination using $id)
         if (cursor) {
+          if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+            return res.status(400).json({ error: 'Invalid cursor format' });
+          }
           queries.push(Query.cursorAfter(cursor));
         }
 
@@ -494,6 +571,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           nextCursor,              // client passes this as cursor on next request
         });
       } catch (error) {
+        const msg = (error?.message || '').toLowerCase();
+        if (error?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'))) {
+          return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+        }
         console.error('❌ Error fetching withdrawals:', error);
         return res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
       }
@@ -528,6 +609,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // Cursor-based pagination
         if (cursor) {
+          if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+            return res.status(400).json({ error: 'Invalid cursor format' });
+          }
           queries.push(Query.cursorAfter(cursor));
         }
 
@@ -577,6 +661,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           nextCursor,            // pass this back as cursor on next request
         });
       } catch (error) {
+        const msg = (error?.message || '').toLowerCase();
+        if (error?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'))) {
+          return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+        }
         console.error('❌ Error fetching withdrawals:', error.message);
         return res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
       }
@@ -710,7 +798,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
         }
 
-        // 2) Load QR document
+        // Acquire per-QR lock — prevents two concurrent approvals both passing the balance check
+        const approveLockKey = `lock:qr:${qrId}`;
+        const approveLockVal = w.id;
+        let approveLockAcquired = false;
+        try {
+            const r = await redisClient.set(approveLockKey, approveLockVal, { NX: true, EX: LOCK_TTL_APPROVE });
+            approveLockAcquired = r === 'OK';
+        } catch (e) {
+            console.error('Redis lock error in withdrawal approve:', e);
+            approveLockAcquired = true; // degrade gracefully
+        }
+        if (!approveLockAcquired) {
+            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
+        }
+        try {
+
+        // 2) Load QR document — fresh read under lock, no stale data
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
           Qr_collectionId,
@@ -752,9 +856,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
 
-        // Prevent negative ledger fields
-        if (newRequested < 0 || newCommissionOnHold < 0) {
-          return res.status(500).json({ error: 'Ledger computation error: negative balance' });
+        // Guard: no field may go negative after approval
+        // newRequested < 0 means we approved more than was pending (data inconsistency)
+        // newCommissionOnHold < 0 means commission on hold was less than expected
+        // newAvailable < 0 means the QR owes more than it ever received (e.g. a transaction was deleted after the request was raised)
+        if (newRequested < 0 || newCommissionOnHold < 0 || newAvailable < 0) {
+          return res.status(409).json({ error: 'Ledger computation error: approval would result in a negative balance. Check if transactions were modified after this withdrawal was requested.' });
         }
 
         // Continue with database updates...
@@ -792,7 +899,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // After updating Withdrawal request doc and QR ledger:
         const user = await getUserMeta(w.userId);
-        const admin = await getadminMeta(); // Implement this based on your user roles
+        const admin = await getadminMeta();
+
+        if (!admin) {
+          console.warn('Admin metadata not found — admin commission will be skipped');
+        }
 
         if (!user) {
           console.warn("User metadata not found for commission processing");
@@ -808,12 +919,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 w.userCommissionRate
               );
 
-              // Admin commission
-              const adminCommissionAmount = calculateCommission(
-                w.preAmount * 100,
-                w.parentCommissionRate
-              );
-
               commissionTxs.push({
                 userId: user.parentId,
                 sourceWithdrawalId: w.id,
@@ -821,22 +926,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 commissionRate: w.userCommissionRate,
                 earningType: 'subadmin',
                 createdAt: new Date().toISOString(),
+                preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
               });
 
-              commissionTxs.push({
-                userId: admin.userId,
-                sourceWithdrawalId: w.id,
-                amount: adminCommissionAmount,
-                commissionRate: w.parentCommissionRate,
-                earningType: 'admin',
-                createdAt: new Date().toISOString(),
-              });
+              // Update dashboard counter for merchant profit
+              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', subadminCommissionAmount).catch(console.error);
 
-              // Update dashboard counters for merchant and admin profit
-              const merchantProfit = subadminCommissionAmount;
-              const adminCommission = adminCommissionAmount;
-              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', merchantProfit).catch(console.error);
-              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommission).catch(console.error);
+              if (admin) {
+                // Admin commission
+                const adminCommissionAmount = calculateCommission(
+                  w.preAmount * 100,
+                  w.parentCommissionRate
+                );
+
+                commissionTxs.push({
+                  userId: admin.userId,
+                  sourceWithdrawalId: w.id,
+                  amount: adminCommissionAmount,
+                  commissionRate: w.parentCommissionRate,
+                  earningType: 'admin',
+                  createdAt: new Date().toISOString(),
+                  preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
+                });
+
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
+              }
 
             }
           } else {
@@ -854,6 +968,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 commissionRate: w.userCommissionRate,
                 earningType: 'admin',
                 createdAt: new Date().toISOString(),
+                preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
               });
 
             }
@@ -876,6 +991,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
 
         return res.json({ success: true, message: 'Withdrawal approved' });
+        } finally {
+            try { const c = await redisClient.get(approveLockKey); if (c === approveLockVal) await redisClient.del(approveLockKey); } catch {}
+        }
       } catch (err) {
         console.error('❌ Approve error:', err);
         return res.status(500).json({ error: 'Failed to approve withdrawal' });
@@ -1128,7 +1246,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
         }
 
-        // 2) Load QR document
+        // Acquire per-QR lock — prevents two concurrent rejections both passing the balance check
+        const rejectLockKey = `lock:qr:${qrId}`;
+        const rejectLockVal = w.id;
+        let rejectLockAcquired = false;
+        try {
+            const r = await redisClient.set(rejectLockKey, rejectLockVal, { NX: true, EX: LOCK_TTL_APPROVE });
+            rejectLockAcquired = r === 'OK';
+        } catch (e) {
+            console.error('Redis lock error in withdrawal reject:', e);
+            rejectLockAcquired = true; // degrade gracefully
+        }
+        if (!rejectLockAcquired) {
+            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
+        }
+        try {
+
+        // 2) Load QR document — fresh read under lock
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
           Qr_collectionId,
@@ -1169,12 +1303,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const newCommissionOnHold = commissionOnHold - commissionPaise;
         const newCommissionPaid = commissionPaid; // unchanged
 
-        // Recalculate available amount after adjustments
+        // Recalculate available amount after adjustments (all in paise)
         const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
 
-        // console.log(`requested: ${requested} - ${withdrawalPaise} = ${newRequested}`);
-        // console.log(`Post-Reject Ledger - Total: ${total}, Approved: ${newApproved}, Requested: ${newRequested}, Available: ${newAvailable}, CommissionOnHold: ${newCommissionOnHold}`);
-        // console.log(`Post-Reject Commission - CommissionOnHold: ${newCommissionOnHold}, CommissionPaid: ${newCommissionPaid}`);
+        // Guard: rejection should always free up balance, never make it worse
+        // newRequested < 0 means we're returning more than was pending (data inconsistency)
+        // newCommissionOnHold < 0 means commission on hold is less than expected
+        if (newRequested < 0 || newCommissionOnHold < 0) {
+          return res.status(409).json({ error: 'Ledger computation error: rejection would result in a negative balance field.' });
+        }
 
         // 4) Update QR ledger
         await databases.updateDocument(
@@ -1208,6 +1345,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
         return res.json({ success: true, message: 'Withdrawal rejected' });
+        } finally {
+            try { const c = await redisClient.get(rejectLockKey); if (c === rejectLockVal) await redisClient.del(rejectLockKey); } catch {}
+        }
       } catch (err) {
         console.error('❌ Reject error:', err);
         return res.status(500).json({ error: 'Failed to reject withdrawal' });

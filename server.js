@@ -45,6 +45,32 @@ httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
 });
 
+// Startup health check — verify critical Appwrite collection IDs are reachable
+(async () => {
+  const collectionsToCheck = [
+    { name: 'QR codes',                  id: APPWRITE_QRCODE_COLLECTION_ID },
+    { name: 'Webhook data',              id: APPWRITE_WEBHOOK_DATA_COLLECTION_ID },
+    { name: 'Users meta',                id: APPWRITE_USERS_META_COLLECTION_ID },
+    { name: 'Withdrawal requests',       id: APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID },
+    { name: 'Daily QR summaries',        id: APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID },
+    { name: 'Commission transactions',   id: APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID },
+  ];
+  const failed = [];
+  for (const col of collectionsToCheck) {
+    try {
+      await databases.listDocuments(APPWRITE_DATABASE_ID, col.id, [Query.limit(1)]);
+    } catch (e) {
+      failed.push(`${col.name} (${col.id}): ${e?.message || e}`);
+    }
+  }
+  if (failed.length) {
+    console.error('⚠️  Startup health check FAILED for the following collections:');
+    failed.forEach(f => console.error('   •', f));
+  } else {
+    console.log('✅ Startup health check passed — all collections reachable');
+  }
+})();
+
 // Global error handlers
 process.on('unhandledRejection', err => {
   console.error('Unhandled Rejection:', err);
@@ -172,12 +198,18 @@ async function flushCountersToAppwrite() {
     try {
         await redisClient.connect();
         await syncCountersFromAppwrite();
-        setInterval(flushCountersToAppwrite, 5 * 60 * 1000);
+        setInterval(flushCountersToAppwrite, COUNTER_FLUSH_MS);
         console.log('Redis setup complete');
     } catch (e) {
         console.error('Redis connect failed — continuing without Redis:', e);
     }
 })();
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const LOCK_TTL_SECONDS      = 15;   // Redis lock TTL for webhook/QR operations
+const COUNTER_FLUSH_MS      = 1 * 60 * 1000; // how often Redis counters flush to Appwrite (1 min)
+const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests on shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
 const globalLimiter = rateLimit({
@@ -389,7 +421,7 @@ app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID
 app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -566,7 +598,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
 
     // Acquire per-QR distributed lock — same pattern as Razorpay webhook
     const lockKey = `lock:qr:${qrCodeId}`;
-    const acquired = await acquireLock(lockKey, paymentId, 15);
+    const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
     if (!acquired) {
       console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — will retry`);
       return res.status(503).json({ message: 'Processing conflict, retry' });
@@ -576,7 +608,6 @@ app.post("/paytm/payment-sync", async (req, res) => {
       // Update daily QR summary under lock (no race on same-day same-QR)
       try {
         await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-        console.log('✅ Daily QR total updated successfully.');
       } catch (e) {
         console.error('❌ Error updating daily QR total:', e?.message || e);
       }
@@ -613,7 +644,6 @@ app.post("/paytm/payment-sync", async (req, res) => {
           }
         );
 
-        console.log(`✅ QR totals updated for qrId ${qrCodeId}`);
 
         // Emit with real assignedUserId from QR doc
         emitTxnNew({
@@ -1243,7 +1273,6 @@ app.get('/test_websocket', (req, res) => {
 // ##### Mainly Used in Pabesto Tech Pvt Ltd Kitpay for Razorpay QR code payments. #####
 
 app.post('/webhook', async (req, res) => {
-    console.log('Webhook Event Received');
 
     // 1. Verify Razorpay signature
     const razorpaySignature = req.headers['x-razorpay-signature'];
@@ -1258,7 +1287,6 @@ app.post('/webhook', async (req, res) => {
         console.warn('❌ Webhook signature mismatch!');
         return res.status(400).send('Invalid signature');
     }
-    console.log('✅ Webhook verified successfully');
 
     // 2. Filter event type
     const eventType = req.body?.event;
@@ -1314,7 +1342,7 @@ app.post('/webhook', async (req, res) => {
         // Prevents race conditions when two different payments for the same QR arrive simultaneously.
         // Redis SET NX EX is atomic — only one process wins the lock at a time.
         const lockKey = `lock:qr:${qrCodeId}`;
-        const acquired = await acquireLock(lockKey, paymentId, 15);
+        const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
         if (!acquired) {
             // Another payment for this QR is mid-process. Webhook doc is already saved,
             // so the idempotency check above will catch any Razorpay retry.
@@ -1359,7 +1387,6 @@ app.post('/webhook', async (req, res) => {
                 // 8. Update daily QR summary — awaited and under lock, so no race on same-day same-QR
                 try {
                     await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-                    console.log('Daily QR total updated successfully.');
                 } catch (e) {
                     console.error('Error updating daily QR total:', e);
                 }
@@ -1405,8 +1432,6 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
   const istDate = moment.tz(txnDate, 'Asia/Kolkata');
   const dayString = istDate.format('YYYY-MM-DD');
 
-  console.log('IST dayString:', dayString);
-  console.log('qrId:', qrCodeId);
 
   // Query existing aggregate document for the day
   const existingDocs = await databases.listDocuments(
@@ -1475,3 +1500,28 @@ app.get('/', (req, res) => {
 // app.listen(PORT, () => {
 //     console.log(`🚀 Server is running on port ${PORT}`);
 // });
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+// Render sends SIGTERM on deploys/restarts. Give in-flight requests time to finish
+// before closing DB/Redis connections, then exit cleanly.
+async function gracefulShutdown(signal) {
+    console.log(`\n${signal} received — starting graceful shutdown`);
+    httpServer.close(async () => {
+        console.log('HTTP server closed — no new connections accepted');
+        try {
+            await redisClient.quit();
+            console.log('Redis connection closed');
+        } catch (e) {
+            console.error('Error closing Redis during shutdown:', e);
+        }
+        process.exit(0);
+    });
+    // Force-kill after 10 s if requests haven't drained
+    setTimeout(() => {
+        console.error('Graceful shutdown timed out — forcing exit');
+        process.exit(1);
+    }, GRACEFUL_SHUTDOWN_MS).unref(); // .unref() so this timer doesn't keep the process alive on its own
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+// ─────────────────────────────────────────────────────────────────────────────
