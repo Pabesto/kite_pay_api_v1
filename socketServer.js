@@ -110,6 +110,17 @@ function initSocket(app) {
     }
   }
 
+  function emitForceRefresh({ assignedUserId, qrCodeId, payload }) {
+    // if (assignedUserId) {
+    //   io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
+    // }
+    console.log('Emitting force refresh signal with payload:', payload);
+    if (qrCodeId) {
+      // io.to(`room:qr:${qrCodeId}`).emit('forceRefresh', payload);
+      io.emit('forceRefresh', payload); // emit to all connected clients
+    }
+  }
+
 // module.exports = { initSocket };
-module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit }; // ✅ Export functions
+module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh }; // ✅ Export functions
 

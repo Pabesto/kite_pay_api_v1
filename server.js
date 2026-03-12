@@ -39,7 +39,7 @@ const { createClient } = require('redis');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const { httpServer, emitTxnNew , emitQrAlert } = initSocket(app);
+const { httpServer, emitTxnNew , emitQrAlert, emitForceRefresh } = initSocket(app);
 
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
@@ -355,7 +355,6 @@ const authenticateAdminOrSubAdminOrEmployee = (req, res, next) => {
 };
 
 // Middleware to load user role & meta info
-
 async function roleAuth(req, res, next) {
     try {
         const token = req.headers.authorization?.split(" ")[1];
@@ -895,6 +894,21 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
         }
     }
 }
+
+app.get('/test_force_refresh', (req, res) => {
+  const eventPayload = {
+        qrId: 'doc.qrId',
+        fileId: 'doc.fileId' || null,
+        imageUrl: 'oc.imageUrl',
+        assignedUserId: 'doc.assignedUserId '|| null,            // anywhere in last 4 hours [15]
+  };
+
+  emitForceRefresh({
+    payload: eventPayload,
+  }); // Socket.IO rooms emit
+
+  return res.status(200).json({ ok: true, payload: eventPayload });
+});
 
 // http://localhost:3000/test_qralert
 app.get('/test_qralert', (req, res) => {

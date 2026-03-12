@@ -971,7 +971,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             }
           }
-
           // Create commission transaction docs
           for (const tx of commissionTxs) {
             await databases.createDocument(
