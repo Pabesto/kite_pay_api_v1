@@ -279,6 +279,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
 
         let qr;
+        let response;
         try {
         // Load QR and validate available balance under lock — fresh read, no stale data
         const qrList = await databases.listDocuments(
@@ -314,7 +315,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Create withdrawal document FIRST (under lock), then update QR.
         // Order matters: if QR update fails we can delete the doc (rollback).
         // If doc creation fails the QR is untouched — no inconsistency.
-        const response = await databases.createDocument(
+        response = await databases.createDocument(
           APPWRITE_DATABASE_ID,
           Withdrawal_request_collectionId,
           ID.unique(),
