@@ -79,7 +79,7 @@ function initSocket(app) {
     });
   });
 
-  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit };
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh };
 }
 
 // Helper: emit a new transaction event to intended audiences
@@ -110,15 +110,9 @@ function initSocket(app) {
     }
   }
 
-  function emitForceRefresh({ assignedUserId, qrCodeId, payload }) {
-    // if (assignedUserId) {
-    //   io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
-    // }
+  function emitForceRefresh({ payload } = {}) {
     console.log('Emitting force refresh signal with payload:', payload);
-    if (qrCodeId) {
-      // io.to(`room:qr:${qrCodeId}`).emit('forceRefresh', payload);
-      io.emit('forceRefresh', payload); // emit to all connected clients
-    }
+    io.emit('forceRefresh', payload); // broadcast to all connected clients
   }
 
 // module.exports = { initSocket };
