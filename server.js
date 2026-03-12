@@ -1008,266 +1008,132 @@ app.get('/test_websocket', (req, res) => {
 
 // this was being used for beast arena not using now
 // This is the route you provide to the Razorpay/Ezetap team
-// app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-//   console.log('Webhook Event Received new');
+app.post('/razorpay-webhook', webhookParser, async (req, res) => {
+    const wdbg = (step, msg, extra) => {
+        const ts = new Date().toISOString();
+        if (extra !== undefined) console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`, extra);
+        else                     console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`);
+    };
 
-//     // // Verify the webhook signature
-//     // const razorpaySignature = req.headers['x-razorpay-signature'];
+    // STEP 0: always logs — confirms the route was hit
+    wdbg('0', 'Request received', {
+        ip:          req.ip,
+        contentType: req.headers['content-type'],
+        hasBody:     !!req.body,
+        bodyKeys:    Object.keys(req.body || {}),
+    });
 
-//     // if (!razorpaySignature) {
-//     //     return res.status(400).send('Missing Razorpay signature');
-//     // }
+    const data = req.body;
 
-//     // // Create HMAC SHA256 with your webhook secret
-//     // const expectedSignature = crypto
-//     //     .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
-//     //     .update(req.rawBody)
-//     //     .digest('hex');
+    // STEP 1: validate status field
+    wdbg('1', 'Checking status field', { status: data?.status });
+    if (data?.status !== 'AUTHORIZED') {
+        wdbg('1', 'BLOCKED — status is not AUTHORIZED', { status: data?.status });
+        return res.status(400).send('Payment not authorized: ' + data?.status);
+    }
+    wdbg('1', 'Status is AUTHORIZED ✅');
 
-//     // // Compare signatures
-//     // if (expectedSignature === razorpaySignature) {
-//     //     console.log('✅ Webhook verified successfully');
-//     // } else {
-//     //     console.warn('❌ Webhook signature mismatch!');
-//     //     return res.status(400).send('Invalid signature');
-//     // }  
-  
-//     const data = req.body;
+    // STEP 2: parse & validate required fields
+    const qrCodeId     = data.tid;
+    const paymentId    = data.Id;
+    const rrnNumber    = data.rrNumber  || null;
+    const amountRupees = data.amount;
+    const amountPaise  = rupeesToPaiseStrict(amountRupees);
+    const vpa          = data.customerName || null;
+    const postingDate  = data.postingDate;
+    const isoDate      = new Date(postingDate).toISOString();
+    const payloadString = JSON.stringify(req.body);
 
-//     // console.log("📩 Webhook Received:", data);
+    wdbg('2', 'Parsed fields', { qrCodeId, paymentId, rrnNumber, amountRupees, amountPaise, vpa, isoDate });
 
-//     // LOGIC: Check for 'status' field [cite: 897]
-//     if (data.status === "AUTHORIZED") {
-//         console.log("✅ Payment Success:", data.txnId);
-//         // Perform your database updates here
-//     } else if (data.status === "FAILED") {
-//         console.log("❌ Payment Failed");
-//         return res.status(400).send('Failed Payment');
-//         // [cite: 898] "Failed" means money won't be deducted
-//     } else {
-//         return res.status(400).send('Error '+ data.status);
-//     }
+    if (!qrCodeId)    { wdbg('2', 'BLOCKED — qrCodeId (data.tid) missing');  return res.status(400).send('QR Code ID not found'); }
+    if (!paymentId)   { wdbg('2', 'BLOCKED — paymentId (data.Id) missing');   return res.status(400).send('Payment ID not found'); }
+    if (!amountPaise) { wdbg('2', 'BLOCKED — amount missing or zero');        return res.status(400).send('Amount not found'); }
 
-//     const qrCodeId = data.tid;
-//     // const paymentsAmount = data.amount;
-//     // const paymentsCount = req.body?.payload?.qr_code?.entity?.payments_count_received;
+    try {
+        // STEP 3: idempotency check — skip if already processed
+        wdbg('3', 'Checking duplicate paymentId in DB…', { paymentId });
+        const existing = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            [Query.equal('paymentId', paymentId), Query.limit(1)]
+        );
+        if (existing.documents.length) {
+            wdbg('3', 'BLOCKED — duplicate paymentId already in DB', { existingDocId: existing.documents[0].$id });
+            return res.status(200).send('Duplicate webhook ignored');
+        }
+        wdbg('3', 'No duplicate found — proceeding ✅');
 
-//     if (!qrCodeId) {
-//         return res.status(400).send('QR Code ID not found');
-//     }
+        // STEP 4: save raw webhook record (source of truth)
+        wdbg('4', 'Creating transaction document in Appwrite…');
+        const created = await databases.createDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            ID.unique(),
+            {
+                payload:     payloadString,
+                qrCodeId,
+                paymentId,
+                rrnNumber,
+                amount:      amountPaise,
+                vpa,
+                provider:    'razorpay',
+                created_at:  isoDate,
+                status:      'normal',
+            }
+        );
+        wdbg('4', 'Transaction document created ✅', { docId: created.$id });
 
-//     const paymentId = data.Id;
+        // STEP 5: update daily QR summary
+        wdbg('5', 'Updating daily QR summary…', { qrCodeId, isoDate, amountPaise });
+        try {
+            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
+            wdbg('5', 'Daily QR summary updated ✅');
+        } catch (e) {
+            wdbg('5', '⚠️  Daily QR summary update FAILED (non-fatal)', { error: e?.message });
+            console.error('❌ Error updating daily QR total:', e?.message || e);
+        }
 
-//     if (!paymentId) {
-//         return res.status(400).send('Payment ID not found');
-//     }
+        // STEP 6: emit real-time event
+        wdbg('6', 'Emitting real-time event…', { qrCodeId });
+        const eventPayload = {
+            $id:        created.$id,
+            qrCodeId,
+            paymentId,
+            amount:     amountPaise,
+            rrnNumber,
+            vpa,
+            provider:   'razorpay',
+            created_at: new Date(isoDate).toISOString(),
+        };
+        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+        wdbg('6', 'Real-time event emitted ✅');
 
-//     // 5) Idempotency guard (process each cf_payment_id once)
-//   // Idempotency guard: skip if this paymentId is already recorded
-//     const existing = await databases.listDocuments(
-//     APPWRITE_DATABASE_ID,
-//     APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//         [Query.equal('paymentId', paymentId), Query.limit(1)]
-//     ); // requires an index on paymentId for performance
+        // STEP 7: update QR totals atomically (optimistic retry, no Redis lock needed here)
+        wdbg('7', 'Updating QR totals atomically…', { qrCodeId, amountPaise });
+        await updateQrTotalAtomic(qrCodeId, amountPaise);
+        wdbg('7', 'QR totals updated ✅');
 
-//     if (existing.documents.length) {
-//         return res.status(200).send('Duplicate webhook ignored'); // already processed
-//     }
+        // STEP 8: atomic Redis counter increments
+        wdbg('8', 'Incrementing Redis dashboard counters…');
+        await Promise.all([
+            redisClient.incrBy('counter:totalTxCount', 1),
+            redisClient.incrBy('counter:totalApiTx', 1),
+            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
+        ]).catch((e) => {
+            wdbg('8', '⚠️  Redis counter update FAILED (non-fatal)', { error: e?.message });
+            console.error('Redis counter update failed:', e?.message || e);
+        });
+        wdbg('8', 'Redis counters updated ✅');
 
-//     const rrnNumber = data.rrNumber;
-//     const amountRupees = data.amount;
-//     const amountPaise = rupeesToPaiseStrict(amountRupees); // 1001
-
-//     const vpa = data.customerName;
-//     const postingDate = data.postingDate;
-
-//     // const isoDate = new Date(unixTimestamp * 1000).toISOString();
-//     const isoDate = new Date(postingDate).toISOString();
-
-//     const payloadString = JSON.stringify(req.body);
-//     try {
-//         const created = await databases.createDocument(
-//             APPWRITE_DATABASE_ID,
-//             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//             ID.unique(),
-//             {
-//                 payload: payloadString,
-//                 qrCodeId: qrCodeId,
-//                 paymentId: paymentId,
-//                 rrnNumber: rrnNumber,
-//                 amount: amountPaise,
-//                 vpa: vpa,
-//                 provider: 'razorpay',
-//                 created_at: isoDate,
-//                 status: 'normal',
-//             }
-//         );
-
-//     // Update Daily QR Total
-//         // (async () => {
-//         // try {
-//         //     await updateDailyQrTotal(
-//         //     qrCodeId,
-//         //     isoDate,
-//         //     amountPaise
-//         //     );
-//         //     console.log('Daily QR total updated successfully.');
-//         // } catch (error) {
-//         //     console.error('Error updating daily QR total:', error);
-//         // }
-//         // })();
-
-//         await updateDailyQrTotal(qrCodeId, isoDate, amountPaise).catch((e) => {
-//           console.error('❌ Error updating daily QR total:', error?.message || error);
-//         });
-
-//         const eventPayload = {
-//           $id: created.$id,                                    // document id
-//           qrCodeId,
-//           paymentId,                                           // string
-//           amount: amountPaise,                           // exact integer
-//           rrnNumber: rrnNumber || null,
-//           vpa: vpa || null,
-//           provider: 'razorpay',
-//           created_at: new Date(isoDate).toISOString(),    // normalize to ISO
-//         }; // normalized event payload for clients [2]
-
-//         // 5) Emit only to intended audiences (user + QR rooms)
-//         emitTxnNew({
-//             assignedUserId : '',      // may be null if QR not found
-//             qrCodeId,
-//             payload: eventPayload,
-//         }); // Socket.IO selective emit via rooms [1]
-
-//         // 4️⃣ Update global counters (async, no await)
-//         // totalTxCount
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalTxCount', 1).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         // totalApiTx
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalApiTx', 1).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         // totalAmountReceived
-//         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountReceived', amountPaise).catch((e) => {
-//             console.error('Error updating dashboard counter:', e);
-//         });
-
-//         /////////////////////////////////////////////////////////////////////////////////////////////////
-
-// //         // 7) Update QR totals atomically // OLD LOGIC
-// //         try {
-// //         const qrResult = await databases.listDocuments(
-// //             APPWRITE_DATABASE_ID,
-// //             APPWRITE_QRCODE_COLLECTION_ID,
-// //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
-// //         );
-
-// //         if (!qrResult.documents.length) {
-// //             // console.log(`QR Code with qrId ${qrCodeId} not found`);
-// //             return res.status(200).send('OK'); // or handle not-found differently
-// //         }
-// // // 
-// //         const qrDoc = qrResult.documents[0];            // <- take first doc
-// //         // const qrDoc = qrResult.documents;           
-// //         const qrDocId = qrDoc.$id;                     // <- required documentId
-// //         const newCount = (qrDoc.totalTransactions || 0) + 1;
-// //         const newTotal  = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-// //         // Recompute available after changing total
-// //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-// //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-// //         const onHold = Number(qrDoc.amountOnHold || 0);
-// //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-// //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
-// //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-// //         await databases.updateDocument(
-// //             APPWRITE_DATABASE_ID,
-// //             APPWRITE_QRCODE_COLLECTION_ID,
-// //             qrDocId,                                     // <- pass $id here
-// //             {
-// //                 totalTransactions: newCount,
-// //                 totalPayInAmount: newTotal ,
-// //                 amountAvailableForWithdrawal: newAvailable, // <-- add this
-// //             }
-// //         );
-// //       } catch (e) {
-// //         console.error('Error updating QR totals:', e);
-// //       }
-
-
-//         // 7) Update QR totals with optimistic retry (no query locking)
-
-//         // Replace your QR update block with:
-//         await updateQrTotalAtomic(qrCodeId, amountPaise);
-
-//         // let attempts = 0;
-//         // const maxAttempts = 5;
-
-//         // while (attempts < maxAttempts) {
-//         //     try {
-//         //         const qrResult = await databases.listDocuments(
-//         //             APPWRITE_DATABASE_ID,
-//         //             APPWRITE_QRCODE_COLLECTION_ID,
-//         //             [Query.equal('qrId', qrCodeId), Query.limit(1)]
-//         //         );
-
-//         //         if (!qrResult.documents.length) {
-//         //             console.log(`QR Code ${qrCodeId} not found`);
-//         //             break;
-//         //         }
-
-//         //         const qrDoc = qrResult.documents[0];
-
-//         //         // Always use FRESH fetched values for calculation
-//         //         const newCount = (qrDoc.totalTransactions || 0) + 1;
-//         //         const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-//         //         const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-//         //         const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-//         //         const onHold = Number(qrDoc.amountOnHold || 0);
-//         //         const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-//         //         const commissionPaid = Number(qrDoc.commissionPaid || 0);
-//         //         const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-//         //         await databases.updateDocument(
-//         //             APPWRITE_DATABASE_ID,
-//         //             APPWRITE_QRCODE_COLLECTION_ID,
-//         //             qrDoc.$id,
-//         //             {
-//         //                 totalTransactions: newCount,
-//         //                 totalPayInAmount: newTotal,
-//         //                 amountAvailableForWithdrawal: newAvailable,
-//         //             }
-//         //             // NO 5th param - uses collection-level permissions
-//         //         );
-
-//         //         console.log(`✅ QR ${qrCodeId} updated (attempt ${attempts + 1})`);
-//         //         break; // Success!
-
-//         //     } catch (error) {
-//         //         attempts++;
-//         //         if (attempts >= maxAttempts) {
-//         //             console.error(`❌ QR ${qrCodeId} failed after ${maxAttempts} attempts:`, error.message);
-//         //             break;
-//         //         }
-//         //         console.warn(`⚠️ QR ${qrCodeId} conflict (attempt ${attempts}/${maxAttempts}), retrying...`);
-//         //         // Tiny delay prevents thrashing
-//         //         await new Promise(resolve => setTimeout(resolve, 10 * attempts));
-//         //     }
-//         // }
-
-
-//         // console.log('✅ Webhook data saved to Appwrite:', result.$id);
-//         res.status(200).send('Webhook received and saved');
-//     } catch (error) {
-//         console.error('❌ Failed to save webhook:', error.message);
-//         res.status(500).send('Error saving webhook');
-//     }
-// });
+        wdbg('DONE', '✅ razorpay-webhook fully processed — sending 200', { paymentId, qrCodeId });
+        res.status(200).send('Webhook received and saved');
+    } catch (error) {
+        wdbg('ERR', '❌ Unhandled error in razorpay-webhook processing', { message: error.message, stack: error.stack });
+        console.error('❌ Failed to process razorpay-webhook:', error.message);
+        res.status(500).send('Error processing webhook');
+    }
+});
 
 // --- Webhook Endpoint ---
 // Secret:   4@cQVD6GBGa2G7j
