@@ -171,7 +171,7 @@ async function syncCountersFromAppwrite() {
     }
 }
 
-// Every 5 minutes: flush Redis counter values back to Appwrite as a backup
+// Every 1 minutes: flush Redis counter values back to Appwrite as a backup
 async function flushCountersToAppwrite() {
     const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
     for (const name of counterNames) {
@@ -1006,7 +1006,7 @@ app.get('/test_websocket', (req, res) => {
 //     res.status(200).send("OK");
 // });
 
-// this was being used for beast arena not using now
+// Main For Pabesto Tech PVT Ltd. Razorpay Webhook Handler
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const wdbg = (step, msg, extra) => {
@@ -1015,23 +1015,13 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         else                     console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`);
     };
 
-    // STEP 0: always logs — confirms the route was hit
-    wdbg('0', 'Request received', {
-        ip:          req.ip,
-        contentType: req.headers['content-type'],
-        hasBody:     !!req.body,
-        bodyKeys:    Object.keys(req.body || {}),
-    });
-
     const data = req.body;
 
     // STEP 1: validate status field
-    wdbg('1', 'Checking status field', { status: data?.status });
     if (data?.status !== 'AUTHORIZED') {
         wdbg('1', 'BLOCKED — status is not AUTHORIZED', { status: data?.status });
         return res.status(400).send('Payment not authorized: ' + data?.status);
     }
-    wdbg('1', 'Status is AUTHORIZED ✅');
 
     // STEP 2: parse & validate required fields
     const qrCodeId     = data.tid;
@@ -1044,28 +1034,22 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const isoDate      = new Date(postingDate).toISOString();
     const payloadString = JSON.stringify(req.body);
 
-    wdbg('2', 'Parsed fields', { qrCodeId, paymentId, rrnNumber, amountRupees, amountPaise, vpa, isoDate });
-
     if (!qrCodeId)    { wdbg('2', 'BLOCKED — qrCodeId (data.tid) missing');  return res.status(400).send('QR Code ID not found'); }
     if (!paymentId)   { wdbg('2', 'BLOCKED — paymentId (data.Id) missing');   return res.status(400).send('Payment ID not found'); }
     if (!amountPaise) { wdbg('2', 'BLOCKED — amount missing or zero');        return res.status(400).send('Amount not found'); }
 
     try {
         // STEP 3: idempotency check — skip if already processed
-        wdbg('3', 'Checking duplicate paymentId in DB…', { paymentId });
         const existing = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             [Query.equal('paymentId', paymentId), Query.limit(1)]
         );
         if (existing.documents.length) {
-            wdbg('3', 'BLOCKED — duplicate paymentId already in DB', { existingDocId: existing.documents[0].$id });
             return res.status(200).send('Duplicate webhook ignored');
         }
-        wdbg('3', 'No duplicate found — proceeding ✅');
 
         // STEP 4: save raw webhook record (source of truth)
-        wdbg('4', 'Creating transaction document in Appwrite…');
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
@@ -1082,20 +1066,15 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
                 status:      'normal',
             }
         );
-        wdbg('4', 'Transaction document created ✅', { docId: created.$id });
 
         // STEP 5: update daily QR summary
-        wdbg('5', 'Updating daily QR summary…', { qrCodeId, isoDate, amountPaise });
         try {
             await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-            wdbg('5', 'Daily QR summary updated ✅');
         } catch (e) {
-            wdbg('5', '⚠️  Daily QR summary update FAILED (non-fatal)', { error: e?.message });
             console.error('❌ Error updating daily QR total:', e?.message || e);
         }
 
         // STEP 6: emit real-time event
-        wdbg('6', 'Emitting real-time event…', { qrCodeId });
         const eventPayload = {
             $id:        created.$id,
             qrCodeId,
@@ -1107,29 +1086,21 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             created_at: new Date(isoDate).toISOString(),
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        wdbg('6', 'Real-time event emitted ✅');
 
         // STEP 7: update QR totals atomically (optimistic retry, no Redis lock needed here)
-        wdbg('7', 'Updating QR totals atomically…', { qrCodeId, amountPaise });
         await updateQrTotalAtomic(qrCodeId, amountPaise);
-        wdbg('7', 'QR totals updated ✅');
 
         // STEP 8: atomic Redis counter increments
-        wdbg('8', 'Incrementing Redis dashboard counters…');
         await Promise.all([
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
         ]).catch((e) => {
-            wdbg('8', '⚠️  Redis counter update FAILED (non-fatal)', { error: e?.message });
             console.error('Redis counter update failed:', e?.message || e);
         });
-        wdbg('8', 'Redis counters updated ✅');
 
-        wdbg('DONE', '✅ razorpay-webhook fully processed — sending 200', { paymentId, qrCodeId });
         res.status(200).send('Webhook received and saved');
     } catch (error) {
-        wdbg('ERR', '❌ Unhandled error in razorpay-webhook processing', { message: error.message, stack: error.stack });
         console.error('❌ Failed to process razorpay-webhook:', error.message);
         res.status(500).send('Error processing webhook');
     }
