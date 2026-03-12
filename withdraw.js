@@ -927,7 +927,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 commissionRate: w.userCommissionRate,
                 earningType: 'subadmin',
                 createdAt: new Date().toISOString(),
-                preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
               });
 
               // Update dashboard counter for merchant profit
@@ -947,7 +946,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                   commissionRate: w.parentCommissionRate,
                   earningType: 'admin',
                   createdAt: new Date().toISOString(),
-                  preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
                 });
 
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
@@ -969,7 +967,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 commissionRate: w.userCommissionRate,
                 earningType: 'admin',
                 createdAt: new Date().toISOString(),
-                preAmountPaise: Math.round((w.preAmount || 0) * 100), // audit: base withdrawal in paise
               });
 
             }
