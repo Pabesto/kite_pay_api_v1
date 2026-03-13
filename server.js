@@ -1344,62 +1344,74 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
   const istDate = moment.tz(txnDate, 'Asia/Kolkata');
   const dayString = istDate.format('YYYY-MM-DD');
 
+  // Per-day Redis lock: serializes ALL concurrent writes to the same daily JSON document.
+  // Without this, two payments for different QR codes arriving at the same time both read
+  // the same totalsJson, compute independent updates, and one silently overwrites the other.
+  const dailyLockKey = `lock:daily:${dayString}`;
+  const dailyLockVal = `${qrCodeId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 
-  // Query existing aggregate document for the day
-  const existingDocs = await databases.listDocuments(
-    APPWRITE_DATABASE_ID,
-    APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-    [
-      Query.equal('date', dayString),
-      Query.limit(1),
-    ]
-  );
+  let dailyLockAcquired = false;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    dailyLockAcquired = await acquireLock(dailyLockKey, dailyLockVal, 10); // 10s TTL
+    if (dailyLockAcquired) break;
+    await new Promise(r => setTimeout(r, 50 + attempt * 40)); // ~50–410ms backoff
+  }
+  if (!dailyLockAcquired) {
+    throw new Error(`updateDailyQrTotal: could not acquire daily lock for ${dayString} after 10 retries`);
+  }
 
-  if (existingDocs.total > 0) {
-    // Document exists - parse JSON string and update totals object
-    const doc = existingDocs.documents[0];
-    const totalsJsonStr = doc.totalsJson || '{}';
-
-    let totalsObj;
-    try {
-      totalsObj = JSON.parse(totalsJsonStr);
-    } catch (e) {
-      // fallback if corrupted JSON
-      totalsObj = {};
-    }
-
-    // Compute new amount for given qrCodeId
-    const oldAmount = Number(totalsObj[qrCodeId] || 0);
-    const newAmount = oldAmount + amountDelta;
-
-    if (newAmount < 0) {
-      throw new Error('Total amount cannot be negative');
-    }
-
-    totalsObj[qrCodeId] = newAmount;
-
-    // Serialize back and update document
-    await databases.updateDocument(
+  try {
+    // Query existing aggregate document for the day
+    const existingDocs = await databases.listDocuments(
       APPWRITE_DATABASE_ID,
       APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-      doc.$id,
-      {
-        totalsJson: JSON.stringify(totalsObj),
-      }
+      [
+        Query.equal('date', dayString),
+        Query.limit(1),
+      ]
     );
-  } else {
-    // Create new document with totalsJson initialized
-    const totalsObj = { [qrCodeId]: amountDelta };
 
-    await databases.createDocument(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-      ID.unique(),
-      {
-        date: dayString,
-        totalsJson: JSON.stringify(totalsObj),
+    if (existingDocs.total > 0) {
+      // Document exists — parse JSON string and update totals object
+      const doc = existingDocs.documents[0];
+      const totalsJsonStr = doc.totalsJson || '{}';
+
+      let totalsObj;
+      try {
+        totalsObj = JSON.parse(totalsJsonStr);
+      } catch (e) {
+        totalsObj = {}; // fallback if corrupted JSON
       }
-    );
+
+      const oldAmount = Number(totalsObj[qrCodeId] || 0);
+      const newAmount = oldAmount + amountDelta;
+
+      if (newAmount < 0) {
+        throw new Error('Total amount cannot be negative');
+      }
+
+      totalsObj[qrCodeId] = newAmount;
+
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+        doc.$id,
+        { totalsJson: JSON.stringify(totalsObj) }
+      );
+    } else {
+      // No document for this day yet — create it
+      await databases.createDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+        ID.unique(),
+        {
+          date: dayString,
+          totalsJson: JSON.stringify({ [qrCodeId]: amountDelta }),
+        }
+      );
+    }
+  } finally {
+    await releaseLock(dailyLockKey, dailyLockVal);
   }
 }
 
