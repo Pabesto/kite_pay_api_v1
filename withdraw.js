@@ -989,7 +989,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         return res.json({ success: true, message: 'Withdrawal approved' });
         } finally {
-            try { const c = await redisClient.get(approveLockKey); if (c === approveLockVal) await redisClient.del(approveLockKey); } catch {}
+            try { const lua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`; await redisClient.eval(lua, { keys: [approveLockKey], arguments: [approveLockVal] }); } catch {}
         }
       } catch (err) {
         console.error('❌ Approve error:', err);
@@ -1093,53 +1093,70 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         perUser[userId] += amt;
       }
 
+      const releaseLua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+
       for (const [userId, delta] of Object.entries(perUser)) {
         if (delta === 0) continue;
 
-        const list = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
-          [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
-        ); // composite query [web:50]
+        // Per-user-month lock: serializes concurrent approvals updating the same user's monthly total.
+        const mLockKey = `lock:commission:monthly:${userId}:${month}`;
+        const mLockVal = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+        let mLockAcquired = false;
+        for (let i = 0; i < 10; i++) {
+          const r = await redisClient.set(mLockKey, mLockVal, { NX: true, EX: 10 }).catch(() => null);
+          if (r === 'OK') { mLockAcquired = true; break; }
+          await new Promise(res => setTimeout(res, 50 + i * 40));
+        }
+        if (!mLockAcquired) throw new Error(`Could not acquire monthly commission lock for ${userId}`);
 
-        if (list.total > 0) {
-          const row = list.documents[0];
-          const newTotal = Number(row.totalCommissionPaise || 0) + delta;
-          if (newTotal < 0) throw new Error(`Negative monthly total for ${userId}`);
-          await databases.updateDocument(
+        try {
+          const list = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
-            row.$id,
-            { totalCommissionPaise: newTotal }
+            [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
           );
-        } else {
-          try {
-            await databases.createDocument(
+
+          if (list.total > 0) {
+            const row = list.documents[0];
+            const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+            if (newTotal < 0) throw new Error(`Negative monthly total for ${userId}`);
+            await databases.updateDocument(
               APPWRITE_DATABASE_ID,
               APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
-              ID.unique(),
-              { userId, month, totalCommissionPaise: delta }
+              row.$id,
+              { totalCommissionPaise: newTotal }
             );
-          } catch (e) {
-            // retry path on unique collision
-            const again = await databases.listDocuments(
-              APPWRITE_DATABASE_ID,
-              APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
-              [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
-            );
-            if (again.total > 0) {
-              const row = again.documents[0];
-              const newTotal = Number(row.totalCommissionPaise || 0) + delta;
-              await databases.updateDocument(
+          } else {
+            try {
+              await databases.createDocument(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
-                row.$id,
-                { totalCommissionPaise: newTotal }
+                ID.unique(),
+                { userId, month, totalCommissionPaise: delta }
               );
-            } else {
-              throw e;
+            } catch (e) {
+              // retry path on unique collision
+              const again = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
+              );
+              if (again.total > 0) {
+                const row = again.documents[0];
+                const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+                await databases.updateDocument(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                  row.$id,
+                  { totalCommissionPaise: newTotal }
+                );
+              } else {
+                throw e;
+              }
             }
           }
+        } finally {
+          await redisClient.eval(releaseLua, { keys: [mLockKey], arguments: [mLockVal] }).catch(() => {});
         }
       }
     }
@@ -1154,52 +1171,69 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         perUser[userId] += amt;
       }
 
+      const releaseLua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+
       for (const [userId, delta] of Object.entries(perUser)) {
         if (delta === 0) continue;
 
-        const list = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
-          [ Query.equal('userId', userId), Query.limit(1) ]
-        );
+        // Per-user lock: serializes concurrent approvals updating the same user's all-time total.
+        const atLockKey = `lock:commission:alltime:${userId}`;
+        const atLockVal = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+        let atLockAcquired = false;
+        for (let i = 0; i < 10; i++) {
+          const r = await redisClient.set(atLockKey, atLockVal, { NX: true, EX: 10 }).catch(() => null);
+          if (r === 'OK') { atLockAcquired = true; break; }
+          await new Promise(res => setTimeout(res, 50 + i * 40));
+        }
+        if (!atLockAcquired) throw new Error(`Could not acquire all-time commission lock for ${userId}`);
 
-        if (list.total > 0) {
-          const row = list.documents[0];
-          const newTotal = Number(row.totalCommissionPaise || 0) + delta;
-          if (newTotal < 0) throw new Error(`Negative all-time total for ${userId}`);
-          await databases.updateDocument(
+        try {
+          const list = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
-            row.$id,
-            { totalCommissionPaise: newTotal }
+            [ Query.equal('userId', userId), Query.limit(1) ]
           );
-        } else {
-          try {
-            await databases.createDocument(
+
+          if (list.total > 0) {
+            const row = list.documents[0];
+            const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+            if (newTotal < 0) throw new Error(`Negative all-time total for ${userId}`);
+            await databases.updateDocument(
               APPWRITE_DATABASE_ID,
               APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
-              ID.unique(),
-              { userId, totalCommissionPaise: delta }
+              row.$id,
+              { totalCommissionPaise: newTotal }
             );
-          } catch (e) {
-            const again = await databases.listDocuments(
-              APPWRITE_DATABASE_ID,
-              APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
-              [ Query.equal('userId', userId), Query.limit(1) ]
-            );
-            if (again.total > 0) {
-              const row = again.documents[0];
-              const newTotal = Number(row.totalCommissionPaise || 0) + delta;
-              await databases.updateDocument(
+          } else {
+            try {
+              await databases.createDocument(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
-                row.$id,
-                { totalCommissionPaise: newTotal }
+                ID.unique(),
+                { userId, totalCommissionPaise: delta }
               );
-            } else {
-              throw e;
+            } catch (e) {
+              const again = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                [ Query.equal('userId', userId), Query.limit(1) ]
+              );
+              if (again.total > 0) {
+                const row = again.documents[0];
+                const newTotal = Number(row.totalCommissionPaise || 0) + delta;
+                await databases.updateDocument(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                  row.$id,
+                  { totalCommissionPaise: newTotal }
+                );
+              } else {
+                throw e;
+              }
             }
           }
+        } finally {
+          await redisClient.eval(releaseLua, { keys: [atLockKey], arguments: [atLockVal] }).catch(() => {});
         }
       }
     }

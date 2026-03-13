@@ -290,7 +290,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // 🔐 Create new user (admin/sub-admin allowed)
     router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
         const { name, email, password, role } = req.body;
-        creatorId = req.user.userId;
+        const creatorId = req.user.userId;
 
         if(role === 'admin'){
             return res.status(400).json({ error: 'admin cant be created' });
