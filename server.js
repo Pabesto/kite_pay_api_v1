@@ -443,7 +443,7 @@ function rupeesToPaiseStrict(rupees) {
 }
 
 app.get('/inc_test', async (req, res) => {
-    const istDate = moment.tz(txnDate, 'Asia/Kolkata');
+    const istDate = moment.tz(new Date(), 'Asia/Kolkata');
     const dayString = istDate.format('YYYY-MM-DD');
 
     const qr_code_id = "QR_09890";
