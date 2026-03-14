@@ -206,9 +206,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       if (amountPaise == null) return res.status(400).json({ error: 'Invalid amount' });
 
       const wdh_id = generateWithdrawalId();
-      // const istOffset = 5.5 * 60 * 60 * 1000;
-      // const istTime = new Date(Date.now() + istOffset).toISOString();
-      const istTime = moment().tz('Asia/Kolkata').toISOString();
+
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const istTime = new Date(Date.now() + istOffset).toISOString();
+
+      print('IST Time for withdrawal request:', istTime);
+
+      // const istTime = moment().tz('Asia/Kolkata').toISOString();
 
         try {
           // Enforce max 2 pending per user

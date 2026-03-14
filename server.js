@@ -55,6 +55,14 @@ process.on('uncaughtException', err => {
   console.error('Uncaught Exception:', err);
 });
 
+// const istOffset = 5.5 * 60 * 60 * 1000;
+// const istTime = new Date(Date.now() + istOffset).toISOString();
+
+// console.log('IST Time for server startup:', istTime);
+
+// console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format());
+// console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSSZ'));
+// → 2026-03-15T05:59:49.122+05:30
 
 // Appwrite Configuration from your provided webhook file
 const APPWRITE_ENDPOINT = 'https://fra.cloud.appwrite.io/v1';
