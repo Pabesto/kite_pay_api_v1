@@ -48,6 +48,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     return users.documents[0];
   }
 
+  // Helper to get user by userId
+  async function getTodayPayins() {
+    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+            // Fetch the daily aggregate doc for today (only one document)
+            const dailySummaryDocs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', todayISO),
+                Query.limit(1),
+            ]
+            );
+
+            let totalsObj = {};
+            if (dailySummaryDocs.total > 0) {
+              try {
+                  totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+              } catch (e) {
+                  totalsObj = {};
+                  console.error('Error parsing totalsJson for daily summary:', e);
+                }
+            }
+    return totalsObj;
+  }
+
     // Helper to calculate commission
     function calculateCommission(preAmount, commissionRatePercent) {
       return Math.ceil(preAmount * commissionRatePercent / 100);
@@ -57,7 +82,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       return value ? parseInt(value, 10) : 0;
     }
 
-    router.post('/withdraw_commission_preview', async (req, res) => {
+    router.post('/withdraw_commission_preview', authenticateToken , async (req, res) => {
       const { userId, qrId, preAmount } = req.body;
 
       // console.log('Withdraw commission preview request received:', req.body);
@@ -139,7 +164,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Users can post a withdrawal request (new version with validations and balance checks)
-    router.post('/withdraw_new', async (req, res) => {
+    router.post('/withdraw_new', authenticateToken, async (req, res) => {
       const { userId, qrId, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
       // console.log('Withdraw request received:', req.body);
@@ -149,6 +174,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // basic validations
       if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
       if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
+      if (!qrId) return res.status(400).json({ error: 'qrId is required' });  // ← add
       if (mode === 'upi') {
         if (!upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
         // UPI ID must contain exactly one @ and have non-empty handle on both sides
@@ -219,7 +245,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
           // Inside the try block, after fetching usrDet and parentDet
 
-          const preAmountPaise = Math.round(preAmount * 100);
+          // before
+          // const preAmountPaise = Math.round(preAmount * 100);
+
+          // after — reuses the toPaise helper already defined above
+          const preAmountPaise = toPaise(preAmount);
+          if (preAmountPaise == null) return res.status(400).json({ error: 'Invalid preAmount' });
 
           const userCommissionRate = Number(usrDet.commission || 0);
           const parentCommissionRate = usrDet.parentId ? Number((await getUserMeta(usrDet.parentId)).commission || 0) : 0;
@@ -242,17 +273,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           // }
 
           const recalculatedCommissionRs = calculateCommission(preAmount, totalCommissionRate);
+          const recalculatedCommissionPaise = recalculatedCommissionRs * 100;
+          const recalculatedTotalPaise = preAmountPaise + recalculatedCommissionPaise;
 
-          const recalculatedTotalAmount = Number(preAmount) + recalculatedCommissionRs;
-
-          // Validation check
-          if (Number(amount) !== recalculatedTotalAmount) {
+          // Validation check — compare in integer paise to avoid floating-point drift
+          // (e.g. 100.1 + 0.3 !== 100.4 in IEEE 754, but 10010 + 30 === 10040 always)
+          if (Math.round(Number(amount) * 100) !== recalculatedTotalPaise) {
             return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.' });
           }
 
-          if (Number(commission) !== recalculatedCommissionRs) {
+          if (Math.round(Number(commission) * 100) !== recalculatedCommissionPaise) {
             return res.status(400).json({ error: 'Commission mismatch. Please check the commission and try again.' });
           }
+
+          // Original float comparison (replaced — susceptible to precision drift):
+          // const recalculatedTotalAmount = Number(preAmount) + recalculatedCommissionRs;
+          // if (Number(amount) !== recalculatedTotalAmount) { ... }
+          // if (Number(commission) !== recalculatedCommissionRs) { ... }
 
           // return res.status(400).json({
           //     error: "Testing error ",
@@ -300,12 +337,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // available = what the user can actually withdraw right now (paise)
         const available = total - approved - requested - onHold - commissionOnHold - commissionPaid;
 
+        const todayPayinsAll = await getTodayPayins();
+
+        const todayPayinsForThisQr = Number(todayPayinsAll[qr.qrId] || 0);
+
+        // canWithdrawToday = whether the user can withdraw today based on today's pay-ins for this QR (paise)
+        const todayWithdrawAmount = available - todayPayinsForThisQr;
+
         // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
         // recalculatedCommissionRs = commission in RUPEES → multiply by 100 to get paise
         const commissionPaiseRequired = recalculatedCommissionRs * 100; // rupees → paise
-        if ((preAmountPaise + commissionPaiseRequired) > available) {
+        if ((preAmountPaise + commissionPaiseRequired) > todayWithdrawAmount) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
         }
+
+        // if ((preAmountPaise + commissionPaiseRequired) > available) {
+        //   return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
+        // }
 
         const newRequested = requested + preAmountPaise;                        // paise
         const newCommissionOnHold = commissionOnHold + commissionPaiseRequired; // paise
@@ -322,7 +370,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             id: wdh_id,
             userId,
-            qrId: qrId || null,
+            qrId: qrId,
             holderName,
             amount: amount, // Rs
             preAmount: preAmount, // Rs
