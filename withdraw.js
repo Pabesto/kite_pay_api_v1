@@ -488,7 +488,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // GET /withdrawals?status=pending&limit=20&cursor=docId
-    router.get('/withdrawals_paginated', authenticateAdminOrLabel('all_withdrawals'), async (req, res) => {
+    router.get('/withdrawals_paginated', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
       try {
         const {userId, qrId, status, limit: limitStr, cursor } = req.query;
 
@@ -523,7 +523,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 let orQueries = [];
 
                 if(merchantIds.length === 0){
-                    res.status(500).json({ message: "Failed to fetch Withdrawals No Merchants assigned.", error: error.message });
+                    return res.status(500).json({ message: "Failed to fetch Withdrawals No Merchants assigned." });
                 }else if(merchantIds.length === 1){
                     queriesUser.push(Query.equal('parentId', merchantIds[0]));
                 }else{
@@ -553,6 +553,33 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             }
 
+            if (req.user.role === 'subadmin' && !userId && !qrId) {
+                const usersUnderSubadmin = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('parentId', req.user.userId),
+                        Query.equal('role', 'user'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
+
+                const usersUnderSubadminIds = usersUnderSubadmin.documents.map(d => d.userId);
+
+                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+
+                let queriesUser = [];
+
+                if(usersUnderSubadminIds.length === 0){
+                    return res.status(500).json({ message: "Failed to fetch Withdrawals No Users assigned." });
+                }else if(usersUnderSubadminIds.length === 1){
+                    queries.push(Query.equal('userId', usersUnderSubadminIds[0]));
+                }else{
+                    usersUnderSubadminIds.forEach(id => queriesUser.push(Query.equal('userId', id)));
+                    queries.push(Query.or(queriesUser));
+                }
+
+            }
 
         if (userId && qrId) {
                 const userQrIds = await getQrIdsForUser(userId);
@@ -1436,7 +1463,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // const istOffset = 5.5 * 60 * 60 * 1000;
       // const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
 
-      rejectedAtIST = istDateTimeNow();
+      const rejectedAtIST = istDateTimeNow();
 
         // 5) Update withdrawal document
         await databases.updateDocument(
@@ -1477,37 +1504,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           console.error("❌ Error fetching config:", err);
             res.status(500).json({ success: false, error: "Failed to fetch config" });
         }
-
-      // try {
-
-      //   const docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
-
-      //   // convert docs into a key:value map
-      //   const config = {};
-      //   for (let doc of docs.documents) {
-      //     let parsedValue = doc.value;
-
-      //     // auto-type parsing
-      //     if (doc.type === "integer") {
-      //       parsedValue = parseInt(doc.value);
-      //     } else if (doc.type === "double") {
-      //       parsedValue = parseFloat(doc.value);
-      //     } else if (doc.type === "boolean") {
-      //       parsedValue = (doc.value === "true");
-      //     } else if (doc.type === "json") {
-      //       parsedValue = JSON.parse(doc.value);
-      //     } else {
-      //       parsedValue = doc.value;
-      //     }
-
-      //     config[doc.key] = parsedValue;
-      //   }
-
-      //   res.json({ success: true, config });
-      // } catch (err) {
-      //   console.error("Error fetching config:", err);
-      //   res.status(500).json({ success: false, error: "Failed to fetch config" });
-      // }
 
     });
 

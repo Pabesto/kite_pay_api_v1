@@ -244,6 +244,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const { accountId } = req.params;
             const updates = req.body;
 
+            console.log('Admin update request for accountId:', accountId, 'with updates:', updates);
+
             if (updates.accountNumber && updates.accountNumber.length > 25)
                 return res.status(400).json({ error: 'Account number too long' });
 

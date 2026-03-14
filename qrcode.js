@@ -159,7 +159,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // GET all QR codes For Admin and Employees
     // This is a public endpoint
-    router.get('/qr-codes', authenticateAdminOrLabel('all_transactions'), async (req, res) => {
+    router.get('/qr-codes', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
         try {
 
             let resultAllQr = [];
@@ -185,7 +185,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 // let orQueries = [];
 
                 if(merchantIds.length === 0){
-                    res.status(500).json({ message: "Failed to fetch QR codes No Merchants assigned.", error: error.message });
+                    return res.status(500).json({ message: "Failed to fetch QR codes No Merchants assigned." });
                 }else if(merchantIds.length === 1){
                     queries.push(Query.equal('parentId', merchantIds[0]));
                 }else{
@@ -209,7 +209,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
                 merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
                 userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
-                queries.push(Query.or(orQueries2));
+                
+                if (orQueries2.length === 1) {
+                    queries.push(orQueries2[0]);
+                } else {
+                    queries.push(Query.or(orQueries2));
+                }
+
+                // queries.push(Query.or(orQueries2));
 
                 // console.log('Employee user list query result count:', usersRes.total);
 
@@ -223,12 +230,51 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
                 // documents = response.documents;
 
+            } else if(req.user.role === 'subadmin'){
+                console.log('Subadmin fetching QR codes for userId:', req.user.userId);
+                
+                const usersUnderSubadmin = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_USERS_META_COLLECTION_ID,
+                    [
+                        Query.equal('parentId', req.user.userId),
+                        Query.equal('role', 'user'),
+                        Query.limit(100)  // Merchants rarely >100/emp
+                    ]
+                );
+
+                const usersUnderSubadminIds = usersUnderSubadmin.documents.map(d => d.userId);
+                
+                let subadminQrQueries = [];
+
+                let queriesUser = [];
+
+                if(usersUnderSubadminIds.length === 0){
+                    return res.status(500).json({ message: "Failed to fetch Qr No Users assigned.", error: "Qr Fetch Failed" });
+                }else if(usersUnderSubadminIds.length === 1){
+                    subadminQrQueries.push(Query.or([
+                        Query.equal('assignedUserId', usersUnderSubadminIds[0]),
+                        Query.equal('managedByUserId', req.user.userId)
+                    ]));
+                }else{
+                    usersUnderSubadminIds.forEach(id => queriesUser.push(Query.equal('assignedUserId', id)));
+                    queriesUser.push(Query.equal('managedByUserId', req.user.userId)); // Include QR codes created by subadmin but not yet assigned 
+                    subadminQrQueries.push(Query.or(queriesUser));
+                }
+                    
+                resultAllQr = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID,
+                        Qr_collectionId,
+                        [...subadminQrQueries,
+                        Query.orderAsc('createdAt'), Query.limit(100) ],
+                    );
+
             } else {
 
                 resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
                     [
-                        Query.orderDesc('createdAt'), // Add this line to sort descending by date
-                        Query.limit(100) // Limits the results to 10 documents
+                        Query.orderAsc('createdAt'), // Add this line to sort descending by date
+                        Query.limit(100) // Limits the results to 100 documents
                     ]
                 );
 
@@ -283,11 +329,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 };
             });
 
-            res.status(200).json(qrCodesWithTodayTotal.reverse());// Reverse the order to show the most recent first
+            return res.status(200).json(qrCodesWithTodayTotal.reverse());// Reverse the order to show the most recent first
 
         } catch (error) {
             console.error('Error fetching QR codes:', error);
-            res.status(500).json({ message: "Failed to fetch QR codes.", error: error.message });
+            return res.status(500).json({ message: "Failed to fetch QR codes.", error: error.message });
         }
     });
 
@@ -383,10 +429,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             //     });
             // }
 
-            res.status(201).json({ message: "QR Code entry created successfully.", qrCode: newQrCode });
+            return res.status(201).json({ message: "QR Code entry created successfully.", qrCode: newQrCode });
         } catch (error) {
             console.error('Error creating QR code entry:', error);
-            res.status(500).json({ message: "Failed to create QR code entry.", error: error.message });
+            return res.status(500).json({ message: "Failed to create QR code entry.", error: error.message });
         }
     });
 
@@ -440,10 +486,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesDisabled', -1).catch(console.error);
             }
 
-            res.status(200).json({ message: "QR Code and file deleted successfully." });
+            return res.status(200).json({ message: "QR Code and file deleted successfully." });
         } catch (error) {
             console.error('Error deleting QR code:', error);
-            res.status(500).json({ message: "Failed to delete QR code.", error: error.message });
+            return res.status(500).json({ message: "Failed to delete QR code.", error: error.message });
         }
     });
 
@@ -525,17 +571,16 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             //     }
             // }
 
-            res.status(200).json({ 
+            return res.status(200).json({ 
                 message: "QR Code updated successfully.", 
                 qrCode: updatedQr 
             });
 
         } catch (error) {
             console.error('Error editing QR code entry:', error);
-            res.status(500).json({ message: "Failed to update QR code entry.", error: error.message });
+            return res.status(500).json({ message: "Failed to update QR code entry.", error: error.message });
         }
     });
-
 
     // PUT to toggle the isActive status
     // This is an admin-only endpoint
@@ -563,7 +608,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                     return res.status(403).json({ message: 'Forbidden: Cannot edit QR codes not created by you' });
                 }
                 if(isActive === true){
-                    return res.status(403).json({ message: 'Forbidden: Subadmin cannot activate an active QR code' });
+                    return res.status(403).json({ message: 'Forbidden: Subadmin cannot toggle QR codes Status' });
                 }
             } else {    
                 // sub-admins can only edit QR codes they created
@@ -587,10 +632,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'qrCodesDisabled', 1).catch(console.error);
             }
 
-            res.status(200).json({ message: "QR Code status updated successfully." });
+            return res.status(200).json({ message: "QR Code status updated successfully." });
         } catch (error) {
             console.error('Error toggling QR code status:', error);
-            res.status(500).json({ message: "Failed to update QR code status.", error: error.message });
+            return res.status(500).json({ message: "Failed to update QR code status.", error: error.message });
         }
     });
 
@@ -701,7 +746,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     //     - if assignedUser exists and assignee.parentId !== managedByUserId => 409 block
     //     - if assignedUser missing and was expected => 409 block
     //     - if assignedUser null or in-scope => proceed
-    router.put('/assign-qr-manager/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.put('/assign-qr-manager/:qrId', authenticateAdmin, async (req, res) => {
         const { qrId } = req.params;
         const { managedByUserId: rawManaged } = req.body;
         const actor = req.user;
@@ -709,7 +754,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         try {
             // Admin-only
             if (actor.role !== 'admin') {
-            return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
+                return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
             }
 
             // Normalize: '' -> null
@@ -785,9 +830,9 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             // Counters only on null <-> non-null transitions
             const newAssigned = updated.assignedUserId || null;
             if (!prevAssigned && newAssigned) {
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
             } else if (prevAssigned && !newAssigned) {
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
             }
 
             return res.status(200).json({ message: 'Manager updated.', updated });
@@ -888,10 +933,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             });
 
 
-            res.status(200).json(userQrCodesWithTodayTotal);
+            return res.status(200).json(userQrCodesWithTodayTotal);
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
-            res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
+            return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
         }
     });
 
@@ -971,11 +1016,10 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 };
             });
 
-
-            res.status(200).json(userQrCodesWithTodayTotal);
+            return res.status(200).json(userQrCodesWithTodayTotal);
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
-            res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
+            return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
         }
     });
 

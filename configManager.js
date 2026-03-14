@@ -42,7 +42,7 @@ class ConfigManager {
 
             configCache = config;
 
-            console.log("Config loaded successfully:", config);
+            // console.log("Config loaded successfully:", config);
 
             return config;
 

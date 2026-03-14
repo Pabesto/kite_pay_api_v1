@@ -522,6 +522,17 @@ function toInt(value) {
   return value ? parseInt(value, 10) : 0;
 }
 
+app.get("/api/get_app_config", async (req, res) => {
+    try {
+        await ConfigManager.refresh(); // Ensure we have the latest config
+        const config = await ConfigManager.getConfig(databases);
+        res.json({ success: true, config });
+    } catch (err) {
+        console.error("❌ Error fetching config:", err);
+        res.status(500).json({ success: false, error: "Failed to fetch config" });
+    }
+});
+
 app.get('/get_app_config', async (req, res) => {
 
     // const result = await databases.listDocuments(
@@ -1121,9 +1132,9 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     const isoDate      = new Date(postingDate).toISOString();
     const payloadString = JSON.stringify(req.body);
 
-    if (!qrCodeId)    { wdbg('2', 'BLOCKED — qrCodeId (data.tid) missing');  return res.status(400).send('QR Code ID not found'); }
-    if (!paymentId)   { wdbg('2', 'BLOCKED — paymentId (data.Id) missing');   return res.status(400).send('Payment ID not found'); }
-    if (!amountPaise) { wdbg('2', 'BLOCKED — amount missing or zero');        return res.status(400).send('Amount not found'); }
+    if (!qrCodeId)    { return res.status(400).send('QR Code ID not found'); }
+    if (!paymentId)   { return res.status(400).send('Payment ID not found'); }
+    if (!amountPaise) { return res.status(400).send('Amount not found'); }
 
     // Acquire per-QR distributed lock FIRST — same pattern as /webhook.
     // Serializes idempotency check + doc creation + QR update for the same QR code,

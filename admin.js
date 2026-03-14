@@ -831,7 +831,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 let orQueries = [];
 
                 if(merchantIds.length === 0){
-                    res.status(500).json({ message: "Failed to fetch Transactions No Merchants assigned.", error: error.message });
+                    return res.status(500).json({ message: "Failed to fetch Transactions No Merchants assigned." });
                 }else if(merchantIds.length === 1){
                     queries.push(Query.equal('parentId', merchantIds[0]));
                 }else{
@@ -859,7 +859,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
                 merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
                 userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
-                queries.push(Query.or(orQueries2));
+                queries.push(orQueries2.length === 1 ? orQueries2[0] : Query.or(orQueries2));
 
                 // console.log('Employee user list query result count:', usersRes.total);
 
@@ -1008,12 +1008,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
-            res.status(200).json({ transactions: docs, nextCursor });
-
+            return res.status(200).json({ transactions: docs, nextCursor });
+            
         } catch (error) {
             if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching transactions:', error);
-            res.status(500).json({ error: 'Failed to fetch transactions' });
+            return res.status(500).json({ error: 'Failed to fetch transactions' });
         }
     });
 
