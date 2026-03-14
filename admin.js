@@ -107,11 +107,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
                 queries.push(Query.or(orQueries));
 
-                const result = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_USERS_META_COLLECTION_ID,
-                    queries // must be an array
-                );
+                // const result = await databases.listDocuments(
+                //     APPWRITE_DATABASE_ID,
+                //     APPWRITE_USERS_META_COLLECTION_ID,
+                //     queries // must be an array
+                // );
 
                 // console.log('Employee user list query result count:', result.total);
 
