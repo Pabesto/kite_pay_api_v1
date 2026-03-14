@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const cors = require('cors');
 const compression = require('compression'); // Added compression middleware
-const { Client, Databases, Storage, Users, Account, ID, Query, InputFile } = require('node-appwrite');
+const { Client, Databases, Storage, Users, Account, ID, Query, InputFile, TablesDB } = require('node-appwrite');
 
 const { createServer } = require('http');
 const { Server } = require('socket.io');
@@ -86,6 +86,8 @@ const databases = new Databases(client);
 const account = new Account(client);
 const storage = new Storage(client);
 const users = new Users(client);
+
+const tablesDB = new TablesDB(client);
 
 // 🔥 Initialize ConfigManager with your databases instance
 ConfigManager.init(databases);
@@ -445,59 +447,63 @@ function rupeesToPaiseStrict(rupees) {
 app.get('/inc_test', async (req, res) => {
     const istDate = moment.tz(new Date(), 'Asia/Kolkata');
     const dayString = istDate.format('YYYY-MM-DD');
-
     const qr_code_id = "QR_09890";
 
     try {
-    // Query existing aggregate document for the day
-    const existingDocs = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      'test_dialy_qr_summaries',
-      [
-        Query.equal('qr_code_id', qr_code_id),
-        Query.equal('date', dayString),
-        Query.limit(1),
-      ]
-    );
+        // Try to create the row first (optimistic insert).
+        // If (qr_code_id, date) unique index is set in Appwrite, only one
+        // concurrent "first insert" wins — all others hit the duplicate error
+        // and fall through to the atomic increment below.
+        try {
+            await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                'test_dialy_qr_summaries',
+                ID.unique(),
+                {
+                    qr_code_id: qr_code_id,
+                    date: dayString,
+                    total_pay_in_amount: 100,
+                    transaction_count: 1,
+                }
+            );
+        } catch (createErr) {
+            // 409 = duplicate — row already exists, use atomic increment instead
+            if (createErr?.code !== 409) throw createErr;
 
-    if (existingDocs.total > 0) {
-      // Document exists — parse JSON string and update totals object
-      const doc = existingDocs.documents[0];
+            const existingDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                'test_dialy_qr_summaries',
+                [
+                    Query.equal('qr_code_id', qr_code_id),
+                    Query.equal('date', dayString),
+                    Query.limit(1),
+                ]
+            );
 
-      await databases.incrementRowColumn(
-        APPWRITE_DATABASE_ID,
-        'test_dialy_qr_summaries',
-        doc.$id,
-        'total_pay_in_amount',
-        100,
-      );
+            const doc = existingDocs.documents[0];
 
-      await databases.incrementRowColumn(
-        APPWRITE_DATABASE_ID,
-        'test_dialy_qr_summaries',
-        doc.$id,
-        'transaction_count',
-        1,
-      );
+            await tablesDB.incrementRowColumn(
+                APPWRITE_DATABASE_ID,
+                'test_dialy_qr_summaries',
+                doc.$id,
+                'total_pay_in_amount',
+                100,
+            );
 
-    } else {
-      // No document for this day yet — create it
-      await databases.createDocument(
-        APPWRITE_DATABASE_ID,
-        'test_dialy_qr_summaries',
-        ID.unique(),
-        {
-          date: dayString,
-          total_pay_in_amount: 100, // Start with the first transaction amount),
-          transaction_count: 1,
+            await tablesDB.incrementRowColumn(
+                APPWRITE_DATABASE_ID,
+                'test_dialy_qr_summaries',
+                doc.$id,
+                'transaction_count',
+                1,
+            );
         }
-      );
-    }
-  } finally {
-    // await releaseLock(dailyLockKey, dailyLockVal);
-  }
 
-    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+        res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+    } catch (err) {
+        console.error('/inc_test error:', err);
+        res.status(500).json({ status: 'error', message: err.message });
+    }
 });
 
 app.get('/health', (req, res) => {
@@ -1082,17 +1088,17 @@ app.get('/test_websocket', (req, res) => {
 // Main For Pabesto Tech PVT Ltd. Razorpay Webhook Handler
 // This is the route you provide to the Razorpay/Ezetap team
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
-    const wdbg = (step, msg, extra) => {
-        const ts = new Date().toISOString();
-        if (extra !== undefined) console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`, extra);
-        else                     console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`);
-    };
+    // const wdbg = (step, msg, extra) => {
+    //     const ts = new Date().toISOString();
+    //     if (extra !== undefined) console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`, extra);
+    //     else                     console.log(`[RZ-WEBHOOK][${ts}] STEP ${step}: ${msg}`);
+    // };
 
     const data = req.body;
 
     // STEP 1: validate status field
     if (data?.status !== 'AUTHORIZED') {
-        wdbg('1', 'BLOCKED — status is not AUTHORIZED', { status: data?.status });
+        // wdbg('1', 'BLOCKED — status is not AUTHORIZED', { status: data?.status });
         return res.status(400).send('Payment not authorized: ' + data?.status);
     }
 
@@ -1115,30 +1121,30 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
     // Serializes idempotency check + doc creation + QR update for the same QR code,
     // preventing duplicate writes when concurrent requests carry the same paymentId.
     const lockKey = `lock:qr:${qrCodeId}`;
-    wdbg('L', 'Acquiring Redis lock…', { lockKey, ttl: LOCK_TTL_SECONDS });
+    // wdbg('L', 'Acquiring Redis lock…', { lockKey, ttl: LOCK_TTL_SECONDS });
     const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
     if (!acquired) {
-        wdbg('L', 'BLOCKED — lock busy, another payment for this QR is processing', { qrCodeId, paymentId });
+        // wdbg('L', 'BLOCKED — lock busy, another payment for this QR is processing', { qrCodeId, paymentId });
         return res.status(503).send('Processing conflict, retry');
     }
-    wdbg('L', 'Lock acquired ✅', { lockKey });
+    // wdbg('L', 'Lock acquired ✅', { lockKey });
 
     try {
         // STEP 3: idempotency check — under lock, so no TOCTOU with concurrent same-paymentId requests
-        wdbg('3', 'Checking duplicate paymentId in DB…', { paymentId });
+        // wdbg('3', 'Checking duplicate paymentId in DB…', { paymentId });
         const existing = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             [Query.equal('paymentId', paymentId), Query.limit(1)]
         );
         if (existing.documents.length) {
-            wdbg('3', 'BLOCKED — duplicate paymentId already in DB');
+            // wdbg('3', 'BLOCKED — duplicate paymentId already in DB');
             return res.status(200).send('Duplicate webhook ignored');
         }
-        wdbg('3', 'No duplicate found — proceeding ✅');
+        // wdbg('3', 'No duplicate found — proceeding ✅');
 
         // STEP 4: save raw webhook record (source of truth) — under lock
-        wdbg('4', 'Creating transaction document in Appwrite…');
+        // wdbg('4', 'Creating transaction document in Appwrite…');
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
@@ -1155,20 +1161,20 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
                 status:      'normal',
             }
         );
-        wdbg('4', 'Transaction document created ✅', { docId: created.$id });
+        // wdbg('4', 'Transaction document created ✅', { docId: created.$id });
 
         // STEP 5: update daily QR summary
-        wdbg('5', 'Updating daily QR summary…');
+        // wdbg('5', 'Updating daily QR summary…');
         try {
             await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-            wdbg('5', 'Daily QR summary updated ✅');
+            // wdbg('5', 'Daily QR summary updated ✅');
         } catch (e) {
-            wdbg('5', '⚠️  Daily QR summary update FAILED (non-fatal)', { error: e?.message });
+            // wdbg('5', '⚠️  Daily QR summary update FAILED (non-fatal)', { error: e?.message });
             console.error('❌ Error updating daily QR total:', e?.message || e);
         }
 
         // STEP 6: emit real-time event
-        wdbg('6', 'Emitting real-time event…');
+        // wdbg('6', 'Emitting real-time event…');
         const eventPayload = {
             $id:        created.$id,
             qrCodeId,
@@ -1180,34 +1186,34 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             created_at: new Date(isoDate).toISOString(),
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        wdbg('6', 'Real-time event emitted ✅');
+        // wdbg('6', 'Real-time event emitted ✅');
 
         // STEP 7: update QR totals — under lock so no concurrent reads on same QR doc
-        wdbg('7', 'Updating QR totals…');
+        // wdbg('7', 'Updating QR totals…');
         await updateQrTotalAtomic(qrCodeId, amountPaise);
-        wdbg('7', 'QR totals updated ✅');
+        // wdbg('7', 'QR totals updated ✅');
 
         // STEP 8: atomic Redis counter increments (non-critical, outside lock scope is fine)
-        wdbg('8', 'Incrementing Redis dashboard counters…');
+        // wdbg('8', 'Incrementing Redis dashboard counters…');
         await Promise.all([
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
         ]).catch((e) => {
-            wdbg('8', '⚠️  Redis counter update FAILED (non-fatal)', { error: e?.message });
+            // wdbg('8', '⚠️  Redis counter update FAILED (non-fatal)', { error: e?.message });
             console.error('Redis counter update failed:', e?.message || e);
         });
 
-        wdbg('DONE', '✅ Webhook fully processed — sending 200', { paymentId, qrCodeId });
+        // wdbg('DONE', '✅ Webhook fully processed — sending 200', { paymentId, qrCodeId });
         res.status(200).send('Webhook received and saved');
     } catch (error) {
-        wdbg('ERR', '❌ Unhandled error', { message: error.message });
+        // wdbg('ERR', '❌ Unhandled error', { message: error.message });
         console.error('❌ Failed to process razorpay-webhook:', error.message);
         res.status(500).send('Error processing webhook');
     } finally {
-        wdbg('Lf', 'Releasing Redis lock…', { lockKey });
+        // wdbg('Lf', 'Releasing Redis lock…', { lockKey });
         await releaseLock(lockKey, paymentId);
-        wdbg('Lf', 'Lock released ✅');
+        // wdbg('Lf', 'Lock released ✅');
     }
 });
 
