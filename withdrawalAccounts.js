@@ -21,31 +21,21 @@ const WITHDRAWAL_ACCOUNTS_COLLECTION_ID = 'withdrawal_accounts'; // Replace with
 module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
 
     // Define your withdrawalAccounts routes here, using the passed dependencies and middleware
-    // ✅ LIST: GET /withdrawal_accounts - User's own accounts only
-    router.get('/withdrawal_accounts', authenticateToken, async (req, res) => {
-        try {
-            const userId = req.user.userId;
-            
-            const response = await databases.listDocuments(
-            APPWRITE_DATABASE_ID, // or your DATABASE_ID
+
+    async function fetchAccounts(userId) {
+        return databases.listDocuments(
+            APPWRITE_DATABASE_ID,
             WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
             [
                 Query.equal('userId', userId),
                 Query.orderDesc('$createdAt'),
                 Query.limit(25)
-                // Add cursor: Query.cursorAfter(req.query.cursor) for pagination if needed
             ]
-            );
+        );
+    }
 
-            if(response.documents.length === 0) {
-                return res.json({
-                    success: true,
-                    accounts: [],
-                    total: 0
-                });
-            }
-
-            res.json({
+    function formatAccounts(response) {
+        return {
             success: true,
             accounts: response.documents.map(doc => ({
                 $id: doc.$id,
@@ -62,14 +52,33 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             })),
             total: response.total,
             nextCursor: response.documents.length === 25 ? response.documents[response.documents.length - 1].$id : null
-            });
+        };
+    }
 
+    // ✅ LIST (User): GET /user_withdrawal_accounts - Own accounts only
+    router.get('/withdrawal_accounts', authenticateToken, async (req, res) => {
+        try {
+            const response = await fetchAccounts(req.user.userId);
+            res.json(formatAccounts(response));
         } catch (error) {
-            console.error('❌ List withdrawal_accounts error:', error.message);
-            res.status(500).json({ error: 'Failed to fetch withdrawal accounts' , errorDetails: error.message});
+            console.error('❌ List user_withdrawal_accounts error:', error.message);
+            res.status(500).json({ error: 'Failed to fetch withdrawal accounts', errorDetails: error.message });
         }
     });
 
+    // ✅ LIST (Admin/Subadmin/Employee): GET /withdrawal_accounts?userId=xxx
+    router.get('/user_withdrawal_accounts', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
+        try {
+            const { userId } = req.query;
+            if (!userId) return res.status(400).json({ error: 'userId query param is required' });
+
+            const response = await fetchAccounts(userId);
+            res.json(formatAccounts(response));
+        } catch (error) {
+            console.error('❌ List withdrawal_accounts error:', error.message);
+            res.status(500).json({ error: 'Failed to fetch withdrawal accounts', errorDetails: error.message });
+        }
+    });
 
     // ✅ CREATE: POST /withdrawal_accounts - Add new account (with validation)
     router.post('/withdrawal_accounts', authenticateToken, async (req, res) => {

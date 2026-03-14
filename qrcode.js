@@ -177,7 +177,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
                 const merchantIds = merchantsRes.documents.map(d => d.userId);
 
-                console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
 
                 let queries = [];
 
