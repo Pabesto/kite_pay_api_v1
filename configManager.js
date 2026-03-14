@@ -31,7 +31,7 @@ class ConfigManager {
                 } else if (doc.type === "double") {
                     parsedValue = parseFloat(doc.value);
                 } else if (doc.type === "boolean") {
-                    parsedValue = (doc.value === "true");
+                    parsedValue = (doc.value == "0" ? false : true);
                 } else if (doc.type === "json") {
                     parsedValue = JSON.parse(doc.value);
                 } else {
@@ -41,7 +41,12 @@ class ConfigManager {
             }
 
             configCache = config;
+
+            console.log("Config loaded successfully:", config);
+
             return config;
+
+
         } catch (err) {
             console.error("Error loading config:", err);
             return {};
