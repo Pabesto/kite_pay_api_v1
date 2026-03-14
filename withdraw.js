@@ -206,8 +206,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       if (amountPaise == null) return res.status(400).json({ error: 'Invalid amount' });
 
       const wdh_id = generateWithdrawalId();
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(Date.now() + istOffset).toISOString();
+      // const istOffset = 5.5 * 60 * 60 * 1000;
+      // const istTime = new Date(Date.now() + istOffset).toISOString();
+      const istTime = moment().tz('Asia/Kolkata').toISOString();
 
         try {
           // Enforce max 2 pending per user
@@ -612,7 +613,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ifscCode: doc.ifscCode,
             status: doc.status,
             createdAt: doc.createdAt,
-            processed_at: doc.processed_at || null,
+            processedAt: doc.processedAt || null,
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
             // Include other metadata if needed
@@ -703,7 +704,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ifscCode: doc.ifscCode,
             status: doc.status,
             createdAt: doc.createdAt,
-            processed_at: doc.processed_at || null,
+            processedAt: doc.processedAt || null,
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
             // Include other metadata if needed
@@ -824,8 +825,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
       }
 
-      const istOffsetMs = 5.5 * 60 * 60 * 1000;
-      const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
+      // const istOffsetMs = 5.5 * 60 * 60 * 1000;
+      // const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
+      const approvedAtIST = moment().tz('Asia/Kolkata').toISOString();
 
       try {
         // 1) Find withdrawal by business id
@@ -946,7 +948,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             status: 'approved',
             utrNumber: utrNumber.trim(),
-            processed_at: approvedAtIST,
+            processedAt: approvedAtIST,
             rejectionReason: null,
           }
         ); // update by $id
@@ -1424,7 +1426,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'rejected',
             rejectionReason: reason.trim(),
             utrNumber: null,
-            processed_at: new Date().toISOString(),
+            processedAt: new Date().toISOString(),
           }
         ); // by $id
 
