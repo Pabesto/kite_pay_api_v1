@@ -948,7 +948,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             status: 'approved',
             utrNumber: utrNumber.trim(),
-            processedAt: approvedAtIST,
+            processedAt: getCurrentTimeIST(),
             rejectionReason: null,
           }
         ); // update by $id
@@ -1058,11 +1058,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     function istDayString(ts = new Date()) {
-      return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM-DD'); // TZ-safe day key [web:51]
+      return moment.tz(ts,'Asia/Kolkata').format('YYYY-MM-DD'); // TZ-safe day key [web:51]
     }
 
     function istMonthString(ts = new Date()) {
       return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM'); // TZ-safe month key [web:51]
+    }
+
+    function getCurrentTimeIST(ts = new Date()) {
+      return rejectedAtIST = moment().tz('Asia/Kolkata').toISOString();
     }
 
     // One entrypoint after computing commissionTxs in your approval route
@@ -1416,7 +1420,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             commissionPaid: newCommissionPaid,
           }
         ); // by $id
-
+      
         // 5) Update withdrawal document
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
@@ -1426,7 +1430,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'rejected',
             rejectionReason: reason.trim(),
             utrNumber: null,
-            processedAt: new Date().toISOString(),
+            processedAt: getCurrentTimeIST(),
           }
         ); // by $id
 
