@@ -177,14 +177,21 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
                 const merchantIds = merchantsRes.documents.map(d => d.userId);
 
-                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
+                console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
 
                 let queries = [];
 
                 let orQueries = [];
                 // let orQueries = [];
-                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
-                queries.push(Query.or(orQueries));
+
+                if(merchantIds.length === 0){
+                    res.status(500).json({ message: "Failed to fetch QR codes No Merchants assigned.", error: error.message });
+                }else if(merchantIds.length === 1){
+                    queries.push(Query.equal('parentId', merchantIds[0]));
+                }else{
+                    merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                    queries.push(Query.or(orQueries));
+                }
 
                 const usersRes = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,

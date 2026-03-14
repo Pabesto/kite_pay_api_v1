@@ -516,9 +516,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 let queriesUser = [];
 
                 let orQueries = [];
+
+                if(merchantIds.length === 0){
+                    res.status(500).json({ message: "Failed to fetch Withdrawals No Merchants assigned.", error: error.message });
+                }else if(merchantIds.length === 1){
+                    queriesUser.push(Query.equal('parentId', merchantIds[0]));
+                }else{
+                    merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                    queriesUser.push(Query.or(orQueries));
+                }
+
                 // let orQueries = [];
-                merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
-                queriesUser.push(Query.or(orQueries));
+                // merchantIds.forEach(id => orQueries.push(Query.equal('parentId', id)));
+                // queriesUser.push(Query.or(orQueries));
 
                 const usersRes = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,

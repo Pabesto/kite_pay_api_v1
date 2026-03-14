@@ -123,10 +123,9 @@ const redisClient = createClient({
         reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
     },
 });
-redisClient.on('error', (e) => console.error('Redis error:', e));
+// redisClient.on('error', (e) => console.error('Redis error:', e));
 redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
 redisClient.on('ready', () => console.log('Redis connected'));
-
 
 // Acquire a distributed lock. Returns true if lock was acquired.
 // Uses SET NX EX which is atomic in Redis — safe under concurrency.
