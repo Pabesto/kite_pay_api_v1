@@ -209,7 +209,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
       const istOffset = 5.5 * 60 * 60 * 1000;
       const istTime = new Date(Date.now() + istOffset).toISOString();
-      
+
       // const istTime = moment().tz('Asia/Kolkata').toISOString();
 
         try {
@@ -829,7 +829,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
       // const istOffsetMs = 5.5 * 60 * 60 * 1000;
       // const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
-      const approvedAtIST = moment().tz('Asia/Kolkata').toISOString();
+      // const approvedAtIST = moment().tz('Asia/Kolkata').toISOString();
+
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const approvedAtIST = new Date(Date.now() + istOffset).toISOString();
 
       try {
         // 1) Find withdrawal by business id
@@ -1419,6 +1422,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           }
         ); // by $id
 
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
+
         // 5) Update withdrawal document
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
@@ -1428,7 +1434,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             status: 'rejected',
             rejectionReason: reason.trim(),
             utrNumber: null,
-            processedAt: new Date().toISOString(),
+            processedAt: rejectedAtIST,
           }
         ); // by $id
 
