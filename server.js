@@ -442,6 +442,64 @@ function rupeesToPaiseStrict(rupees) {
   return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
 
+app.get('/inc_test', async (req, res) => {
+    const istDate = moment.tz(txnDate, 'Asia/Kolkata');
+    const dayString = istDate.format('YYYY-MM-DD');
+
+    const qr_code_id = "QR_09890";
+
+    try {
+    // Query existing aggregate document for the day
+    const existingDocs = await databases.listDocuments(
+      APPWRITE_DATABASE_ID,
+      'test_dialy_qr_summaries',
+      [
+        Query.equal('qr_code_id', qr_code_id),
+        Query.equal('date', dayString),
+        Query.limit(1),
+      ]
+    );
+
+    if (existingDocs.total > 0) {
+      // Document exists — parse JSON string and update totals object
+      const doc = existingDocs.documents[0];
+
+      await databases.incrementRowColumn(
+        APPWRITE_DATABASE_ID,
+        'test_dialy_qr_summaries',
+        doc.$id,
+        'total_pay_in_amount',
+        100,
+      );
+
+      await databases.incrementRowColumn(
+        APPWRITE_DATABASE_ID,
+        'test_dialy_qr_summaries',
+        doc.$id,
+        'transaction_count',
+        1,
+      );
+
+    } else {
+      // No document for this day yet — create it
+      await databases.createDocument(
+        APPWRITE_DATABASE_ID,
+        'test_dialy_qr_summaries',
+        ID.unique(),
+        {
+          date: dayString,
+          total_pay_in_amount: 100, // Start with the first transaction amount),
+          transaction_count: 1,
+        }
+      );
+    }
+  } finally {
+    // await releaseLock(dailyLockKey, dailyLockVal);
+  }
+
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
