@@ -207,8 +207,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
       const wdh_id = generateWithdrawalId();
 
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(Date.now() + istOffset).toISOString();
+      // const istOffset = 5.5 * 60 * 60 * 1000;
+      // const istTime = new Date(Date.now() + istOffset).toISOString();
+
+      const istTime = istDateTimeNow();
 
       // const istTime = moment().tz('Asia/Kolkata').toISOString();
 
@@ -831,8 +833,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
       // const approvedAtIST = moment().tz('Asia/Kolkata').toISOString();
 
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const approvedAtIST = new Date(Date.now() + istOffset).toISOString();
+      // const istOffset = 5.5 * 60 * 60 * 1000;
+      // const approvedAtIST = new Date(Date.now() + istOffset).toISOString();
+
+      const approvedAtIST = istDateTimeNow();
+
 
       try {
         // 1) Find withdrawal by business id
@@ -1068,6 +1073,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     function istMonthString(ts = new Date()) {
       return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM'); // TZ-safe month key [web:51]
+    }
+
+    function istDateTimeNow(){
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const AtIST = new Date(Date.now() + istOffset).toISOString();
+      return AtIST;
     }
 
     // One entrypoint after computing commissionTxs in your approval route
@@ -1422,8 +1433,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           }
         ); // by $id
 
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
+      // const istOffset = 5.5 * 60 * 60 * 1000;
+      // const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
+
+      rejectedAtIST = istDateTimeNow();
 
         // 5) Update withdrawal document
         await databases.updateDocument(
