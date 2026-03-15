@@ -2780,26 +2780,42 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // 1) Fetch all QRs managed by merchantId (paginate)
-            const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const AllManagedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
                 Query.equal('managedByUserId', merchantId),
                 Query.limit(100),
                 Query.orderAsc('$id'),
             ]);
 
-            const userQrIds = qrs.map(q => q.qrId);
+            // 1) Fetch all QRs managed by merchantId (paginate)
+            const AllSelfAssignedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('assignedUserId', merchantId),
+                Query.limit(100),
+                Query.orderAsc('$id'),
+            ]);
 
-            // console.log(`Merchant ${merchantId} has ${qrs.length} QRs IDS [${userQrIds.join(', ')}]`);
+            // QRs managed by merchantId but assigned to someone else (their sub-users)
+            const AllUserAssignedQrs = AllManagedQrs.filter(q => q.assignedUserId !== merchantId);
+
+            const AllManagedQrIds = AllManagedQrs.map(q => q.qrId);
+            const AllSelfAssignedQrIds = AllSelfAssignedQrs.map(q => q.qrId);
+            const AllUserAssignedQrIds = AllUserAssignedQrs.map(q => q.qrId);
+
+            // console.log(`Merchant ${merchantId} has ${AllManagedQrs.length} managed QRs, ${AllSelfAssignedQrs.length} self-assigned QRs, ${AllUserAssignedQrs.length} user-assigned QRs`);
+
+            // console.log(`Merchant ${merchantId} has ${AllManagedQrs.length} QRs IDS [${userQrIds.join(', ')}]`);
 
             const existingDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 [
-                Query.equal('date', dayString),
-                Query.limit(1),
+                    Query.equal('date', dayString),
+                    Query.limit(1),
                 ]
             );
 
             let todayPayInAllQrs = 0;
+            let todayPayInSelfAssignedQrs = 0;
+            let todayPayInUserAssignedQrs = 0;
 
             if (existingDocs.total > 0) {
                 // Document exists - parse JSON string and update totals object
@@ -2822,12 +2838,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
                 // OPTIONAL: If you need user-specific subset (instead of all)
+                // Total across all QRs assigned to this merchant (not just self-assigned)
                 todayPayInAllQrs = Object.entries(totalsObj)
-                    .filter(([qrid]) => userQrIds.includes(qrid))
+                    .filter(([qrid]) => AllManagedQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                todayPayInSelfAssignedQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => AllSelfAssignedQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                todayPayInUserAssignedQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => AllUserAssignedQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
 
                 // ✅ Separate logic: Check each user QR individually for 10000 limit
-                const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
+                const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => AllManagedQrIds.includes(qrid));
 
                 userQrEntries.forEach(([qrid, valueStr]) => {
                         const value = parseInt(valueStr || 0, 10);
@@ -2842,36 +2867,122 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
             }
 
-            // 2) Aggregate QR-derived counters
+            // 2) Aggregate QR-derived counters for AllManagedQrs
             let totalTxCount = 0;
-            let totalAmountReceived = 0;         // sum of qr.totalTransactions (if that is amount); if it's count, rename accordingly
-            let totalAvailableAmount = 0;        // sum of qr.amountAvailableForWithdrawal
-            let totalWithdrawalPendingAmount = 0;// sum of qr.withdrawalRequestedAmount
-            let totalAmountPaid = 0;             // sum of qr.withdrawalApprovedAmount
-            let totalAmountOnHold = 0;             // sum of qr.amountOnHold
+            let totalAmountReceived = 0;
+            let totalAvailableAmount = 0;
+            let totalWithdrawalPendingAmount = 0;
+            let totalAmountPaid = 0;
+            let totalAmountOnHold = 0;
 
-            let totalQrsAssignedToMerchant = qrs.length;
+            let totalCommissionOnHold = 0;         // sum of qr.commissionOnHold (paise)
+            let totalCommissionPaid = 0;           // sum of qr.commissionPaid (paise)
+
+            let totalQrsAssignedToMerchant = AllManagedQrs.length;
             let qrCodesActive = 0;
             let qrCodesDisabled = 0;
 
-            let totalMerchantProfit = 0;      // compute if you have commission rules per qr/txn
+            let totalMerchantProfit = 0;
 
-            for (const qr of qrs) {
-            // Adjust these field names to your schema
-            const isActive = !!qr.isActive;
-            const txAmount = parseInt(qr.totalPayInAmount || 0, 10); // if this is count, rename to totalTxCount and keep amount separate
-            const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
-            const paid = parseInt(qr.withdrawalApprovedAmount || 0, 10);
-            const pendingW = parseInt(qr.withdrawalRequestedAmount || 0, 10);
-            const onHold = parseInt(qr.amountOnHold || 0, 10);
+            for (const qr of AllManagedQrs) {
+                const isActive = !!qr.isActive;
 
-            if (isActive) qrCodesActive++; else qrCodesDisabled++;
+                const txAmount = parseInt(qr.totalPayInAmount || 0, 10);
+                const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+                const paid = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+                const pendingW = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+                const onHold = parseInt(qr.amountOnHold || 0, 10);
+
+                const commHold = parseInt(qr.commissionOnHold || 0, 10);
+                const commPaid = parseInt(qr.commissionPaid || 0, 10);
+
+                if (isActive) qrCodesActive++; else qrCodesDisabled++;
+                totalTxCount += parseInt(qr.totalTransactions || 0, 10);
                 totalAmountReceived += txAmount;
-                totalTxCount += parseInt(qr.totalTransactions || 0, 10); // if you store counts separately
                 totalAvailableAmount += avail;
-                totalAmountPaid += paid;
                 totalWithdrawalPendingAmount += pendingW;
+                totalAmountPaid += paid;
                 totalAmountOnHold += onHold;
+
+                totalCommissionOnHold += commHold;
+                totalCommissionPaid += commPaid;
+            }
+
+            // 2b) Aggregate QR-derived counters for AllSelfAssignedQrs
+            let selfTotalTxCount = 0;
+            let selfTotalAmountReceived = 0;
+            let selfTotalAvailableAmount = 0;
+            let selfTotalWithdrawalPendingAmount = 0;
+            let selfTotalAmountPaid = 0;
+            let selfTotalAmountOnHold = 0;
+            
+            let selfTotalCommissionOnHold = 0;         // sum of qr.commissionOnHold (paise)
+            let selfTotalCommissionPaid = 0;           // sum of qr.commissionPaid (paise)
+
+            let selfQrCodesActive = 0;
+            let selfQrCodesDisabled = 0;
+
+            for (const qr of AllSelfAssignedQrs) {
+                const isActive = !!qr.isActive;
+                const txAmount = parseInt(qr.totalPayInAmount || 0, 10);
+                const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+                const paid = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+                const pendingW = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+                const onHold = parseInt(qr.amountOnHold || 0, 10);
+
+                const commHold = parseInt(qr.commissionOnHold || 0, 10);
+                const commPaid = parseInt(qr.commissionPaid || 0, 10);
+
+                if (isActive) selfQrCodesActive++; else selfQrCodesDisabled++;
+                selfTotalTxCount += parseInt(qr.totalTransactions || 0, 10);
+                selfTotalAmountReceived += txAmount;
+                selfTotalAvailableAmount += avail;
+                selfTotalWithdrawalPendingAmount += pendingW;
+                selfTotalAmountPaid += paid;
+                selfTotalAmountOnHold += onHold;
+
+                selfTotalCommissionOnHold += commHold;
+                selfTotalCommissionPaid += commPaid;
+            }
+
+            // 2c) Aggregate QR-derived counters for AllUserAssignedQrs (managed by merchant, assigned to sub-users)
+            let userTotalTxCount = 0;
+            let userTotalAmountReceived = 0;
+            let userTotalAvailableAmount = 0;
+            let userTotalWithdrawalPendingAmount = 0;
+            let userTotalAmountPaid = 0;
+            let userTotalAmountOnHold = 0;
+
+            let userTotalCommissionOnHold = 0;         // sum of qr.commissionOnHold (paise)
+            let userTotalCommissionPaid = 0;           // sum of qr.commissionPaid (paise)
+
+            let userQrCodesActive = 0;
+            let userQrCodesDisabled = 0;
+
+            for (const qr of AllUserAssignedQrs) {
+
+                // console.log(`Processing user-assigned QR ${qr.qrId} assigned to user ${qr.assignedUserId} with totalPayInAmount ${qr.totalPayInAmount}`);
+
+                const isActive = !!qr.isActive;
+                const txAmount = parseInt(qr.totalPayInAmount || 0, 10);
+                const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+                const paid = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+                const pendingW = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+                const onHold = parseInt(qr.amountOnHold || 0, 10);
+
+                const commHold = parseInt(qr.commissionOnHold || 0, 10);
+                const commPaid = parseInt(qr.commissionPaid || 0, 10);
+
+                if (isActive) userQrCodesActive++; else userQrCodesDisabled++;
+                userTotalTxCount += parseInt(qr.totalTransactions || 0, 10);
+                userTotalAmountReceived += txAmount;
+                userTotalAvailableAmount += avail;
+                userTotalWithdrawalPendingAmount += pendingW;
+                userTotalAmountPaid += paid;
+                userTotalAmountOnHold += onHold;
+
+                userTotalCommissionOnHold += commHold;
+                userTotalCommissionPaid += commPaid;
             }
 
             // 3) Users under this merchant
@@ -2901,25 +3012,61 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const totalMembershipPurchased = 0;
             const pendingMembershipUsers = 0;
 
+            let withdrawableAmount = totalAvailableAmount - todayPayInAllQrs;
+            let selfWithdrawableAmount = selfTotalAvailableAmount - todayPayInSelfAssignedQrs;
+            let userWithdrawableAmount = userTotalAvailableAmount - todayPayInUserAssignedQrs;
+
             // Response
             return res.json({
                 merchantId,
-                // Overview
-                totalTxCount,
+
+                // --- AllManagedQrs metrics ---
+                totalQrsAssignedToMerchant,
                 todayPayInAllQrs,
+                totalTxCount,
                 totalAmountReceived,
                 totalAvailableAmount,
-                totalMerchantProfit, // compute if you have commission rules per qr/txn
-                totalQrsAssignedToMerchant,
-
-                // QR breakdown
+                withdrawableAmount,
                 qrCodesActive,
                 qrCodesDisabled,
-
-                // Payouts
                 totalAmountPaid,
                 totalWithdrawalPendingAmount,
                 totalAmountOnHold,
+                totalCommissionOnHold,
+                totalCommissionPaid,
+
+                // --- AllSelfAssignedQrs metrics ---
+                totalSelfAssignedQrs: AllSelfAssignedQrs.length,
+                todayPayInSelfAssignedQrs,
+                selfTotalTxCount,
+                selfTotalAmountReceived,
+                selfTotalAvailableAmount,
+                selfWithdrawableAmount,
+                selfQrCodesActive,
+                selfQrCodesDisabled,
+                selfTotalAmountPaid,
+                selfTotalWithdrawalPendingAmount,
+                selfTotalAmountOnHold,
+                selfTotalCommissionOnHold,
+                selfTotalCommissionPaid,
+
+                // --- AllUserAssignedQrs metrics (managed by merchant, assigned to sub-users) ---
+                totalUserAssignedQrs: AllUserAssignedQrs.length,
+                todayPayInUserAssignedQrs,
+                userTotalTxCount,
+                userTotalAmountReceived,
+                userTotalAvailableAmount,
+                userWithdrawableAmount,
+                userQrCodesActive,
+                userQrCodesDisabled,
+                userTotalAmountPaid,
+                userTotalWithdrawalPendingAmount,
+                userTotalAmountOnHold,
+                userTotalCommissionOnHold,
+                userTotalCommissionPaid,
+
+                // --- Other ---
+                totalMerchantProfit,
 
                 // Users
                 activeUsers,
@@ -2953,10 +3100,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const isEmployee = actor.role === 'employee';
 
             if (!isAdmin && !isSelf && !isEmployee) {
-            // Optional: allow parent/manager
-            // if (actor.role === 'subadmin' && await isUserUnderMerchant(userId, actor.userId)) { /* allow */ }
-            // else
-            return res.status(403).json({ message: 'Forbidden' });
+                // Optional: allow parent/manager
+                // if (actor.role === 'subadmin' && await isUserUnderMerchant(userId, actor.userId)) { /* allow */ }
+                // else
+                return res.status(403).json({ message: 'Forbidden' });
             }
 
             // 1) Fetch all QRs assigned to this user
@@ -2968,7 +3115,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const userQrIds = qrs.map(q => q.qrId);
 
-            const existingDocs = await databases.listDocuments(
+            const existingDocs = await databases.listDocuments (
                 APPWRITE_DATABASE_ID,
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 [
@@ -3024,6 +3171,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             let totalTxCount = 0;           // sum of qr.totalTransactions (count)
             let totalAmountPayIn = 0;       // sum of qr.totalPayInAmount (paise)
 
+            let withdrawableAmount = 0;          // sum of qr.amountAvailableForWithdrawal (paise)
+
             let totalWithdrawalApprovedAmount = 0; // sum of qr.withdrawalApprovedAmount (paise)
             let totalWithdrawalPendingAmount = 0;  // sum of qr.withdrawalRequestedAmount (paise)
             let totalAvailableAmount = 0;          // sum of qr.amountAvailableForWithdrawal (paise)
@@ -3033,57 +3182,61 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             let totalCommissionPaid = 0;           // sum of qr.commissionPaid (paise)
 
             for (const qr of qrs) {
-            const isActive = !!qr.isActive;
+                const isActive = !!qr.isActive;
 
-            // Adjust field names to your actual schema
-            const txCount = parseInt(qr.totalTransactions || 0, 10);
-            const payIn = parseInt(qr.totalPayInAmount || 0, 10);
+                // Adjust field names to your actual schema
+                const txCount = parseInt(qr.totalTransactions || 0, 10);
+                const payIn = parseInt(qr.totalPayInAmount || 0, 10);
 
-            const wApproved = parseInt(qr.withdrawalApprovedAmount || 0, 10);
-            const wPending = parseInt(qr.withdrawalRequestedAmount || 0, 10);
-            const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
-            const onHold = parseInt(qr.amountOnHold || 0, 10);
+                const wApproved = parseInt(qr.withdrawalApprovedAmount || 0, 10);
+                const wPending = parseInt(qr.withdrawalRequestedAmount || 0, 10);
+                const avail = parseInt(qr.amountAvailableForWithdrawal || 0, 10);
+                const onHold = parseInt(qr.amountOnHold || 0, 10);
 
-            const commHold = parseInt(qr.commissionOnHold || 0, 10);
-            const commPaid = parseInt(qr.commissionPaid || 0, 10);
+                const commHold = parseInt(qr.commissionOnHold || 0, 10);
+                const commPaid = parseInt(qr.commissionPaid || 0, 10);
 
-            if (isActive) qrCodesActive++; else qrCodesDisabled++;
+                if (isActive) qrCodesActive++; else qrCodesDisabled++;
 
-            totalTxCount += txCount;
-            totalAmountPayIn += payIn;
+                totalTxCount += txCount;
+                totalAmountPayIn += payIn;
 
-            totalWithdrawalApprovedAmount += wApproved;
-            totalWithdrawalPendingAmount += wPending;
-            totalAvailableAmount += avail;
-            totalAmountOnHold += onHold;
+                totalWithdrawalApprovedAmount += wApproved;
+                totalWithdrawalPendingAmount += wPending;
+                totalAvailableAmount += avail;
+                totalAmountOnHold += onHold;
 
-            totalCommissionOnHold += commHold;
-            totalCommissionPaid += commPaid;
+                totalCommissionOnHold += commHold;
+                totalCommissionPaid += commPaid;
             }
+
+            withdrawableAmount = totalAvailableAmount - todayPayInAllQrs;
 
             // 3) Respond
             return res.json({
-            userId,
-            // QR breakdown
-            totalQrs,
-            todayPayInAllQrs,
-            qrCodesActive,
-            qrCodesDisabled,
+                userId,
+                // QR breakdown
+                totalQrs,
+                todayPayInAllQrs,
+                qrCodesActive,
+                qrCodesDisabled,
 
-            // Transactions
-            totalTxCount,
-            totalAmountPayIn,
+                // Transactions
+                totalTxCount,
+                totalAmountPayIn,
 
-            // Payouts
-            totalWithdrawalApprovedAmount,
-            totalWithdrawalPendingAmount,
-            totalAvailableAmount,
-            totalAmountOnHold,
+                // Payouts
+                totalWithdrawalApprovedAmount,
+                totalWithdrawalPendingAmount,
+                totalAvailableAmount,
+                withdrawableAmount,
+                totalAmountOnHold,
 
-            // Commission
-            totalCommissionOnHold,
-            totalCommissionPaid,
+                // Commission
+                totalCommissionOnHold,
+                totalCommissionPaid,
             });
+
         } catch (e) {
             console.error('User dashboard error:', e);
             return res.status(500).json({ message: 'Failed to build user dashboard', error: e.message });
