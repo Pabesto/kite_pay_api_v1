@@ -266,14 +266,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                         APPWRITE_DATABASE_ID,
                         Qr_collectionId,
                         [...subadminQrQueries,
-                        Query.orderAsc('createdAt'), Query.limit(100) ],
+                        Query.orderDesc('createdAt'), Query.limit(100) ],
                     );
 
             } else {
 
                 resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
                     [
-                        Query.orderAsc('createdAt'), // Add this line to sort descending by date
+                        Query.orderDesc('createdAt'), // Add this line to sort descending by date
                         Query.limit(100) // Limits the results to 100 documents
                     ]
                 );
