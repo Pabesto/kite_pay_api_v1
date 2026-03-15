@@ -333,7 +333,6 @@ const authenticateAdminOrLabel = (requiredLabel, { isSubadminAllowed = false } =
     });
 };
 
-
 // --- Admin Authentication Middleware ---
 // This middleware first authenticates the token and then checks for the 'admin' label.
 const authenticateAdmin = (req, res, next) => {
@@ -533,69 +532,12 @@ app.get("/api/get_app_config", async (req, res) => {
     }
 });
 
-app.get('/get_app_config', async (req, res) => {
-
-    // const result = await databases.listDocuments(
-    //       APPWRITE_DATABASE_ID,
-    //       '68a73217002ed987b246',
-    //     );
-
-    // console.log('Config documents:', result);
-
-    // const docs = result.documents;  // direct access
-
-    // const config = docs.reduce((acc, doc) => {
-    //   acc[doc.key] = doc.value;
-    //   return acc;
-    // }, {});
-
-    // console.log('✅ Config JSON:', config);
-
-    // console.log('Max Withdrawal Amount:', config.max_withdrawal_amount);
-
-    // const maxAmount = toInt(config.max_withdrawal_amount);  // 200000 or fallback 0
-
-    // console.log('Max Withdrawal Amount Value:', maxAmount);
-
-
-    /////////////////////////////////////////////////////////
-
-    // const result = await databases.listDocuments(
-    //         APPWRITE_DATABASE_ID,
-    //         '68a73217002ed987b246',
-    //         [
-    //           Query.equal('key', 'max_withdrawal_requests'),  // ← Add this!
-    //           Query.limit(1)  // Just one result
-    //         ]
-    //       );
-
-    //       const max_withdrawal_requests = result.documents[0];  // Your single document
-
-    //       console.log('Max Withdrawal Requests Config:', max_withdrawal_requests.value);
-
-    // Example: get value for "overhead_balance_required"
-    // const docs = result.data.documents;
-
-    // const overheadDoc = docs.find(d => d.key === 'overhead_balance_required');
-
-    // if (overheadDoc) {
-    //   const overheadValue = overheadDoc.value; // 5000
-    //   console.log('overhead_balance_required:', overheadValue);
-    // }
-
-    // Usage:
-    // const maxWithdrawal = getConfigValue(result, 'max_withdrawal_amount');
-    // const minWithdrawal = getConfigValue(result, 'min_withdrawal_amount');
-
-    // console.log('Max Withdrawal:', maxWithdrawal);
-    // console.log('Min Withdrawal:', minWithdrawal);
-
-    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
 // Rate limiter specifically for webhook endpoints
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.use('/paytm/payment-sync', webhookLimiter);
 // Endpoint to receive Paytm transaction
+
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.post("/paytm/payment-sync", async (req, res) => {
   try {
     const data = req.body;
@@ -760,6 +702,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
 });
 
 // GET last timestamp (per company)
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.get("/paytm/last-timestamp-company", async (req, res) => {
   try {
     const { company } = req.query;
@@ -794,6 +737,7 @@ app.get("/paytm/last-timestamp-company", async (req, res) => {
 });
 
 // UPDATE last timestamp (per company)
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.post("/paytm/update-last-timestamp-company", async (req, res) => {
   try {
     const { company, last_mail_timestamp } = req.body;
@@ -855,6 +799,7 @@ app.post("/paytm/update-last-timestamp-company", async (req, res) => {
 });
 
 // Endpoint to Send Paytm transaction last timestamp
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.get("/paytm/last-timestamp", async (req, res) => {
   // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
 
@@ -874,6 +819,7 @@ app.get("/paytm/last-timestamp", async (req, res) => {
 });
 
 // Endpoint to UPDATE the Paytm transaction timestamp
+// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
 app.post("/paytm/update-last-timestamp", async (req, res) => {
     try {
         // 1. Get the new timestamp from the request body
@@ -1206,7 +1152,6 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
         // wdbg('6', 'Real-time event emitted ✅');
-
         // STEP 7: update QR totals — under lock so no concurrent reads on same QR doc
         // wdbg('7', 'Updating QR totals…');
         await updateQrTotalAtomic(qrCodeId, amountPaise);
