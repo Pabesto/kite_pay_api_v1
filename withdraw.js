@@ -163,9 +163,98 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       });
     });
 
+    /**
+     * Check if the current IST time falls within any of the given windows.
+     *
+     * @param {Array<{from: string, to: string}>} windows
+     *   Each window uses 12-hour format matching moment's 'hh:mm A', e.g.:
+     *   { from: '12:00 PM', to: '01:30 PM' }
+     * @returns {boolean}
+     *
+     * Usage:
+     *   isWithdrawTimeAllowed([
+     *     { from: '12:00 PM', to: '01:30 PM' },
+     *     { from: '03:30 PM', to: '04:30 PM' },
+     *     { from: '06:30 PM', to: '07:30 PM' },
+     *   ])
+     */
+    function isWithdrawTimeAllowed() {
+        windows = [
+              // { from: '04:00 AM', to: '05:30 AM' },
+              { from: '12:00 PM', to: '01:30 PM' },
+              { from: '03:30 PM', to: '04:30 PM' },
+              { from: '06:30 PM', to: '07:30 PM' },
+            ];
+        const now = moment().tz('Asia/Kolkata');
+        const nowMinutes = now.hours() * 60 + now.minutes();
+
+        const toMinutes = (timeStr) => {
+            const t = moment(timeStr, 'hh:mm A');
+            return t.hours() * 60 + t.minutes();
+        };
+
+        return windows.some(({ from, to }) => {
+            const start = toMinutes(from);
+            const end   = toMinutes(to);
+            return nowMinutes >= start && nowMinutes <= end;
+        });
+    }
+
+    // New endpoint to check if withdrawals are currently allowed based on time windows (for non-admins)
+    router.get('/withdrawal_time_check', authenticateToken, async (req, res) => {
+      try {
+        if (req.user.role !== 'admin') {
+          await ConfigManager.refresh();
+
+          const isWithdrawalTimeWindowsEnabled = await ConfigManager.get(
+            'withdrawal_time_windows_enabled'
+          );
+
+          if (isWithdrawalTimeWindowsEnabled) {
+            const isAllowed = isWithdrawTimeAllowed();
+
+            return res.json({
+              isAllowed,
+              message: isAllowed
+                ? 'Withdrawals are allowed at this time.'
+                : 'Withdrawals are only allowed during:\n• 12:00 PM – 01:30 PM\n• 03:30 PM – 04:30 PM\n• 06:30 PM – 07:30 PM',
+            });
+          } else {
+            return res.json({
+              isAllowed: true,
+              message: 'Withdrawal time windows are disabled. Withdrawals are allowed at any time.',
+            });
+          }
+        } else {
+          return res.json({
+            isAllowed: true,
+            message: 'Admins are not restricted by withdrawal time windows.',
+          });
+        }
+      } catch (err) {
+        console.error('withdrawal_time_check error:', err);
+        return res.status(500).json({
+          isAllowed: false,
+          message: 'Internal server error. Please try again later.',
+        });
+      }
+    });
+
     // Users can post a withdrawal request (new version with validations and balance checks)
     router.post('/withdraw_new', authenticateToken, async (req, res) => {
       const { userId, qrId, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+
+      // If the requester is not an admin, check if withdrawal time windows are enabled and enforce them
+      if (req.user.role != 'admin'){
+         await ConfigManager.refresh(); // Ensure we have the latest config values
+         let isWithdrawalTimeWindowsEnabled = await ConfigManager.get(databases, APPWRITE_DATABASE_ID, 'withdrawal_time_windows_enabled');
+         if(isWithdrawalTimeWindowsEnabled){
+          let is =  isWithdrawTimeAllowed();
+          if(!is){
+            return res.status(400).json({ error: 'Withdrawals are only allowed during:\n• 12:00 PM – 01:30 PM\n• 03:30 PM – 04:30 PM\n• 06:30 PM – 07:30 PM' });
+          }
+         }
+      }
 
       // console.log('Withdraw request received:', req.body);
 
@@ -801,52 +890,52 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
     });
 
-    router.get('/user_withdrawals', async (req, res) => {
-      const status = req.query.status;   // optional: 'pending', 'approved', 'rejected'
-      const userId = req.query.userId;   // optional: to fetch specific user's withdrawals
-      const queries = [];
+    // router.get('/user_withdrawals', async (req, res) => {
+    //   const status = req.query.status;   // optional: 'pending', 'approved', 'rejected'
+    //   const userId = req.query.userId;   // optional: to fetch specific user's withdrawals
+    //   const queries = [];
 
-      if (status) {
-        queries.push(Query.equal('status', status));
-      }
+    //   if (status) {
+    //     queries.push(Query.equal('status', status));
+    //   }
 
-      if (userId) {
-        queries.push(Query.equal('userId', userId));
-      }
+    //   if (userId) {
+    //     queries.push(Query.equal('userId', userId));
+    //   }
 
-      queries.push(Query.orderDesc('$createdAt'));
-      queries.push(Query.limit(100)); // adjust limit if needed
+    //   queries.push(Query.orderDesc('$createdAt'));
+    //   queries.push(Query.limit(100)); // adjust limit if needed
 
-      try {
-        const result = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          queries
-        );
+    //   try {
+    //     const result = await databases.listDocuments(
+    //       APPWRITE_DATABASE_ID,
+    //       Withdrawal_request_collectionId,
+    //       queries
+    //     );
 
-        const withdrawals = result.documents.map((doc) => {
-          const {
-            $id,
-            $collectionId,
-            $databaseId,
-            $createdAt,
-            $updatedAt,
-            $permissions,
-            ...customFields
-          } = doc;
+    //     const withdrawals = result.documents.map((doc) => {
+    //       const {
+    //         $id,
+    //         $collectionId,
+    //         $databaseId,
+    //         $createdAt,
+    //         $updatedAt,
+    //         $permissions,
+    //         ...customFields
+    //       } = doc;
 
-          return customFields;
-        });
+    //       return customFields;
+    //     });
 
-        res.json({
-          count: result.total,
-          withdrawals: withdrawals,
-        });
-      } catch (error) {
-        console.error('❌ Error fetching withdrawals:', error.message);
-        res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
-      }
-    });
+    //     res.json({
+    //       count: result.total,
+    //       withdrawals: withdrawals,
+    //     });
+    //   } catch (error) {
+    //     console.error('❌ Error fetching withdrawals:', error.message);
+    //     res.status(500).json({ error: 'Failed to fetch withdrawal requests' });
+    //   }
+    // });
 
     // POST /withdrawals/approve_new (with balance and ledger updates)
     router.post('/withdrawals/approve_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
@@ -1091,6 +1180,157 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       } catch (err) {
         console.error('❌ Approve error:', err);
         return res.status(500).json({ error: 'Failed to approve withdrawal' });
+      }
+    });
+
+        // POST /withdrawals/reject_new (new with balance and ledger updates)
+    router.post('/withdrawals/reject_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
+      const { id, reason } = req.body;
+
+      if (!id || !reason || reason.trim().length < 4) {
+        return res.status(400).json({ error: 'Invalid ID or reason too short' });
+      }
+
+      try {
+        // 1) Find withdrawal by business id
+        const result = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          [Query.equal('id', id), Query.limit(1)]
+        ); // list then index 0 [19][1]
+
+        if (!result.total) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+
+        const w = result.documents[0];
+        if (w.status !== 'pending') {
+          return res.status(400).json({ error: `Cannot reject a ${w.status} request` });
+        }
+
+        // normalize money to paise
+        const toPaise = (val) => {
+        const n = Number(val);
+          if (!isFinite(n) || n <= 0) return null;
+          return Math.round(n * 100);
+        };
+
+        const amountPaise = toPaise(w.amount);
+        const qrId = w.qrId;
+        if (!qrId || amountPaise <= 0) {
+          return res.status(400).json({ error: 'Invalid withdrawal document data' });
+        }
+
+        // Acquire per-QR lock — prevents two concurrent rejections both passing the balance check
+        const rejectLockKey = `lock:qr:${qrId}`;
+        const rejectLockVal = w.id;
+        let rejectLockAcquired = false;
+        try {
+            const r = await redisClient.set(rejectLockKey, rejectLockVal, { NX: true, EX: LOCK_TTL_APPROVE });
+            rejectLockAcquired = r === 'OK';
+        } catch (e) {
+            console.error('Redis lock error in withdrawal reject:', e);
+            rejectLockAcquired = true; // degrade gracefully
+        }
+        if (!rejectLockAcquired) {
+            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
+        }
+        try {
+
+        // 2) Load QR document — fresh read under lock
+        const qrList = await databases.listDocuments(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          [Query.equal('qrId', qrId), Query.limit(1)]
+        ); // list then index 0 [19]
+        if (!qrList.documents.length) {
+          return res.status(404).json({ error: 'QR not found for withdrawal' });
+        }
+        const qr = qrList.documents[0];
+
+        // 3) Compute new ledger values (all in paise)
+        const total = Number(qr.totalPayInAmount || 0);
+        const approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requested = Number(qr.withdrawalRequestedAmount || 0);
+        const onHold = Number(qr.amountOnHold || 0);
+        const commissionOnHold = Number(qr.commissionOnHold || 0);
+        const commissionPaid = Number(qr.commissionPaid || 0);
+
+        // console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
+
+        // Convert commission from rupees to paise safely
+        const commissionPaise = Math.round((w.commission || 0) * 100);
+
+        // Withdrawal amount portion excluding commission
+        const withdrawalPaise = amountPaise - commissionPaise;
+
+        // Validation: separate checks for withdrawal and commission amounts
+        if (requested < withdrawalPaise) {
+          return res.status(409).json({ error: 'Requested amount is lower than rejection withdrawal amount' });
+        }
+        if (commissionOnHold < commissionPaise) {
+          return res.status(409).json({ error: 'Commission on hold is lower than rejection commission amount' });
+        }
+
+        // Adjust ledger amounts properly
+        const newRequested = requested - withdrawalPaise;
+        const newApproved = approved; // unchanged
+        const newCommissionOnHold = commissionOnHold - commissionPaise;
+        const newCommissionPaid = commissionPaid; // unchanged
+
+        // Recalculate available amount after adjustments (all in paise)
+        const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
+
+        // Guard: rejection should always free up balance, never make it worse
+        // newRequested < 0 means we're returning more than was pending (data inconsistency)
+        // newCommissionOnHold < 0 means commission on hold is less than expected
+        if (newRequested < 0 || newCommissionOnHold < 0) {
+          return res.status(409).json({ error: 'Ledger computation error: rejection would result in a negative balance field.' });
+        }
+
+        // 4) Update QR ledger
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Qr_collectionId,
+          qr.$id,
+          {
+            withdrawalRequestedAmount: newRequested,
+            amountAvailableForWithdrawal: newAvailable,
+            commissionOnHold: newCommissionOnHold,
+            commissionPaid: newCommissionPaid,
+          }
+        ); // by $id
+
+      // const istOffset = 5.5 * 60 * 60 * 1000;
+      // const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
+
+      const rejectedAtIST = istDateTimeNow();
+
+        // 5) Update withdrawal document
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          Withdrawal_request_collectionId,
+          w.$id,
+          {
+            status: 'rejected',
+            rejectionReason: reason.trim(),
+            utrNumber: null,
+            processedAt: rejectedAtIST,
+          }
+        ); // by $id
+
+        const preAmountPaise = toPaise(w.preAmount || 0);
+
+        // After rejecting a withdrawal
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
+
+        return res.json({ success: true, message: 'Withdrawal rejected' });
+        } finally {
+            try { const c = await redisClient.get(rejectLockKey); if (c === rejectLockVal) await redisClient.del(rejectLockKey); } catch {}
+        }
+      } catch (err) {
+        console.error('❌ Reject error:', err);
+        return res.status(500).json({ error: 'Failed to reject withdrawal' });
       }
     });
 
@@ -1340,158 +1580,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
       }
     }
-
-
-    // POST /withdrawals/reject_new (new with balance and ledger updates)
-    router.post('/withdrawals/reject_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
-      const { id, reason } = req.body;
-
-      if (!id || !reason || reason.trim().length < 4) {
-        return res.status(400).json({ error: 'Invalid ID or reason too short' });
-      }
-
-      try {
-        // 1) Find withdrawal by business id
-        const result = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          [Query.equal('id', id), Query.limit(1)]
-        ); // list then index 0 [19][1]
-
-        if (!result.total) {
-          return res.status(404).json({ error: 'Withdrawal request not found' });
-        }
-
-        const w = result.documents[0];
-        if (w.status !== 'pending') {
-          return res.status(400).json({ error: `Cannot reject a ${w.status} request` });
-        }
-
-        // normalize money to paise
-        const toPaise = (val) => {
-        const n = Number(val);
-          if (!isFinite(n) || n <= 0) return null;
-          return Math.round(n * 100);
-        };
-
-        const amountPaise = toPaise(w.amount);
-        const qrId = w.qrId;
-        if (!qrId || amountPaise <= 0) {
-          return res.status(400).json({ error: 'Invalid withdrawal document data' });
-        }
-
-        // Acquire per-QR lock — prevents two concurrent rejections both passing the balance check
-        const rejectLockKey = `lock:qr:${qrId}`;
-        const rejectLockVal = w.id;
-        let rejectLockAcquired = false;
-        try {
-            const r = await redisClient.set(rejectLockKey, rejectLockVal, { NX: true, EX: LOCK_TTL_APPROVE });
-            rejectLockAcquired = r === 'OK';
-        } catch (e) {
-            console.error('Redis lock error in withdrawal reject:', e);
-            rejectLockAcquired = true; // degrade gracefully
-        }
-        if (!rejectLockAcquired) {
-            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
-        }
-        try {
-
-        // 2) Load QR document — fresh read under lock
-        const qrList = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          [Query.equal('qrId', qrId), Query.limit(1)]
-        ); // list then index 0 [19]
-        if (!qrList.documents.length) {
-          return res.status(404).json({ error: 'QR not found for withdrawal' });
-        }
-        const qr = qrList.documents[0];
-
-        // 3) Compute new ledger values (all in paise)
-        const total = Number(qr.totalPayInAmount || 0);
-        const approved = Number(qr.withdrawalApprovedAmount || 0);
-        const requested = Number(qr.withdrawalRequestedAmount || 0);
-        const onHold = Number(qr.amountOnHold || 0);
-        const commissionOnHold = Number(qr.commissionOnHold || 0);
-        const commissionPaid = Number(qr.commissionPaid || 0);
-
-        // console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
-
-        // Convert commission from rupees to paise safely
-        const commissionPaise = Math.round((w.commission || 0) * 100);
-
-        // Withdrawal amount portion excluding commission
-        const withdrawalPaise = amountPaise - commissionPaise;
-
-        // Validation: separate checks for withdrawal and commission amounts
-        if (requested < withdrawalPaise) {
-          return res.status(409).json({ error: 'Requested amount is lower than rejection withdrawal amount' });
-        }
-        if (commissionOnHold < commissionPaise) {
-          return res.status(409).json({ error: 'Commission on hold is lower than rejection commission amount' });
-        }
-
-        // Adjust ledger amounts properly
-        const newRequested = requested - withdrawalPaise;
-        const newApproved = approved; // unchanged
-        const newCommissionOnHold = commissionOnHold - commissionPaise;
-        const newCommissionPaid = commissionPaid; // unchanged
-
-        // Recalculate available amount after adjustments (all in paise)
-        const newAvailable = total - newApproved - newRequested - onHold - newCommissionOnHold - newCommissionPaid;
-
-        // Guard: rejection should always free up balance, never make it worse
-        // newRequested < 0 means we're returning more than was pending (data inconsistency)
-        // newCommissionOnHold < 0 means commission on hold is less than expected
-        if (newRequested < 0 || newCommissionOnHold < 0) {
-          return res.status(409).json({ error: 'Ledger computation error: rejection would result in a negative balance field.' });
-        }
-
-        // 4) Update QR ledger
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          qr.$id,
-          {
-            withdrawalRequestedAmount: newRequested,
-            amountAvailableForWithdrawal: newAvailable,
-            commissionOnHold: newCommissionOnHold,
-            commissionPaid: newCommissionPaid,
-          }
-        ); // by $id
-
-      // const istOffset = 5.5 * 60 * 60 * 1000;
-      // const rejectedAtIST = new Date(Date.now() + istOffset).toISOString();
-
-      const rejectedAtIST = istDateTimeNow();
-
-        // 5) Update withdrawal document
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          Withdrawal_request_collectionId,
-          w.$id,
-          {
-            status: 'rejected',
-            rejectionReason: reason.trim(),
-            utrNumber: null,
-            processedAt: rejectedAtIST,
-          }
-        ); // by $id
-
-        const preAmountPaise = toPaise(w.preAmount || 0);
-
-        // After rejecting a withdrawal
-        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
-
-        return res.json({ success: true, message: 'Withdrawal rejected' });
-        } finally {
-            try { const c = await redisClient.get(rejectLockKey); if (c === rejectLockVal) await redisClient.del(rejectLockKey); } catch {}
-        }
-      } catch (err) {
-        console.error('❌ Reject error:', err);
-        return res.status(500).json({ error: 'Failed to reject withdrawal' });
-      }
-    });
 
     // GET all config
     router.get("/config", async (req, res) => {

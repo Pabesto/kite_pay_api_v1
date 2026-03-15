@@ -60,7 +60,7 @@ process.on('uncaughtException', err => {
 
 // console.log('IST Time for server startup:', istTime);
 
-// console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format());
+console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('hh:mm:a'));
 // console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSSZ'));
 // → 2026-03-15T05:59:49.122+05:30
 

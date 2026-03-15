@@ -58,6 +58,7 @@ class ConfigManager {
     }
 
     static refresh() {
+        console.log("Refreshing config cache...");
         configCache = null;
         return this.getConfig();
     }
