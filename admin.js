@@ -2532,9 +2532,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /dashboard/counters
     router.get('/dashboard/counters', authenticateAdmin, async (req, res) => {
 
-        // console.log('Max limit:', ConfigManager.get('max_withdrawal_amount', 0));
-        // console.log('QR limit:', ConfigManager.get('qr_limit_today_pay_in', 0));
-
         const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
 
         const actor = req.user;
@@ -2579,19 +2576,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
             }
 
-            const istDate = moment.tz('Asia/Kolkata');
-            const dayString = istDate.format('YYYY-MM-DD');
+            const todayDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const yesterdayDayString = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
 
-            const existingDocs = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-                [
-                Query.equal('date', dayString),
-                Query.limit(1),
-                ]
+            const fetchSummary = (date) => databases.listDocuments(
+                APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [Query.equal('date', date), Query.limit(1)]
             );
 
+            const [existingDocs, existingDocsYesterday] = await Promise.all([
+                fetchSummary(todayDayString), fetchSummary(yesterdayDayString)
+            ]);
+
             let todayPayInAllQrs = 0;
+            let yesterdayPayInAllQrs = 0;
+
+            // Yesterday
+            if (existingDocsYesterday.total > 0) {
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(existingDocsYesterday.documents[0].totalsJson || '{}');
+                } catch (e) {
+                    totalsObj = {};
+                }
+                yesterdayPayInAllQrs = Object.values(totalsObj).reduce((sum, value) => sum + parseInt(value || 0, 10), 0);
+            }
 
             if (existingDocs.total > 0) {
                 // Document exists - parse JSON string and update totals object
@@ -2666,6 +2675,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             totalTxCount: get('totalTxCount'),
             totalAmountReceived: get('totalAmountReceived'),
             todayPayInAllQrs: todayPayInAllQrs,
+            yesterdayPayInAllQrs: yesterdayPayInAllQrs,
             totalAdminProfit: get('totalAdminProfit'),
             totalMerchantProfit: get('totalMerchantProfit'),
             totalQrsUploaded: get('totalQrsUploaded'),
@@ -2717,9 +2727,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const { merchantId } = req.params;
         const actor = req.user;
 
-        const istDate = moment.tz('Asia/Kolkata');
-        const dayString = istDate.format('YYYY-MM-DD');
-
         const isSelf = actor.userId === merchantId;
         const isAdmin = actor.role === 'admin';
         const isEmployee = actor.role === 'employee';
@@ -2727,6 +2734,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // console.log(`Dashboard for merchantId: ${merchantId} requested by userId: ${actor.userId} with role: ${actor.role}`);
 
         const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
+
+        const todayDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+        const yesterdayDayString = moment.tz('Asia/Kolkata').clone().subtract(1, 'day').format('YYYY-MM-DD');
 
         try {
             // Authorization: allow admin or the merchant owner
@@ -2765,7 +2775,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 APPWRITE_DATABASE_ID,
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 [
-                    Query.equal('date', dayString),
+                    Query.equal('date', todayDayString),
                     Query.limit(1),
                 ]
             );
@@ -2786,13 +2796,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     // fallback if corrupted JSON
                     totalsObj = {};
                 }
-
-                // ✅ SUM ALL QR totals from stored JSON (today's complete aggregate)
-                // todayPayInAllQrs = Object.values(totalsObj).reduce((sum, value) => {
-                //     return sum + parseInt(value || 0, 10);
-                // }, 0);
-
-                // console.log('📊 Raw totalsObj from DB:', totalsObj);
 
                 // OPTIONAL: If you need user-specific subset (instead of all)
                 // Total across all QRs assigned to this merchant (not just self-assigned)
@@ -2821,7 +2824,42 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                         }
                 });
 
-                // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+            }
+
+            // Yesterday's pay-in
+            const existingDocsYesterday = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [
+                    Query.equal('date', yesterdayDayString),
+                    Query.limit(1),
+                ]
+            );
+
+            let yesterdayPayInAllQrs = 0;
+            let yesterdayPayInSelfAssignedQrs = 0;
+            let yesterdayPayInUserAssignedQrs = 0;
+
+            if (existingDocsYesterday.total > 0) {
+                const doc = existingDocsYesterday.documents[0];
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(doc.totalsJson || '{}');
+                } catch (e) {
+                    totalsObj = {};
+                }
+
+                yesterdayPayInAllQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => AllManagedQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                yesterdayPayInSelfAssignedQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => AllSelfAssignedQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+
+                yesterdayPayInUserAssignedQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => AllUserAssignedQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
             }
 
             // 2) Aggregate QR-derived counters for AllManagedQrs
@@ -2980,6 +3018,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // --- AllManagedQrs metrics ---
                 totalQrsAssignedToMerchant,
                 todayPayInAllQrs,
+                yesterdayPayInAllQrs,
                 totalTxCount,
                 totalAmountReceived,
                 totalAvailableAmount,
@@ -2995,6 +3034,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // --- AllSelfAssignedQrs metrics ---
                 totalSelfAssignedQrs: AllSelfAssignedQrs.length,
                 todayPayInSelfAssignedQrs,
+                yesterdayPayInSelfAssignedQrs,
                 selfTotalTxCount,
                 selfTotalAmountReceived,
                 selfTotalAvailableAmount,
@@ -3010,6 +3050,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // --- AllUserAssignedQrs metrics (managed by merchant, assigned to sub-users) ---
                 totalUserAssignedQrs: AllUserAssignedQrs.length,
                 todayPayInUserAssignedQrs,
+                yesterdayPayInUserAssignedQrs,
                 userTotalTxCount,
                 userTotalAmountReceived,
                 userTotalAvailableAmount,
@@ -3047,8 +3088,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const Qr_today_pay_in_limit = ConfigManager.get('qr_limit_today_pay_in', 30000000); // default 3L if not set
 
-        const istDate = moment.tz('Asia/Kolkata');
-        const dayString = istDate.format('YYYY-MM-DD');
+        const todayDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');;
+        const yesterdayDayString = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
 
         try {
             // Authorization: allow admin, the same user, or that user's manager/subadmin if policy allows
@@ -3072,20 +3113,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const userQrIds = qrs.map(q => q.qrId);
 
-            const existingDocs = await databases.listDocuments (
+            const existingDocsTodayPayin = await databases.listDocuments (
                 APPWRITE_DATABASE_ID,
                 APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 [
-                Query.equal('date', dayString),
-                Query.limit(1),
+                    Query.equal('date', todayDayString),
+                    Query.limit(1),
                 ]
             );
 
             let todayPayInAllQrs = 0;
 
-            if (existingDocs.total > 0) {
+            // Check if document for today's date exists
+            if (existingDocsTodayPayin.total > 0) {
                 // Document exists - parse JSON string and update totals object
-                const doc = existingDocs.documents[0];
+                const doc = existingDocsTodayPayin.documents[0];
                 const totalsJsonStr = doc.totalsJson || '{}';
 
                 let totalsObj;
@@ -3095,17 +3137,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     // fallback if corrupted JSON
                     totalsObj = {};
                 }
-
-                // console.log('📊 Raw totalsObj from DB:', totalsObj);
-
                 // OPTIONAL: If you need user-specific subset (instead of all)
                 todayPayInAllQrs = Object.entries(totalsObj)
                     .filter(([qrid]) => userQrIds.includes(qrid))
                     .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
-
                 // ✅ Separate logic: Check each user QR individually for 10000 limit
                 const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
-
                 userQrEntries.forEach(([qrid, valueStr]) => {
                         const value = parseInt(valueStr || 0, 10);
                         if (value >= Qr_today_pay_in_limit) {
@@ -3115,9 +3152,48 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                             emitQrLimit({ qrCodeId: qrid, payload: payload });
                         }
                 });
+            }
 
-                // console.log('User QRs totals:', todayPayInAllQrs, 'Crossed limit:', userQrEntries.filter(([, v]) => parseInt(v || 0, 10) >= 10000).map(([qrid]) => qrid));
-                // console.log('📊 Stored totals sum:', todayPayInAllQrs, 'from', Object.keys(totalsObj).length, 'QRs');
+            const existingDocsYesterdayPayin = await databases.listDocuments (
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                [
+                    Query.equal('date', yesterdayDayString),
+                    Query.limit(1),
+                ]
+            );
+
+            let yesterdayPayInAllQrs = 0;
+
+            // Check if document for today's date exists
+            if (existingDocsYesterdayPayin.total > 0) {
+                // Document exists - parse JSON string and update totals object
+                const doc = existingDocsYesterdayPayin.documents[0];
+                const totalsJsonStr = doc.totalsJson || '{}';
+
+                let totalsObj;
+                try {
+                    totalsObj = JSON.parse(totalsJsonStr);
+                } catch (e) {
+                    // fallback if corrupted JSON
+                    totalsObj = {};
+                }
+                // OPTIONAL: If you need user-specific subset (instead of all)
+                yesterdayPayInAllQrs = Object.entries(totalsObj)
+                    .filter(([qrid]) => userQrIds.includes(qrid))
+                    .reduce((sum, [, value]) => sum + parseInt(value || 0, 10), 0);
+                
+                    // ✅ Separate logic: Check each user QR individually for 10000 limit
+                // const userQrEntries = Object.entries(totalsObj).filter(([qrid]) => userQrIds.includes(qrid));
+                // userQrEntries.forEach(([qrid, valueStr]) => {
+                //         const value = parseInt(valueStr || 0, 10);
+                //         if (value >= Qr_today_pay_in_limit) {
+                //             // Execute function for this specific QR that crossed limit
+                //             // handleQrLimitCrossed(qrid, value);
+                //             const payload = { userid: actor.userId, qrCodeId: qrid, todayPayIn: value };
+                //             emitQrLimit({ qrCodeId: qrid, payload: payload });
+                //         }
+                // });
             }
 
             // 2) Aggregate QR-derived counters
@@ -3175,6 +3251,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // QR breakdown
                 totalQrs,
                 todayPayInAllQrs,
+                yesterdayPayInAllQrs,
                 qrCodesActive,
                 qrCodesDisabled,
 
