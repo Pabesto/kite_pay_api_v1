@@ -29,8 +29,10 @@ const walletRoutes = require('./wallet');
 // 🔥 PINELEABS FILE IMPORT
 const digiqrRoutes = require('./pinelabs_digiqr.routes');
 
+// Import the Socket.IO initialization function
 const { initSocket } = require('./socketServer');
 
+// Import the ConfigManager for dynamic configuration management
 const ConfigManager = require('./configManager');
 
 const { createClient } = require('redis');
@@ -39,7 +41,33 @@ const { createClient } = require('redis');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const { httpServer, emitTxnNew , emitQrAlert, emitForceRefresh } = initSocket(app);
+
+// Appwrite Configuration from your provided webhook file
+const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT || 'https://fra.cloud.appwrite.io/v1';
+const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID || '688c98fd002bfe3cf596';
+const APPWRITE_API_KEY = process.env.APPWRITE_API_KEY || 'standard_b2443fedac19c0903a7a280fbb0d121ea52353d7d81533f1b8a76dab54721871a595a87624511da1ad635336e50946caf684a8650bfe4fd4f5d9839cb916e595314f8b2921cc78dcd477e468393bcd4932616d3412da4e5cc5d6d79a4b31e391d2d5e1172eaa08a2fafc3b2b8615bc9ec57b17d70884c7b48957ccdc7d8d803a';
+const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID || '688ca9f3003e593a6227';
+const APPWRITE_QRCODE_COLLECTION_ID = process.env.APPWRITE_QRCODE_COLLECTION_ID || '688f6b46002963a163aa';
+const APPWRITE_WEBHOOK_DATA_COLLECTION_ID = process.env.APPWRITE_WEBHOOK_DATA_COLLECTION_ID || '688cf5920023475022df';
+const APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID = process.env.APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID || '68920fba001e27b604c9';
+const APPWRITE_USERS_META_COLLECTION_ID = process.env.APPWRITE_USERS_META_COLLECTION_ID || 'users_meta_test';
+const APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID || 'daily_qr_summaries';
+const APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID || 'daily_commission_summaries';
+const APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID = process.env.APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID || 'all_time_commission_total';
+const APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID || 'monthly_commission_totals';
+const APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID || 'commission_transactions';
+const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID || '688d2517002810ac532b';
+
+// Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '4@cQVD6GBGa2G7j';
+
+const { httpServer, emitTxnNew , emitQrAlert, emitForceRefresh } = initSocket(app, {
+  appwriteEndpoint: APPWRITE_ENDPOINT,
+  appwriteProjectId: APPWRITE_PROJECT_ID,
+  appwriteApiKey: APPWRITE_API_KEY,
+  appwriteDatabaseId: APPWRITE_DATABASE_ID,
+  usersMetaCollectionId: APPWRITE_USERS_META_COLLECTION_ID,
+});
 
 httpServer.listen(PORT, () => {
   console.log(`HTTP + WS listening on :${PORT}`);
@@ -55,33 +83,23 @@ process.on('uncaughtException', err => {
   console.error('Uncaught Exception:', err);
 });
 
-// const istOffset = 5.5 * 60 * 60 * 1000;
-// const istTime = new Date(Date.now() + istOffset).toISOString();
+	function istDateTimeNow(){
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const AtIST = new Date(Date.now() + istOffset).toISOString();
+      return AtIST;
+    }
 
-// console.log('IST Time for server startup:', istTime);
+    console.log('IST Time for server startup:', istDateTimeNow());
+	
+	function istDateTimeNowNew(){
+      return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    }
 
-console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('hh:mm:a'));
+    console.log('IST Time for server startup:', istDateTimeNowNew());
+
+// console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('hh:mm:a'));
 // console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSSZ'));
 // → 2026-03-15T05:59:49.122+05:30
-
-// Appwrite Configuration from your provided webhook file
-const APPWRITE_ENDPOINT = 'https://fra.cloud.appwrite.io/v1';
-const APPWRITE_PROJECT_ID = '688c98fd002bfe3cf596';
-const APPWRITE_API_KEY = 'standard_b2443fedac19c0903a7a280fbb0d121ea52353d7d81533f1b8a76dab54721871a595a87624511da1ad635336e50946caf684a8650bfe4fd4f5d9839cb916e595314f8b2921cc78dcd477e468393bcd4932616d3412da4e5cc5d6d79a4b31e391d2d5e1172eaa08a2fafc3b2b8615bc9ec57b17d70884c7b48957ccdc7d8d803a';
-const APPWRITE_DATABASE_ID = '688ca9f3003e593a6227';
-const APPWRITE_QRCODE_COLLECTION_ID = '688f6b46002963a163aa';
-const APPWRITE_WEBHOOK_DATA_COLLECTION_ID = '688cf5920023475022df'; // This was not in your webhook file, keeping the placeholder for completeness
-const APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID = '68920fba001e27b604c9'
-const APPWRITE_USERS_META_COLLECTION_ID = 'users_meta_test';
-const APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID = 'daily_qr_summaries';
-const APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID = 'daily_commission_summaries';
-const APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID = 'all_time_commission_total';
-const APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID = 'monthly_commission_totals';
-const APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID = 'commission_transactions'; // This was not in your webhook file, keeping the placeholder for completeness
-const APPWRITE_BUCKET_ID = '688d2517002810ac532b'; // This was not in your webhook file, keeping the placeholder for completeness
-
-// Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
-const RAZORPAY_WEBHOOK_SECRET = '4@cQVD6GBGa2G7j';
 
 // Initialize Appwrite SDK with the server key for backend operations
 const client = new Client();
@@ -126,6 +144,13 @@ ConfigManager.init(databases);
   }
 })();
 
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const LOCK_TTL_SECONDS      = 15;   // Redis lock TTL for webhook/QR operations
+const COUNTER_FLUSH_MS      = 1 * 60 * 1000; // how often Redis counters flush to Appwrite (1 min)
+const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests on shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── Redis Client ────────────────────────────────────────────────────────────
 const redisClient = createClient({
     url: process.env.REDIS_URL || 'redis://red-d6osqip4tr6s73d1ba50:6379',
@@ -145,7 +170,7 @@ async function acquireLock(key, value, ttlSeconds = 15) {
         return result === 'OK';
     } catch (e) {
         console.error('acquireLock error:', e);
-        return true; // degrade gracefully if Redis is down — idempotency check is still the first defence
+        return false; // fail safe — reject and let caller retry rather than proceed without lock
     }
 }
 
@@ -182,8 +207,37 @@ async function syncCountersFromAppwrite() {
     }
 }
 
-// Every 1 minutes: flush Redis counter values back to Appwrite as a backup
+// Every 1 minutes: flush Redis counter values back to Appwrite as a backup.
+// Only flushes if Redis counters are known to be accurate (no failed incrBy since last flush).
+// Flags live on redisClient so admin.js (which receives redisClient) can also set them.
+redisClient.countersDirty = false;  // set true when incrBy succeeds, false after flush
+redisClient.countersStale = false;  // set true when incrBy fails — blocks flush until re-synced
+
 async function flushCountersToAppwrite() {
+    if (redisClient.countersStale) {
+        // Redis missed increments — re-seed from Appwrite to avoid overwriting with stale values
+        console.warn('Counters marked stale — re-syncing from Appwrite instead of flushing');
+        try {
+            const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
+            for (const name of counterNames) {
+                const list = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, 'dashboard_counters',
+                    [Query.equal('id', name), Query.limit(1)]
+                );
+                const val = Number(list.documents[0]?.totals || 0);
+                await redisClient.set(`counter:${name}`, val);
+            }
+            redisClient.countersStale = false;
+            redisClient.countersDirty = false;
+            console.log('Counters re-synced from Appwrite');
+        } catch (e) {
+            console.error('Counter re-sync failed:', e);
+        }
+        return;
+    }
+
+    if (!redisClient.countersDirty) return; // nothing changed since last flush
+
     const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
     for (const name of counterNames) {
         try {
@@ -203,6 +257,7 @@ async function flushCountersToAppwrite() {
             console.error(`Failed to flush counter ${name} to Appwrite:`, e);
         }
     }
+    redisClient.countersDirty = false;
 }
 
 // Connect Redis, seed counters, start periodic flush
@@ -216,12 +271,6 @@ async function flushCountersToAppwrite() {
         console.error('Redis connect failed — continuing without Redis:', e);
     }
 })();
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─── Constants ───────────────────────────────────────────────────────────────
-const LOCK_TTL_SECONDS      = 15;   // Redis lock TTL for webhook/QR operations
-const COUNTER_FLUSH_MS      = 1 * 60 * 1000; // how often Redis counters flush to Appwrite (1 min)
-const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests on shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
 const globalLimiter = rateLimit({
@@ -434,7 +483,7 @@ app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Merchant API routes
-app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
+app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Withdrawal Accounts routes
 app.use('/api/withdrawal-accounts', withdrawalAccountsRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -812,7 +861,8 @@ app.post("/paytm/payment-sync", async (req, res) => {
       redisClient.incrBy('counter:totalTxCount', 1),
       redisClient.incrBy('counter:totalApiTx', 1),
       redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-    ]).catch((e) => console.error('Redis counter update failed:', e?.message || e));
+    ]).then(() => { redisClient.countersDirty = true; })
+      .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
 
     console.log("✅ Received Paytm transaction:", data);
     res.status(200).json({ message: "Transaction processed successfully" });
@@ -1285,10 +1335,8 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]).catch((e) => {
-            // wdbg('8', '⚠️  Redis counter update FAILED (non-fatal)', { error: e?.message });
-            console.error('Redis counter update failed:', e?.message || e);
-        });
+        ]).then(() => { redisClient.countersDirty = true; })
+          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
 
         // wdbg('DONE', '✅ Webhook fully processed — sending 200', { paymentId, qrCodeId });
         res.status(200).send('Webhook received and saved');
@@ -1510,10 +1558,8 @@ app.post('/webhook', async (req, res) => {
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]).catch((e) => {
-            wdbg('10', '⚠️  Redis counter update FAILED (non-fatal)', { error: e.message });
-            console.error('Redis counter update failed:', e);
-        });
+        ]).then(() => { redisClient.countersDirty = true; })
+          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e); });
         wdbg('10', 'Redis counters updated ✅');
 
         wdbg('DONE', '✅ Webhook fully processed — sending 200', { paymentId, qrCodeId });
@@ -1566,7 +1612,8 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
       try {
         totalsObj = JSON.parse(totalsJsonStr);
       } catch (e) {
-        totalsObj = {}; // fallback if corrupted JSON
+        console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss');
+        throw new Error('Daily summary JSON is corrupted — manual fix required');
       }
 
       const oldAmount = Number(totalsObj[qrCodeId] || 0);

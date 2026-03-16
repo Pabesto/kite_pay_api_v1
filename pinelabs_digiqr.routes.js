@@ -12,6 +12,10 @@ const router = express.Router();
 const PINE_BASE_URL = 'https://identitytest.pinelabs.com';
 const PINE_QR_BASE_URL = 'https://api-test.pinelabs.com';
 
+if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET) {
+  console.error('WARNING: PINE_LABS CLIENT_ID or CLIENT_SECRET env vars are missing — DigiQR routes will fail');
+}
+
 /* ================= TOKEN CACHE ================= */
 
 let tokenCache = {

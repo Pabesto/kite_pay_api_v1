@@ -18,8 +18,8 @@ class ConfigManager {
 
         try {
             const docs = await databasesInstance.listDocuments(
-                process.env.APPWRITE_DATABASE_ID || '688ca9f3003e593a6227', 
-                '68a73217002ed987b246'
+                process.env.APPWRITE_DATABASE_ID || '688ca9f3003e593a6227',
+                process.env.APPWRITE_CONFIG_COLLECTION_ID || '68a73217002ed987b246'
             );
 
             const config = {};
@@ -31,9 +31,14 @@ class ConfigManager {
                 } else if (doc.type === "double") {
                     parsedValue = parseFloat(doc.value);
                 } else if (doc.type === "boolean") {
-                    parsedValue = (doc.value == "0" ? false : true);
+                    parsedValue = !["0", "false", "no", ""].includes(String(doc.value ?? '').toLowerCase());
                 } else if (doc.type === "json") {
-                    parsedValue = JSON.parse(doc.value);
+                    try {
+                        parsedValue = JSON.parse(doc.value);
+                    } catch (e) {
+                        console.error(`Invalid JSON for config key "${doc.key}":`, e.message);
+                        continue;
+                    }
                 } else {
                     parsedValue = doc.value;
                 }

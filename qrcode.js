@@ -14,23 +14,11 @@ const moment = require('moment-timezone');
 const { updateDashboardCounter } = require('./dashboardCounters');
 const { type } = require('os');
 
-
-// --------------------
-// Razorpay Setup
-// --------------------
-// TEST MODE
-// const razorpay = new Razorpay({
-//   key_id: 'rzp_test_R9fF4cePyFbq4m',
-//   key_secret: 'YK65c6Y1AO6rNSx6SzMUv8wP',
-// });
 // Production mode
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
-
-// console.log(process.env.RAZORPAY_KEY_ID);
-// console.log(process.env.RAZORPAY_KEY_SECRET);
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, roleAuth, requireRole) => {
@@ -315,6 +303,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             try {
                 totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
+                console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
                 totalsObj = {};
             }
             }
@@ -918,6 +907,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             try {
                 totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
+                console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
                 totalsObj = {};
             }
             }
@@ -1002,6 +992,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             try {
                 totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
+                console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
                 totalsObj = {};
             }
             }
@@ -1099,7 +1090,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         return qr; // contains id, image_url, etc.
     }
 
-    async function createRazorpayQrSingle(userId, amountInPaise) {
+    async function createRazorpayQrSinglePayment(userId, amountInPaise) {
         const { name, email } = await getUserDetails(userId);
 
         // Current time + 4 minutes (in seconds)
@@ -1177,8 +1168,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         //     }
         // );
 
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(Date.now() + istOffset).toISOString();
+      const istTime = moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
 
         const newQrCode = await saveQrEntry({
             qrId: razorpayQr.id,

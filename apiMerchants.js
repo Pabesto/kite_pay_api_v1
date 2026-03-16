@@ -16,25 +16,36 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 const router = express.Router();
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
+
+    // Atomic lock helpers
+    const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+    async function acquireLock(key, value, ttlSeconds = 15) {
+        try {
+            const result = await redisClient.set(key, value, { NX: true, EX: ttlSeconds });
+            return result === 'OK';
+        } catch (e) {
+            console.error('acquireLock error:', e);
+            return false;
+        }
+    }
+    async function releaseLock(key, val) {
+        try { await redisClient.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [val] }); } catch (e) { console.error(`releaseLock failed for ${key}:`, e.message); }
+    }
 
     async function authenticateMerchant(req, res, next) {
         const auth = req.headers.authorization?.split(' ')[1];
         const { merchantId } = req.body || req.params;
-
-        // console.log('Authenticating merchant:', merchantId);
-        // console.log('Auth token:', auth);
 
         if (!auth || !merchantId) {
             return res.status(401).json({ error: 'Missing credentials' });
         }
 
         try {
-            // ✅ Find by correct schema field
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
                 'api_merchants',
-                [Query.equal('merchantId', merchantId), Query.limit(1)]  // ✅ merchantId
+                [Query.equal('merchantId', merchantId), Query.limit(1)]
             );
 
             const merchant = merchantDocs.documents[0];
@@ -43,12 +54,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(401).json({ error: 'Merchant not found' });
             }
 
-            // ✅ Simple string comparison (plain apiSecret)
-            if (merchant.apiSecret !== auth) {  // ✅ === merchant.apiSecret (plain text)
-                console.log('Secret mismatch:', {
-                    expected: merchant.apiSecret ? '[HIDDEN]' : 'NULL',
-                    received: auth ? '[HIDDEN]' : 'NULL'
-                });
+            // Verify secret using bcrypt
+            const secretValid = await bcrypt.compare(auth, merchant.apiSecret);
+            if (!secretValid) {
                 return res.status(401).json({ error: 'Invalid API secret' });
             }
 
@@ -206,9 +214,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             // 1. Extract + basic validation
             const { orderId, amount, rrnNumber } = req.body || {};
-            const merchantId = req.merchantId || req.body?.merchantId || req.params?.merchantId;
+            const merchantId = req.merchant?.merchantId;
 
-            // If you always set merchant on req in authenticateMerchant, prefer ONLY that
             if (!merchantId) {
                 return res.status(401).json({
                     success: false,
@@ -330,7 +337,22 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 });
             }
 
-            // 7. Mark webhook as verified
+            // 7. Acquire lock to prevent concurrent double-verification
+            const verifyLockKey = `lock:verify:${rrnNumber}`;
+            const verifyLockVal = `${merchantId}:${Date.now()}`;
+            const verifyLockAcquired = await acquireLock(verifyLockKey, verifyLockVal, 15);
+            if (!verifyLockAcquired) {
+                return res.status(409).json({ success: false, error: 'This payment is already being verified. Please try again.' });
+            }
+
+            try {
+            // Re-check alreadyVerified under lock (fresh read)
+            const freshTxn = await databases.getDocument(APPWRITE_DATABASE_ID, '688cf5920023475022df', webhookTxnId);
+            if (freshTxn.alreadyVerified) {
+                return res.status(200).json({ success: true, message: 'Payment already verified' });
+            }
+
+            // 8. Mark webhook as verified
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 '688cf5920023475022df',
@@ -341,7 +363,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             );
 
-            // 8. Mark QR request as success
+            // 9. Mark QR request as success
             const verifiedAt = new Date().toISOString().replace('Z', '+00:00');
 
             await databases.updateDocument(
@@ -358,7 +380,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             );
 
-            // 9. Success response
+            // 10. Success response
             return res.status(200).json({
                 success: true,
                 message: 'Payment verified successfully',
@@ -375,6 +397,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     verifiedAt,
                 },
             });
+            } finally {
+                await releaseLock(verifyLockKey, verifyLockVal);
+            }
         } catch (error) {
             console.error('Verify payment error:', error);
             return res.status(500).json({
@@ -395,15 +420,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/admin/merchants', authenticateAdmin, async (req, res) => {
         const { name, email, vpa, dailyLimit = 100 } = req.body;
         const creds = await generateMerchantCredentials();
-        console.log('Creating merchant:', name, email, creds.merchantId, vpa, dailyLimit, creds.apiSecret, creds.hash, new Date().toISOString());
         await databases.createDocument(APPWRITE_DATABASE_ID, 'api_merchants', ID.unique(), {
             merchantId: creds.merchantId,
-            apiSecret: creds.apiSecret,
+            apiSecret: creds.hash,  // Store bcrypt hash, not plain text
             name, email, vpa,
-            status: true,  // Fixed: string
+            status: true,
             dailyLimit,
-            $createdAt: new Date().toISOString()
         });
+        // Return plain secret once — merchant must save it, we only store the hash
         res.json({ success: true, name, email, vpa, status: true, merchantId: creds.merchantId, apiSecret: creds.apiSecret });
     });
 
@@ -460,22 +484,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const merchant = merchantDocs.documents[0];
             const docId = merchant.$id;
 
-            // ✅ Step 2: Prepare safe updates (merge with current)
-            const updates = {
-                ...merchant,  // ✅ Current values as base
-                ...req.body, // ✅ Overwrite with request
-                $updatedAt: new Date().toISOString()  // ✅ Custom timestamp field
-            };
+            // Step 2: Prepare safe updates (only allowed fields)
+            const { name, email, vpa, dailyLimit, status, rotateSecret } = req.body;
+            const updates = {};
+            if (name !== undefined) updates.name = name;
+            if (email !== undefined) updates.email = email;
+            if (vpa !== undefined) updates.vpa = vpa;
+            if (dailyLimit !== undefined) updates.dailyLimit = dailyLimit;
+            if (status !== undefined) updates.status = status;
 
-            // ✅ Optional: Rotate secret if requested
-            if (req.body.rotateSecret === true) {
-                const newSecret = crypto.randomBytes(32).toString('hex');
+            // Optional: Rotate secret if requested
+            let newSecret = null;
+            if (rotateSecret === true) {
+                newSecret = crypto.randomBytes(32).toString('hex');
                 updates.apiSecret = await bcrypt.hash(newSecret, 12);
-                updates.current_api_secret = await encryptSecret(newSecret);
-                res.newSecret = newSecret;  // Return once
             }
 
-            // ✅ Step 3: Update document
+            // Step 3: Update document
             const updatedMerchant = await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 'api_merchants',
@@ -486,7 +511,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             res.json({
                 success: true,
                 merchant: updatedMerchant,
-                ...(res.newSecret && { newApiSecret: res.newSecret })
+                ...(newSecret && { newApiSecret: newSecret })
             });
         } catch (error) {
             console.error('Update merchant error:', error);
@@ -532,7 +557,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             res.json({
                 success: true,
-                merchantId: merchant.merchant_id,
+                merchantId: merchant.merchantId,
                 previousStatus: merchant.status,
                 newStatus: newStatus,
                 statusText: newStatus ? 'Active' : 'Suspended',

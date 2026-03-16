@@ -29,8 +29,37 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
-        const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-        return new Date(Date.now() + istOffset).toISOString();
+        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    }
+
+    // Atomic lock release — only deletes the key if its value still matches ours.
+    // Prevents accidentally releasing a lock that another process acquired after ours expired.
+    const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+    async function releaseLock(key, val) {
+        try { await redisClient.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [val] }); } catch (e) { console.error(`releaseLock failed for ${key} — lock will expire after TTL:`, e.message); }
+    }
+
+    // Acquire a distributed lock with retry. Same pattern as server.js acquireLock.
+    async function acquireLock(key, value, ttlSeconds = 15) {
+        try {
+            const result = await redisClient.set(key, value, { NX: true, EX: ttlSeconds });
+            return result === 'OK';
+        } catch (e) {
+            console.error('acquireLock error:', e);
+            return false; // fail safe — reject request rather than proceed unprotected
+        }
+    }
+
+    // Acquire daily summary lock with retry — serializes all totalsJson read-modify-writes for a given date.
+    // Must be used by ANY code path that modifies totalsJson (edit, delete, manual txn).
+    async function acquireDailyLock(dayString) {
+        const key = `lock:daily:${dayString}`;
+        const val = `admin:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            if (await acquireLock(key, val, 10)) return { key, val };
+            await new Promise(r => setTimeout(r, 50 + attempt * 40));
+        }
+        throw new Error(`Could not acquire daily lock for ${dayString} after 20 retries`);
     }
 
     // Returns true when an Appwrite error is caused by an invalid/expired pagination cursor
@@ -628,8 +657,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(403).json({ error: 'Cannot delete admin users' });
             }
 
-            // Find and delete corresponding document in users_mets collection
-            const list = await databases.listDocuments(
+            // Find and delete corresponding document in users_meta collection
+            const listOfUsersMeta = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_USERS_META_COLLECTION_ID,
                 [
@@ -637,29 +666,36 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 ]
             );
 
-            console.log(`User metadata documents found for userId ${userId}:`, list.total);
+            // console.log(`User metadata documents found for userId ${userId}:`, list.total);
 
-            if (list.documents.length > 0) {
-                const docId = list.documents[0].userId;
+            if (listOfUsersMeta.documents.length > 0) {
 
+                if(listOfUsersMeta.documents[0].role == 'admin'){
+                    return res.status(403).json({ error: 'Cannot delete admin users' });
+                }
+
+                // Get the user ID of the user being deleted
+                const userIdofUserDeleting = listOfUsersMeta.documents[0].userId;
+
+                // Check if user has assigned QR codes before allowing deletion
                 const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, 
-                    [Query.equal('assignedUserId', docId)]
+                    [Query.equal('assignedUserId', userIdofUserDeleting)]
                 );
 
-                console.log(`QR codes assigned to user ${userId}:`, response.total);
+                // console.log(`QR codes assigned to user ${userId}:`, response.total);
 
                 if (response.total > 0) {
                     return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
                 }
 
-                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, docId);
+                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, listOfUsersMeta.documents[0].$id);
 
                 // Delete user in Appwrite users service
                 await users.delete(userId);
 
                 // Update dashboard counters
-                const role = list.documents[0].role;
-                const status = list.documents[0].status;
+                const role = listOfUsersMeta.documents[0].role;
+                const status = listOfUsersMeta.documents[0].status;
                 if (role === 'subadmin') {
                     if (status === true) {
                         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', -1).catch(console.error);
@@ -863,15 +899,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
-            // Date filtering helper (unchanged)
+            // Date filtering helper — timezone-safe, works on any server
             function toISTRange(dateStr) {
-                const d = new Date(dateStr);
-                const start = new Date(d);
-                start.setHours(0, 0, 0, 0);
-                start.setMinutes(start.getMinutes() - 330);
-                const end = new Date(d);
-                end.setHours(23, 59, 59, 999);
-                end.setMinutes(end.getMinutes() - 330);
+                const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+                const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
                 return { start, end };
             }
 
@@ -1008,16 +1039,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
-            // Date filter helper same as above
+            // Date filter helper — timezone-safe, works on any server
             function toISTRange(dateStr) {
-            const d = new Date(dateStr);
-            const start = new Date(d);
-            start.setHours(0, 0, 0, 0);
-            start.setMinutes(start.getMinutes() - 330);
-            const end = new Date(d);
-            end.setHours(23, 59, 59, 999);
-            end.setMinutes(end.getMinutes() - 330);
-            return { start, end };
+                const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+                const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+                return { start, end };
             }
 
             if (from && to) {
@@ -1156,15 +1182,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
-            // Date filter helper (copied exactly)
+            // Date filter helper — timezone-safe, works on any server
             function toISTRange(dateStr) {
-                const d = new Date(dateStr);
-                const start = new Date(d);
-                start.setHours(0, 0, 0, 0);
-                start.setMinutes(start.getMinutes() - 330);
-                const end = new Date(d);
-                end.setHours(23, 59, 59, 999);
-                end.setMinutes(end.getMinutes() - 330);
+                const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+                const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
                 return { start, end };
             }
 
@@ -1566,11 +1587,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 lkAcquired = r === 'OK';
             } catch (e) {
                 console.error('Redis lock error in transaction edit:', e);
-                lkAcquired = true; // degrade gracefully if Redis is down
+                lkAcquired = false; // fail safe — reject rather than proceed unprotected
             }
             if (!lkAcquired) {
                 for (const { key, val } of editLocks) {
-                    try { const c = await redisClient.get(key); if (c === val) await redisClient.del(key); } catch {}
+                    await releaseLock(key, val);
                 }
                 return res.status(409).json({ error: `QR ${qId} is currently being modified by another operation. Please try again in a moment.` });
             }
@@ -1715,6 +1736,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             if (sameSlot && effectiveNewAmount !== oldAmountPaise) {
                 // Same QR + same date, only amount changed: apply delta in place
+                const dailyLock = await acquireDailyLock(oldDateStr);
+                try {
                 const summaryList = await databases.listDocuments(
                     APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                     [Query.equal('date', oldDateStr), Query.limit(1)]
@@ -1722,15 +1745,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 if (summaryList.total > 0) {
                     const doc = summaryList.documents[0];
                     let totalsObj = {};
-                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss'); throw new Error('Daily summary JSON is corrupted — manual fix required'); }
                     const slotDelta = effectiveNewAmount - oldAmountPaise;
                     const slotNewAmt = Number(totalsObj[oldQrId] || 0) + slotDelta;
                     if (slotNewAmt < 0) throw new Error('Daily summary total cannot go negative');
                     totalsObj[oldQrId] = slotNewAmt;
                     await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
                 }
+                } finally { await releaseLock(dailyLock.key, dailyLock.val); }
             } else if (!sameSlot) {
                 // QR or date changed: subtract old amount from old slot, add new amount to new slot
+                // Lock old date, then new date (sorted order to prevent deadlock if they differ)
+                const datesToLock = [...new Set([oldDateStr, newDateStr])].sort();
+                const dailyLocks = [];
+                for (const d of datesToLock) { dailyLocks.push(await acquireDailyLock(d)); }
+                try {
                 const oldSummaryList = await databases.listDocuments(
                     APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                     [Query.equal('date', oldDateStr), Query.limit(1)]
@@ -1738,7 +1767,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 if (oldSummaryList.total > 0) {
                     const doc = oldSummaryList.documents[0];
                     let totalsObj = {};
-                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss'); throw new Error('Daily summary JSON is corrupted — manual fix required'); }
                     totalsObj[oldQrId] = Math.max(0, Number(totalsObj[oldQrId] || 0) - oldAmountPaise);
                     await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
                 }
@@ -1749,10 +1778,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 if (newSummaryList.total > 0) {
                     const doc = newSummaryList.documents[0];
                     let totalsObj = {};
-                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { totalsObj = {}; }
+                    try { totalsObj = JSON.parse(doc.totalsJson || '{}'); } catch (e) { console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss'); throw new Error('Daily summary JSON is corrupted — manual fix required'); }
                     totalsObj[newQrId] = Number(totalsObj[newQrId] || 0) + effectiveNewAmount;
                     await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, doc.$id, { totalsJson: JSON.stringify(totalsObj) });
                 }
+                } finally { for (const lk of dailyLocks) await releaseLock(lk.key, lk.val); }
             }
             // else: sameSlot and no amount change → nothing to update in daily summaries
         }
@@ -1769,7 +1799,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } finally {
             // Release all QR locks acquired for this edit
             for (const { key, val } of editLocks) {
-                try { const c = await redisClient.get(key); if (c === val) await redisClient.del(key); } catch {}
+                await releaseLock(key, val);
             }
         }
     } catch (err) {
@@ -1804,7 +1834,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     deleteLockAcquired = r === 'OK';
                 } catch (e) {
                     console.error('Redis lock error in transaction delete:', e);
-                    deleteLockAcquired = true; // degrade gracefully
+                    deleteLockAcquired = false; // fail safe
                 }
                 if (!deleteLockAcquired) {
                     return res.status(409).json({ error: 'QR is currently being modified by another operation. Please try again in a moment.' });
@@ -1880,6 +1910,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             console.log('qrId:', qrId);
 
             // Query existing document only by date because totalsJson contains all qrId totals
+            const dailyLock = await acquireDailyLock(dayString);
+            try {
             const existingQrSummary = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
@@ -1892,12 +1924,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (existingQrSummary.total > 0) {
             const doc = existingQrSummary.documents[0];
 
-            // Parse totalsJson string or fallback to empty object
+            // Parse totalsJson — abort if corrupted to prevent wiping other QRs' data
             let totalsObj = {};
             try {
                 totalsObj = JSON.parse(doc.totalsJson || '{}');
             } catch (e) {
-                totalsObj = {};
+                console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss');
+                throw new Error('Daily summary JSON is corrupted — manual fix required');
             }
 
             const currentTotal = Number(totalsObj[qrId] || 0);
@@ -1918,8 +1951,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     totalsJson: JSON.stringify(totalsObj),
                 }
             );
-            } 
-            // Optionally handle creation of new document if none exists
+            }
+            } finally { await releaseLock(dailyLock.key, dailyLock.val); }
 
 
             } else {
@@ -1934,16 +1967,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             await Promise.all([
                 redisClient.incrBy('counter:totalTxCount', -1),
                 redisClient.incrBy('counter:totalAmountReceived', -amountPaise),
-            ]).catch((e) => console.error('Redis counter update failed (delete tx):', e));
+            ]).then(() => { redisClient.countersDirty = true; })
+              .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (delete tx):', e); });
 
             if (tx.provider === 'manual') {
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1).catch((e) => {
                     console.error('Error updating totalManualTx counter:', e);
                 });
             } else {
-                await redisClient.incrBy('counter:totalApiTx', -1).catch((e) => {
-                    console.error('Error updating totalApiTx counter:', e);
-                });
+                await redisClient.incrBy('counter:totalApiTx', -1)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Error updating totalApiTx counter:', e); });
             }
 
             // 4) Delete the transaction document — counters are already decremented
@@ -1957,7 +1991,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             } finally {
                 // Release the QR lock acquired for this delete
                 if (qrId) {
-                    try { const c = await redisClient.get(deleteLockKey); if (c === deleteLockVal) await redisClient.del(deleteLockKey); } catch {}
+                    await releaseLock(deleteLockKey, deleteLockVal);
                 }
             }
         } catch (err) {
@@ -1988,7 +2022,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 rrnLockAcquired = r === 'OK';
             } catch (e) {
                 console.error('Redis RRN lock error:', e);
-                rrnLockAcquired = true; // degrade gracefully if Redis is down
+                rrnLockAcquired = false; // fail safe
             }
             if (!rrnLockAcquired) {
                 return res.status(409).json({ error: 'A transaction with this RRN is already being processed. Please try again.' });
@@ -2029,7 +2063,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 );
             } finally {
                 // Release RRN lock once the document is created (or if it failed)
-                try { const c = await redisClient.get(rrnLockKey); if (c === '1') await redisClient.del(rrnLockKey); } catch {}
+                await releaseLock(rrnLockKey, '1');
             }
 
             // (async () => {
@@ -2055,7 +2089,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 manualLockAcquired = r === 'OK';
             } catch (e) {
                 console.error('Redis lock error in manual transaction:', e);
-                manualLockAcquired = true; // degrade gracefully
+                manualLockAcquired = false; // fail safe
             }
             if (!manualLockAcquired) {
                 console.warn(`QR ${qrCodeId} lock busy during manual transaction — QR totals may lag by one cycle`);
@@ -2100,7 +2134,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             } finally {
                 if (manualLockAcquired) {
-                    try { const c = await redisClient.get(manualLockKey); if (c === manualLockVal) await redisClient.del(manualLockKey); } catch {}
+                    await releaseLock(manualLockKey, manualLockVal);
                 }
             }
 
@@ -2130,7 +2164,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             await Promise.all([
                 redisClient.incrBy('counter:totalTxCount', 1),
                 redisClient.incrBy('counter:totalAmountReceived', finalAmount),
-            ]).catch((e) => console.error('Redis counter update failed (manual tx):', e));
+            ]).then(() => { redisClient.countersDirty = true; })
+              .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (manual tx):', e); });
 
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1).catch((e) => {
                 console.error('Error updating totalManualTx counter:', e);
@@ -2267,15 +2302,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // IST day range helper
             function istDayRangeISO(dateStr) {
-                const d = new Date(dateStr);
-                const start = new Date(d);
-                start.setHours(0, 0, 0, 0);
-                // shift to UTC by subtracting 5h30m to represent IST day in UTC
-                start.setMinutes(start.getMinutes() - 330);
-                const end = new Date(d);
-                end.setHours(23, 59, 59, 999);
-                end.setMinutes(end.getMinutes() - 330);
-                return { startISO: start.toISOString(), endISO: end.toISOString() };
+                const startISO = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toISOString();
+                const endISO = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toISOString();
+                return { startISO, endISO };
             }
 
             // Date filters (createdAt field is ISO string)
@@ -2594,6 +2623,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(existingDocsYesterday.documents[0].totalsJson || '{}');
                 } catch (e) {
+                    console.error('WARNING: corrupted totalsJson in yesterday summary (read-only) —', e.message);
                     totalsObj = {};
                 }
                 yesterdayPayInAllQrs = Object.values(totalsObj).reduce((sum, value) => sum + parseInt(value || 0, 10), 0);
@@ -2608,7 +2638,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(totalsJsonStr);
                 } catch (e) {
-                    // fallback if corrupted JSON
+                    console.error('WARNING: corrupted totalsJson in daily summary (read-only path) —', e.message);
                     totalsObj = {};
                 }
 
@@ -2790,7 +2820,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(totalsJsonStr);
                 } catch (e) {
-                    // fallback if corrupted JSON
+                    console.error('WARNING: corrupted totalsJson in daily summary (read-only path) —', e.message);
                     totalsObj = {};
                 }
 
@@ -2843,6 +2873,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(doc.totalsJson || '{}');
                 } catch (e) {
+                    console.error('WARNING: corrupted totalsJson for doc', doc.$id, '(read-only) —', e.message);
                     totalsObj = {};
                 }
 
@@ -3131,7 +3162,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(totalsJsonStr);
                 } catch (e) {
-                    // fallback if corrupted JSON
+                    console.error('WARNING: corrupted totalsJson in daily summary (read-only path) —', e.message);
                     totalsObj = {};
                 }
                 // OPTIONAL: If you need user-specific subset (instead of all)
@@ -3172,7 +3203,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 try {
                     totalsObj = JSON.parse(totalsJsonStr);
                 } catch (e) {
-                    // fallback if corrupted JSON
+                    console.error('WARNING: corrupted totalsJson in daily summary (read-only path) —', e.message);
                     totalsObj = {};
                 }
                 // OPTIONAL: If you need user-specific subset (instead of all)

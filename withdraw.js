@@ -21,6 +21,12 @@ const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdra
 
 module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
 
+  // Atomic lock release via Lua script — only deletes if value still matches ours
+  const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+  async function releaseLock(key, val) {
+      try { await redisClient.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [val] }); } catch (e) { console.error(`releaseLock failed for ${key} — lock will expire after TTL:`, e.message); }
+  }
+
   function generateWithdrawalId() {
     const prefix = 'wdh_';
     const timestamp = Date.now(); // milliseconds since epoch
@@ -73,9 +79,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     return totalsObj;
   }
 
-    // Helper to calculate commission
+    // Helper to calculate commission in PAISE from paise input.
+    // All arithmetic stays in integers to avoid floating-point drift.
+    // Example: 1050 paise * 2.5% = Math.ceil(1050 * 250 / 10000) = Math.ceil(26.25) = 27 paise
+    function calculateCommissionPaise(preAmountPaise, commissionRatePercent) {
+      // Multiply rate by 100 to make it integer (2.5% → 250), divide by 10000 at the end
+      const rateTimes100 = Math.round(commissionRatePercent * 100);
+      return Math.ceil(preAmountPaise * rateTimes100 / 10000);
+    }
+
+    // Legacy wrapper — takes rupees, returns rupees (for preview endpoint backward compat)
     function calculateCommission(preAmount, commissionRatePercent) {
-      return Math.ceil(preAmount * commissionRatePercent / 100);
+      const paise = calculateCommissionPaise(Math.round(preAmount * 100), commissionRatePercent);
+      return paise / 100;
     }
 
     function toInt(value) {
@@ -206,7 +222,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         if (req.user.role !== 'admin') {
           await ConfigManager.refresh();
 
-          const isWithdrawalTimeWindowsEnabled = await ConfigManager.get(
+          const isWithdrawalTimeWindowsEnabled = ConfigManager.get(
             'withdrawal_time_windows_enabled'
           );
 
@@ -247,7 +263,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // If the requester is not an admin, check if withdrawal time windows are enabled and enforce them
       if (req.user.role != 'admin'){
          await ConfigManager.refresh(); // Ensure we have the latest config values
-         let isWithdrawalTimeWindowsEnabled = await ConfigManager.get(databases, APPWRITE_DATABASE_ID, 'withdrawal_time_windows_enabled');
+         let isWithdrawalTimeWindowsEnabled = ConfigManager.get('withdrawal_time_windows_enabled');
          if(isWithdrawalTimeWindowsEnabled){
           let is =  isWithdrawTimeAllowed();
           if(!is){
@@ -311,7 +327,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             [Query.equal('userId', userId), Query.equal('status', 'pending')]
         );
 
-          let MAX_PENDING_WITHDRAWALS = await ConfigManager.get('max_withdrawal_requests') || MAX_PENDING_WITHDRAWALS;
+          let MAX_PENDING_WITHDRAWALS = ConfigManager.get('max_withdrawal_requests') || MAX_PENDING_WITHDRAWALS;
 
           if (pendingRequests.total >= MAX_PENDING_WITHDRAWALS) {
             return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
@@ -339,8 +355,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(422).json({ error: 'Combined commission rate exceeds 100%. Please contact support.' });
           }
 
-          const recalculatedCommissionRs = calculateCommission(preAmount, totalCommissionRate);
-          const recalculatedCommissionPaise = recalculatedCommissionRs * 100;
+          const recalculatedCommissionPaise = calculateCommissionPaise(preAmountPaise, totalCommissionRate);
+          const recalculatedCommissionRs = recalculatedCommissionPaise / 100;
           const recalculatedTotalPaise = preAmountPaise + recalculatedCommissionPaise;
 
           // Validation check — compare in integer paise to avoid floating-point drift
@@ -363,7 +379,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             wdLockAcquired = lockResult === 'OK';
         } catch (e) {
             console.error('Redis lock error in withdraw_new, proceeding without lock:', e);
-            wdLockAcquired = true; // degrade gracefully if Redis is down
+            wdLockAcquired = false; // fail safe — reject rather than proceed unprotected
         }
         if (!wdLockAcquired) {
             return res.status(409).json({ error: 'Another withdrawal for this QR is being processed. Please try again.' });
@@ -399,8 +415,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const todayWithdrawAmount = available - todayPayinsForThisQr;
 
         // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
-        // recalculatedCommissionRs = commission in RUPEES → multiply by 100 to get paise
-        const commissionPaiseRequired = recalculatedCommissionRs * 100; // rupees → paise
+        // Commission already computed in paise — no conversion needed
+        const commissionPaiseRequired = recalculatedCommissionPaise;
         if ((preAmountPaise + commissionPaiseRequired) > todayWithdrawAmount) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
         }
@@ -460,16 +476,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             .catch(e => console.error(`CRITICAL: QR update failed and rollback also failed. Orphaned withdrawal id=${response.$id} for qrId=${qrId}`, e));
           throw qrUpdateErr;
         }
+        // Update dashboard counter inside lock scope
+        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', preAmountPaise).catch(console.error);
+
         } finally {
             // Always release the lock — whether the balance check passed, failed, or threw
-            try {
-                const current = await redisClient.get(wdLockKey);
-                if (current === wdh_id) await redisClient.del(wdLockKey);
-            } catch (e) { console.error('Redis releaseLock error in withdraw_new:', e); }
+            await releaseLock(wdLockKey, wdh_id);
         }
-
-        // After creating a withdrawal request
-        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', preAmountPaise).catch(console.error);
 
         return res.json({ success: true, data: response });
       } catch (err) {
@@ -954,7 +967,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             approveLockAcquired = r === 'OK';
         } catch (e) {
             console.error('Redis lock error in withdrawal approve:', e);
-            approveLockAcquired = true; // degrade gracefully
+            approveLockAcquired = false; // fail safe
         }
         if (!approveLockAcquired) {
             return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
@@ -1061,8 +1074,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const parent = await getUserMeta(user.parentId);
             if (parent) {
               // Subadmin commission
-              const subadminCommissionAmount = calculateCommission(
-                w.preAmount * 100,
+              const subadminCommissionAmount = calculateCommissionPaise(
+                Math.round(w.preAmount * 100),
                 w.userCommissionRate
               );
 
@@ -1081,8 +1094,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
               if (admin) {
                 // Admin commission
-                const adminCommissionAmount = calculateCommission(
-                  w.preAmount * 100,
+                const adminCommissionAmount = calculateCommissionPaise(
+                  Math.round(w.preAmount * 100),
                   w.parentCommissionRate
                 );
 
@@ -1104,8 +1117,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           } else {
             // User has no parent, so admin earns commission only
             if (admin) {
-              const adminCommissionAmount = calculateCommission(
-                w.preAmount * 100,
+              const adminCommissionAmount = calculateCommissionPaise(
+                Math.round(w.preAmount * 100),
                 w.userCommissionRate
               );
 
@@ -1151,7 +1164,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         return res.json({ success: true, message: 'Withdrawal approved' });
         } finally {
-            try { const lua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`; await redisClient.eval(lua, { keys: [approveLockKey], arguments: [approveLockVal] }); } catch {}
+            await releaseLock(approveLockKey, approveLockVal);
         }
       } catch (err) {
         console.error('❌ Approve error:', err);
@@ -1206,7 +1219,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             rejectLockAcquired = r === 'OK';
         } catch (e) {
             console.error('Redis lock error in withdrawal reject:', e);
-            rejectLockAcquired = true; // degrade gracefully
+            rejectLockAcquired = false; // fail safe
         }
         if (!rejectLockAcquired) {
             return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
@@ -1302,7 +1315,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         return res.json({ success: true, message: 'Withdrawal rejected' });
         } finally {
-            try { const c = await redisClient.get(rejectLockKey); if (c === rejectLockVal) await redisClient.del(rejectLockKey); } catch {}
+            await releaseLock(rejectLockKey, rejectLockVal);
         }
       } catch (err) {
         console.error('❌ Reject error:', err);
@@ -1319,9 +1332,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     function istDateTimeNow(){
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const AtIST = new Date(Date.now() + istOffset).toISOString();
-      return AtIST;
+      return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     // One entrypoint after computing commissionTxs in your approval route

@@ -16,20 +16,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // Helper function to generate UPI QR code
     async function generateUpiQR(userId, amount, txnId) {
-        console.log('🔧 [Wallet API] Generating UPI QR for user:', userId, 'amount:', amount);
-                // 3. Generate UPI deep link
-        const upiLink = `upi://pay?pa=${encodeURIComponent(vpa)}&pn=${encodeURIComponent(COMPANY_NAME)}&am=${amount.toFixed(2)}&cu=INR&tn=Order-${encodeURIComponent(txnId)}`;
-    
-        // 4. Generate QR code
-        const qrBase64 = await QRCode.toDataURL(upiLink, {
-            width: 300,
-            margin: 1,
-            color: {
-                dark: '#000000',
-                light: '#FFFFFF',
-            },
-        });
-        return qrBase64;
+        try {
+            const upiLink = `upi://pay?pa=${encodeURIComponent(vpa)}&pn=${encodeURIComponent(COMPANY_NAME)}&am=${amount.toFixed(2)}&cu=INR&tn=Order-${encodeURIComponent(txnId)}`;
+            const qrBase64 = await QRCode.toDataURL(upiLink, {
+                width: 300,
+                margin: 1,
+                color: { dark: '#000000', light: '#FFFFFF' },
+            });
+            return qrBase64;
+        } catch (err) {
+            console.error('QR generation failed for user:', userId, err.message);
+            throw new Error('Failed to generate UPI QR code');
+        }
     }
 
     // ✅ GET /wallet/balance
@@ -105,7 +103,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         try {
             const userId = req.user.userId;
-            const limit = parseInt(req.query.limit || 25);
+            const parsedLimit = parseInt(req.query.limit);
+            const limit = (!parsedLimit || parsedLimit < 1) ? 25 : Math.min(parsedLimit, 100);
             const cursor = req.query.cursor;
 
             const queries = [

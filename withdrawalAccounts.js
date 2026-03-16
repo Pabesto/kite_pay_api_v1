@@ -119,27 +119,26 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const userId = req.user.userId;
             const updates = req.body; // { notes, upiId, etc. }
 
-            // Optional: Fetch first to verify ownership (extra security)
-            const existing = await databases.listDocuments(
+            // Fetch by document ID and verify ownership
+            const existing = await databases.getDocument(
                 APPWRITE_DATABASE_ID,
                 WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
-                [Query.equal('userId', userId), Query.equal('$id', accountId), Query.limit(1)]
+                accountId
             );
-            if (existing.documents.length === 0) {
+            if (!existing || existing.userId !== userId) {
                 return res.status(404).json({ error: 'Account not found' });
             }
 
             // Validate lengths
             if (updates.accountNumber && updates.accountNumber.length > 25) {
-            return res.status(400).json({ error: 'Account number too long' });
+                return res.status(400).json({ error: 'Account number too long' });
             }
-            // Add other validations...
 
             const response = await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
-            accountId,
-            updates
+                APPWRITE_DATABASE_ID,
+                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                accountId,
+                updates
             );
 
             res.json({
@@ -160,13 +159,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const userId = req.user.userId;
 
             // Verify ownership
-            const existing = await databases.listDocuments(
+            const existing = await databases.getDocument(
                 APPWRITE_DATABASE_ID,
                 WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
-                [Query.equal('userId', userId), Query.equal('$id', accountId), Query.limit(1)]
+                accountId
             );
-
-            if (existing.documents.length === 0) {
+            if (!existing || existing.userId !== userId) {
                 return res.status(404).json({ error: 'Account not found' });
             }
 

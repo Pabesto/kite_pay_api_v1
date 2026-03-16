@@ -1,11 +1,11 @@
 // server.js (CommonJS)
 const http = require('http');
-const jwt = require('jsonwebtoken');
+const { Client, Account, Databases, Query } = require('node-appwrite');
 const { Server } = require('socket.io');
 
 let io; // Declare io in outer scope for access in emit functions
 
-function initSocket(app) {
+function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, appwriteDatabaseId, usersMetaCollectionId }) {
   // reuse the same HTTP server as Express
   const httpServer = http.createServer(app);
 
@@ -17,21 +17,47 @@ function initSocket(app) {
     transports: ['websocket'],
   });
 
-  // Auth middleware: expect Bearer token in auth or headers
-//   io.use((socket, next) => {
-//     try {
-//       const token =
-//         socket.handshake.auth?.token ||
-//         (socket.handshake.headers.authorization || '').split(' ')[15];
-//       if (!token) return next(new Error('Unauthorized'));
-//       const payload = jwt.verify(token, process.env.JWT_SECRET);
-//       socket.data.userId = payload.id || payload.userId;
-//       if (!socket.data.userId) return next(new Error('Unauthorized'));
-//       return next();
-//     } catch (e) {
-//       return next(new Error('Unauthorized'));
-//     }
-//   });
+  // Appwrite admin client for querying users_meta
+  const adminClient = new Client()
+    .setEndpoint(appwriteEndpoint)
+    .setProject(appwriteProjectId)
+    .setKey(appwriteApiKey);
+  const databases = new Databases(adminClient);
+
+  // Auth middleware: verify Appwrite JWT via account.get()
+  io.use(async (socket, next) => {
+    try {
+      const token =
+        socket.handshake.auth?.token ||
+        (socket.handshake.headers.authorization || '').split(' ')[1];
+      if (!token) return next(new Error('Unauthorized'));
+
+      // Verify JWT by creating a user-scoped Appwrite client
+      const userClient = new Client()
+        .setEndpoint(appwriteEndpoint)
+        .setProject(appwriteProjectId)
+        .setJWT(token);
+
+      const account = new Account(userClient);
+      const user = await account.get();
+
+      if (!user.$id) return next(new Error('Unauthorized'));
+
+      // Fetch user metadata
+      const list = await databases.listDocuments(
+        appwriteDatabaseId,
+        usersMetaCollectionId,
+        [Query.equal('userId', user.$id)]
+      );
+
+      socket.data.userId = user.$id;
+      socket.data.userMeta = list.documents[0] || null;
+      return next();
+    } catch (e) {
+      console.error('Socket auth error:', e.message);
+      return next(new Error('Unauthorized'));
+    }
+  });
 
   io.on('connection', (socket) => {
     console.log('Socket connected:', socket.id, 'userId:', socket.data.userId);
@@ -84,35 +110,46 @@ function initSocket(app) {
 
 // Helper: emit a new transaction event to intended audiences
   function emitTxnNew({ assignedUserId, qrCodeId, payload }) {
-    if (assignedUserId) {
-      io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
-    }
-    if (qrCodeId) {
-      io.to(`room:qr:${qrCodeId}`).emit('txn:new', payload);
+    try {
+      if (!io) return;
+      if (assignedUserId) {
+        io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
+      }
+      if (qrCodeId) {
+        io.to(`room:qr:${qrCodeId}`).emit('txn:new', payload);
+      }
+    } catch (e) {
+      console.error('emitTxnNew error:', e.message);
     }
   }
 
   function emitQrAlert({ payload }) {
-    // console.log('Emitting QR alert with payload');
-    if (payload) {
+    try {
+      if (!io || !payload) return;
       io.to(`qrsAlert`).emit('qrsAlert', payload);
-      // io.emit('qrsAlert', payload); // emit to all connected clients
+    } catch (e) {
+      console.error('emitQrAlert error:', e.message);
     }
   }
 
   function emitQrLimit({ assignedUserId, qrCodeId, payload }) {
-    // if (assignedUserId) {
-    //   io.to(`room:user:${assignedUserId}`).emit('txn:new', payload);
-    // }
-    console.log('Emitting QR limit alert with payload:', payload);
-    if (qrCodeId) {
-      io.to(`room:qr:${qrCodeId}`).emit('qrLimitAlert', payload);
+    try {
+      if (!io) return;
+      if (qrCodeId) {
+        io.to(`room:qr:${qrCodeId}`).emit('qrLimitAlert', payload);
+      }
+    } catch (e) {
+      console.error('emitQrLimit error:', e.message);
     }
   }
 
   function emitForceRefresh({ payload } = {}) {
-    console.log('Emitting force refresh signal with payload:', payload);
-    io.emit('forceRefresh', payload); // broadcast to all connected clients
+    try {
+      if (!io) return;
+      io.emit('forceRefresh', payload);
+    } catch (e) {
+      console.error('emitForceRefresh error:', e.message);
+    }
   }
 
 // module.exports = { initSocket };
