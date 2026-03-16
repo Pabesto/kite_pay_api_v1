@@ -61,7 +61,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // Consistent ordering is CRUCIAL for cursor pagination
-            queries.push(Query.orderAsc('$id'));
+            queries.push(Query.orderDesc('$id'));
 
             // Role-based filtering
             if (role === 'subadmin') {
@@ -613,10 +613,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // 🧹 Delete user endpoint
     router.delete('/delete-user/:id', authenticateAdmin, async (req, res) => {
         const userId = req.params.id;
+        const userRequested = req.user; // set by your JWT middleware
 
         if (!userId) {
             return res.status(400).json({ error: 'Missing user ID' });
         }
+
+        console.log(`Attempting to delete user ${userId} by requester ${userRequested.userId} with role ${userRequested.role}`);
 
         try {
             const user = await users.get(userId);
@@ -634,12 +637,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 ]
             );
 
-            if (list.documents.length > 0) {
-                const docId = list.documents[0].$id;
+            console.log(`User metadata documents found for userId ${userId}:`, list.total);
 
-                const response = await databases.listDocuments(APPWRITE_DATABASE_ID,Qr_collectionId, // Ensure this matches your actual QR codes collection ID
-                    [Query.equal('assignedUserId', docId.userId)]
+            if (list.documents.length > 0) {
+                const docId = list.documents[0].userId;
+
+                const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, 
+                    [Query.equal('assignedUserId', docId)]
                 );
+
+                console.log(`QR codes assigned to user ${userId}:`, response.total);
 
                 if (response.total > 0) {
                     return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
