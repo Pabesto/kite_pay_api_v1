@@ -18,8 +18,8 @@ class ConfigManager {
 
         try {
             const docs = await databasesInstance.listDocuments(
-                process.env.APPWRITE_DATABASE_ID || '688ca9f3003e593a6227',
-                process.env.APPWRITE_CONFIG_COLLECTION_ID || '68a73217002ed987b246'
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246'
             );
 
             const config = {};
