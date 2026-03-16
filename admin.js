@@ -250,43 +250,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
     });
 
-    //     } catch (err) {
-    //         console.error('List users error:', err);
-    //         return res.status(500).json({ error: 'Failed to fetch users' });
-    //     }
-    // });
-
-    // 🔐 Create new user (admin-only)
-    // router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
-    //     const {name, email, password } = req.body;
-
-    //     if (!name || !email || !password) {
-    //         return res.status(400).json({ error: 'Name, Email and password are required' });
-    //     }
-
-    //     try {
-    //         const response = await users.create(
-    //             ID.unique(),
-    //             email,
-    //             undefined,
-    //             password,
-    //             name
-    //         );
-
-    //         return res.status(201).json({
-    //             message: 'User created successfully',
-    //             user: {
-    //                 $id: response.$id,
-    //                 email: response.email,
-    //                 name: response.name,
-    //             },
-    //         });
-    //     } catch (err) {
-    //         console.error('❌ Create user error:', err.message || err);
-    //         return res.status(500).json({ error: err.message || 'User creation failed' });
-    //     }
-    // });
-
     // 🔐 Create new user (admin/sub-admin allowed)
     router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
         const { name, email, password, role } = req.body;
@@ -791,6 +754,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     }
 
+    // Helper: convert amount to paise
+    const toPaise = (amt) => Math.round(amt * 100);
+
+
+
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
@@ -1002,6 +970,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 vpa: d.vpa,
                 created_at: d.created_at,
                 status: d.status,
+                imageUrl: d.imageUrl || null,
             });
             const docs = transactions.documents.map(pickTxn);
 
@@ -1017,82 +986,377 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // GET /transactions/aggregate
-    // Admin/Subadmin with all_transactions label
-    // GET /transactions/aggregate-all
-    // router.get('/transactions/aggregate-all', async (req, res) => {
-    // const {
-    //     startCursor,
-    //     pageLimit = 100,
-    //     maxPages = 200, // scans up to 20,000 docs by default
-    // } = req.query;
+        // Fetch transactions only for that user with optional one-field search
+    router.get('/user/transactions', authenticateToken, async (req, res) => {
+        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 50);
 
-    // const limitNum = Math.min(parseInt(pageLimit) || 100, 100);
-    // const maxPagesNum = Math.min(parseInt(maxPages) || 200, 200);
+        // console.log('Transaction query params:', req.query);
 
-    // try {
-    //     let totalCount = 0;
-    //     let vpaNullCount = 0;
-    //     let vpaPresentCount = 0;
-    //     let totalAmountPaise = 0;
+        const userRequested = req.user;
+        const isSubadmin = userRequested.role === 'subadmin';
+        const isAdmin = userRequested.role === 'admin';
 
-    //     let cursor = startCursor || null;
-    //     let page = 0;
-    //     let hasMore = true;
+        if (!isSubadmin && userRequested.userId !== userId) {
+            return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+        }
 
-    //     while (hasMore && page < maxPagesNum) {
-    //     const queries = [Query.orderDesc('created_at'), Query.limit(limitNum)];
-    //     if (cursor) queries.push(Query.cursorAfter(cursor));
+        if (!userId) {
+            return res.status(400).json({ error: 'userId is required' });
+        }
 
-    //     const resp = await databases.listDocuments(
-    //         APPWRITE_DATABASE_ID,
-    //         webhook_collectionId,
-    //         queries
-    //     );
+        const filters = [];
 
-    //     const docs = resp.documents || [];
+        try {
+            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+            // console.log('User QR IDs:', userQrIds);
+            if (qrId) {
+                if (userQrIds.includes(qrId) || isAdmin) {
+                    filters.push(Query.equal('qrCodeId', qrId));
+                } else {
+                    return res.status(200).json({ transactions: [] });
+                }
+            } else {
+                if (userQrIds.length === 0) {
+                    return res.status(200).json({ transactions: [] });
+                }
+                filters.push(Query.equal('qrCodeId', userQrIds));
+            }
 
-    //     for (const d of docs) {
-    //         totalCount += 1;
+            // Date filter helper same as above
+            function toISTRange(dateStr) {
+            const d = new Date(dateStr);
+            const start = new Date(d);
+            start.setHours(0, 0, 0, 0);
+            start.setMinutes(start.getMinutes() - 330);
+            const end = new Date(d);
+            end.setHours(23, 59, 59, 999);
+            end.setMinutes(end.getMinutes() - 330);
+            return { start, end };
+            }
 
-    //         const v = d.vpa;
-    //         const vpaEmpty = v == null || (typeof v === 'string' && v.trim() === '');
-    //         if (vpaEmpty) vpaNullCount += 1; else vpaPresentCount += 1;
+            if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+            }
+            } else if (from && !to) {
+            const { start, end } = toISTRange(from);
+            filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+            } else if (!from && to) {
+            const { end } = toISTRange(to);
+            filters.push(Query.lessThanEqual('created_at', end.toISOString()));
+            }
 
-    //         const amt = Number.isFinite(d.amount) ? d.amount : parseInt(d.amount || 0, 10);
-    //         if (!isNaN(amt)) totalAmountPaise += amt;
-    //     }
+            // Single field search if provided and valid
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                const exactMatchFields = ['amount', 'rrnNumber'];
 
-    //     if (docs.length === limitNum) {
-    //         cursor = docs[docs.length - 1].$id;
-    //         hasMore = true;
-    //     } else {
-    //         hasMore = false;
-    //         if (docs.length > 0) cursor = docs[docs.length - 1].$id;
-    //     }
+                if (fulltextFields.includes(searchField)) {
+                    // Use fulltext search for these fields
+                    filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                    const amountValue = parseInt(searchValue, 10);
+                    if (isNaN(amountValue)) {
+                    return res.status(400).json({ error: 'Amount must be an integer value' });
+                    }
+                    filters.push(Query.equal('amount', amountValue*100));
+                } else if (searchField === 'rrnNumber') {
+                    // rrnNumber exact match as string
+                    filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                    return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
 
-    //     page += 1;
-    //     }
+            if(status){
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+                if (!allowedStatuses.has(status.toLowerCase())) {
+                    return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
+                }
+                if(status.toLowerCase() === 'normal'){
+                    filters.push(
+                        Query.or([
+                            Query.equal('status', 'normal'),
+                            Query.equal('status', ''),       // if some docs stored empty string
+                            Query.isNull('status'),          // null or missing field
+                        ])
+                    );
+                }else{
+                    filters.push(Query.equal('status', status.toLowerCase()));
+                }
+            }
 
-    //     return res.status(200).json({
-    //     totalCount,
-    //     vpaNullCount,
-    //     vpaPresentCount,
-    //     totalAmountPaise,
-    //     hasMore,
-    //     cursor,
-    //     pageSize: limitNum,
-    //     pagesScanned: page,
-    //     });
-    // } catch (err) {
-    //     console.error('Error aggregating all transactions:', err);
-    //     return res.status(500).json({ error: 'Failed to aggregate transactions' });
-    // }
-    // });
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
+            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
 
-    // Helper: convert amount to paise
-    const toPaise = (amt) => Math.round(amt * 100);
+            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
 
+            const pickTxn = (d) => ({
+                $id: d.$id,
+                id: d.$id,                // keep if needed
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                rrnNumber: d.rrnNumber,
+                amount: d.amount,
+                vpa: d.vpa,
+                created_at: d.created_at,
+                status: d.status,
+                imageUrl: d.imageUrl || null,
+            });
+            const docs = transactions.documents.map(pickTxn);
+
+            // const docs = transactions.documents;
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+            res.status(200).json({ transactions: docs, nextCursor });
+
+        } catch (error) {
+            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+            console.error('❌ Error in /user/transactions:', error);
+            res.status(500).json({ error: 'Failed to fetch user transactions' });
+        }
+    });
+
+    // Export endpoint with same filters but returns all matching transactions (up to a reasonable max limit) for CSV export
+    router.get('/user/transactions/export', authenticateToken, async (req, res) => {
+        const { userId, qrId, from, to, status, searchField, searchValue, maxTxns = 50 } = req.query;
+        const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 500);  // safety limit
+
+        console.log('Export transaction query params:', req.query);
+
+        const userRequested = req.user;
+        const isSubadmin = userRequested.role === 'subadmin';
+        const isAdmin = userRequested.role === 'admin';
+
+        if(!isAdmin){
+
+            if (!isSubadmin && userRequested.userId !== userId) {
+                return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+            }
+
+            if (!userId) {
+                return res.status(400).json({ error: 'userId is required' });
+            }
+
+        }
+
+        let allTxns = [];
+        let cursor = null;
+
+        do {
+            const filters = [];
+
+            try {
+            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+            
+            if (qrId) {
+                if (userQrIds.includes(qrId) || isAdmin) {
+                filters.push(Query.equal('qrCodeId', qrId));
+                } else {
+                return res.status(200).json({ transactions: [] });
+                }
+            } else {
+                if (userQrIds.length === 0) {
+                return res.status(200).json({ transactions: [] });
+                }
+                filters.push(Query.equal('qrCodeId', userQrIds));
+            }
+
+            // Date filter helper (copied exactly)
+            function toISTRange(dateStr) {
+                const d = new Date(dateStr);
+                const start = new Date(d);
+                start.setHours(0, 0, 0, 0);
+                start.setMinutes(start.getMinutes() - 330);
+                const end = new Date(d);
+                end.setHours(23, 59, 59, 999);
+                end.setMinutes(end.getMinutes() - 330);
+                return { start, end };
+            }
+
+            if (from && to) {
+                if (from === to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+                } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+                }
+            } else if (from && !to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
+            } else if (!from && to) {
+                const { end } = toISTRange(to);
+                filters.push(Query.lessThanEqual('created_at', end.toISOString()));
+            }
+
+            // Single field search (copied exactly)
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                const exactMatchFields = ['amount', 'rrnNumber'];
+
+                if (fulltextFields.includes(searchField)) {
+                filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                const amountValue = parseInt(searchValue, 10);
+                if (isNaN(amountValue)) {
+                    return res.status(400).json({ error: 'Amount must be an integer value' });
+                }
+                filters.push(Query.equal('amount', amountValue * 100));
+                } else if (searchField === 'rrnNumber') {
+                filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+            if (status) {
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']);
+                if (!allowedStatuses.has(status.toLowerCase())) {
+                return res.status(400).json({ error: 'Invalid status filter' });
+                }
+                if (status.toLowerCase() === 'normal') {
+                filters.push(
+                    Query.or([
+                    Query.equal('status', 'normal'),
+                    Query.equal('status', ''),
+                    Query.isNull('status'),
+                    ])
+                );
+                } else {
+                filters.push(Query.equal('status', status.toLowerCase()));
+                }
+            }
+
+            const queries = [
+                ...filters,
+                Query.orderDesc('created_at'),
+                Query.limit(100),
+                ...(cursor ? [Query.cursorAfter(cursor)] : [])
+            ];
+
+            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+            allTxns.push(...result.documents);
+            cursor = result.documents[99]?.$id;
+
+            } catch (error) {
+            console.error('❌ Export pagination error:', error);
+            break;
+            }
+
+        } while (allTxns.length < maxTxnsNum && cursor);
+
+        // Limit to requested max
+        allTxns = allTxns.slice(0, maxTxnsNum);
+
+        const pickTxn = (d) => ({
+            $id: d.$id,
+            id: d.$id,
+            qrCodeId: d.qrCodeId,
+            paymentId: d.paymentId,
+            rrnNumber: d.rrnNumber,
+            amount: d.amount,
+            vpa: d.vpa,
+            created_at: d.created_at,
+            status: d.status,
+        });
+
+        const docs = allTxns.map(pickTxn);
+
+        res.json({
+            success: true,
+            count: docs.length,
+            transactions: docs,
+            filters: { userId, qrId, from, to, status, searchField, searchValue }
+        });
+
+    });
+
+    router.post("/create-image-entry-in-transaction", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+        try {   
+            const { txnId, imageUrl } = req.body;
+            if (!txnId || !imageUrl) {
+                return res.status(400).json({ error: 'txnId and imageUrl are required' });
+            }   
+            const txDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
+                [Query.equal('$id', txnId), Query.limit(1)]
+            );
+            const tx = txDocs.documents[0];
+            if (!tx) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
+            const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId, { imageUrl });
+            return res.status(200).json({ success: true, transaction: updated });
+        } catch (error) {
+            console.error('Error in /create-image-entry-in-transaction:', error);
+            return res.status(500).json({ error: 'Failed to add image URL to transaction' });
+        }
+    });
+
+    router.post("/delete-transaction-image", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+        try { 
+            const { txnId } = req.body;
+            if (!txnId) {
+                return res.status(400).json({ error: 'txnId is required' });
+            }   
+
+            // Step 1: Fetch transaction to get current imageUrl and fileId
+            const txDocs = await databases.listDocuments(
+                APPWRITE_DATABASE_ID, 
+                webhook_collectionId,
+                [Query.equal('$id', txnId), Query.limit(1)]
+            );
+            const tx = txDocs.documents[0];
+            if (!tx) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
+
+            // Step 2: Extract fileId from imageUrl or transaction data
+            // Assuming imageUrl format: .../buckets/{bucketId}/files/{fileId}/view
+            const fileId = tx.imageUrl ? 
+                tx.imageUrl.match(/files\/([a-f0-9\-]+)\//)?.[1] : 
+                null;
+
+            if (!fileId) {
+                return res.status(400).json({ error: 'No image file found in transaction' });
+            }
+
+            // Step 3: Delete file from Appwrite Storage
+            await storage.deleteFile(bucketId, fileId);
+            // console.log(`✅ Deleted file: ${fileId}`);
+
+            // Step 4: Remove imageUrl from transaction (set to null/empty)
+            const updated = await databases.updateDocument(
+                APPWRITE_DATABASE_ID, 
+                webhook_collectionId, 
+                txnId, 
+                { imageUrl: null }  // Clear the image field
+            );
+
+            return res.status(200).json({ 
+                success: true, 
+                message: 'Image deleted successfully',
+                transaction: updated 
+            });
+
+        } catch (error) {
+            // console.error('Error in /delete-transaction-image:', error);
+            return res.status(500).json({ error: 'Failed to delete transaction image' });
+        }
+    });
+
+
+    // Admin-only: update transaction status with reconciliation logic
     router.patch('/transactions/:id/status', authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
         try {
             const { id: TxnID } = req.params;
@@ -1718,6 +1982,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // Manual transaction creation endpoint
     router.post("/transactions/manual", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
         try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
@@ -1897,301 +2162,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(500).json({ error: err.message || "Transaction upload failed" });
         }
     });
-
-    // Fetch transactions only for that user with optional one-field search
-    router.get('/user/transactions', authenticateToken, async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
-        const limitNum = Math.min(parseInt(limit) || 25, 50);
-
-        // console.log('Transaction query params:', req.query);
-
-        const userRequested = req.user;
-        const isSubadmin = userRequested.role === 'subadmin';
-        const isAdmin = userRequested.role === 'admin';
-
-        if (!isSubadmin && userRequested.userId !== userId) {
-            return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
-        }
-
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
-        }
-
-        const filters = [];
-
-        try {
-            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-            // console.log('User QR IDs:', userQrIds);
-            if (qrId) {
-                if (userQrIds.includes(qrId) || isAdmin) {
-                    filters.push(Query.equal('qrCodeId', qrId));
-                } else {
-                    return res.status(200).json({ transactions: [] });
-                }
-            } else {
-                if (userQrIds.length === 0) {
-                    return res.status(200).json({ transactions: [] });
-                }
-                filters.push(Query.equal('qrCodeId', userQrIds));
-            }
-
-            // Date filter helper same as above
-            function toISTRange(dateStr) {
-            const d = new Date(dateStr);
-            const start = new Date(d);
-            start.setHours(0, 0, 0, 0);
-            start.setMinutes(start.getMinutes() - 330);
-            const end = new Date(d);
-            end.setHours(23, 59, 59, 999);
-            end.setMinutes(end.getMinutes() - 330);
-            return { start, end };
-            }
-
-            if (from && to) {
-            if (from === to) {
-                const { start, end } = toISTRange(from);
-                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-            } else {
-                const { start } = toISTRange(from);
-                const { end } = toISTRange(to);
-                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-            }
-            } else if (from && !to) {
-            const { start, end } = toISTRange(from);
-            filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-            } else if (!from && to) {
-            const { end } = toISTRange(to);
-            filters.push(Query.lessThanEqual('created_at', end.toISOString()));
-            }
-
-            // Single field search if provided and valid
-            if (searchField && searchValue) {
-                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
-                const exactMatchFields = ['amount', 'rrnNumber'];
-
-                if (fulltextFields.includes(searchField)) {
-                    // Use fulltext search for these fields
-                    filters.push(Query.search(searchField, searchValue));
-                } else if (searchField === 'amount') {
-                    const amountValue = parseInt(searchValue, 10);
-                    if (isNaN(amountValue)) {
-                    return res.status(400).json({ error: 'Amount must be an integer value' });
-                    }
-                    filters.push(Query.equal('amount', amountValue*100));
-                } else if (searchField === 'rrnNumber') {
-                    // rrnNumber exact match as string
-                    filters.push(Query.equal('rrnNumber', searchValue));
-                } else {
-                    return res.status(400).json({ error: 'Invalid searchField parameter' });
-                }
-            }
-
-            if(status){
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
-                if (!allowedStatuses.has(status.toLowerCase())) {
-                    return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
-                }
-                if(status.toLowerCase() === 'normal'){
-                    filters.push(
-                        Query.or([
-                            Query.equal('status', 'normal'),
-                            Query.equal('status', ''),       // if some docs stored empty string
-                            Query.isNull('status'),          // null or missing field
-                        ])
-                    );
-                }else{
-                    filters.push(Query.equal('status', status.toLowerCase()));
-                }
-            }
-
-            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
-                return res.status(400).json({ error: 'Invalid cursor format' });
-            }
-            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
-            if (cursor) queries.push(Query.cursorAfter(cursor));
-
-            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-
-            const pickTxn = (d) => ({
-                $id: d.$id,
-                id: d.$id,                // keep if needed
-                qrCodeId: d.qrCodeId,
-                paymentId: d.paymentId,
-                rrnNumber: d.rrnNumber,
-                amount: d.amount,
-                vpa: d.vpa,
-                created_at: d.created_at,
-                status: d.status,
-            });
-            const docs = transactions.documents.map(pickTxn);
-
-            // const docs = transactions.documents;
-            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
-
-            res.status(200).json({ transactions: docs, nextCursor });
-
-        } catch (error) {
-            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
-            console.error('❌ Error in /user/transactions:', error);
-            res.status(500).json({ error: 'Failed to fetch user transactions' });
-        }
-    });
-
-    router.get('/user/transactions/export', authenticateToken, async (req, res) => {
-        const { userId, qrId, from, to, status, searchField, searchValue, maxTxns = 50 } = req.query;
-        const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 500);  // safety limit
-
-        console.log('Export transaction query params:', req.query);
-
-        const userRequested = req.user;
-        const isSubadmin = userRequested.role === 'subadmin';
-        const isAdmin = userRequested.role === 'admin';
-
-        if(!isAdmin){
-
-            if (!isSubadmin && userRequested.userId !== userId) {
-                return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
-            }
-
-            if (!userId) {
-                return res.status(400).json({ error: 'userId is required' });
-            }
-
-        }
-
-        let allTxns = [];
-        let cursor = null;
-
-        do {
-            const filters = [];
-
-            try {
-            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-            
-            if (qrId) {
-                if (userQrIds.includes(qrId) || isAdmin) {
-                filters.push(Query.equal('qrCodeId', qrId));
-                } else {
-                return res.status(200).json({ transactions: [] });
-                }
-            } else {
-                if (userQrIds.length === 0) {
-                return res.status(200).json({ transactions: [] });
-                }
-                filters.push(Query.equal('qrCodeId', userQrIds));
-            }
-
-            // Date filter helper (copied exactly)
-            function toISTRange(dateStr) {
-                const d = new Date(dateStr);
-                const start = new Date(d);
-                start.setHours(0, 0, 0, 0);
-                start.setMinutes(start.getMinutes() - 330);
-                const end = new Date(d);
-                end.setHours(23, 59, 59, 999);
-                end.setMinutes(end.getMinutes() - 330);
-                return { start, end };
-            }
-
-            if (from && to) {
-                if (from === to) {
-                const { start, end } = toISTRange(from);
-                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-                } else {
-                const { start } = toISTRange(from);
-                const { end } = toISTRange(to);
-                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-                }
-            } else if (from && !to) {
-                const { start, end } = toISTRange(from);
-                filters.push(Query.between('created_at', start.toISOString(), end.toISOString()));
-            } else if (!from && to) {
-                const { end } = toISTRange(to);
-                filters.push(Query.lessThanEqual('created_at', end.toISOString()));
-            }
-
-            // Single field search (copied exactly)
-            if (searchField && searchValue) {
-                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
-                const exactMatchFields = ['amount', 'rrnNumber'];
-
-                if (fulltextFields.includes(searchField)) {
-                filters.push(Query.search(searchField, searchValue));
-                } else if (searchField === 'amount') {
-                const amountValue = parseInt(searchValue, 10);
-                if (isNaN(amountValue)) {
-                    return res.status(400).json({ error: 'Amount must be an integer value' });
-                }
-                filters.push(Query.equal('amount', amountValue * 100));
-                } else if (searchField === 'rrnNumber') {
-                filters.push(Query.equal('rrnNumber', searchValue));
-                } else {
-                return res.status(400).json({ error: 'Invalid searchField parameter' });
-                }
-            }
-
-            if (status) {
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']);
-                if (!allowedStatuses.has(status.toLowerCase())) {
-                return res.status(400).json({ error: 'Invalid status filter' });
-                }
-                if (status.toLowerCase() === 'normal') {
-                filters.push(
-                    Query.or([
-                    Query.equal('status', 'normal'),
-                    Query.equal('status', ''),
-                    Query.isNull('status'),
-                    ])
-                );
-                } else {
-                filters.push(Query.equal('status', status.toLowerCase()));
-                }
-            }
-
-            const queries = [
-                ...filters,
-                Query.orderDesc('created_at'),
-                Query.limit(100),
-                ...(cursor ? [Query.cursorAfter(cursor)] : [])
-            ];
-
-            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
-            allTxns.push(...result.documents);
-            cursor = result.documents[99]?.$id;
-
-            } catch (error) {
-            console.error('❌ Export pagination error:', error);
-            break;
-            }
-
-        } while (allTxns.length < maxTxnsNum && cursor);
-
-        // Limit to requested max
-        allTxns = allTxns.slice(0, maxTxnsNum);
-
-        const pickTxn = (d) => ({
-            $id: d.$id,
-            id: d.$id,
-            qrCodeId: d.qrCodeId,
-            paymentId: d.paymentId,
-            rrnNumber: d.rrnNumber,
-            amount: d.amount,
-            vpa: d.vpa,
-            created_at: d.created_at,
-            status: d.status,
-        });
-
-        const docs = allTxns.map(pickTxn);
-
-        res.json({
-            success: true,
-            count: docs.length,
-            transactions: docs,
-            filters: { userId, qrId, from, to, status, searchField, searchValue }
-        });
-
-    });
-
 
     router.get('/getMyMetaData', authenticateToken, async (req, res) => {
         try {
