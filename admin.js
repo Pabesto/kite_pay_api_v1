@@ -39,26 +39,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return err?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'));
     }
 
-    // 🔥 List all users AppWrite Users
-    // router.get('/users', authenticateAdmin, async (req, res) => {
-    //     try {
-    //         const result = await users.list();
-
-    //         const simplifiedUsers = result.users.map(user => ({
-    //             $id: user.$id,
-    //             email: user.email,
-    //             name: user.name,
-    //             status: user.status,
-    //             labels: user.labels,
-    //         }));
-
-    //         return res.json(simplifiedUsers);
-    //     } catch (err) {
-    //         console.error('List users error:', err);
-    //         return res.status(500).json({ error: 'Failed to fetch users' });
-    //     }
-    // });
-
     // 🔥 List all users AppWrite Collections users_meta
     router.get('/users', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const {limit = 25, cursor} = req.query;
