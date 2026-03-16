@@ -744,8 +744,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // Helper: convert amount to paise
     const toPaise = (amt) => Math.round(amt * 100);
 
-
-
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
@@ -1341,7 +1339,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(500).json({ error: 'Failed to delete transaction image' });
         }
     });
-
 
     // Admin-only: update transaction status with reconciliation logic
     router.patch('/transactions/:id/status', authenticateAdminOrLabel('edit_transactions'), async (req, res) => {

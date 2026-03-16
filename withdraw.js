@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // We will now pass the required dependencies and middleware from the main server file
 // ─── Constants ───────────────────────────────────────────────────────────────
-const MAX_PENDING_WITHDRAWALS = 2;   // max concurrent pending withdrawal requests per user
+// const MAX_PENDING_WITHDRAWALS = 2;   // max concurrent pending withdrawal requests per user
 const LOCK_TTL_APPROVE        = 30;  // Redis lock TTL (seconds) for approve/reject operations
 const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdrawal request
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,25 +311,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             [Query.equal('userId', userId), Query.equal('status', 'pending')]
         );
 
-        //  Added Config Check for max withdrawal requests per user
-          // const result = await databases.listDocuments(
-          //   APPWRITE_DATABASE_ID,
-          //   '68a73217002ed987b246',
-          //   [
-          //     Query.equal('key', 'max_withdrawal_requests'),  // ← Add this!
-          //     Query.limit(1)  // Just one result
-          //   ]
-          // );
-
-          // const max_withdrawal_requests = result.documents[0];  // Your single document
-
-          // console.log('Max Withdrawal Requests Config:', max_withdrawal_requests.value);
-
-          // const max_withdrawal_requests_value = toInt(max_withdrawal_requests.value);
-
-          // if (pendingRequests.total >= max_withdrawal_requests_value) {
-          //   return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
-          // }
+          let MAX_PENDING_WITHDRAWALS = await ConfigManager.get('max_withdrawal_requests') || MAX_PENDING_WITHDRAWALS;
 
           if (pendingRequests.total >= MAX_PENDING_WITHDRAWALS) {
             return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
@@ -338,10 +320,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const usrDet = await getUserMeta(userId);
 
           // Inside the try block, after fetching usrDet and parentDet
-
-          // before
-          // const preAmountPaise = Math.round(preAmount * 100);
-
           // after — reuses the toPaise helper already defined above
           const preAmountPaise = toPaise(preAmount);
           if (preAmountPaise == null) return res.status(400).json({ error: 'Invalid preAmount' });
@@ -361,11 +339,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             return res.status(422).json({ error: 'Combined commission rate exceeds 100%. Please contact support.' });
           }
 
-          // if (usrDet.parentId) {
-          //   const parentDet = await getUserMeta(usrDet.parentId);
-          //   commissionRate += Number(parentDet.commission || 0);
-          // }
-
           const recalculatedCommissionRs = calculateCommission(preAmount, totalCommissionRate);
           const recalculatedCommissionPaise = recalculatedCommissionRs * 100;
           const recalculatedTotalPaise = preAmountPaise + recalculatedCommissionPaise;
@@ -379,19 +352,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           if (Math.round(Number(commission) * 100) !== recalculatedCommissionPaise) {
             return res.status(400).json({ error: 'Commission mismatch. Please check the commission and try again.' });
           }
-
-          // Original float comparison (replaced — susceptible to precision drift):
-          // const recalculatedTotalAmount = Number(preAmount) + recalculatedCommissionRs;
-          // if (Number(amount) !== recalculatedTotalAmount) { ... }
-          // if (Number(commission) !== recalculatedCommissionRs) { ... }
-
-          // return res.status(400).json({
-          //     error: "Testing error ",
-          //     recalculatedTotalAmount,
-          //     recalculatedCommissionRs,
-          //     commissionRate,
-          //     preAmount,
-          // });
 
         // Acquire per-QR lock before reading balance — prevents two simultaneous withdrawal
         // requests from both passing the balance check on the same stale QR data.
@@ -1106,17 +1066,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 w.userCommissionRate
               );
 
-              commissionTxs.push({
-                userId: user.parentId,
-                sourceWithdrawalId: w.id,
-                amount: subadminCommissionAmount,
-                commissionRate: w.userCommissionRate,
-                earningType: 'subadmin',
-                createdAt: new Date().toISOString(),
-              });
+              if (subadminCommissionAmount > 0) {
+                commissionTxs.push({
+                  userId: user.parentId,
+                  sourceWithdrawalId: w.id,
+                  amount: subadminCommissionAmount,
+                  commissionRate: w.userCommissionRate,
+                  earningType: 'subadmin',
+                  createdAt: new Date().toISOString(),
+                });
 
-              // Update dashboard counter for merchant profit
-              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', subadminCommissionAmount).catch(console.error);
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', subadminCommissionAmount).catch(console.error);
+              }
 
               if (admin) {
                 // Admin commission
@@ -1125,16 +1086,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                   w.parentCommissionRate
                 );
 
-                commissionTxs.push({
-                  userId: admin.userId,
-                  sourceWithdrawalId: w.id,
-                  amount: adminCommissionAmount,
-                  commissionRate: w.parentCommissionRate,
-                  earningType: 'admin',
-                  createdAt: new Date().toISOString(),
-                });
+                if (adminCommissionAmount > 0) {
+                  commissionTxs.push({
+                    userId: admin.userId,
+                    sourceWithdrawalId: w.id,
+                    amount: adminCommissionAmount,
+                    commissionRate: w.parentCommissionRate,
+                    earningType: 'admin',
+                    createdAt: new Date().toISOString(),
+                  });
 
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
+                  await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
+                }
               }
 
             }
@@ -1146,18 +1109,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 w.userCommissionRate
               );
 
-              commissionTxs.push({
-                userId: admin.userId,
-                sourceWithdrawalId: w.id,
-                amount: adminCommissionAmount,
-                commissionRate: w.userCommissionRate,
-                earningType: 'admin',
-                createdAt: new Date().toISOString(),
-              });
+              if (adminCommissionAmount > 0) {
+                commissionTxs.push({
+                  userId: admin.userId,
+                  sourceWithdrawalId: w.id,
+                  amount: adminCommissionAmount,
+                  commissionRate: w.userCommissionRate,
+                  earningType: 'admin',
+                  createdAt: new Date().toISOString(),
+                });
+              }
 
             }
           }
-          // Create commission transaction docs
+          // Create commission transaction docs (source of truth — must never be skipped)
           for (const tx of commissionTxs) {
             await databases.createDocument(
               APPWRITE_DATABASE_ID,
@@ -1167,9 +1132,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             );
           }
 
-          await recordCommissionRollups(commissionTxs).catch((err) => {
-            console.error('❌ Commission rollup error:', err);
-          });
+          // Rollup summaries are derived from tx docs and can be rebuilt from them.
+          // If rollup fails: flag the withdrawal so ops can query and reprocess.
+          // Do NOT return 500 — the payment and raw audit trail are already committed.
+          try {
+            await recordCommissionRollups(commissionTxs);
+          } catch (rollupErr) {
+            console.error(`CRITICAL: Commission rollup failed for withdrawal ${w.id}. Raw tx docs saved. Needs reconciliation.`, rollupErr);
+            await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              Withdrawal_request_collectionId,
+              w.$id,
+              { commissionRollupFailed: true }
+            ).catch(e => console.error(`CRITICAL: Could not mark commissionRollupFailed on withdrawal ${w.id}`, e));
+          }
 
         }
 
@@ -1359,68 +1335,88 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     async function upsertDailyCommissionFromTxs(commissionTxs) {
       const day = istDayString();
 
-      const existing = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-        [ Query.equal('date', day), Query.limit(1) ]
-      ); // list by equality [web:52][web:47]
-
-      let commissionsObj = {};
-      let docId = null;
-
-      if (existing.total > 0) {
-        const doc = existing.documents[0];
-        docId = doc.$id;
-        try {
-          commissionsObj = JSON.parse(doc.commissionsJson) || {};
-        } catch {
-          commissionsObj = {};
-        }
+      // Per-day lock: serializes concurrent approvals updating the same day's JSON doc
+      const releaseLua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
+      const dLockKey = `lock:commission:daily:${day}`;
+      const dLockVal = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      let dLockAcquired = false;
+      for (let i = 0; i < 10; i++) {
+        const r = await redisClient.set(dLockKey, dLockVal, { NX: true, EX: 10 }).catch(() => null);
+        if (r === 'OK') { dLockAcquired = true; break; }
+        await new Promise(res => setTimeout(res, 50 + i * 40));
       }
+      if (!dLockAcquired) throw new Error(`Could not acquire daily commission lock for ${day}`);
 
-      for (const { userId, amount } of commissionTxs) {
-        const amt = Number(amount || 0);
-        commissionsObj[userId] = (commissionsObj[userId] || 0) + amt;
-        if (commissionsObj[userId] < 0) {
-          throw new Error(`Negative daily total for ${userId}`);
-        }
-      }
-
-      const payload = { date: day, commissionsJson: JSON.stringify(commissionsObj) };
-
-      if (docId) {
-        await databases.updateDocument(
+      try {
+        const existing = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
           APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-          docId,
-          payload
-        ); // update by id [web:45]
-      } else {
-        try {
-          await databases.createDocument(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-            ID.unique(),
-            payload
-          );
-        } catch (e) {
-          // race fallback: re-read then update
-          const again = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-            [ Query.equal('date', day), Query.limit(1) ]
-          );
-          if (again.total > 0) {
-            await databases.updateDocument(
-              APPWRITE_DATABASE_ID,
-              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
-              again.documents[0].$id,
-              payload
-            );
-          } else {
-            throw e;
+          [ Query.equal('date', day), Query.limit(1) ]
+        );
+
+        let commissionsObj = {};
+        let docId = null;
+
+        if (existing.total > 0) {
+          const doc = existing.documents[0];
+          docId = doc.$id;
+          try {
+            commissionsObj = JSON.parse(doc.commissionsJson) || {};
+          } catch {
+            commissionsObj = {};
           }
         }
+
+        let totalDelta = 0;
+        for (const { userId, amount } of commissionTxs) {
+          const amt = Number(amount || 0);
+          totalDelta += amt;
+          commissionsObj[userId] = (commissionsObj[userId] || 0) + amt;
+          if (commissionsObj[userId] < 0) {
+            throw new Error(`Negative daily total for ${userId}`);
+          }
+        }
+
+        if (totalDelta === 0) return;
+
+        const payload = { date: day, commissionsJson: JSON.stringify(commissionsObj) };
+
+        if (docId) {
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+            docId,
+            payload
+          );
+        } else {
+          try {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+              ID.unique(),
+              payload
+            );
+          } catch (e) {
+            // race fallback: re-read then update
+            const again = await databases.listDocuments(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+              [ Query.equal('date', day), Query.limit(1) ]
+            );
+            if (again.total > 0) {
+              await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+                again.documents[0].$id,
+                payload
+              );
+            } else {
+              throw e;
+            }
+          }
+        }
+      } finally {
+        await redisClient.eval(releaseLua, { keys: [dLockKey], arguments: [dLockVal] }).catch(() => {});
       }
     }
 

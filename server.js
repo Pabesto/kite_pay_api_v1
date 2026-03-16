@@ -451,6 +451,128 @@ function rupeesToPaiseStrict(rupees) {
   return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
 
+// GET /commission/totals — total commission earned per userId across all time
+app.get('/commission/totals', async (_req, res) => {
+    try {
+        // Paginate through all commission transaction docs
+        const PAGE_SIZE = 100;
+        let allDocs = [];
+        let lastId = null;
+
+        while (true) {
+            const queryFilters = [Query.limit(PAGE_SIZE), Query.orderAsc('$id')];
+            if (lastId) queryFilters.push(Query.cursorAfter(lastId));
+
+            const page = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID,
+                queryFilters
+            );
+
+            allDocs = allDocs.concat(page.documents);
+            if (page.documents.length < PAGE_SIZE) break;
+            lastId = page.documents[page.documents.length - 1].$id;
+        }
+
+        // Group by userId — sum amount (paise) and track earningType
+        const totals = {};
+        for (const doc of allDocs) {
+            const { userId, amount, earningType } = doc;
+            if (!totals[userId]) {
+                totals[userId] = { userId, earningType, totalAmountPaise: 0, totalAmountRs: 0, txCount: 0 };
+            }
+            totals[userId].totalAmountPaise += Number(amount || 0);
+            totals[userId].txCount += 1;
+        }
+
+        // Convert paise → rupees for display
+        for (const entry of Object.values(totals)) {
+            entry.totalAmountRs = entry.totalAmountPaise / 100;
+        }
+
+        const result = Object.values(totals).sort((a, b) => b.totalAmountPaise - a.totalAmountPaise);
+
+        // console.log('Commission totals by userId:', JSON.stringify(result, null, 2));
+
+        return res.json({ count: result.length, totals: result });
+    } catch (err) {
+        console.error('Commission totals error:', err);
+        return res.status(500).json({ error: 'Failed to compute commission totals' });
+    }
+});
+
+// GET /commission/totals/monthly — commission per userId per month, built from raw tx docs
+// Optional query params: ?userId=xxx  ?month=2026-03  ?earningType=admin|subadmin
+app.get('/commission/totals/monthly', async (req, res) => {
+    const { userId, month, earningType } = req.query;
+    try {
+        const PAGE_SIZE = 100;
+        let allDocs = [];
+        let lastId = null;
+
+        while (true) {
+            const queryFilters = [Query.limit(PAGE_SIZE), Query.orderAsc('$id')];
+            if (lastId) queryFilters.push(Query.cursorAfter(lastId));
+            if (userId) queryFilters.push(Query.equal('userId', userId));
+            if (earningType) queryFilters.push(Query.equal('earningType', earningType));
+
+            const page = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID,
+                queryFilters
+            );
+
+            allDocs = allDocs.concat(page.documents);
+            if (page.documents.length < PAGE_SIZE) break;
+            lastId = page.documents[page.documents.length - 1].$id;
+        }
+
+        // Group by userId + month (derived from createdAt)
+        const totals = {};
+        for (const doc of allDocs) {
+            const docMonth = moment.tz(doc.createdAt, 'Asia/Kolkata').format('YYYY-MM');
+            if (month && docMonth !== month) continue;
+
+            const key = `${doc.userId}__${docMonth}`;
+            if (!totals[key]) {
+                totals[key] = { userId: doc.userId, month: docMonth, earningType: doc.earningType, totalAmountPaise: 0, totalAmountRs: 0, txCount: 0 };
+            }
+            totals[key].totalAmountPaise += Number(doc.amount || 0);
+            totals[key].txCount += 1;
+        }
+
+        for (const entry of Object.values(totals)) {
+            entry.totalAmountRs = entry.totalAmountPaise / 100;
+        }
+
+        // Sort by month desc, then by amount desc
+        const result = Object.values(totals).sort((a, b) =>
+            b.month.localeCompare(a.month) || b.totalAmountPaise - a.totalAmountPaise
+        );
+
+        // console.log('Monthly commission totals:', JSON.stringify(result, null, 2));
+
+        return res.json({ count: result.length, totals: result });
+    } catch (err) {
+        console.error('Monthly commission totals error:', err);
+        return res.status(500).json({ error: 'Failed to compute monthly commission totals' });
+    }
+});
+
+app.get('/get_daily_qr_summaries', async (req, res) => {
+
+    const page = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                 [
+                    // Query.equal('date', '2026-03-16'),
+                    Query.contains('totalsJson', '"96199309"')
+                 ]
+            );
+
+    return res.json({ page: page.length, totals: page });
+});
+
 app.get('/inc_test', async (req, res) => {
     const istDate = moment.tz(new Date(), 'Asia/Kolkata');
     const dayString = istDate.format('YYYY-MM-DD');
@@ -1481,7 +1603,7 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 
 // Root endpoint for testing
 app.get('/', (req, res) => {
-    res.send('QR Code Admin API is running!');
+    res.send('KitePay API is running!');
 });
 
 // // Start the server
