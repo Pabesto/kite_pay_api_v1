@@ -105,7 +105,7 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
     });
   });
 
-  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh };
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew };
 }
 
 // Helper: emit a new transaction event to intended audiences
@@ -152,6 +152,19 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
     }
   }
 
-// module.exports = { initSocket };
-module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh }; // ✅ Export functions
+  function emitTxnStatusNew({ assignedUserId, qrCodeId, payload }) {
+    try {
+      if (!io) return;
+      if (assignedUserId) {
+        io.to(`room:user:${assignedUserId}`).emit('txn:statusChange', payload);
+      }
+      if (qrCodeId) {
+        io.to(`room:qr:${qrCodeId}`).emit('txn:statusChange', payload);
+      }
+    } catch (e) {
+      console.error('emitTxnStatusNew error:', e.message);
+    }
+  }
+
+module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew };
 

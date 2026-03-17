@@ -60,7 +60,7 @@ const APPWRITE_BUCKET_ID = '688d2517002810ac532b';
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
 const RAZORPAY_WEBHOOK_SECRET = '4@cQVD6GBGa2G7j';
 
-const { httpServer, emitTxnNew , emitQrAlert, emitForceRefresh } = initSocket(app, {
+const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew } = initSocket(app, {
   appwriteEndpoint: APPWRITE_ENDPOINT,
   appwriteProjectId: APPWRITE_PROJECT_ID,
   appwriteApiKey: APPWRITE_API_KEY,
@@ -82,19 +82,19 @@ process.on('uncaughtException', err => {
   console.error('Uncaught Exception:', err);
 });
 
-	function istDateTimeNow(){
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const AtIST = new Date(Date.now() + istOffset).toISOString();
-      return AtIST;
-    }
+	// function istDateTimeNow(){
+    //   const istOffset = 5.5 * 60 * 60 * 1000;
+    //   const AtIST = new Date(Date.now() + istOffset).toISOString();
+    //   return AtIST;
+    // }
 
-    console.log('IST Time for server startup:', istDateTimeNow());
+    // console.log('IST Time for server startup:', istDateTimeNow());
 	
-	function istDateTimeNowNew(){
-      return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
-    }
+	// function istDateTimeNowNew(){
+    //   return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    // }
 
-    console.log('IST Time for server startup:', istDateTimeNowNew());
+    // console.log('IST Time for server startup:', istDateTimeNowNew());
 
 // console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('hh:mm:a'));
 // console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSSZ'));
@@ -476,7 +476,7 @@ function requireRole(...roles) {
 app.use('/api', qrCodeRoutes(databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+app.use('/api/admin', adminRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew));
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
@@ -847,6 +847,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
           qrCodeId,
           payload: eventPayload,
         });
+        
       } else {
         console.warn(`⚠️ QR Code with qrId ${qrCodeId} not found — skipping QR totals`);
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });

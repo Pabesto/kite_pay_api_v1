@@ -25,7 +25,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -947,7 +947,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             if(status){
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']); // enum gate [14]
                 if (!allowedStatuses.has(status.toLowerCase())) {
                     return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
                 }
@@ -1086,7 +1086,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             if(status){
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']); // enum gate [14]
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']); // enum gate [14]
                 if (!allowedStatuses.has(status.toLowerCase())) {
                     return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
                 }
@@ -1227,7 +1227,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             if (status) {
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback']);
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']);
                 if (!allowedStatuses.has(status.toLowerCase())) {
                 return res.status(400).json({ error: 'Invalid status filter' });
                 }
@@ -1371,7 +1371,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (Object.keys(req.body).some(k => k !== 'status')) {
             return res.status(400).json({ error: 'Only status can be updated here' });
             }
-            const allowed = new Set(['normal','cyber','refund','chargeback']);
+            const allowed = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']);
             if (typeof status !== 'string' || !allowed.has(status.toLowerCase())) {
             return res.status(400).json({ error: 'Invalid status' });
             }
@@ -1495,9 +1495,61 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             await inc('chargebackAmount', -amt);
             await inc('refundCount', 1);
             await inc('refundAmount', amt);
+            // ── failed transitions ──
+            } else if (prev === 'normal' && next === 'failed') {
+            await inc('failedCount', 1);
+            await inc('failedAmount', amt);
+            } else if (prev === 'failed' && next === 'normal') {
+            await inc('failedCount', -1);
+            await inc('failedAmount', -amt);
+            } else if (prev === 'failed' && next === 'cyber') {
+            await inc('failedCount', -1);
+            await inc('failedAmount', -amt);
+            await inc('cyberCount', 1);
+            await inc('cyberAmount', amt);
+            } else if (prev === 'failed' && next === 'refund') {
+            await inc('failedCount', -1);
+            await inc('failedAmount', -amt);
+            await inc('refundCount', 1);
+            await inc('refundAmount', amt);
+            } else if (prev === 'failed' && next === 'chargeback') {
+            await inc('failedCount', -1);
+            await inc('failedAmount', -amt);
+            await inc('chargebackCount', 1);
+            await inc('chargebackAmount', amt);
+            } else if (prev === 'cyber' && next === 'failed') {
+            await inc('cyberCount', -1);
+            await inc('cyberAmount', -amt);
+            await inc('failedCount', 1);
+            await inc('failedAmount', amt);
+            } else if (prev === 'refund' && next === 'failed') {
+            await inc('refundCount', -1);
+            await inc('refundAmount', -amt);
+            await inc('failedCount', 1);
+            await inc('failedAmount', amt);
+            } else if (prev === 'chargeback' && next === 'failed') {
+            await inc('chargebackCount', -1);
+            await inc('chargebackAmount', -amt);
+            await inc('failedCount', 1);
+            await inc('failedAmount', amt);
             } else {
             console.log('Unhandled transition:', prev, '->', next, 'no counters changed');
             }
+
+            // Emit status change event to user/QR rooms
+            emitTxnStatusNew({
+                assignedUserId: tx.assignedUserId || '',
+                qrCodeId: tx.qrCodeId || '',
+                payload: {
+                    txnId: TxnID,
+                    qrCodeId: tx.qrCodeId,
+                    previousStatus: prevStatus,
+                    newStatus: nextStatus,
+                    amount: Number(tx.amount || 0),
+                    rrnNumber: tx.rrnNumber || null,
+                    updatedAt: updated.$updatedAt,
+                },
+            });
 
             return res.status(200).json({ message: 'Status updated', transaction: updated });
         } catch (err) {
@@ -2724,6 +2776,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             cyberAmount: get('cyberAmount'),
             refundCount: get('refundCount'),
             refundAmount: get('refundAmount'),
+            failedCount: get('failedCount'),
+            failedAmount: get('failedAmount'),
 
             // Payouts
             totalAmountPaid: get('totalAmountPaid'),
