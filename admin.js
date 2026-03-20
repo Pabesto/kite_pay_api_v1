@@ -2717,6 +2717,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
 
             if (qrId) queries.unshift(Query.equal('qrId', qrId));
+            if (req.query.userId) queries.unshift(Query.equal('assignedUserId', req.query.userId));
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
             const result = await databases.listDocuments(
