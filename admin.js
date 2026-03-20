@@ -3374,10 +3374,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const isAdmin = actor.role === 'admin';
             const isEmployee = actor.role === 'employee';
 
-            if (!isAdmin && !isSelf && !isEmployee) {
-                // Optional: allow parent/manager
-                // if (actor.role === 'subadmin' && await isUserUnderMerchant(userId, actor.userId)) { /* allow */ }
-                // else
+            const isSubadmin = actor.role === 'subadmin';
+
+            if (isSubadmin && !isSelf) {
+                // Subadmin can only view users under them (parentId === subadmin's userId)
+                const userDoc = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                    [Query.equal('userId', userId), Query.equal('parentId', actor.userId), Query.limit(1)]
+                );
+                if (userDoc.documents.length === 0)
+                    return res.status(403).json({ message: 'This user is not managed by you' });
+            } else if (!isAdmin && !isSelf && !isEmployee) {
                 return res.status(403).json({ message: 'Forbidden' });
             }
 
