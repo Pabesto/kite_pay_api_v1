@@ -32,6 +32,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
+    function isExportTimeAllowed() {
+        const windows = [
+            { from: '10:00 AM', to: '02:00 PM' },
+            { from: '04:00 PM', to: '08:00 PM' },
+        ];
+        const now = moment().tz('Asia/Kolkata');
+        const nowMinutes = now.hours() * 60 + now.minutes();
+        const toMinutes = (timeStr) => {
+            const t = moment(timeStr, 'hh:mm A');
+            return t.hours() * 60 + t.minutes();
+        };
+        return windows.some(({ from, to }) => {
+            const start = toMinutes(from);
+            const end = toMinutes(to);
+            return nowMinutes >= start && nowMinutes < end;
+        });
+    }
+
     // Atomic lock release — only deletes the key if its value still matches ours.
     // Prevents accidentally releasing a lock that another process acquired after ours expired.
     const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
@@ -1148,14 +1166,45 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const isSubadmin = userRequested.role === 'subadmin';
         const isAdmin = userRequested.role === 'admin';
 
-        if(!isAdmin){
+        const isEmployee = userRequested.role === 'employee';
 
-            if (!isSubadmin && userRequested.userId !== userId) {
-                return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
+        if(!isAdmin){
+            // Master kill switch — if exports disabled, only admin can download
+            const isExportsEnabled = ConfigManager.get('exports_enabled');
+            if (!isExportsEnabled) {
+                return res.status(403).json({ error: 'Exports are currently disabled' });
+            }
+
+            // Time window check — only admin is exempt
+            const isExportTimeWindowsEnabled = ConfigManager.get('export_time_windows_enabled');
+            if (isExportTimeWindowsEnabled && !isExportTimeAllowed()) {
+                return res.status(403).json({ error: 'Export is only allowed during permitted time windows' });
             }
 
             if (!userId) {
                 return res.status(400).json({ error: 'userId is required' });
+            }
+
+            if (isEmployee) {
+                // Employee can export for subadmins assigned to them + users under those subadmins
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                    [Query.equal('assigned_to', userRequested.userId), Query.equal('role', 'subadmin'), Query.limit(100)]
+                );
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+                let allowedIds = [...merchantIds];
+                if (merchantIds.length > 0) {
+                    const usersRes = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                        [Query.equal('parentId', merchantIds), Query.limit(500)]
+                    );
+                    allowedIds.push(...usersRes.documents.map(d => d.userId));
+                }
+                if (!allowedIds.includes(userId)) {
+                    return res.status(403).json({ error: 'Forbidden: This user is not under your management' });
+                }
+            } else if (!isSubadmin && userRequested.userId !== userId) {
+                return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
             }
 
         }
