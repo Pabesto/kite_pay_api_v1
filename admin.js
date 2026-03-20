@@ -1169,6 +1169,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const isEmployee = userRequested.role === 'employee';
 
         if(!isAdmin){
+            await ConfigManager.refresh();
+        
             // Master kill switch — if exports disabled, only admin can download
             const isExportsEnabled = ConfigManager.get('exports_enabled');
             if (!isExportsEnabled) {
