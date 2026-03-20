@@ -2709,16 +2709,66 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // ✅ GET /manual-hold-on-qr — list hold history (filter by qrId or all)
+    // ✅ GET /manual-hold-on-qr — role-based hold history
+    // admin: all records (optional ?qrId, ?userId filters)
+    // subadmin: only QRs assigned/managed by them or their users
+    // employee: only QRs of subadmins/users assigned to them
+    // user: only their own QRs
     router.get('/manual-hold-on-qr', authenticateToken, async (req, res) => {
         try {
             const { qrId, cursor, limit } = req.query;
             const limitNum = Math.min(Number(limit) || 25, 100);
-            const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
+            const role = req.user.role;
+            const requestorId = req.user.userId;
 
-            if (qrId) queries.unshift(Query.equal('qrId', qrId));
-            if (req.query.userId) queries.unshift(Query.equal('assignedUserId', req.query.userId));
+            const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            if (role === 'admin') {
+                // Admin sees all — optional filters
+                if (qrId) queries.unshift(Query.equal('qrId', qrId));
+                if (req.query.userId) queries.unshift(Query.equal('assignedUserId', req.query.userId));
+
+            } else if (role === 'subadmin') {
+                // Subadmin sees holds on QRs assigned to them or their users
+                const usersRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                    [Query.equal('parentId', requestorId), Query.limit(100)]
+                );
+                const userIds = usersRes.documents.map(d => d.userId);
+                const allIds = [requestorId, ...userIds];
+                queries.unshift(Query.equal('assignedUserId', allIds));
+                if (qrId) queries.unshift(Query.equal('qrId', qrId));
+
+            } else if (role === 'employee') {
+                // Employee sees holds on QRs of subadmins assigned to them + their users
+                const merchantsRes = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                    [Query.equal('assigned_to', requestorId), Query.equal('role', 'subadmin'), Query.limit(100)]
+                );
+                const merchantIds = merchantsRes.documents.map(d => d.userId);
+
+                // Also get users under those subadmins
+                let allIds = [...merchantIds];
+                if (merchantIds.length > 0) {
+                    const usersRes = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                        [Query.equal('parentId', merchantIds), Query.limit(500)]
+                    );
+                    allIds.push(...usersRes.documents.map(d => d.userId));
+                }
+
+                if (allIds.length === 0)
+                    return res.status(200).json({ success: true, records: [], total: 0, nextCursor: null });
+
+                queries.unshift(Query.equal('assignedUserId', allIds));
+                if (qrId) queries.unshift(Query.equal('qrId', qrId));
+
+            } else {
+                // Regular user — only their own QRs
+                queries.unshift(Query.equal('assignedUserId', requestorId));
+                if (qrId) queries.unshift(Query.equal('qrId', qrId));
+            }
 
             const result = await databases.listDocuments(
                 APPWRITE_DATABASE_ID, MANUAL_HOLD_COLLECTION_ID, queries
