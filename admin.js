@@ -2607,6 +2607,150 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
     });
 
+    // ✅ Manual hold on QR — admin can add/remove hold amount (paise)
+    // POST /manual-hold-on-qr { qrId, amountPaise, action: 'hold' | 'release', reason }
+    const MANUAL_HOLD_COLLECTION_ID = 'manual_hold_transactions';
+
+    router.post('/manual-hold-on-qr', authenticateAdmin, async (req, res) => {
+        const { qrId, amountPaise, action, reason } = req.body;
+
+        // --- Validation ---
+        if (!qrId) return res.status(400).json({ error: 'qrId is required' });
+        if (!action || !['hold', 'release'].includes(action))
+            return res.status(400).json({ error: 'action must be "hold" or "release"' });
+        if (!amountPaise || !Number.isInteger(amountPaise) || amountPaise <= 0)
+            return res.status(400).json({ error: 'amountPaise must be a positive integer' });
+
+        // --- Acquire per-QR Redis lock ---
+        const lockKey = `lock:qr:${qrId}`;
+        const lockVal = `hold-${Date.now()}`;
+        let lockAcquired = false;
+        try {
+            const r = await redisClient.set(lockKey, lockVal, { NX: true, EX: 20 });
+            lockAcquired = r === 'OK';
+        } catch (e) {
+            console.error('Redis lock error in manual-hold-on-qr:', e);
+        }
+        if (!lockAcquired)
+            return res.status(409).json({ error: 'QR is currently being modified. Try again shortly.' });
+
+        try {
+            // --- Fetch QR doc ---
+            const qrResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID, Qr_collectionId,
+                [Query.equal('qrId', qrId), Query.limit(1)]
+            );
+            if (!qrResult.documents.length)
+                return res.status(404).json({ error: 'QR not found' });
+
+            const qrDoc = qrResult.documents[0];
+            const currentHold = Number(qrDoc.amountOnHold || 0);
+
+            let newHold;
+            if (action === 'hold') {
+                newHold = currentHold + amountPaise;
+            } else {
+                if (amountPaise > currentHold)
+                    return res.status(400).json({ error: `Cannot release ${amountPaise} paise. Only ${currentHold} paise currently on hold.` });
+                newHold = currentHold - amountPaise;
+            }
+
+            // Recompute available
+            const total     = Number(qrDoc.totalPayInAmount || 0);
+            const approved  = Number(qrDoc.withdrawalApprovedAmount || 0);
+            const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+            const commHold  = Number(qrDoc.commissionOnHold || 0);
+            const commPaid  = Number(qrDoc.commissionPaid || 0);
+            const newAvailable = total - approved - requested - newHold - commHold - commPaid;
+
+            // Update QR balance
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID, Qr_collectionId, qrDoc.$id,
+                {
+                    amountOnHold: newHold,
+                    amountAvailableForWithdrawal: newAvailable,
+                }
+            );
+
+            // Save hold transaction record
+            const holdRecord = {
+                qrId,
+                assignedUserId: qrDoc.assignedUserId || null,
+                action,
+                amountPaise,
+                previousHold: currentHold,
+                newHold,
+                newAvailable,
+                reason: reason || null,
+                adminId: req.user.userId,
+                adminName: req.user.name || null,
+                createdAt: istDateTimeNow(),
+            };
+
+            await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                MANUAL_HOLD_COLLECTION_ID,
+                ID.unique(),
+                holdRecord
+            );
+
+            console.log(`✅ Manual ${action} on QR ${qrId}: ${amountPaise} paise by ${req.user.userId}. Reason: ${reason || 'N/A'}`);
+
+            return res.status(200).json({
+                success: true,
+                message: `${action === 'hold' ? 'Hold placed' : 'Hold released'} successfully`,
+                record: holdRecord,
+            });
+        } catch (err) {
+            console.error('❌ Manual hold error:', err);
+            return res.status(500).json({ error: err.message || 'Failed to update hold' });
+        } finally {
+            await releaseLock(lockKey, lockVal);
+        }
+    });
+
+    // ✅ GET /manual-hold-on-qr — list hold history (filter by qrId or all)
+    router.get('/manual-hold-on-qr', authenticateAdmin, async (req, res) => {
+        try {
+            const { qrId, cursor, limit } = req.query;
+            const limitNum = Math.min(Number(limit) || 25, 100);
+            const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
+
+            if (qrId) queries.unshift(Query.equal('qrId', qrId));
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const result = await databases.listDocuments(
+                APPWRITE_DATABASE_ID, MANUAL_HOLD_COLLECTION_ID, queries
+            );
+
+            const records = result.documents.map(doc => ({
+                $id: doc.$id,
+                qrId: doc.qrId,
+                assignedUserId: doc.assignedUserId,
+                action: doc.action,
+                amountPaise: doc.amountPaise,
+                previousHold: doc.previousHold,
+                newHold: doc.newHold,
+                newAvailable: doc.newAvailable,
+                reason: doc.reason,
+                adminId: doc.adminId,
+                adminName: doc.adminName,
+                createdAt: doc.createdAt,
+            }));
+
+            const nextCursor = records.length === limitNum ? result.documents[records.length - 1].$id : null;
+
+            return res.status(200).json({ success: true, records, total: result.total, nextCursor });
+        } catch (err) {
+            console.error('❌ List hold records error:', err);
+            return res.status(500).json({ error: 'Failed to fetch hold records' });
+        }
+    });
+
+    function istDateTimeNow(){
+        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    }
+
     // GET /dashboard/counters
     router.get('/dashboard/counters', authenticateAdmin, async (req, res) => {
 
