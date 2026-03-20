@@ -2710,7 +2710,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // ✅ GET /manual-hold-on-qr — list hold history (filter by qrId or all)
-    router.get('/manual-hold-on-qr', authenticateAdmin, async (req, res) => {
+    router.get('/manual-hold-on-qr', authenticateToken, async (req, res) => {
         try {
             const { qrId, cursor, limit } = req.query;
             const limitNum = Math.min(Number(limit) || 25, 100);
