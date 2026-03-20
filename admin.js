@@ -1160,7 +1160,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const { userId, qrId, from, to, status, searchField, searchValue, maxTxns = 50 } = req.query;
         const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 500);  // safety limit
 
-        console.log('Export transaction query params:', req.query);
+        // console.log('Export transaction query params:', req.query);
 
         const userRequested = req.user;
         const isSubadmin = userRequested.role === 'subadmin';
