@@ -340,15 +340,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
-            // Update dashboard counters
-            if(role === 'subadmin'){
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', 1).catch(console.error);
-            }else if(role === 'user'){
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', 1).catch(console.error);
-            }
-
-            // Total users count (all roles)
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', 1).catch(console.error);
+            // Update dashboard counters in parallel
+            const counterUpdates = [
+                updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', 1),
+            ];
+            if (role === 'subadmin') counterUpdates.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', 1));
+            else if (role === 'user') counterUpdates.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', 1));
+            await Promise.all(counterUpdates).catch(console.error);
 
             return res.status(201).json({
             message: 'User created successfully',
@@ -523,17 +521,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         updatePayload.commission = commissionNum;
         }
 
-        // Update specialized user data (name/email) if present 
-        if (name !== undefined) await users.updateName(userIdtoEdit, name);
-        if (email !== undefined) await users.updateEmail(userIdtoEdit, email);
-
-        // Update metadata document with labels or commission or other fields
-        await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_USERS_META_COLLECTION_ID,
-        docId,
-        updatePayload
-        );
+        // Update specialized user data (name/email) and metadata in parallel
+        const userUpdates = [];
+        if (name !== undefined) userUpdates.push(users.updateName(userIdtoEdit, name));
+        if (email !== undefined) userUpdates.push(users.updateEmail(userIdtoEdit, email));
+        userUpdates.push(databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_USERS_META_COLLECTION_ID,
+            docId,
+            updatePayload
+        ));
+        await Promise.all(userUpdates);
 
         return res.json({ message: 'User updated successfully' });
     } catch (err) {
@@ -636,18 +634,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 { status }
             );
 
-            if(doc.role === 'subadmin'){
-                // Update dashboard counter for subadmin status change
-                const delta = status ? 1 : -1;
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', delta).catch(console.error);
-                // merchantDisabled
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantDisabled', -delta).catch(console.error);
-            }else if(doc.role === 'user'){
-                // Update dashboard counter for user status change
-                const delta = status ? 1 : -1;
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', delta).catch(console.error);
-                // disabledUsers
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'disabledUsers', -delta).catch(console.error);
+            const delta = status ? 1 : -1;
+            if (doc.role === 'subadmin') {
+                await Promise.all([
+                    updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', delta),
+                    updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantDisabled', -delta),
+                ]).catch(console.error);
+            } else if (doc.role === 'user') {
+                await Promise.all([
+                    updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', delta),
+                    updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'disabledUsers', -delta),
+                ]).catch(console.error);
             }
 
             return res.json({ success: true, status: result.status });
@@ -714,21 +711,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 // Update dashboard counters
                 const role = listOfUsersMeta.documents[0].role;
                 const status = listOfUsersMeta.documents[0].status;
+                const deleteCounterUpdates = [
+                    updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1),
+                ];
                 if (role === 'subadmin') {
-                    if (status === true) {
-                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', -1).catch(console.error);
-                    } else {
-                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantDisabled', -1).catch(console.error);
-                    }
+                    deleteCounterUpdates.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, status ? 'merchantActive' : 'merchantDisabled', -1));
                 } else if (role === 'user') {
-                    if (status === true) {
-                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'activeUsers', -1).catch(console.error);
-                    } else {
-                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'disabledUsers', -1).catch(console.error);
-                    }
+                    deleteCounterUpdates.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, status ? 'activeUsers' : 'disabledUsers', -1));
                 }
-                // Total users count (all roles)
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1).catch(console.error);
+                await Promise.all(deleteCounterUpdates).catch(console.error);
             }
 
             return res.status(200).json({ message: 'User deleted successfully' });
@@ -2067,21 +2058,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // If Redis fails here, the transaction is still intact — admin can retry.
             // If we deleted first and then Redis failed, the transaction is gone with no counter fix.
             // amountPaise is in paise (1 rupee = 100 paise)
-            await Promise.all([
-                redisClient.incrBy('counter:totalTxCount', -1),
-                redisClient.incrBy('counter:totalAmountReceived', -amountPaise),
-            ]).then(() => { redisClient.countersDirty = true; })
-              .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (delete tx):', e); });
-
-            if (tx.provider === 'manual') {
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1).catch((e) => {
-                    console.error('Error updating totalManualTx counter:', e);
-                });
-            } else {
-                await redisClient.incrBy('counter:totalApiTx', -1)
+            const deleteCounters = [
+                redisClient.incrBy('counter:totalTxCount', -1)
                     .then(() => { redisClient.countersDirty = true; })
-                    .catch((e) => { redisClient.countersStale = true; console.error('Error updating totalApiTx counter:', e); });
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (delete tx):', e); }),
+                redisClient.incrBy('counter:totalAmountReceived', -amountPaise)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (delete tx):', e); }),
+            ];
+            if (tx.provider === 'manual') {
+                deleteCounters.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', -1)
+                    .catch((e) => { console.error('Error updating totalManualTx counter:', e); }));
+            } else {
+                deleteCounters.push(redisClient.incrBy('counter:totalApiTx', -1)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Error updating totalApiTx counter:', e); }));
             }
+            await Promise.all(deleteCounters);
 
             // 4) Delete the transaction document — counters are already decremented
             await databases.deleteDocument(
@@ -2265,14 +2258,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // totalManualTx is low-frequency and stays in Appwrite
             // finalAmount is in paise (1 rupee = 100 paise)
             await Promise.all([
-                redisClient.incrBy('counter:totalTxCount', 1),
-                redisClient.incrBy('counter:totalAmountReceived', finalAmount),
-            ]).then(() => { redisClient.countersDirty = true; })
-              .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (manual tx):', e); });
-
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1).catch((e) => {
-                console.error('Error updating totalManualTx counter:', e);
-            });
+                redisClient.incrBy('counter:totalTxCount', 1)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (manual tx):', e); }),
+                redisClient.incrBy('counter:totalAmountReceived', finalAmount)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (manual tx):', e); }),
+                updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1)
+                    .catch((e) => { console.error('Error updating totalManualTx counter:', e); }),
+            ]);
 
             return res.status(201).json({
                 message: "Transaction uploaded successfully",

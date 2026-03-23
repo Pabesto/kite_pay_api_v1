@@ -1,6 +1,9 @@
 // configManager.js
 let configCache = null;
+let rawDocsCache = null; // Store raw docs for update operations
 let databasesInstance = null; // Store reference
+const CONFIG_DB_ID = '688ca9f3003e593a6227';
+const CONFIG_COLLECTION_ID = '68a73217002ed987b246';
 
 class ConfigManager {
     // ✅ Pass databases once during init
@@ -18,8 +21,8 @@ class ConfigManager {
 
         try {
             const docs = await databasesInstance.listDocuments(
-                '688ca9f3003e593a6227',
-                '68a73217002ed987b246'
+                CONFIG_DB_ID,
+                CONFIG_COLLECTION_ID
             );
 
             const config = {};
@@ -46,8 +49,7 @@ class ConfigManager {
             }
 
             configCache = config;
-
-            // console.log("Config loaded successfully:", config);
+            rawDocsCache = docs.documents;
 
             return config;
 
@@ -62,9 +64,28 @@ class ConfigManager {
         return configCache?.[key] ?? defaultValue;
     }
 
+    static getRawDoc(key) {
+        return rawDocsCache?.find(doc => doc.key === key) || null;
+    }
+
+    static async set(key, value) {
+        if (!databasesInstance) {
+            throw new Error('ConfigManager not initialized.');
+        }
+        const doc = this.getRawDoc(key);
+        if (doc) {
+            await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { value: String(value) });
+        } else {
+            await databasesInstance.createDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, 'unique()', { key, value: String(value) });
+        }
+        // Refresh cache so subsequent get() calls return updated value
+        await this.refresh();
+    }
+
     static refresh() {
         console.log("Refreshing config cache...");
         configCache = null;
+        rawDocsCache = null;
         return this.getConfig();
     }
 }

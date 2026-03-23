@@ -885,18 +885,12 @@ app.get("/paytm/last-timestamp-company", async (req, res) => {
 
     const keyName = `gmail_paytm_sync_timestamp_${company}`;
 
-    const config_docs = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      '68a73217002ed987b246'
-    );
+    await ConfigManager.refresh();
+    const value = ConfigManager.get(keyName);
 
-    const timestampDoc = config_docs.documents.find(
-      doc => doc.key === keyName
-    );
-
-    if (timestampDoc) {
-      console.log(`[${company}] Found timestamp:`, timestampDoc.value);
-      return res.json({ last_mail_timestamp: timestampDoc.value });
+    if (value !== null) {
+      console.log(`[${company}] Found timestamp:`, value);
+      return res.json({ last_mail_timestamp: value });
     }
 
     console.log(`[${company}] No timestamp found, sending default`);
@@ -923,46 +917,11 @@ app.post("/paytm/update-last-timestamp-company", async (req, res) => {
     }
 
     const keyName = `gmail_paytm_sync_timestamp_${company}`;
-    const COLLECTION_ID = '68a73217002ed987b246';
-
-    const config_docs = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      COLLECTION_ID
-    );
-
-    const timestampDoc = config_docs.documents.find(
-      doc => doc.key === keyName
-    );
-
     const timestampInt = parseInt(last_mail_timestamp, 10);
+    await ConfigManager.set(keyName, timestampInt);
 
-    if (timestampDoc) {
-      // UPDATE existing
-      await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        COLLECTION_ID,
-        timestampDoc.$id,
-        { value: timestampInt }
-      );
-
-      console.log(`[${company}] Timestamp updated → ${timestampInt}`);
-      return res.json({ success: true, message: "Timestamp updated" });
-
-    } else {
-      // CREATE new doc if not exists (recommended)
-      await databases.createDocument(
-        APPWRITE_DATABASE_ID,
-        COLLECTION_ID,
-        'unique()',
-        {
-          key: keyName,
-          value: timestampInt
-        }
-      );
-
-      console.log(`[${company}] Timestamp created → ${timestampInt}`);
-      return res.json({ success: true, message: "Timestamp created" });
-    }
+    console.log(`[${company}] Timestamp saved → ${timestampInt}`);
+    return res.json({ success: true, message: "Timestamp saved" });
 
   } catch (error) {
     console.error("POST timestamp error:", error);
@@ -975,19 +934,16 @@ app.post("/paytm/update-last-timestamp-company", async (req, res) => {
 app.get("/paytm/last-timestamp", async (req, res) => {
   // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
 
-      const config_docs = await databases.listDocuments(APPWRITE_DATABASE_ID, '68a73217002ed987b246');
-      const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
+      await ConfigManager.refresh();
+      const value = ConfigManager.get('gmail_paytm_sync_timestamp');
 
-      if (timestampDoc) {
-        const timestampValue = timestampDoc.value;
-        console.log('Found timestamp:', timestampValue);
-        res.json({ last_mail_timestamp: timestampValue });
-        return
-      } else {
-        console.log('No timestampDoc key found');
+      if (value !== null) {
+        console.log('Found timestamp:', value);
+        return res.json({ last_mail_timestamp: value });
       }
 
-    res.json({ last_mail_timestamp: "1764272304" });
+      console.log('No timestampDoc key found');
+      res.json({ last_mail_timestamp: "1764272304" });
 });
 
 // Endpoint to UPDATE the Paytm transaction timestamp
@@ -1001,39 +957,11 @@ app.post("/paytm/update-last-timestamp", async (req, res) => {
             return res.status(400).json({ error: "Missing last_mail_timestamp in body" });
         }
 
-        const COLLECTION_ID = '68a73217002ed987b246'; // Your config collection ID
+        const timestampInt = parseInt(last_mail_timestamp, 10);
+        await ConfigManager.set('gmail_paytm_sync_timestamp', timestampInt);
 
-        // 2. Find the document (Same logic as your GET request)
-        // Note: Using Query.equal is better performance if you have the Query object imported,
-        // but here is your original logic using JS find():
-        const config_docs = await databases.listDocuments(
-            APPWRITE_DATABASE_ID, 
-            COLLECTION_ID
-        );
-        
-        const timestampDoc = config_docs.documents.find(doc => doc.key === 'gmail_paytm_sync_timestamp');
-
-        if (timestampDoc) {
-            // FIX: Ensure it is an Integer, not a String
-            const timestampInt = parseInt(last_mail_timestamp, 10);
-
-            // 3. UPDATE the document using its ID
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID,
-                COLLECTION_ID,
-                timestampDoc.$id, // The unique ID of the document we found
-                {
-                    value: timestampInt // <--- Sending Integer now
-                }
-            );
-
-            console.log(`Updated timestamp to: ${last_mail_timestamp}`);
-            return res.json({ success: true, message: "Timestamp updated" });
-
-        } else {
-            console.log('No timestampDoc key found');
-            return res.status(404).json({ error: "Config document not found" });
-        }
+        console.log(`Updated timestamp to: ${timestampInt}`);
+        return res.json({ success: true, message: "Timestamp updated" });
 
     } catch (error) {
         console.error("Database Update Failed:", error);
