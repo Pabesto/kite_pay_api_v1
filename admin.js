@@ -589,7 +589,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // POST /reset-password-own (self password reset with current password verification)
     router.post('/reset-password-own', authenticateToken, async (req, res) => {
-        const { currentPassword, newPassword } = req.body;
+        const { currentPassword, newPassword, logoutAll } = req.body;
 
         if (!currentPassword || !newPassword) {
             return res.status(400).json({ error: 'currentPassword and newPassword are required' });
@@ -623,7 +623,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             console.log('Password reset own result:', result);
 
-            return res.json({ message: 'Password updated successfully' });
+            // If logoutAll is true, delete all sessions for this user
+            if (logoutAll === true) {
+                try {
+                    await users.deleteSessions(req.user.userId);
+                } catch (sessionErr) {
+                    console.error('Failed to logout all sessions:', sessionErr.message);
+                }
+            }
+
+            return res.json({ message: 'Password updated successfully', loggedOutAll: logoutAll === true });
         } catch (err) {
             console.error('Reset password own error:', err.message);
 
