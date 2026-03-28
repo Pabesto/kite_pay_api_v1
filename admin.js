@@ -1202,6 +1202,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         }
 
+        if (!userId) {
+            return res.status(400).json({ error: 'userId is required' });
+        }
+
         let allTxns = [];
         let cursor = null;
 
