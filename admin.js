@@ -5,6 +5,7 @@
 const express = require('express');
 const multer = require('multer');
 const moment = require('moment-timezone');
+const { Client, Account } = require('node-appwrite');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -34,8 +35,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     function isExportTimeAllowed() {
         const windows = [
-            { from: '10:00 AM', to: '02:00 PM' },
-            { from: '04:00 PM', to: '08:00 PM' },
+            { from: '09:00 AM', to: '10:00 AM' },
+            // { from: '04:00 PM', to: '08:00 PM' },
         ];
         const now = moment().tz('Asia/Kolkata');
         const nowMinutes = now.hours() * 60 + now.minutes();
@@ -583,6 +584,54 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } catch (err) {
             console.error(err);
             return res.status(500).json({ error: err.message || 'Failed to reset password' });
+        }
+    });
+
+    // POST /reset-password-own (self password reset with current password verification)
+    router.post('/reset-password-own', authenticateToken, async (req, res) => {
+        const { currentPassword, newPassword } = req.body;
+
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ error: 'currentPassword and newPassword are required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'New password must be at least 6 characters' });
+        }
+
+        if (currentPassword === newPassword) {
+            return res.status(400).json({ error: 'New password must be different from current password' });
+        }
+
+        try {
+            const token = req.headers['authorization']?.split(' ')[1];
+
+            const userClient = new Client()
+                .setEndpoint('https://fra.cloud.appwrite.io/v1')
+                .setProject('688c98fd002bfe3cf596')
+                .setJWT(token);
+
+            const account = new Account(userClient);
+
+            // This verifies the current password and updates to the new one
+            // await account.updatePassword(newPassword, currentPassword);
+
+            const result = await account.updatePassword({
+                password: newPassword,
+                oldPassword: currentPassword // optional
+            });
+
+            console.log('Password reset own result:', result);
+
+            return res.json({ message: 'Password updated successfully' });
+        } catch (err) {
+            console.error('Reset password own error:', err.message);
+
+            if (err.code === 401 || err.type === 'user_invalid_credentials') {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+
+            return res.status(500).json({ error: err.message || 'Failed to update password' });
         }
     });
 
