@@ -543,7 +543,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // 🔐 Reset user password ( admin/sub-admin or employee with all_users allowed )
     router.post('/reset-password/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userId = req.params.id;
-        const { password } = req.body;
+        const { password, logoutAll } = req.body;
 
         const userRequested = req.user; // set by your JWT middleware
 
@@ -580,7 +580,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             await users.updatePassword(userId, password);
 
-            return res.json({ message: 'Password reset successfully' });
+            if (logoutAll === true) {
+                try {
+                    await users.deleteSessions(userId);
+                } catch (sessionErr) {
+                    console.error('Failed to logout all sessions:', sessionErr.message);
+                }
+            }
+
+            return res.json({ message: 'Password reset successfully', loggedOutAll: logoutAll === true });
         } catch (err) {
             console.error(err);
             return res.status(500).json({ error: err.message || 'Failed to reset password' });
