@@ -1240,8 +1240,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(403).json({ error: 'Export is only allowed during permitted time windows' });
             }
 
-            if (!userId) {
-                return res.status(400).json({ error: 'userId is required' });
+            if (!userId && !qrId) {
+                return res.status(400).json({ error: 'userId or qrId is required' });
             }
 
             if (isEmployee) {
@@ -1259,17 +1259,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     );
                     allowedIds.push(...usersRes.documents.map(d => d.userId));
                 }
-                if (!allowedIds.includes(userId)) {
+                if (userId && !allowedIds.includes(userId)) {
                     return res.status(403).json({ error: 'Forbidden: This user is not under your management' });
                 }
-            } else if (!isSubadmin && userRequested.userId !== userId) {
+                // If only qrId passed, verify the QR belongs to an allowed user
+                if (!userId && qrId) {
+                    const qrDoc = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [Query.equal('qrId', qrId), Query.limit(1)]);
+                    if (qrDoc.documents.length === 0 || !allowedIds.includes(qrDoc.documents[0].assignedUserId)) {
+                        return res.status(403).json({ error: 'Forbidden: This QR is not under your management' });
+                    }
+                }
+            } else if (!isSubadmin && userId && userRequested.userId !== userId) {
                 return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
             }
 
         }
 
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
+        if (!userId && !qrId) {
+            return res.status(400).json({ error: 'userId or qrId is required' });
         }
 
         let allTxns = [];
@@ -1279,19 +1286,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const filters = [];
 
             try {
-            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-            
-            if (qrId) {
-                if (userQrIds.includes(qrId) || isAdmin) {
+            if (!userId && qrId) {
+                // Only qrId passed — query directly by qrId
                 filters.push(Query.equal('qrCodeId', qrId));
-                } else {
-                return res.status(200).json({ transactions: [] });
-                }
             } else {
-                if (userQrIds.length === 0) {
-                return res.status(200).json({ transactions: [] });
+                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+
+                if (qrId) {
+                    if (userQrIds.includes(qrId) || isAdmin) {
+                    filters.push(Query.equal('qrCodeId', qrId));
+                    } else {
+                    return res.status(200).json({ transactions: [] });
+                    }
+                } else {
+                    if (userQrIds.length === 0) {
+                    return res.status(200).json({ transactions: [] });
+                    }
+                    filters.push(Query.equal('qrCodeId', userQrIds));
                 }
-                filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
             // Date filter helper — timezone-safe, works on any server
