@@ -3866,7 +3866,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             await ConfigManager.refresh();
             const rawDocs = ConfigManager.getRawDocs();
-            res.json({ success: true, configs: rawDocs.map(d => ({ id: d.$id, key: d.key, val: d.val ?? String(d.value ?? ''), type: d.type })) });
+            res.json({ success: true, configs: rawDocs.map(d => ({ id: d.$id, key: d.key, val: d.val ?? String(d.value ?? ''), type: d.type, description: d.description ?? '', $createdAt: d.$createdAt, $updatedAt: d.$updatedAt })) });
         } catch (err) {
             console.error(err);
             res.status(500).json({ error: err.message || 'Failed to fetch configs' });
@@ -3876,7 +3876,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // POST create new config
     router.post('/config', authenticateAdmin, async (req, res) => {
         try {
-            const { key, val, type } = req.body;
+            const { key, val, type, description } = req.body;
             if (!key || typeof key !== 'string' || !key.trim()) {
                 return res.status(400).json({ error: 'key is required and must be a non-empty string' });
             }
@@ -3896,11 +3896,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(409).json({ error: `Config key "${key.trim()}" already exists. Use PUT to update.` });
             }
 
+            const createData = { key: key.trim(), val, type };
+            if (description != null) createData.description = String(description);
+
             await databases.createDocument(
-                ConfigManager.CONFIG_DB_ID || '688ca9f3003e593a6227',
-                ConfigManager.CONFIG_COLLECTION_ID || '68a73217002ed987b246',
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
                 ID.unique(),
-                { key: key.trim(), val, type }
+                createData
             );
 
             await ConfigManager.refresh();
@@ -3914,7 +3917,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // PUT update existing config
     router.put('/config', authenticateAdmin, async (req, res) => {
         try {
-            const { key, val, type } = req.body;
+            const { key, val, type, description } = req.body;
             if (!key || typeof key !== 'string' || !key.trim()) {
                 return res.status(400).json({ error: 'key is required' });
             }
@@ -3941,8 +3944,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 updateData.val = val;
             }
 
+            if (description != null) {
+                updateData.description = String(description);
+            }
+
             if (Object.keys(updateData).length === 0) {
-                return res.status(400).json({ error: 'Nothing to update. Provide val and/or type.' });
+                return res.status(400).json({ error: 'Nothing to update. Provide val, type, and/or description.' });
             }
 
             await databases.updateDocument(
