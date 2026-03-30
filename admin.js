@@ -3843,6 +3843,149 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // ===================== Config Management (Admin Only) =====================
+
+    const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json'];
+
+    function validateConfigVal(type, val) {
+        if (typeof val !== 'string') return 'val must be a string';
+        if (type === 'integer') {
+            if (!/^-?\d+$/.test(val)) return 'val must be a valid integer (e.g. "100")';
+        } else if (type === 'double') {
+            if (isNaN(parseFloat(val))) return 'val must be a valid number (e.g. "10.5")';
+        } else if (type === 'boolean') {
+            if (!['true', 'false', '1', '0', 'yes', 'no'].includes(val.toLowerCase())) return 'val must be a boolean string (true/false/1/0/yes/no)';
+        } else if (type === 'json') {
+            try { JSON.parse(val); } catch (e) { return 'val must be valid JSON'; }
+        }
+        return null;
+    }
+
+    // GET all configs
+    router.get('/config', async (_req, res) => {
+        try {
+            await ConfigManager.refresh();
+            const rawDocs = ConfigManager.getRawDocs();
+            res.json({ success: true, configs: rawDocs.map(d => ({ id: d.$id, key: d.key, val: d.val ?? String(d.value ?? ''), type: d.type })) });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to fetch configs' });
+        }
+    });
+
+    // POST create new config
+    router.post('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key, val, type } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required and must be a non-empty string' });
+            }
+            if (!type || !ALLOWED_CONFIG_TYPES.includes(type)) {
+                return res.status(400).json({ error: `type is required and must be one of: ${ALLOWED_CONFIG_TYPES.join(', ')}` });
+            }
+            if (val == null) {
+                return res.status(400).json({ error: 'val is required' });
+            }
+            const valErr = validateConfigVal(type, val);
+            if (valErr) return res.status(400).json({ error: valErr });
+
+            // Check if key already exists
+            await ConfigManager.refresh();
+            const existing = ConfigManager.getRawDoc(key.trim());
+            if (existing) {
+                return res.status(409).json({ error: `Config key "${key.trim()}" already exists. Use PUT to update.` });
+            }
+
+            await databases.createDocument(
+                ConfigManager.CONFIG_DB_ID || '688ca9f3003e593a6227',
+                ConfigManager.CONFIG_COLLECTION_ID || '68a73217002ed987b246',
+                ID.unique(),
+                { key: key.trim(), val, type }
+            );
+
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" created` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to create config' });
+        }
+    });
+
+    // PUT update existing config
+    router.put('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key, val, type } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required' });
+            }
+
+            await ConfigManager.refresh();
+            const doc = ConfigManager.getRawDoc(key.trim());
+            if (!doc) {
+                return res.status(404).json({ error: `Config key "${key.trim()}" not found` });
+            }
+
+            const updateData = {};
+            const effectiveType = type || doc.type;
+
+            if (type) {
+                if (!ALLOWED_CONFIG_TYPES.includes(type)) {
+                    return res.status(400).json({ error: `type must be one of: ${ALLOWED_CONFIG_TYPES.join(', ')}` });
+                }
+                updateData.type = type;
+            }
+
+            if (val != null) {
+                const valErr = validateConfigVal(effectiveType, val);
+                if (valErr) return res.status(400).json({ error: valErr });
+                updateData.val = val;
+            }
+
+            if (Object.keys(updateData).length === 0) {
+                return res.status(400).json({ error: 'Nothing to update. Provide val and/or type.' });
+            }
+
+            await databases.updateDocument(
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
+                doc.$id,
+                updateData
+            );
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" updated` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to update config' });
+        }
+    });
+
+    // DELETE config
+    router.delete('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required' });
+            }
+
+            await ConfigManager.refresh();
+            const doc = ConfigManager.getRawDoc(key.trim());
+            if (!doc) {
+                return res.status(404).json({ error: `Config key "${key.trim()}" not found` });
+            }
+
+            await databases.deleteDocument(
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
+                doc.$id
+            );
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" deleted` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to delete config' });
+        }
+    });
+
     return router;
 
 };

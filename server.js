@@ -100,6 +100,8 @@ process.on('uncaughtException', err => {
 // console.log('IST Time for server startup:', moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSSZ'));
 // → 2026-03-15T05:59:49.122+05:30
 
+// await ConfigManager.migrateValueToVal(); // uncomment and run once to migrate, then comment out
+
 // Initialize Appwrite SDK with the server key for backend operations
 const client = new Client();
 client
