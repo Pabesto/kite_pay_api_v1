@@ -60,7 +60,8 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
   });
 
   io.on('connection', (socket) => {
-    console.log('Socket connected:', socket.id, 'userId:', socket.data.userId);
+    // console.log('Socket connected:', socket.id, 'userId:', socket.data.userId);
+    console.log('Socket connected:');
     const userId = socket.data.userId;
     // join per-user room
     socket.join(`room:user:${userId}`);
