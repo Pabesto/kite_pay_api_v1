@@ -1168,7 +1168,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         //     }
         // );
 
-      const istTime = moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+      const istTime = moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
 
         const newQrCode = await saveQrEntry({
             qrId: razorpayQr.id,

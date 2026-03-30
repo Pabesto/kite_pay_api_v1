@@ -30,7 +30,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
-        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+        return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     function isExportTimeAllowed() {
@@ -2926,7 +2926,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     function istDateTimeNow(){
-        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+        return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     // GET /dashboard/counters
