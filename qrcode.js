@@ -818,7 +818,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
-        const { limit = 50, cursor } = req.query;
+        const { limit = 100, cursor } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         if (!userId) {
@@ -906,7 +906,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
-        const { limit = 50, cursor } = req.query;
+        const { limit = 100, cursor } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         if (!userId) {
