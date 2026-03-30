@@ -1331,8 +1331,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM'); // TZ-safe month key [web:51]
     }
 
+    // function istDateTimeNow(){
+    //   return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    // }
+
     function istDateTimeNow(){
-      return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+      return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     // One entrypoint after computing commissionTxs in your approval route
