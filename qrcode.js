@@ -149,8 +149,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This is a public endpoint
     router.get('/qr-codes', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
         try {
+            const { limit = 50, cursor } = req.query;
+            const limitNum = Math.min(parseInt(limit) || 25, 100);
 
             let resultAllQr = [];
+            let roleFilters = [];
 
             if (req.user.role === 'employee') {
                 const merchantsRes = await databases.listDocuments(
@@ -159,18 +162,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                     [
                         Query.equal('assigned_to', req.user.$id),
                         Query.equal('role', 'subadmin'),
-                        Query.limit(100)  // Merchants rarely >100/emp
+                        Query.limit(100)
                     ]
                 );
 
                 const merchantIds = merchantsRes.documents.map(d => d.userId);
 
-                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
-
                 let queries = [];
-
                 let orQueries = [];
-                // let orQueries = [];
 
                 if(merchantIds.length === 0){
                     return res.status(500).json({ message: "Failed to fetch QR codes No Merchants assigned." });
@@ -184,91 +183,73 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 const usersRes = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_USERS_META_COLLECTION_ID,
-                    queries // must be an array
+                    queries
                 );
 
                 queries = [];
 
                 const userIds = usersRes.documents.map(d => d.userId);
 
-                // console.log(`Employee ${req.user.$id} has ${userIds.length} assigned users:`, userIds);
-
                 let orQueries2 = [];
 
                 merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
                 userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
-                
+
                 if (orQueries2.length === 1) {
-                    queries.push(orQueries2[0]);
+                    roleFilters.push(orQueries2[0]);
                 } else {
-                    queries.push(Query.or(orQueries2));
+                    roleFilters.push(Query.or(orQueries2));
                 }
-
-                // queries.push(Query.or(orQueries2));
-
-                // console.log('Employee user list query result count:', usersRes.total);
-
-                resultAllQr = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    queries,
-                );
-
-                // console.log('Employee QR code query result count:', resultAllQr.total);
-
-                // documents = response.documents;
 
             } else if(req.user.role === 'subadmin'){
                 console.log('Subadmin fetching QR codes for userId:', req.user.userId);
-                
+
                 const usersUnderSubadmin = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_USERS_META_COLLECTION_ID,
                     [
                         Query.equal('parentId', req.user.userId),
                         Query.equal('role', 'user'),
-                        Query.limit(100)  // Merchants rarely >100/emp
+                        Query.limit(100)
                     ]
                 );
 
                 const usersUnderSubadminIds = usersUnderSubadmin.documents.map(d => d.userId);
-                
-                let subadminQrQueries = [];
 
                 let queriesUser = [];
 
                 if(usersUnderSubadminIds.length === 0){
                     return res.status(500).json({ message: "Failed to fetch Qr No Users assigned.", error: "Qr Fetch Failed" });
                 }else if(usersUnderSubadminIds.length === 1){
-                    subadminQrQueries.push(Query.or([
+                    roleFilters.push(Query.or([
                         Query.equal('assignedUserId', usersUnderSubadminIds[0]),
                         Query.equal('managedByUserId', req.user.userId)
                     ]));
                 }else{
                     usersUnderSubadminIds.forEach(id => queriesUser.push(Query.equal('assignedUserId', id)));
-                    queriesUser.push(Query.equal('managedByUserId', req.user.userId)); // Include QR codes created by subadmin but not yet assigned 
-                    subadminQrQueries.push(Query.or(queriesUser));
+                    queriesUser.push(Query.equal('managedByUserId', req.user.userId));
+                    roleFilters.push(Query.or(queriesUser));
                 }
-                    
-                resultAllQr = await databases.listDocuments(
-                        APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
-                        [...subadminQrQueries,
-                        Query.orderDesc('createdAt'), Query.limit(100) ],
-                    );
-
-            } else {
-
-                resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
-                    [
-                        Query.orderDesc('createdAt'), // Add this line to sort descending by date
-                        Query.limit(100) // Limits the results to 100 documents
-                    ]
-                );
 
             }
 
+            // Build final query with pagination
+            const finalQueries = [
+                ...roleFilters,
+                Query.orderDesc('createdAt'),
+                Query.limit(limitNum),
+            ];
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                finalQueries.push(Query.cursorAfter(cursor));
+            }
+
+            resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, finalQueries);
+
             const qrCodes = resultAllQr.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -318,7 +299,9 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 };
             });
 
-            return res.status(200).json(qrCodesWithTodayTotal.reverse());// Reverse the order to show the most recent first
+            const nextCursor = qrCodesWithTodayTotal.length === limitNum ? qrCodesWithTodayTotal[qrCodesWithTodayTotal.length - 1].$id : null;
+
+            return res.status(200).json({ qrCodes: qrCodesWithTodayTotal, nextCursor });
 
         } catch (error) {
             console.error('Error fetching QR codes:', error);
@@ -835,6 +818,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
+        const { limit = 50, cursor } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         if (!userId) {
             return res.status(400).json({ message: 'Missing userId parameter' });
@@ -842,37 +827,29 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
         const userRequested = req.user;
         const isSubadmin = userRequested.role === 'subadmin';
-        const isAdmin = userRequested.role === 'admin';
-        const isEmployee = userRequested.role === 'employee';
-        const requestorId = userRequested.userId;
 
         try {
-            let documents = [];
+            const queries = [];
 
             if (isSubadmin) {
-                const response = await databases.listDocuments(
-                        APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
-                        [Query.contains('managedByUserId', userRequested.userId)]
-                    );
-                    documents = response.documents;
+                queries.push(Query.contains('managedByUserId', userRequested.userId));
             } else {
-                const response = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    [
-                        // Query.or([
-                        //     Query.equal('assignedUserId', userId),
-                        //     Query.equal('createdByUserId', userId),
-                        // ]),
-                        Query.equal('assignedUserId', userId),
-                        // Query.limit(50),
-                    ]
-                );
-                documents = response.documents;
+                queries.push(Query.equal('assignedUserId', userId));
             }
 
-            const userQrCodes = documents.map(doc => ({
+            queries.push(Query.orderDesc('createdAt'));
+            queries.push(Query.limit(limitNum));
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                queries.push(Query.cursorAfter(cursor));
+            }
+
+            const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, queries);
+
+            const userQrCodes = response.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -892,7 +869,6 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 
-            // Fetch the daily aggregate doc for today (only one document)
             const dailySummaryDocs = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
@@ -912,18 +888,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }
             }
 
-            // Map today totals to each QR code
-            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
-                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+            const qrCodesWithTodayTotal = userQrCodes.map(qr => ({
+                ...qr,
+                todayTotalPayIn: totalsObj[qr.qrId] || 0,
+            }));
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+            const nextCursor = qrCodesWithTodayTotal.length === limitNum ? qrCodesWithTodayTotal[qrCodesWithTodayTotal.length - 1].$id : null;
 
-
-            return res.status(200).json(userQrCodesWithTodayTotal);
+            return res.status(200).json({ qrCodes: qrCodesWithTodayTotal, nextCursor });
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
             return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
@@ -934,6 +906,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
+        const { limit = 50, cursor } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         if (!userId) {
             return res.status(400).json({ message: 'Missing userId parameter' });
@@ -946,20 +920,22 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         }
 
         try {
-            let documents = [];
+            const queries = [
+                Query.equal('assignedUserId', userId),
+                Query.orderDesc('createdAt'),
+                Query.limit(limitNum),
+            ];
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                queries.push(Query.cursorAfter(cursor));
+            }
 
-            const response = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                [
-                    Query.equal('assignedUserId', userId),
-                    Query.limit(100),
-                ]
-            );
-            
-            documents = response.documents;
+            const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, queries);
 
-            const userQrCodes = documents.map(doc => ({
+            const userQrCodes = response.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -977,7 +953,6 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 
-            // Fetch the daily aggregate doc for today (only one document)
             const dailySummaryDocs = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
@@ -997,17 +972,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }
             }
 
-            // Map today totals to each QR code
-            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
-                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+            const qrCodesWithTodayTotal = userQrCodes.map(qr => ({
+                ...qr,
+                todayTotalPayIn: totalsObj[qr.qrId] || 0,
+            }));
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+            const nextCursor = qrCodesWithTodayTotal.length === limitNum ? qrCodesWithTodayTotal[qrCodesWithTodayTotal.length - 1].$id : null;
 
-            return res.status(200).json(userQrCodesWithTodayTotal);
+            return res.status(200).json({ qrCodes: qrCodesWithTodayTotal, nextCursor });
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
             return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
