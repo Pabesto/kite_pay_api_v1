@@ -1078,6 +1078,85 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // Fetch only soft-deleted transactions (admin only)
+    router.get('/deleted_transactions_only', authenticateAdmin, async (req, res) => {
+        const { limit = 25, cursor, from, to, searchField, searchValue } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
+
+        let filters = [Query.equal('deleted', true)];
+
+        try {
+            function toISTRange(dateStr) {
+                const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+                const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+                return { start, end };
+            }
+
+            if (from && to) {
+                if (from === to) {
+                    const { start, end } = toISTRange(from);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                } else {
+                    const { start } = toISTRange(from);
+                    const { end } = toISTRange(to);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                }
+            } else if (from && !to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            } else if (!from && to) {
+                const { end } = toISTRange(to);
+                filters.push(Query.lessThanEqual("created_at", end.toISOString()));
+            }
+
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                if (fulltextFields.includes(searchField)) {
+                    filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                    const amountValue = parseInt(searchValue, 10);
+                    if (isNaN(amountValue)) {
+                        return res.status(400).json({ error: 'Amount must be an integer value' });
+                    }
+                    filters.push(Query.equal('amount', amountValue * 100));
+                } else if (searchField === 'rrnNumber') {
+                    filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                    return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
+            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+
+            const pickTxn = (d) => ({
+                $id: d.$id,
+                id: d.$id,
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                rrnNumber: d.rrnNumber,
+                amount: d.amount,
+                vpa: d.vpa,
+                created_at: d.created_at,
+                status: d.status,
+                imageUrl: d.imageUrl || null,
+            });
+            const docs = transactions.documents.map(pickTxn);
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+            return res.status(200).json({ transactions: docs, nextCursor });
+        } catch (error) {
+            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+            console.error('Error fetching deleted transactions:', error);
+            return res.status(500).json({ error: 'Failed to fetch deleted transactions' });
+        }
+    });
+
         // Fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
