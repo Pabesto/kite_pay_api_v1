@@ -1042,6 +1042,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
+            filters.push(Query.notEqual('deleted', true));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) {
                 queries.push(Query.cursorAfter(cursor));
@@ -1181,6 +1182,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
+            filters.push(Query.notEqual('deleted', true));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
@@ -1368,6 +1370,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
+            filters.push(Query.notEqual('deleted', true));
             const queries = [
                 ...filters,
                 Query.orderDesc('created_at'),
@@ -2158,11 +2161,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
             await Promise.all(deleteCounters);
 
-            // 4) Delete the transaction document — counters are already decremented
-            await databases.deleteDocument(
+            // 4) Soft-delete the transaction document — counters are already decremented
+            await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 webhook_collectionId,
-                id
+                id,
+                { deleted: true }
             );
 
             return res.status(200).json({ message: 'Transaction deleted', id });
