@@ -2079,6 +2079,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             );
             if (!tx) return res.status(404).json({ error: 'Transaction not found' });
 
+            if (tx.deleted === true) {
+                return res.status(400).json({ error: 'Transaction is already deleted' });
+            }
+
             const amountPaise = Number(tx.amount || 0); // paise
             const qrId = tx.qrCodeId;
 
