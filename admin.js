@@ -1042,7 +1042,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
-            filters.push(Query.notEqual('deleted', true));
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) {
                 queries.push(Query.cursorAfter(cursor));
@@ -1182,7 +1182,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
-            filters.push(Query.notEqual('deleted', true));
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
@@ -1370,7 +1370,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
-            filters.push(Query.notEqual('deleted', true));
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [
                 ...filters,
                 Query.orderDesc('created_at'),
