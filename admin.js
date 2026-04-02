@@ -1103,7 +1103,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
-            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            const queries = [...filters, Query.orderDesc('updatedAt'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
