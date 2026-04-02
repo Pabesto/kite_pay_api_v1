@@ -27,7 +27,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -2212,9 +2212,53 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 webhook_collectionId,
                 id,
                 { deleted: true ,
-                  edited_by: `ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
+                  edited_by: `admin:${req.userId} | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
                 }
             );
+
+            // 5) Update daily_deleted_summary — same pattern as daily_qr_summaries
+            const delIstDate = moment.tz(tx.created_at, 'Asia/Kolkata');
+            const delDayString = delIstDate.format('YYYY-MM-DD');
+
+            const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
+            try {
+                const existingDelSummary = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', delDayString), Query.limit(1)]
+                );
+
+                if (existingDelSummary.total > 0) {
+                    const doc = existingDelSummary.documents[0];
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(doc.totalsJson || '{}');
+                    } catch (e) {
+                        console.error('CORRUPT totalsJson in daily_deleted_summary doc', doc.$id, '— aborting');
+                        throw new Error('Daily deleted summary JSON is corrupted — manual fix required');
+                    }
+
+                    const currentTotal = Number(totalsObj[qrId || 'no_qr'] || 0);
+                    totalsObj[qrId || 'no_qr'] = currentTotal + amountPaise;
+
+                    await databases.updateDocument(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                        doc.$id,
+                        { totalsJson: JSON.stringify(totalsObj) }
+                    );
+                } else {
+                    const totalsObj = { [qrId || 'no_qr']: amountPaise };
+                    await databases.createDocument(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                        ID.unique(),
+                        { date: delDayString, totalsJson: JSON.stringify(totalsObj) }
+                    );
+                }
+            } finally {
+                await releaseLock(delDailyLock.key, delDailyLock.val);
+            }
 
             return res.status(200).json({ message: 'Transaction deleted', id });
             } finally {
