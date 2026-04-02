@@ -1025,7 +1025,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
 
             const pickTxn = (d) => ({
-                $id: d.$id,   
+                $id: d.$id,
                 id: d.$id,                // keep if needed
                 qrCodeId: d.qrCodeId,
                 paymentId: d.paymentId,
@@ -1035,6 +1035,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 created_at: d.created_at,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
             });
             const docs = transactions.documents.map(pickTxn);
 
@@ -1042,7 +1044,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
             return res.status(200).json({ transactions: docs, nextCursor });
-            
+
         } catch (error) {
             if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching transactions:', error);
@@ -1117,6 +1119,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 created_at: d.created_at,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
             });
             const docs = transactions.documents.map(pickTxn);
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
@@ -1129,7 +1133,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-        // Fetch transactions only for that user with optional one-field search
+    // Fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
@@ -1250,6 +1254,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 created_at: d.created_at,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
             });
             const docs = transactions.documents.map(pickTxn);
 
