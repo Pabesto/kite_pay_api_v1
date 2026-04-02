@@ -1156,7 +1156,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
     const data = req.body;
 
-    console.log("📩 Razorpay Webhook Received Pabesto Tech /razorpay-webhook: ", data);
+    // console.log("📩 Razorpay Webhook Received Pabesto Tech /razorpay-webhook: ", data);
 
     // STEP 1: validate status field
     if (data?.status !== 'AUTHORIZED') {
