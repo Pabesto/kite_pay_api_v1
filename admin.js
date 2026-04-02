@@ -2205,7 +2205,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 APPWRITE_DATABASE_ID,
                 webhook_collectionId,
                 id,
-                { deleted: true }
+                { deleted: true ,
+                  edited_by: `ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
+                }
             );
 
             return res.status(200).json({ message: 'Transaction deleted', id });
