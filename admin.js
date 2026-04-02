@@ -3933,7 +3933,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Fetch daily deleted transaction summary (same pattern as payin-summary)
-    router.get('/deleted-summary', authenticateToken, async (req, res) => {
+    router.get('/deleted-summary', authenticateAdmin, async (req, res) => {
         try {
             const actor = req.user;
             const isAdmin = actor.role === 'admin';
