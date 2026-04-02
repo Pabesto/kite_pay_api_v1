@@ -1165,6 +1165,8 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
     console.log('Webhook Event Received at /razorpay-webhook :', {
         ip: req.ip,
+        headers: req.headers,
+        body: data,
     });
 
     // STEP 1: validate status field
@@ -1293,6 +1295,8 @@ app.post('/webhook', async (req, res) => {
 
   console.log('Webhook Event Received at /webhook:', {
     ip: req.ip,
+    headers: req.headers,
+    body: data,
   });
 
     const wdbg = (step, msg, extra) => {
