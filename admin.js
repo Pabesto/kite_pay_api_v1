@@ -2217,8 +2217,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             );
 
             // 5) Update daily_deleted_summary — same pattern as daily_qr_summaries
-            const delIstDate = moment.tz(tx.created_at, 'Asia/Kolkata');
-            const delDayString = delIstDate.format('YYYY-MM-DD');
+            const delDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
 
             const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
             try {
