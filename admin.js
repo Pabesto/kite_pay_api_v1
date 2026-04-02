@@ -2212,7 +2212,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 webhook_collectionId,
                 id,
                 { deleted: true ,
-                  edited_by: `admin:${req.userId} | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
+                  edited_by: `admin | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
                 }
             );
 
