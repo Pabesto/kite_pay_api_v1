@@ -1301,23 +1301,13 @@ app.post('/webhook', async (req, res) => {
         else                     console.log(`[WEBHOOK][${ts}] STEP ${step}: ${msg}`);
     };
 
-    wdbg('0', 'Request received', {
-        ip: req.ip,
-        contentType: req.headers['content-type'],
-        hasSignature: !!req.headers['x-razorpay-signature'],
-        hasRawBody:   !!req.rawBody,
-        rawBodyLen:   req.rawBody?.length ?? 0,
-    });
-
     // 1. Verify Razorpay signature
     const razorpaySignature = req.headers['x-razorpay-signature'];
     if (!razorpaySignature) {
-        wdbg('1', 'BLOCKED — missing x-razorpay-signature header');
         return res.status(400).send('Missing Razorpay signature');
     }
 
     if (!req.rawBody) {
-        wdbg('1', 'BLOCKED — req.rawBody is undefined (bodyParser did not capture body; check Content-Type header)');
         return res.status(400).send('Missing raw body for signature verification');
     }
 
@@ -1327,20 +1317,13 @@ app.post('/webhook', async (req, res) => {
         .digest('hex');
 
     if (expectedSignature !== razorpaySignature) {
-        wdbg('1', 'BLOCKED — signature mismatch', {
-            received: razorpaySignature.substring(0, 10) + '…',
-            expected: expectedSignature.substring(0, 10) + '…',
-        });
         console.warn('❌ Webhook signature mismatch!');
         return res.status(400).send('Invalid signature');
     }
-    wdbg('1', 'Signature verified ✅');
 
     // 2. Filter event type
     const eventType = req.body?.event;
-    wdbg('2', 'Event type received', { eventType });
     if (eventType !== 'qr_code.credited') {
-        wdbg('2', 'BLOCKED — unsupported event type (not qr_code.credited)');
         return res.status(400).send('Unsupported event type');
     }
 
@@ -1354,8 +1337,6 @@ app.post('/webhook', async (req, res) => {
     const isoDate       = new Date(unixTimestamp * 1000).toISOString();
     const payloadString = JSON.stringify(req.body);
 
-    wdbg('3', 'Parsed fields', { qrCodeId, paymentId, rrnNumber, amountPaise, vpa, isoDate });
-
     if (!qrCodeId) { wdbg('3', 'BLOCKED — qrCodeId missing from payload'); return res.status(400).send('QR Code ID not found'); }
     if (!paymentId) { wdbg('3', 'BLOCKED — paymentId missing from payload'); return res.status(400).send('Payment ID not found'); }
     if (!amountPaise) { wdbg('3', 'BLOCKED — amount missing from payload'); return res.status(400).send('Amount not found'); }
@@ -1366,32 +1347,25 @@ app.post('/webhook', async (req, res) => {
         //    Without this, two concurrent same-paymentId requests can both pass the idempotency
         //    check before either creates the document, resulting in duplicate writes.
         const lockKey = `lock:qr:${qrCodeId}`;
-        wdbg('6', 'Acquiring Redis lock…', { lockKey, ttl: LOCK_TTL_SECONDS });
         const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
         if (!acquired) {
-            wdbg('6', 'BLOCKED — lock busy, another payment for this QR is processing', { qrCodeId, paymentId });
             console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — Razorpay will retry`);
             return res.status(503).send('Processing conflict, retry');
         }
-        wdbg('6', 'Lock acquired ✅', { lockKey });
 
         try {
             // 4. Idempotency check — under lock, so no TOCTOU with concurrent same-paymentId requests
-            wdbg('4', 'Checking duplicate paymentId in DB…', { paymentId });
             const existing = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
                 [Query.equal('paymentId', paymentId), Query.limit(1)]
             );
             if (existing.total > 0) {
-                wdbg('4', 'BLOCKED — duplicate paymentId already in DB', { existingDocId: existing.documents[0].$id });
                 console.log('Duplicate webhook, ignoring:', paymentId);
                 return res.status(200).send('Already processed');
             }
-            wdbg('4', 'No duplicate found — proceeding ✅');
 
             // 5. Save raw webhook record (source of truth) — under lock
-            wdbg('5', 'Creating transaction document in Appwrite…');
             const created = await databases.createDocument(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
@@ -1408,10 +1382,8 @@ app.post('/webhook', async (req, res) => {
                     status: 'normal',
                 }
             );
-            wdbg('5', 'Transaction document created ✅', { docId: created.$id });
 
             // 7. Fetch fresh QR doc under lock
-            wdbg('7', 'Fetching QR document from Appwrite…', { qrCodeId });
             const qrResult = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_QRCODE_COLLECTION_ID,
@@ -1431,15 +1403,6 @@ app.post('/webhook', async (req, res) => {
                 const commissionPaid  = Number(qrDoc.commissionPaid || 0);
                 const newAvailable    = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-                wdbg('7', 'QR doc found ✅', {
-                    qrDocId,
-                    prevTotal: qrDoc.totalPayInAmount,
-                    newTotal,
-                    newCount,
-                    newAvailable,
-                });
-
-                wdbg('7b', 'Updating QR document totals…');
                 await databases.updateDocument(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_QRCODE_COLLECTION_ID,
@@ -1450,20 +1413,15 @@ app.post('/webhook', async (req, res) => {
                         amountAvailableForWithdrawal: newAvailable,
                     }
                 );
-                wdbg('7b', 'QR document updated ✅');
 
                 // 8. Update daily QR summary
-                wdbg('8', 'Updating daily QR summary…', { qrCodeId, isoDate, amountPaise });
                 try {
                     await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-                    wdbg('8', 'Daily QR summary updated ✅');
                 } catch (e) {
-                    wdbg('8', '⚠️  Daily QR summary update FAILED (non-fatal)', { error: e.message });
                     console.error('Error updating daily QR total:', e);
                 }
 
                 // 9. Emit real-time event
-                wdbg('9', 'Emitting real-time event…', { assignedUserId: qrDoc.assignedUserId || '(none)' });
                 const assignedUserId = qrDoc.assignedUserId || '';
                 const eventPayload = {
                     $id: created.$id,
@@ -1476,32 +1434,24 @@ app.post('/webhook', async (req, res) => {
                     created_at: isoDate,
                 };
                 emitTxnNew({ assignedUserId, qrCodeId, payload: eventPayload });
-                wdbg('9', 'Real-time event emitted ✅');
 
             } else {
-                wdbg('7', '⚠️  QR NOT FOUND in DB — skipping QR totals and daily summary', { qrCodeId });
                 console.warn(`QR ${qrCodeId} not found in DB — skipping QR totals and daily summary`);
             }
         } finally {
-            wdbg('6f', 'Releasing Redis lock…', { lockKey });
             await releaseLock(lockKey, paymentId);
-            wdbg('6f', 'Lock released ✅');
         }
 
         // 10. Atomic dashboard counter increments (outside lock — counters are non-critical)
-        wdbg('10', 'Incrementing Redis dashboard counters…');
         await Promise.all([
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
         ]).then(() => { redisClient.countersDirty = true; })
           .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e); });
-        wdbg('10', 'Redis counters updated ✅');
 
-        wdbg('DONE', '✅ Webhook fully processed — sending 200', { paymentId, qrCodeId });
         res.status(200).send('Webhook received and saved');
     } catch (error) {
-        wdbg('ERR', '❌ Unhandled error in webhook processing', { message: error.message, stack: error.stack });
         console.error('❌ Failed to process webhook:', error.message);
         res.status(500).send('Error processing webhook');
     }
