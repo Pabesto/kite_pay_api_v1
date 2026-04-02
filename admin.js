@@ -3932,6 +3932,125 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
+    // Fetch daily deleted transaction summary (same pattern as payin-summary)
+    router.get('/deleted-summary', authenticateToken, async (req, res) => {
+        try {
+            const actor = req.user;
+            const isAdmin = actor.role === 'admin';
+            const isSubadmin = actor.role === 'subadmin';
+            const isEmployee = actor.role === 'employee';
+
+            const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+
+            const from = req.query.from || todayStr;
+            const to = req.query.to || todayStr;
+            const filterUserId = req.query.userId || null;
+            const filterQrId = req.query.qrId || null;
+
+            // 1) Determine which QR IDs the caller can see
+            let allowedQrIds = null; // null = all (admin)
+
+            if (isAdmin || isEmployee) {
+                if (filterUserId) {
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                }
+            } else if (isSubadmin) {
+                if (filterUserId) {
+                    const managedUsers = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                        [Query.equal('parentId', actor.userId)]
+                    );
+                    const managedUserIds = managedUsers.documents.map(u => u.userId);
+                    if (filterUserId !== actor.userId && !managedUserIds.includes(filterUserId)) {
+                        return res.status(403).json({ error: 'You can only view your own users' });
+                    }
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                } else {
+                    allowedQrIds = [...(await getQrIdsForSubadmin(actor.userId))];
+                }
+            } else {
+                allowedQrIds = await getQrIdsForUser(actor.userId);
+            }
+
+            if (filterQrId) {
+                if (allowedQrIds && !allowedQrIds.includes(filterQrId)) {
+                    return res.status(403).json({ error: 'You do not have access to this QR code' });
+                }
+                allowedQrIds = [filterQrId];
+            }
+
+            // 2) Fetch daily deleted summary docs for the date range
+            const startDate = moment.tz(from, 'Asia/Kolkata');
+            const endDate = moment.tz(to, 'Asia/Kolkata');
+            if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+                return res.status(400).json({ error: 'Invalid date range' });
+            }
+
+            const days = [];
+            let grandTotalPaise = 0;
+            let todayPaise = 0;
+            let yesterdayPaise = 0;
+
+            const cursor = startDate.clone();
+            while (cursor.isSameOrBefore(endDate, 'day')) {
+                const dateStr = cursor.format('YYYY-MM-DD');
+
+                const summaryDocs = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', dateStr), Query.limit(1)]
+                );
+
+                let dayTotal = 0;
+                let qrBreakdown = {};
+
+                if (summaryDocs.total > 0) {
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(summaryDocs.documents[0].totalsJson || '{}');
+                    } catch (e) {
+                        console.error('WARNING: corrupted totalsJson in deleted summary for date', dateStr, '—', e.message);
+                        totalsObj = {};
+                    }
+
+                    for (const [qrId, paise] of Object.entries(totalsObj)) {
+                        if (allowedQrIds && !allowedQrIds.includes(qrId)) continue;
+                        const amount = parseInt(paise || 0, 10);
+                        qrBreakdown[qrId] = amount;
+                        dayTotal += amount;
+                    }
+                }
+
+                days.push({
+                    date: dateStr,
+                    totalPaise: dayTotal,
+                    totalRs: dayTotal / 100,
+                    qrs: qrBreakdown,
+                });
+
+                grandTotalPaise += dayTotal;
+                if (dateStr === todayStr) todayPaise = dayTotal;
+                if (dateStr === yesterdayStr) yesterdayPaise = dayTotal;
+
+                cursor.add(1, 'day');
+            }
+
+            return res.json({
+                days,
+                grandTotalPaise,
+                grandTotalRs: grandTotalPaise / 100,
+                todayPaise,
+                todayRs: todayPaise / 100,
+                yesterdayPaise,
+                yesterdayRs: yesterdayPaise / 100,
+            });
+        } catch (err) {
+            console.error('Deleted summary error:', err);
+            return res.status(500).json({ error: 'Failed to fetch deleted summary' });
+        }
+    });
+
     // ===================== Config Management (Admin Only) =====================
 
     const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json'];
