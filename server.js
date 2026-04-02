@@ -36,6 +36,7 @@ const { initSocket } = require('./socketServer');
 const ConfigManager = require('./configManager');
 
 const { createClient } = require('redis');
+const userMetaCache = require('./userMetaCache');
 
 // --- Configuration & Initialization ---
 const app = express();
@@ -63,9 +64,6 @@ const RAZORPAY_WEBHOOK_SECRET = '4@cQVD6GBGa2G7j';
 const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew } = initSocket(app, {
   appwriteEndpoint: APPWRITE_ENDPOINT,
   appwriteProjectId: APPWRITE_PROJECT_ID,
-  appwriteApiKey: APPWRITE_API_KEY,
-  appwriteDatabaseId: APPWRITE_DATABASE_ID,
-  usersMetaCollectionId: APPWRITE_USERS_META_COLLECTION_ID,
 });
 
 httpServer.listen(PORT, () => {
@@ -190,21 +188,27 @@ async function releaseLock(key, value) {
 // On startup: seed Redis counters from Appwrite if Redis is empty (e.g. after a restart)
 async function syncCountersFromAppwrite() {
     const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
-    for (const name of counterNames) {
-        try {
+    try {
+        // Check which counters are missing in Redis
+        const missing = [];
+        for (const name of counterNames) {
             const exists = await redisClient.exists(`counter:${name}`);
-            if (!exists) {
-                const list = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID, 'dashboard_counters',
-                    [Query.equal('id', name), Query.limit(1)]
-                );
-                const val = Number(list.documents[0]?.totals || 0);
-                await redisClient.set(`counter:${name}`, val);
-                console.log(`Seeded counter ${name} = ${val} from Appwrite`);
-            }
-        } catch (e) {
-            console.error(`Failed to seed counter ${name}:`, e);
+            if (!exists) missing.push(name);
         }
+        if (!missing.length) return;
+
+        // Single batch query instead of N individual queries
+        const list = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, 'dashboard_counters',
+            [Query.equal('id', missing), Query.limit(missing.length)]
+        );
+        for (const doc of list.documents) {
+            const val = Number(doc.totals || 0);
+            await redisClient.set(`counter:${doc.id}`, val);
+            console.log(`Seeded counter ${doc.id} = ${val} from Appwrite`);
+        }
+    } catch (e) {
+        console.error('Failed to seed counters:', e);
     }
 }
 
@@ -220,13 +224,13 @@ async function flushCountersToAppwrite() {
         console.warn('Counters marked stale — re-syncing from Appwrite instead of flushing');
         try {
             const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
-            for (const name of counterNames) {
-                const list = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID, 'dashboard_counters',
-                    [Query.equal('id', name), Query.limit(1)]
-                );
-                const val = Number(list.documents[0]?.totals || 0);
-                await redisClient.set(`counter:${name}`, val);
+            const list = await databases.listDocuments(
+                APPWRITE_DATABASE_ID, 'dashboard_counters',
+                [Query.equal('id', counterNames), Query.limit(counterNames.length)]
+            );
+            for (const doc of list.documents) {
+                const val = Number(doc.totals || 0);
+                await redisClient.set(`counter:${doc.id}`, val);
             }
             redisClient.countersStale = false;
             redisClient.countersDirty = false;
@@ -240,23 +244,22 @@ async function flushCountersToAppwrite() {
     if (!redisClient.countersDirty) return; // nothing changed since last flush
 
     const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
-    for (const name of counterNames) {
-        try {
-            const val = await redisClient.get(`counter:${name}`);
+    try {
+        // Single batch query to get all counter doc IDs
+        const list = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, 'dashboard_counters',
+            [Query.equal('id', counterNames), Query.limit(counterNames.length)]
+        );
+        for (const doc of list.documents) {
+            const val = await redisClient.get(`counter:${doc.id}`);
             if (val === null) continue;
-            const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 'dashboard_counters',
-                [Query.equal('id', name), Query.limit(1)]
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID, 'dashboard_counters', doc.$id,
+                { totals: Number(val) }
             );
-            if (list.documents.length > 0) {
-                await databases.updateDocument(
-                    APPWRITE_DATABASE_ID, 'dashboard_counters', list.documents[0].$id,
-                    { totals: Number(val) }
-                );
-            }
-        } catch (e) {
-            console.error(`Failed to flush counter ${name} to Appwrite:`, e);
         }
+    } catch (e) {
+        console.error('Failed to flush counters to Appwrite:', e);
     }
     redisClient.countersDirty = false;
 }
@@ -265,6 +268,7 @@ async function flushCountersToAppwrite() {
 (async () => {
     try {
         await redisClient.connect();
+        userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
         await syncCountersFromAppwrite();
         setInterval(flushCountersToAppwrite, COUNTER_FLUSH_MS);
         console.log('Redis setup complete');
@@ -345,21 +349,15 @@ const authenticateToken = async (req, res, next) => {
 
         // req.user = user;
 
-         // Query your users_meta collection by userId (user.$id)
-        const list = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [
-                Query.equal('userId', user.$id)
-            ]
-        );
+         // Query your users_meta collection by userId (user.$id) — cached in Redis
+        const userMeta = await userMetaCache.getUserMeta(user.$id);
 
-        if (list.documents.length === 0) {
+        if (!userMeta) {
             return res.status(404).json({ error: 'User metadata not found' });
         }
 
         // Attach the users_meta document to req.user
-        req.user = list.documents[0];
+        req.user = userMeta;
 
         next();
     } catch (err) {

@@ -8,6 +8,7 @@ const Razorpay = require("razorpay");
 const fs = require("fs");
 const axios = require("axios");
 const { File } = require('buffer');
+const userMetaCache = require('./userMetaCache');
 const path = require('path');
 const moment = require('moment-timezone');
 
@@ -926,7 +927,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
-        const { limit = 25, cursor } = req.query;
+        const { limit = 100, cursor } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         // console.log(`[/qr-codes/user_assigned] userId=${userId}, limit=${limitNum}, cursor=${cursor || 'none'}`);
@@ -950,12 +951,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
         // Subadmin can only access users under them
         if (isSubadmin && userRequested.userId !== userId) {
-            const userMeta = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [Query.equal('userId', userId), Query.limit(1)]
-            );
-            if (userMeta.documents.length === 0 || userMeta.documents[0].parentId !== userRequested.userId) {
+            const userMeta = await userMetaCache.getUserMeta(userId);
+            if (!userMeta || userMeta.parentId !== userRequested.userId) {
                 return res.status(403).json({ message: 'Forbidden: This user is not under your management' });
             }
         }

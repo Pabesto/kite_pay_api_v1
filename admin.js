@@ -19,6 +19,7 @@ const tz = require('dayjs/plugin/timezone');
 const { updateDashboardCounter } = require('./dashboardCounters');
 
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
+const userMetaCache = require('./userMetaCache');
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -340,6 +341,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     throw e;
                 }
             }
+            await userMetaCache.invalidate(userId);
 
             // Update dashboard counters in parallel
             const counterUpdates = [
@@ -393,23 +395,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // Step 1: Find document where userId matches
-            const documents = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [Query.equal('userId', userId)] // your provided userId value
-            );
+            const userDoc = await userMetaCache.getUserMeta(userId);
 
-            if (documents.documents.length === 0) {
+            if (!userDoc) {
             throw new Error('User document not found');
             }
 
-            const documentId = documents.documents[0].$id; // Get the actual document ID
+            const documentId = userDoc.$id; // Get the actual document ID
 
             const update = { assigned_to: unassign ? null : employeeId };
 
             console.log(`Updating user ${userId} assignment to employee ${employeeId}, unassign: ${unassign}`);
 
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, documentId, update);
+            await userMetaCache.invalidate(userId);
 
             return res.status(200).json({ message: 'Assignment updated.' });
         } catch (err) {
@@ -457,6 +456,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const update = { parentId: unassign ? null : subadminId };
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId, update);
+            await userMetaCache.invalidate(userId);
 
             return res.status(200).json({ message: 'Assignment updated.' });
         } catch (err) {
@@ -491,22 +491,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(403).json({ error: 'Cannot edit admin users' });
         }
 
-        const list = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_USERS_META_COLLECTION_ID,
-        [Query.equal('userId', userIdtoEdit)]
-        );
-        if (list.documents.length === 0) {
+        const doc = await userMetaCache.getUserMeta(userIdtoEdit);
+        if (!doc) {
         return res.status(404).json({ error: 'User metadata document not found in users_mets' });
         }
 
         if (userRequested.role === 'subadmin') {
-        if (list.documents[0].parentId !== userRequested.userId) {
+        if (doc.parentId !== userRequested.userId) {
             return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
         }
         }
-
-        const doc = list.documents[0];
         const docId = doc.$id;
 
         const updatePayload = {};
@@ -533,6 +527,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             updatePayload
         ));
         await Promise.all(userUpdates);
+        await userMetaCache.invalidate(userIdtoEdit);
 
         return res.json({ message: 'User updated successfully' });
     } catch (err) {
@@ -547,24 +542,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         const userRequested = req.user; // set by your JWT middleware
 
-        // Find document in users_mets collection matching userId
-        const list = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [
-                Query.equal('userId', userId)
-            ]
-        );
-        if (list.documents.length === 0) {
-            return res.status(404).json({ error: 'User metadata document not found in users_mets' });
+        // Find document in users_meta collection matching userId
+        const userDoc = await userMetaCache.getUserMeta(userId);
+        if (!userDoc) {
+            return res.status(404).json({ error: 'User metadata document not found in users_meta' });
         }
 
         if(userRequested.role === 'subadmin'){
-            if(list.documents[0].parentId !== userRequested.userId){
+            if(userDoc.parentId !== userRequested.userId){
                 return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
-            }   
-        } else {    
-            // sub-admins can only edit users they created
+            }
         }
 
         if (!password || password.length < 6) {
@@ -670,27 +657,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const result = await users.updateStatus(userId, status);
 
-           // Update status in users_mets collection
-            const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('userId', userId)
-                ]
-            );
-            if (list.documents.length === 0) {
+           // Update status in users_meta collection
+            const doc = await userMetaCache.getUserMeta(userId);
+            if (!doc) {
                 return res.status(404).json({ error: 'User metadata document not found in users_meta' });
             }
 
              if(userRequested.role === 'subadmin'){
-                if(list.documents[0].parentId !== userRequested.userId){
+                if(doc.parentId !== userRequested.userId){
                     return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
-                }   
-            } else {    
-                // sub-admins can only edit users they created
+                }
             }
 
-            const doc = list.documents[0];
             const docId = doc.$id;
 
             await databases.updateDocument(
@@ -699,6 +677,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 docId,
                 { status }
             );
+            await userMetaCache.invalidate(userId);
 
             const delta = status ? 1 : -1;
             if (doc.role === 'subadmin') {
@@ -739,24 +718,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // Find and delete corresponding document in users_meta collection
-            const listOfUsersMeta = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('userId', userId)
-                ]
-            );
+            const userMetaDoc = await userMetaCache.getUserMeta(userId);
 
-            // console.log(`User metadata documents found for userId ${userId}:`, list.total);
+            if (userMetaDoc) {
 
-            if (listOfUsersMeta.documents.length > 0) {
-
-                if(listOfUsersMeta.documents[0].role == 'admin'){
+                if(userMetaDoc.role == 'admin'){
                     return res.status(403).json({ error: 'Cannot delete admin users' });
                 }
 
                 // Get the user ID of the user being deleted
-                const userIdofUserDeleting = listOfUsersMeta.documents[0].userId;
+                const userIdofUserDeleting = userMetaDoc.userId;
 
                 // Check if user has assigned QR codes before allowing deletion
                 const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, 
@@ -769,14 +740,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
                 }
 
-                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, listOfUsersMeta.documents[0].$id);
+                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userMetaDoc.$id);
+                await userMetaCache.invalidate(userId);
 
                 // Delete user in Appwrite users service
                 await users.delete(userId);
 
                 // Update dashboard counters
-                const role = listOfUsersMeta.documents[0].role;
-                const status = listOfUsersMeta.documents[0].status;
+                const role = userMetaDoc.role;
+                const status = userMetaDoc.status;
                 const deleteCounterUpdates = [
                     updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1),
                 ];
@@ -1500,13 +1472,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (!txnId || !imageUrl) {
                 return res.status(400).json({ error: 'txnId and imageUrl are required' });
             }   
-            const txDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
-                [Query.equal('$id', txnId), Query.limit(1)]
-            );
-            const tx = txDocs.documents[0];
-            if (!tx) {
-                return res.status(404).json({ error: 'Transaction not found' });
-            }
+            try { await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
             const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId, { imageUrl });
             return res.status(200).json({ success: true, transaction: updated });
         } catch (error) {
@@ -1523,15 +1490,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }   
 
             // Step 1: Fetch transaction to get current imageUrl and fileId
-            const txDocs = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 
-                webhook_collectionId,
-                [Query.equal('$id', txnId), Query.limit(1)]
-            );
-            const tx = txDocs.documents[0];
-            if (!tx) {
-                return res.status(404).json({ error: 'Transaction not found' });
-            }
+            let tx;
+            try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
 
             // Step 2: Extract fileId from imageUrl or transaction data
             // Assuming imageUrl format: .../buckets/{bucketId}/files/{fileId}/view
@@ -1584,10 +1545,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const nextStatus = status.toLowerCase();
 
             // 2) Load transaction
-            const txDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
-            [Query.equal('$id', TxnID), Query.limit(1)]);
-            const tx = txDocs.documents[0];
-            if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+            let tx;
+            try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
 
             const prevStatus = ((tx.status || 'normal').trim().toLowerCase());
             if (prevStatus === nextStatus) {
@@ -1776,13 +1736,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } // enforce separation of concerns [web:185][web:198]
 
         // 1) Fetch existing transaction
-        const Txndocuments = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        webhook_collectionId,
-        [Query.equal('$id', TxnID), Query.limit(1)]
-        );
-        const tx = Txndocuments.documents[0];
-        if (!tx) return res.status(404).json({ error: 'Transaction not found' }); // standard REST practice [web:185]
+        let tx;
+        try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID); }
+        catch (e) { return res.status(404).json({ error: 'Transaction not found' }); } // standard REST practice [web:185]
 
         // 2) Prepare validated updates (partial)
         const updates = {};
@@ -1857,16 +1813,22 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
         try {
 
+        // Fetch old QR doc once — reused in both 5A and 5B
+        let oldQrDoc = null;
+        if (oldQrId) {
+            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('qrId', oldQrId),
+                Query.limit(1),
+            ]);
+            if (oldQrList.documents.length) oldQrDoc = oldQrList.documents[0];
+        }
+
         // 5A) Same QR, amount changed: adjust based on existing status
         if (hasAmountChange && !movedQr) {
         const amountDiff = newAmountPaise - oldAmountPaise; // +/- delta [web:185]
 
-        const qrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-            Query.equal('qrId', oldQrId),
-            Query.limit(1),
-        ]);
-            if (qrList.documents.length) {
-                const qr = qrList.documents[0];
+            if (oldQrDoc) {
+                const qr = oldQrDoc;
 
                 if (isPrevNormal) {
                     // Normal: adjust ledger total; available derives from totals
@@ -1910,14 +1872,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // 5B) QR changed: remove prior impact from old QR, add new impact to new QR, based on existing status
         if (movedQr) {
-        // Old QR: reverse prior impact
-        if (oldQrId) {
-            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-            Query.equal('qrId', oldQrId),
-            Query.limit(1),
-            ]);
-            if (oldQrList.documents.length) {
-            const oldQr = oldQrList.documents[0];
+        // Old QR: reverse prior impact (reuse oldQrDoc fetched above)
+        if (oldQrId && oldQrDoc) {
+            const oldQr = oldQrDoc;
             if (isPrevNormal) {
                 const newTotal = Number(oldQr.totalPayInAmount || 0) - oldAmountPaise;
                 const newAvailableOldQr = recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal });
@@ -1948,7 +1905,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
                 amountAvailableForWithdrawal: newAvailableOldQr,
                 }); // remove from hold for non-normal tx [web:170][web:176]
-            }
             }
         }
 
@@ -2454,17 +2410,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // console.log('getMyMetaData for userId:', userId);
 
-            const result = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [Query.equal('userId', userId)] // must be in an array
-            );
+            const doc = await userMetaCache.getUserMeta(userId);
 
-            if (!result.documents.length) {
-            return res.status(404).json({ error: 'User metadata not found 2' });
+            if (!doc) {
+            return res.status(404).json({ error: 'User metadata not found' });
             }
-
-            const doc = result.documents[0];
 
             // console.log('getMyMetaData doc:', doc);
 

@@ -8,6 +8,7 @@ const moment = require('moment-timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
 const ConfigManager = require('./configManager');
+const userMetaCache = require('./userMetaCache');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -34,14 +35,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     return `${prefix}${timestamp}${random}`;
   }
 
-  // Helper to get user by userId
+  // Helper to get user by userId — cached in Redis
   async function getUserMeta(userId) {
-    const users = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_USERS_META_COLLECTION_ID,
-      [Query.equal("userId", userId), Query.limit(1)]
-    );
-    return users.documents[0];
+    return userMetaCache.getUserMeta(userId);
   }
 
   // Helper to get user by userId
