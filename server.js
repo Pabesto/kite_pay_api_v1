@@ -1163,6 +1163,10 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
     const data = req.body;
 
+    console.log('Webhook Event Received at /razorpay-webhook :', {
+        ip: req.ip,
+    });
+
     // STEP 1: validate status field
     if (data?.status !== 'AUTHORIZED') {
         // wdbg('1', 'BLOCKED — status is not AUTHORIZED', { status: data?.status });
@@ -1287,7 +1291,9 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
 app.post('/webhook', async (req, res) => {
 
-  console.log('Webhook Event Received');
+  console.log('Webhook Event Received at /webhook:', {
+    ip: req.ip,
+  });
 
     const wdbg = (step, msg, extra) => {
         const ts = new Date().toISOString();
