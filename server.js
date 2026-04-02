@@ -1293,12 +1293,6 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
 app.post('/webhook', async (req, res) => {
 
-  console.log('Webhook Event Received at /webhook:', {
-    ip: req.ip,
-    headers: req.headers,
-    body: data,
-  });
-
     const wdbg = (step, msg, extra) => {
         const ts = new Date().toISOString();
         if (extra !== undefined) console.log(`[WEBHOOK][${ts}] STEP ${step}: ${msg}`, extra);
@@ -1314,6 +1308,12 @@ app.post('/webhook', async (req, res) => {
     if (!req.rawBody) {
         return res.status(400).send('Missing raw body for signature verification');
     }
+
+      console.log('Webhook Event Received at /webhook:', {
+        ip: req.ip,
+        headers: req.headers,
+        body: req.body,
+    });
 
     const expectedSignature = crypto
         .createHmac('sha256', RAZORPAY_WEBHOOK_SECRET)
