@@ -354,7 +354,13 @@ const authenticateToken = async (req, res, next) => {
         // req.user = user;
 
          // Query your users_meta collection by userId (user.$id) — cached in Redis
-        const userMeta = await userMetaCache.getUserMeta(user.$id);
+        let userMeta;
+        try {
+            userMeta = await userMetaCache.getUserMeta(user.$id);
+        } catch (metaErr) {
+            console.error('User meta lookup failed for', user.$id, ':', metaErr.message);
+            return res.status(503).json({ error: 'Service temporarily unavailable. Please retry.' });
+        }
 
         if (!userMeta) {
             return res.status(404).json({ error: 'User metadata not found' });

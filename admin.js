@@ -2473,7 +2473,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const doc = await userMetaCache.getUserMeta(userId);
 
             if (!doc) {
-            return res.status(404).json({ error: 'User metadata not found' });
+                return res.status(404).json({ error: 'User metadata not found' });
             }
 
             // console.log('getMyMetaData doc:', doc);

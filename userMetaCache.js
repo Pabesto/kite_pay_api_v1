@@ -26,24 +26,29 @@ async function getUserMeta(userId) {
 
     // Try cache
     try {
-        const cached = await _redisClient.get(cacheKey);
-        if (cached) return JSON.parse(cached);
+        if (_redisClient?.isOpen) {
+            const cached = await _redisClient.get(cacheKey);
+            if (cached) return JSON.parse(cached);
+        }
     } catch (e) {
         console.error('userMetaCache read error:', e.message);
         // fall through to DB
     }
 
-    // Cache miss — query Appwrite
+    // Cache miss — query Appwrite directly
     const list = await _databases.listDocuments(
         _dbId, _collectionId,
         [_Query.equal('userId', userId), _Query.limit(1)]
     );
     const doc = list.documents[0] || null;
 
-    // Populate cache
+    // Populate cache (best-effort)
     if (doc) {
-        try { await _redisClient.set(cacheKey, JSON.stringify(doc), { EX: CACHE_TTL }); }
-        catch (e) { console.error('userMetaCache write error:', e.message); }
+        try {
+            if (_redisClient?.isOpen) {
+                await _redisClient.set(cacheKey, JSON.stringify(doc), { EX: CACHE_TTL });
+            }
+        } catch (e) { console.error('userMetaCache write error:', e.message); }
     }
 
     return doc;
