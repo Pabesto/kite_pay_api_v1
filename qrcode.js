@@ -717,6 +717,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }
 
             // TRANSFER (block strategy)
+            // Only admin can transfer a QR that already has a manager
+            if (qr.managedByUserId && qr.managedByUserId !== normalizedManaged && req.user.role !== 'admin') {
+                return res.status(403).json({ message: 'Only admin can transfer QR to a different manager.' });
+            }
+
             // Validate target manager
             const manager = await getUser(normalizedManaged);
             if (!manager) return res.status(400).json({ message: 'Manager not found.' });

@@ -548,7 +548,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
       try {
-        const {userId, qrId, status, limit: limitStr, cursor } = req.query;
+        const {userId, qrId, status, from, to, limit: limitStr, cursor } = req.query;
 
         // 1) Parse limit with sane default + cap
         const DEFAULT_LIMIT = 25;
@@ -661,6 +661,29 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           queries.push(Query.equal('status', status));
         }
 
+        // Date filters (IST-aware)
+        function toISTRange(dateStr) {
+            const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+            const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+            return { start, end };
+        }
+        if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            }
+        } else if (from && !to) {
+            const { start, end } = toISTRange(from);
+            queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+        } else if (!from && to) {
+            const { end } = toISTRange(to);
+            queries.push(Query.lessThanEqual('$createdAt', end.toISOString()));
+        }
+
         // Stable order by creation time (newest first)
         queries.push(Query.orderDesc('$createdAt'));
 
@@ -732,7 +755,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /user_withdrawals?userId=...&status=pending&limit=20&cursor=<docId>
     router.get('/user_withdrawals_paginated', async (req, res) => {
       try {
-        const { status, userId, limit: limitStr, cursor } = req.query;
+        const { status, userId, from, to, limit: limitStr, cursor } = req.query;
 
         // Parse and cap limit
         const DEFAULT_LIMIT = 25;
@@ -753,8 +776,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           queries.push(Query.equal('userId', userId));
         }
 
+        // Date filters (IST-aware)
+        function toISTRange(dateStr) {
+            const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+            const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+            return { start, end };
+        }
+        if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            }
+        } else if (from && !to) {
+            const { start, end } = toISTRange(from);
+            queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+        } else if (!from && to) {
+            const { end } = toISTRange(to);
+            queries.push(Query.lessThanEqual('$createdAt', end.toISOString()));
+        }
+
         // Order by $createdAt descending
-        queries.push(Query.orderDesc('$createdAt')); // ensure index on $createdAt for performance
+        queries.push(Query.orderDesc('$createdAt'));
 
         // Cursor-based pagination
         if (cursor) {
