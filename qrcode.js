@@ -683,16 +683,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     //     - if assignedUser exists and assignee.parentId !== managedByUserId => 409 block
     //     - if assignedUser missing and was expected => 409 block
     //     - if assignedUser null or in-scope => proceed
-    router.put('/assign-qr-manager/:qrId', authenticateAdminOrLabel('assign_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
+    router.put('/assign-qr-manager/:qrId', authenticateAdminOrLabel('assign_qr_codes'), async (req, res) => {
         const { qrId } = req.params;
         const { managedByUserId: rawManaged } = req.body;
-        const actor = req.user;
 
         try {
-            // Admin-only
-            if (actor.role !== 'admin') {
-                return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
-            }
 
             // Normalize: '' -> null
             const normalizedManaged = (rawManaged === '' ? null : (rawManaged ?? null));
