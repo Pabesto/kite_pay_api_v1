@@ -89,7 +89,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // 🔥 List all users AppWrite Collections users_meta
-    router.get('/users', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
+    router.get('/users', authenticateAdminOrLabel('view_users', { isSubadminAllowed: true }), async (req, res) => {
         const {limit = 25, cursor} = req.query;
     
         const requestorId = req.user.userId;
@@ -280,12 +280,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // 🔐 Create new user (admin/sub-admin allowed)
-    router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.post('/create-user', authenticateAdminOrLabel('create_subadmin', { isSubadminAllowed: true }), async (req, res) => {
         const { name, email, password, role } = req.body;
         let creatorId = req.user.userId;
 
         if(role === 'admin'){
             return res.status(400).json({ error: 'admin cant be created' });
+        }
+
+        if (req.user.role === 'user') {
+            return res.status(403).json({ error: 'Users cannot create other users' });
         }
 
         if (!name || !email || !password || !role) {
@@ -294,6 +298,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         if (req.user.role === 'subadmin' && role !== 'user') {
             return res.status(403).json({ error: 'Sub-admins can only create users' });
+        }
+
+        if (req.user.role === 'employee' && role !== 'subadmin') {
+            return res.status(403).json({ error: 'Employees can only create sub-admins' });
         }
 
         if(req.user.role === 'admin'){
@@ -316,6 +324,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 parentId: creatorId,
                 status: true,
                 commission: 0,
+                assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
             // 3) Idempotent metadata write: use 1:1 docId = userId
@@ -367,7 +376,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // 🔐 Assign employee to employee (admin-only or employee with all_users)
+    // 🔐 Assign subadmin to employee (admin-only or employee with all_users)
     router.put('/assign-subadmin/:employeeId', authenticateAdmin, async (req, res) => {
         const { employeeId } = req.params;
         const { userId, unassign = false } = req.body; // userId can be string; unassign=true clears parentId
@@ -828,7 +837,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const toPaise = (amt) => Math.round(amt * 100);
 
     // Admin-only: fetch all or filtered transactions
-    router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
+    router.get('/transactions', authenticateAdminOrLabel('view_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
 
@@ -1472,7 +1481,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     });
 
-    router.post("/create-image-entry-in-transaction", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/create-image-entry-in-transaction", authenticateAdminOrLabel('transaction_image_upload'), async (req, res) => {
         try {   
             const { txnId, imageUrl } = req.body;
             if (!txnId || !imageUrl) {
@@ -1488,7 +1497,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    router.post("/delete-transaction-image", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/delete-transaction-image", authenticateAdminOrLabel('transaction_image_upload'), async (req, res) => {
         try { 
             const { txnId } = req.body;
             if (!txnId) {
@@ -1535,7 +1544,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Admin-only: update transaction status with reconciliation logic
-    router.patch('/transactions/:id/status', authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
+    router.patch('/transactions/:id/status', authenticateAdminOrLabel('change_transaction_status'), async (req, res) => {
         try {
             const { id: TxnID } = req.params;
             const { status } = req.body;
@@ -1731,7 +1740,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // ✏️ Edit transaction endpoint
-    router.patch('/transactions/:id',  authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
+    router.patch('/transactions/:id',  authenticateAdmin, async (req, res) => {
     try {
         const { id: TxnID } = req.params;
         const { qrCodeId, rrnNumber, amount, isoDate /* status removed */ } = req.body;
@@ -2273,7 +2282,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Manual transaction creation endpoint
-    router.post("/transactions/manual", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
         try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
 
@@ -2493,8 +2502,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // GET /commissions
     // Roles: admin and subadmin (optional narrowing by current user)
-    router.get('/commissions',authenticateAdminOrLabel('all_commissions', { isSubadminAllowed: true }),
-        async (req, res) => {
+    router.get('/commissions',authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
             const {
             userId,
             earningType,           // 'admin' | 'subadmin'

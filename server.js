@@ -266,11 +266,13 @@ async function flushCountersToAppwrite() {
     redisClient.countersDirty = false;
 }
 
+// Init userMetaCache early so Appwrite fallback works even if Redis is down
+userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
+
 // Connect Redis, seed counters, start periodic flush
 (async () => {
     try {
         await redisClient.connect();
-        userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
         await syncCountersFromAppwrite();
         setInterval(flushCountersToAppwrite, COUNTER_FLUSH_MS);
         console.log('Redis setup complete');

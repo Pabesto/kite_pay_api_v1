@@ -148,7 +148,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // GET all QR codes For Admin and Employees
     // This is a public endpoint
-    router.get('/qr-codes', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
+    router.get('/qr-codes', authenticateAdminOrLabel('view_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
         try {
             const { limit = 50, cursor } = req.query;
             const limitNum = Math.min(parseInt(limit) || 25, 100);
@@ -565,7 +565,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // PUT to toggle the isActive status
     // This is an admin-only endpoint
-    router.put('/toggle-qr-status/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.put('/toggle-qr-status/:qrId', authenticateAdminOrLabel('toggle_qr_status', { isSubadminAllowed: false }), async (req, res) => {
         const { qrId } = req.params;
         const { isActive } = req.body;
 
@@ -621,53 +621,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     });
 
     // PUT to assign a user to a QR code
-    // This is an admin-only endpoint
-    // MODIFIED: Endpoint to assign or unlink a user from a QR code
-    // router.put('/assign-qr/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
-    //     const { qrId } = req.params;
-    //     const { assignedUserId , managedByUserId } = req.body; // assignedUserId can now be null or a string
-
-    //     try {
-    //         // Fetch current assignment
-    //         const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-    //             Query.equal('qrId', qrId)
-    //         ]);
-    //         if (docResult.documents.length === 0) {
-    //             return res.status(404).json({ message: "QR Code not found." });
-    //         }
-    //         const prevAssignedUserId = docResult.documents[0].assignedUserId;
-    //         // Update assignment
-    //         if(managedByUserId){
-    //             const result = await assignQrToUserNew({
-    //                 qrId,
-    //                 assignedUserId,
-    //                 managedByUserId : managedByUserId,
-    //             });
-    //         }else{
-    //             const result = await assignQrToUserNew({
-    //                 qrId,
-    //                 assignedUserId
-    //             });
-    //         }
-            
-    //         // Only increment if previously unassigned and now assigned
-    //         if (!prevAssignedUserId && assignedUserId) {
-    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
-    //         }
-    //         // Only decrement if previously assigned and now unassigned
-    //         else if (prevAssignedUserId && !assignedUserId) {
-    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
-    //         }
-    //         // No change if reassigned from one user to another
-    //         res.status(200).json({ message: "User assignment updated successfully." });
-    //     } catch (error) {
-    //         console.error('Error updating user assignment for QR code:', error);
-    //         res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
-    //     }
-    // });
-
-    // PUT to assign a user to a QR code
-    router.put('/assign-qr-user/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.put('/assign-qr-user/:qrId', authenticateAdminOrLabel('assign_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
         const { qrId } = req.params;
         const { assignedUserId } = req.body; // may be null (unassign)
         const actor = req.user;
@@ -727,7 +681,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     //     - if assignedUser exists and assignee.parentId !== managedByUserId => 409 block
     //     - if assignedUser missing and was expected => 409 block
     //     - if assignedUser null or in-scope => proceed
-    router.put('/assign-qr-manager/:qrId', authenticateAdmin, async (req, res) => {
+    router.put('/assign-qr-manager/:qrId', authenticateAdminOrLabel('assign_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
         const { qrId } = req.params;
         const { managedByUserId: rawManaged } = req.body;
         const actor = req.user;

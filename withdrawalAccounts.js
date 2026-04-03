@@ -111,7 +111,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-
     // ✅ EDIT (UPDATE): PUT /withdrawal_accounts/:accountId
     router.put('/withdrawal_accounts/:accountId', authenticateToken, async (req, res) => {
         try {
