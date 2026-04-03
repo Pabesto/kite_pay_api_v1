@@ -2480,15 +2480,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // Optionally pick only safe fields
             const payload = {
-            id: doc.userId,
-            email: doc.email,
-            name: doc.name,
-            role: doc.role,
-            parentId: doc.parentId,
-            status: doc.status,
-            labels: doc.labels,
-            commission: doc.commission || 0,
-            // childrenCount: doc.childrenCount, // if you added counter cache
+                id: doc.userId,
+                email: doc.email,
+                name: doc.name,
+                role: doc.role,
+                parentId: doc.parentId,
+                status: doc.status,
+                labels: doc.labels,
+                commission: doc.commission || 0,
+                // childrenCount: doc.childrenCount, // if you added counter cache
             };
 
             // console.log('getMyMetaData payload:', payload);

@@ -196,11 +196,13 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
                 userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
 
-                if (orQueries2.length === 1) {
-                    roleFilters.push(orQueries2[0]);
-                } else {
-                    roleFilters.push(Query.or(orQueries2));
-                }
+                // Also include QR codes not assigned to anyone
+                orQueries2.push(Query.and([
+                    Query.isNull('assignedUserId'),
+                    Query.isNull('managedByUserId'),
+                ]));
+
+                roleFilters.push(Query.or(orQueries2));
 
             } else if(req.user.role === 'subadmin'){
                 console.log('Subadmin fetching QR codes for userId:', req.user.userId);
