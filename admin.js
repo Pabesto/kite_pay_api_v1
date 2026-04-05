@@ -1047,6 +1047,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 deleted: d.deleted || false,
                 edited_by: d.edited_by || null,
             });
+
             const docs = transactions.documents.map(pickTxn);
 
             // const docs = transactions.documents;
@@ -1130,6 +1131,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 imageUrl: d.imageUrl || null,
                 deleted: d.deleted || false,
                 edited_by: d.edited_by || null,
+                updatedAt: d.$updatedAt || null,
             });
             const docs = transactions.documents.map(pickTxn);
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
