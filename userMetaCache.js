@@ -11,6 +11,14 @@ let _dbId = null;
 let _collectionId = null;
 let _Query = null;
 
+// Race a promise against a timeout
+function withTimeout(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Redis op timed out after ${ms}ms`)), ms)),
+    ]);
+}
+
 function init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query }) {
     _redisClient = redisClient;
     _databases = databases;
@@ -24,10 +32,10 @@ async function getUserMeta(userId) {
     if (!userId) return null;
     const cacheKey = KEY_PREFIX + userId;
 
-    // Try cache
+    // Try cache (with 2s timeout to prevent hanging on broken Redis connections)
     try {
         if (_redisClient?.isOpen) {
-            const cached = await _redisClient.get(cacheKey);
+            const cached = await withTimeout(_redisClient.get(cacheKey), 2000);
             if (cached) return JSON.parse(cached);
         }
     } catch (e) {
@@ -35,20 +43,27 @@ async function getUserMeta(userId) {
         // fall through to DB
     }
 
-    // Cache miss — query Appwrite directly
-    const list = await _databases.listDocuments(
-        _dbId, _collectionId,
-        [_Query.equal('userId', userId), _Query.limit(1)]
-    );
-    const doc = list.documents[0] || null;
+    // Cache miss — try direct doc fetch first (docId === userId), fall back to query
+    let doc = null;
+    try {
+        doc = await _databases.getDocument(_dbId, _collectionId, userId);
+    } catch (e) {
+        // docId may not match userId for older users — fall back to query
+        if (e?.code === 404) {
+            const list = await _databases.listDocuments(
+                _dbId, _collectionId,
+                [_Query.equal('userId', userId), _Query.limit(1)]
+            );
+            doc = list.documents[0] || null;
+        } else {
+            throw e;
+        }
+    }
 
-    // Populate cache (best-effort)
-    if (doc) {
-        try {
-            if (_redisClient?.isOpen) {
-                await _redisClient.set(cacheKey, JSON.stringify(doc), { EX: CACHE_TTL });
-            }
-        } catch (e) { console.error('userMetaCache write error:', e.message); }
+    // Populate cache (best-effort, don't block on write)
+    if (doc && _redisClient?.isOpen) {
+        withTimeout(_redisClient.set(cacheKey, JSON.stringify(doc), { EX: CACHE_TTL }), 2000)
+            .catch(e => console.error('userMetaCache write error:', e.message));
     }
 
     return doc;

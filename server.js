@@ -329,6 +329,14 @@ const webhookParser = express.json({
 
 // --- Authentication Middleware ---
 // This middleware verifies the user's JWT token via Appwrite's server-side API.
+// Helper: race a promise against a timeout
+function withTimeout(promise, ms, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+    ]);
+}
+
 const authenticateToken = async (req, res, next) => {
     try {
         const authHeader = req.headers['authorization'];
@@ -338,8 +346,6 @@ const authenticateToken = async (req, res, next) => {
             return res.status(401).json({ error: 'Authentication token is required.' });
         }
 
-        // console.log('Verifying token:', token);
-
         // Create a new client instance for this specific request with the user's JWT
         const userClient = new Client()
             .setEndpoint(APPWRITE_ENDPOINT)
@@ -347,16 +353,12 @@ const authenticateToken = async (req, res, next) => {
             .setJWT(token);
 
         const account = new Account(userClient);
-        const user = await account.get(); // This call verifies the JWT with Appwrite
+        const user = await withTimeout(account.get(), 9000, 'Appwrite account.get');
 
-        // console.log('Authenticated user:', user.$id);
-
-        // req.user = user;
-
-         // Query your users_meta collection by userId (user.$id) — cached in Redis
+        // Query your users_meta collection by userId (user.$id) — cached in Redis
         let userMeta;
         try {
-            userMeta = await userMetaCache.getUserMeta(user.$id);
+            userMeta = await withTimeout(userMetaCache.getUserMeta(user.$id), 8000, 'getUserMeta');
         } catch (metaErr) {
             console.error('User meta lookup failed for', user.$id, ':', metaErr.message);
             return res.status(503).json({ error: 'Service temporarily unavailable. Please retry.' });
@@ -372,6 +374,9 @@ const authenticateToken = async (req, res, next) => {
         next();
     } catch (err) {
         console.error('JWT verification error:', err.message);
+        if (err.message.includes('timed out')) {
+            return res.status(504).json({ error: 'Authentication service timed out. Please retry.' });
+        }
         return res.status(401).json({ error: 'Invalid or expired token.' });
     }
 };
