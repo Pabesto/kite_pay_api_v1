@@ -1497,7 +1497,8 @@ const pinelabPoller = startPinelabPoller(
   {
     env: 'production',
     intervalMs: 1 * 60 * 1000,
-    overlapMinutes: 50,
+    bufferMinutes: 5,        // small guard against micro-delays (txn anchor is ground truth)
+    maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
     pageSize: 100,
     maxPagesPerTick: 50,
     dryRun: false,
@@ -1525,7 +1526,7 @@ app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
 app.get('/admin/pinelabs/status', authenticateAdmin, async (req, res) => {
   try {
     const keys = [
-      'pinelabs:poller:lastPolledAt',
+      'pinelabs:poller:latestTxnAt',
       'pinelabs:poller:lastRunAt',
       'pinelabs:poller:lastTxnsSeen',
       'pinelabs:poller:lastTxnsSaved',

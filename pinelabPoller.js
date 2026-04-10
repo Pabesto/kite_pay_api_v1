@@ -49,15 +49,18 @@ function startPinelabPoller(deps, opts = {}) {
   } = deps;
 
   const env               = opts.env               || 'production';
-  const intervalMs        = opts.intervalMs        || 2 * 60 * 1000; // 2 min
-  const overlapMin        = opts.overlapMinutes   ?? 30;             // lookback buffer for wall-clock ticks
-  const recoveryOverlapMin = opts.recoveryOverlapMinutes ?? 10;      // smaller buffer when DB has ground truth
+  const intervalMs        = opts.intervalMs        || 2 * 60 * 1000;  // 2 min
+  const bufferMin         = opts.bufferMinutes    ?? 5;               // small guard against micro-delays (txn anchor is ground truth)
+  const maxLookbackMin    = opts.maxLookbackMinutes ?? 60;            // ceiling on window size during quiet periods
   const pageSize          = opts.pageSize          || 100;
-  const maxPagesPerTick   = opts.maxPagesPerTick   || 50;            // safety cap
+  const maxPagesPerTick   = opts.maxPagesPerTick   || 50;             // safety cap
   const dryRun            = !!opts.dryRun;
-  const notFoundCacheMs   = opts.notFoundCacheMs   || 5 * 60 * 1000; // 5 min
+  const notFoundCacheMs   = opts.notFoundCacheMs   || 5 * 60 * 1000;  // 5 min
 
-  const watermarkKey      = 'pinelabs:poller:lastPolledAt';
+  // Watermark: ISO timestamp of the latest txn we've successfully saved.
+  // Advanced only when a tick actually finds new txns. During quiet periods
+  // it stays put, and the maxLookback cap prevents the window from growing.
+  const watermarkKey      = 'pinelabs:poller:latestTxnAt';
   const mLastRunAt        = 'pinelabs:poller:lastRunAt';
   const mLastTxnsSeen     = 'pinelabs:poller:lastTxnsSeen';
   const mLastTxnsSaved    = 'pinelabs:poller:lastTxnsSaved';
@@ -242,10 +245,8 @@ function startPinelabPoller(deps, opts = {}) {
   }
 
   // Resume point when Redis watermark is missing (fresh deploy, Redis flush, etc.).
-  // Returns { anchor, source } so the caller can choose the right overlap buffer:
-  //   source='db'        → latest processed txn is ground truth, use small buffer
-  //   source='coldstart' → no prior data, use normal buffer
-  async function resolveResumeFromDb(now) {
+  // Returns the latest saved pinelabs txn timestamp, or null if the DB has none.
+  async function resolveResumeFromDb() {
     try {
       const result = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
@@ -259,17 +260,21 @@ function startPinelabPoller(deps, opts = {}) {
       if (result.documents.length > 0 && result.documents[0].created_at) {
         const d = new Date(result.documents[0].created_at);
         log('RESUME', 'recovered from DB — latest pinelabs txn', { created_at: result.documents[0].created_at });
-        return { anchor: d, source: 'db' };
+        return d;
       }
       log('RESUME', 'no prior pinelabs txns in DB — cold start');
     } catch (e) {
       console.error('[PINELAB-POLL] resolveResumeFromDb failed:', e.message);
     }
-    return { anchor: new Date(now.getTime() - overlapMin * 60 * 1000), source: 'coldstart' };
+    return null;
   }
 
   // Fetch and process a single explicit [from, to] window.
   // Shared by scheduled ticks and manual runOnce() calls.
+  //
+  // Watermark model: tracks the max `created_at` of every txn SEEN in this
+  // window (saved or dedup'd — both represent points we've processed).
+  // On success, advances the Redis watermark to max(existing, maxSeen).
   async function fetchWindow(from, to, { advanceWatermark } = { advanceWatermark: true }) {
     const startedAt = Date.now();
     const fromDate = fmtIst(from);
@@ -281,6 +286,7 @@ function startPinelabPoller(deps, opts = {}) {
     let totalSeen  = 0;
     let totalSaved = 0;
     let hitPageCap = false;
+    let maxSeenMs  = 0; // max txn created_at (ms) across all pages
 
     do {
       if (stopped) { log('RUN', 'stopped mid-run — aborting'); return { totalSeen, totalSaved, aborted: true }; }
@@ -304,6 +310,9 @@ function startPinelabPoller(deps, opts = {}) {
       totalSeen += txns.length;
 
       for (const txn of txns) {
+        const ts = parsePineDate(txn.transactionDate).getTime();
+        if (Number.isFinite(ts) && ts > maxSeenMs) maxSeenMs = ts;
+
         const saved = await processTransaction(txn);
         if (saved) totalSaved += 1;
       }
@@ -316,11 +325,21 @@ function startPinelabPoller(deps, opts = {}) {
       }
     } while (page < totalPages);
 
-    // Advance watermark only when we finished the whole window. If we hit the
-    // page cap, leave the watermark alone so the next tick re-fetches the tail.
-    if (advanceWatermark && !hitPageCap) {
-      try { await redisClient.set(watermarkKey, to.toISOString()); }
-      catch (e) { console.error('[PINELAB-POLL] redis.set watermark failed:', e.message); }
+    // Advance watermark to the latest txn timestamp we actually saw.
+    // If zero txns came back, leave the watermark untouched — the next tick's
+    // maxLookback cap keeps the window bounded during quiet periods.
+    // If we hit the page cap we still advance, because every txn up to maxSeenMs
+    // HAS been processed (we just stopped fetching more).
+    if (advanceWatermark && maxSeenMs > 0) {
+      try {
+        const existing = await redisClient.get(watermarkKey);
+        const existingMs = existing ? new Date(existing).getTime() : 0;
+        if (maxSeenMs > existingMs) {
+          await redisClient.set(watermarkKey, new Date(maxSeenMs).toISOString());
+        }
+      } catch (e) {
+        console.error('[PINELAB-POLL] redis watermark update failed:', e.message);
+      }
     }
 
     const durationMs = Date.now() - startedAt;
@@ -334,29 +353,27 @@ function startPinelabPoller(deps, opts = {}) {
   }
 
   // Resolve the [from, to] window for a scheduled / default run.
-  // Buffer logic:
-  //   - Redis watermark present → normal overlapMin (wall-clock anchor, fat buffer)
-  //   - DB recovery             → recoveryOverlapMin (real txn anchor, lean buffer)
-  //   - Cold start              → normal overlapMin (no ground truth, fat buffer)
+  //
+  // anchor = latest saved txn timestamp (Redis watermark, fallback to DB query)
+  // from   = max(anchor, now − maxLookback) − bufferMin
+  //          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ceiling prevents window growth
+  //                                         during quiet periods
+  // to     = now
   async function resolveDefaultWindow() {
     const now = new Date();
-    let lastIso = null;
-    try { lastIso = await redisClient.get(watermarkKey); }
+    let anchorIso = null;
+    try { anchorIso = await redisClient.get(watermarkKey); }
     catch (e) { console.error('[PINELAB-POLL] redis.get watermark failed:', e.message); }
 
-    let fromBase;
-    let bufferMin;
-    if (lastIso) {
-      fromBase = new Date(lastIso);
-      bufferMin = overlapMin;
-    } else {
-      const resume = await resolveResumeFromDb(now);
-      fromBase = resume.anchor;
-      bufferMin = resume.source === 'db' ? recoveryOverlapMin : overlapMin;
-    }
+    let anchor = anchorIso ? new Date(anchorIso) : null;
+    if (!anchor) anchor = await resolveResumeFromDb();
 
-    const from = new Date(fromBase.getTime() - bufferMin * 60 * 1000);
-    return { from, to: now, bufferMin };
+    // Ceiling: never look back further than maxLookbackMin from now.
+    const cap = new Date(now.getTime() - maxLookbackMin * 60 * 1000);
+    const capped = (anchor && anchor.getTime() > cap.getTime()) ? anchor : cap;
+
+    const from = new Date(capped.getTime() - bufferMin * 60 * 1000);
+    return { from, to: now };
   }
 
   async function tick() {
