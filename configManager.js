@@ -27,23 +27,23 @@ class ConfigManager {
 
             const config = {};
             for (let doc of docs.documents) {
-                // console.log(`Loading config key: ${doc.key} with value: ${doc.value} and type: ${doc.type}`);
-                let parsedValue = doc.value;
+                const rawValue = doc.val ?? String(doc.value ?? '');
+                let parsedValue = rawValue;
                 if (doc.type === "integer") {
-                    parsedValue = parseInt(doc.value);
+                    parsedValue = parseInt(rawValue);
                 } else if (doc.type === "double") {
-                    parsedValue = parseFloat(doc.value);
+                    parsedValue = parseFloat(rawValue);
                 } else if (doc.type === "boolean") {
-                    parsedValue = !["0", "false", "no", ""].includes(String(doc.value ?? '').toLowerCase());
+                    parsedValue = !["0", "false", "no", ""].includes(String(rawValue ?? '').toLowerCase());
                 } else if (doc.type === "json") {
                     try {
-                        parsedValue = JSON.parse(doc.value);
+                        parsedValue = JSON.parse(rawValue);
                     } catch (e) {
                         console.error(`Invalid JSON for config key "${doc.key}":`, e.message);
                         continue;
                     }
                 } else {
-                    parsedValue = doc.value;
+                    parsedValue = rawValue;
                 }
                 config[doc.key] = parsedValue;
             }
@@ -68,19 +68,40 @@ class ConfigManager {
         return rawDocsCache?.find(doc => doc.key === key) || null;
     }
 
+    static getRawDocs() {
+        return rawDocsCache || [];
+    }
+
     static async set(key, value) {
         if (!databasesInstance) {
             throw new Error('ConfigManager not initialized.');
         }
         const doc = this.getRawDoc(key);
         if (doc) {
-            await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { value: String(value) });
+            await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { val: String(value) });
         } else {
-            await databasesInstance.createDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, 'unique()', { key, value: String(value) });
+            await databasesInstance.createDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, 'unique()', { key, val: String(value) });
         }
         // Refresh cache so subsequent get() calls return updated value
         await this.refresh();
     }
+
+    // static async migrateValueToVal() {
+    //     if (!databasesInstance) {
+    //         throw new Error('ConfigManager not initialized.');
+    //     }
+    //     const docs = await databasesInstance.listDocuments(CONFIG_DB_ID, CONFIG_COLLECTION_ID, []);
+    //     let migrated = 0;
+    //     for (let doc of docs.documents) {
+    //         if (doc.val == null || doc.val === '') {
+    //             await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { val: String(doc.value ?? '') });
+    //             migrated++;
+    //             console.log(`Migrated key "${doc.key}": value=${doc.value} → val="${String(doc.value ?? '')}"`);
+    //         }
+    //     }
+    //     console.log(`Migration complete. ${migrated}/${docs.documents.length} docs migrated.`);
+    //     return { migrated, total: docs.documents.length };
+    // }
 
     static refresh() {
         console.log("Refreshing config cache...");

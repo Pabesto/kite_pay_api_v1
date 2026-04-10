@@ -8,6 +8,7 @@ const Razorpay = require("razorpay");
 const fs = require("fs");
 const axios = require("axios");
 const { File } = require('buffer');
+const userMetaCache = require('./userMetaCache');
 const path = require('path');
 const moment = require('moment-timezone');
 
@@ -147,10 +148,13 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // GET all QR codes For Admin and Employees
     // This is a public endpoint
-    router.get('/qr-codes', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
+    router.get('/qr-codes', authenticateAdminOrLabel('view_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
         try {
+            const { limit = 50, cursor } = req.query;
+            const limitNum = Math.min(parseInt(limit) || 25, 100);
 
             let resultAllQr = [];
+            let roleFilters = [];
 
             if (req.user.role === 'employee') {
                 const merchantsRes = await databases.listDocuments(
@@ -159,18 +163,14 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                     [
                         Query.equal('assigned_to', req.user.$id),
                         Query.equal('role', 'subadmin'),
-                        Query.limit(100)  // Merchants rarely >100/emp
+                        Query.limit(100)
                     ]
                 );
 
                 const merchantIds = merchantsRes.documents.map(d => d.userId);
 
-                // console.log(`Employee ${req.user.$id} has ${merchantIds.length} assigned merchants:`, merchantIds);
-
                 let queries = [];
-
                 let orQueries = [];
-                // let orQueries = [];
 
                 if(merchantIds.length === 0){
                     return res.status(500).json({ message: "Failed to fetch QR codes No Merchants assigned." });
@@ -184,91 +184,75 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
                 const usersRes = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_USERS_META_COLLECTION_ID,
-                    queries // must be an array
+                    queries
                 );
 
                 queries = [];
 
                 const userIds = usersRes.documents.map(d => d.userId);
 
-                // console.log(`Employee ${req.user.$id} has ${userIds.length} assigned users:`, userIds);
-
                 let orQueries2 = [];
 
                 merchantIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
                 userIds.forEach(id => orQueries2.push(Query.equal('assignedUserId', id)));
-                
-                if (orQueries2.length === 1) {
-                    queries.push(orQueries2[0]);
-                } else {
-                    queries.push(Query.or(orQueries2));
-                }
 
-                // queries.push(Query.or(orQueries2));
+                // Also include QR codes not assigned to anyone
+                orQueries2.push(Query.and([
+                    Query.isNull('assignedUserId'),
+                    Query.isNull('managedByUserId'),
+                ]));
 
-                // console.log('Employee user list query result count:', usersRes.total);
-
-                resultAllQr = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    queries,
-                );
-
-                // console.log('Employee QR code query result count:', resultAllQr.total);
-
-                // documents = response.documents;
+                roleFilters.push(Query.or(orQueries2));
 
             } else if(req.user.role === 'subadmin'){
                 console.log('Subadmin fetching QR codes for userId:', req.user.userId);
-                
+
                 const usersUnderSubadmin = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
                     APPWRITE_USERS_META_COLLECTION_ID,
                     [
                         Query.equal('parentId', req.user.userId),
                         Query.equal('role', 'user'),
-                        Query.limit(100)  // Merchants rarely >100/emp
+                        Query.limit(100)
                     ]
                 );
 
                 const usersUnderSubadminIds = usersUnderSubadmin.documents.map(d => d.userId);
-                
-                let subadminQrQueries = [];
 
                 let queriesUser = [];
 
                 if(usersUnderSubadminIds.length === 0){
                     return res.status(500).json({ message: "Failed to fetch Qr No Users assigned.", error: "Qr Fetch Failed" });
                 }else if(usersUnderSubadminIds.length === 1){
-                    subadminQrQueries.push(Query.or([
+                    roleFilters.push(Query.or([
                         Query.equal('assignedUserId', usersUnderSubadminIds[0]),
                         Query.equal('managedByUserId', req.user.userId)
                     ]));
                 }else{
                     usersUnderSubadminIds.forEach(id => queriesUser.push(Query.equal('assignedUserId', id)));
-                    queriesUser.push(Query.equal('managedByUserId', req.user.userId)); // Include QR codes created by subadmin but not yet assigned 
-                    subadminQrQueries.push(Query.or(queriesUser));
+                    queriesUser.push(Query.equal('managedByUserId', req.user.userId));
+                    roleFilters.push(Query.or(queriesUser));
                 }
-                    
-                resultAllQr = await databases.listDocuments(
-                        APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
-                        [...subadminQrQueries,
-                        Query.orderDesc('createdAt'), Query.limit(100) ],
-                    );
-
-            } else {
-
-                resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, // Transactions collection
-                    [
-                        Query.orderDesc('createdAt'), // Add this line to sort descending by date
-                        Query.limit(100) // Limits the results to 100 documents
-                    ]
-                );
 
             }
 
+            // Build final query with pagination
+            const finalQueries = [
+                ...roleFilters,
+                Query.orderDesc('createdAt'),
+                Query.limit(limitNum),
+            ];
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                finalQueries.push(Query.cursorAfter(cursor));
+            }
+
+            resultAllQr = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, finalQueries);
+
             const qrCodes = resultAllQr.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -287,38 +271,48 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+            const yesterdayDate = new Date();
+            yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+            const yesterdayISO = yesterdayDate.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 
-            // Fetch the daily aggregate doc for today (only one document)
-            const dailySummaryDocs = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-            [
-                Query.equal('date', todayISO),
-                Query.limit(1),
-            ]
-            );
+            // Fetch daily aggregate docs for today and yesterday
+            const [dailySummaryDocs, yesterdaySummaryDocs] = await Promise.all([
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', todayISO), Query.limit(1),
+                ]),
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', yesterdayISO), Query.limit(1),
+                ]),
+            ]);
 
-            let totalsObj = {};
+            let todayTotalsObj = {};
             if (dailySummaryDocs.total > 0) {
             try {
-                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+                todayTotalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
                 console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
-                totalsObj = {};
             }
             }
 
-            // Map today totals to each QR code
-            const qrCodesWithTodayTotal = qrCodes.map(qr => {
-                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+            let yesterdayTotalsObj = {};
+            if (yesterdaySummaryDocs.total > 0) {
+            try {
+                yesterdayTotalsObj = JSON.parse(yesterdaySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                console.error('WARNING: corrupted totalsJson in yesterday summary (read-only) —', e.message);
+            }
+            }
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+            // Map today and yesterday totals to each QR code
+            const qrCodesWithTotals = qrCodes.map(qr => ({
+                ...qr,
+                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
+                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+            }));
 
-            return res.status(200).json(qrCodesWithTodayTotal.reverse());// Reverse the order to show the most recent first
+            const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
+
+            return res.status(200).json({ qrCodes: qrCodesWithTotals, nextCursor });
 
         } catch (error) {
             console.error('Error fetching QR codes:', error);
@@ -573,7 +567,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
     // PUT to toggle the isActive status
     // This is an admin-only endpoint
-    router.put('/toggle-qr-status/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.put('/toggle-qr-status/:qrId', authenticateAdminOrLabel('toggle_qr_status', { isSubadminAllowed: false }), async (req, res) => {
         const { qrId } = req.params;
         const { isActive } = req.body;
 
@@ -629,53 +623,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     });
 
     // PUT to assign a user to a QR code
-    // This is an admin-only endpoint
-    // MODIFIED: Endpoint to assign or unlink a user from a QR code
-    // router.put('/assign-qr/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
-    //     const { qrId } = req.params;
-    //     const { assignedUserId , managedByUserId } = req.body; // assignedUserId can now be null or a string
-
-    //     try {
-    //         // Fetch current assignment
-    //         const docResult = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-    //             Query.equal('qrId', qrId)
-    //         ]);
-    //         if (docResult.documents.length === 0) {
-    //             return res.status(404).json({ message: "QR Code not found." });
-    //         }
-    //         const prevAssignedUserId = docResult.documents[0].assignedUserId;
-    //         // Update assignment
-    //         if(managedByUserId){
-    //             const result = await assignQrToUserNew({
-    //                 qrId,
-    //                 assignedUserId,
-    //                 managedByUserId : managedByUserId,
-    //             });
-    //         }else{
-    //             const result = await assignQrToUserNew({
-    //                 qrId,
-    //                 assignedUserId
-    //             });
-    //         }
-            
-    //         // Only increment if previously unassigned and now assigned
-    //         if (!prevAssignedUserId && assignedUserId) {
-    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', 1).catch(console.error);
-    //         }
-    //         // Only decrement if previously assigned and now unassigned
-    //         else if (prevAssignedUserId && !assignedUserId) {
-    //             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
-    //         }
-    //         // No change if reassigned from one user to another
-    //         res.status(200).json({ message: "User assignment updated successfully." });
-    //     } catch (error) {
-    //         console.error('Error updating user assignment for QR code:', error);
-    //         res.status(500).json({ message: "Failed to update user assignment.", error: error.message });
-    //     }
-    // });
-
-    // PUT to assign a user to a QR code
-    router.put('/assign-qr-user/:qrId', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.put('/assign-qr-user/:qrId', authenticateAdminOrLabel('assign_qr_codes', { isSubadminAllowed: true }), async (req, res) => {
         const { qrId } = req.params;
         const { assignedUserId } = req.body; // may be null (unassign)
         const actor = req.user;
@@ -735,16 +683,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     //     - if assignedUser exists and assignee.parentId !== managedByUserId => 409 block
     //     - if assignedUser missing and was expected => 409 block
     //     - if assignedUser null or in-scope => proceed
-    router.put('/assign-qr-manager/:qrId', authenticateAdmin, async (req, res) => {
+    router.put('/assign-qr-manager/:qrId', authenticateAdminOrLabel('assign_qr_codes'), async (req, res) => {
         const { qrId } = req.params;
         const { managedByUserId: rawManaged } = req.body;
-        const actor = req.user;
 
         try {
-            // Admin-only
-            if (actor.role !== 'admin') {
-                return res.status(403).json({ message: 'Only admin can change managedByUserId.' });
-            }
 
             // Normalize: '' -> null
             const normalizedManaged = (rawManaged === '' ? null : (rawManaged ?? null));
@@ -774,6 +717,11 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }
 
             // TRANSFER (block strategy)
+            // Only admin can transfer a QR that already has a manager
+            if (qr.managedByUserId && qr.managedByUserId !== normalizedManaged && req.user.role !== 'admin') {
+                return res.status(403).json({ message: 'Only admin can transfer QR to a different manager.' });
+            }
+
             // Validate target manager
             const manager = await getUser(normalizedManaged);
             if (!manager) return res.status(400).json({ message: 'Manager not found.' });
@@ -835,6 +783,8 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
+        const { limit = 100, cursor } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
 
         if (!userId) {
             return res.status(400).json({ message: 'Missing userId parameter' });
@@ -842,37 +792,29 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
 
         const userRequested = req.user;
         const isSubadmin = userRequested.role === 'subadmin';
-        const isAdmin = userRequested.role === 'admin';
-        const isEmployee = userRequested.role === 'employee';
-        const requestorId = userRequested.userId;
 
         try {
-            let documents = [];
+            const queries = [];
 
             if (isSubadmin) {
-                const response = await databases.listDocuments(
-                        APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
-                        [Query.contains('managedByUserId', userRequested.userId)]
-                    );
-                    documents = response.documents;
+                queries.push(Query.contains('managedByUserId', userRequested.userId));
             } else {
-                const response = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
-                    [
-                        // Query.or([
-                        //     Query.equal('assignedUserId', userId),
-                        //     Query.equal('createdByUserId', userId),
-                        // ]),
-                        Query.equal('assignedUserId', userId),
-                        // Query.limit(50),
-                    ]
-                );
-                documents = response.documents;
+                queries.push(Query.equal('assignedUserId', userId));
             }
 
-            const userQrCodes = documents.map(doc => ({
+            queries.push(Query.orderDesc('createdAt'));
+            queries.push(Query.limit(limitNum));
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                queries.push(Query.cursorAfter(cursor));
+            }
+
+            const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, queries);
+
+            const userQrCodes = response.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -891,39 +833,46 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+            const yesterdayDate = new Date();
+            yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+            const yesterdayISO = yesterdayDate.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 
-            // Fetch the daily aggregate doc for today (only one document)
-            const dailySummaryDocs = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-            [
-                Query.equal('date', todayISO),
-                Query.limit(1),
-            ]
-            );
+            const [dailySummaryDocs, yesterdaySummaryDocs] = await Promise.all([
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', todayISO), Query.limit(1),
+                ]),
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', yesterdayISO), Query.limit(1),
+                ]),
+            ]);
 
-            let totalsObj = {};
+            let todayTotalsObj = {};
             if (dailySummaryDocs.total > 0) {
             try {
-                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+                todayTotalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
                 console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
-                totalsObj = {};
             }
             }
 
-            // Map today totals to each QR code
-            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
-                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+            let yesterdayTotalsObj = {};
+            if (yesterdaySummaryDocs.total > 0) {
+            try {
+                yesterdayTotalsObj = JSON.parse(yesterdaySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                console.error('WARNING: corrupted totalsJson in yesterday summary (read-only) —', e.message);
+            }
+            }
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+            const qrCodesWithTotals = userQrCodes.map(qr => ({
+                ...qr,
+                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
+                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+            }));
 
+            const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
 
-            return res.status(200).json(userQrCodesWithTodayTotal);
+            return res.status(200).json({ qrCodes: qrCodesWithTotals, nextCursor });
         } catch (error) {
             console.error('Error fetching QR codes for user:', error);
             return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
@@ -934,32 +883,57 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
     // This endpoint can be accessed by admin, subadmin, or the user themselves
     router.get('/qr-codes/user_assigned/:userId', authenticateToken, async (req, res) => {
         const { userId } = req.params;
+        const { limit = 100, cursor } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
+
+        // console.log(`[/qr-codes/user_assigned] userId=${userId}, limit=${limitNum}, cursor=${cursor || 'none'}`);
 
         if (!userId) {
             return res.status(400).json({ message: 'Missing userId parameter' });
         }
 
         const userRequested = req.user;
+        const isAdmin = userRequested.role === 'admin';
+        const isSubadmin = userRequested.role === 'subadmin';
 
-        if(userRequested.userId !== userId){
+        // console.log(`[/qr-codes/user_assigned] requestor=${userRequested.userId}, role=${userRequested.role}`);
+
+        // Admin can access any user's QR codes
+        // Subadmin can access QR codes of users under them
+        // User can only access their own
+        if (!isAdmin && !isSubadmin && userRequested.userId !== userId) {
             return res.status(403).json({ message: 'Forbidden: Cannot access QR codes of other users' });
         }
 
+        // Subadmin can only access users under them
+        if (isSubadmin && userRequested.userId !== userId) {
+            const userMeta = await userMetaCache.getUserMeta(userId);
+            if (!userMeta || userMeta.parentId !== userRequested.userId) {
+                return res.status(403).json({ message: 'Forbidden: This user is not under your management' });
+            }
+        }
+
         try {
-            let documents = [];
+            const queries = [
+                Query.equal('assignedUserId', userId),
+                Query.orderDesc('createdAt'),
+                Query.limit(limitNum),
+            ];
+            if (cursor) {
+                if (!/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                    return res.status(400).json({ error: 'Invalid cursor format' });
+                }
+                queries.push(Query.cursorAfter(cursor));
+            }
 
-            const response = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                Qr_collectionId,
-                [
-                    Query.equal('assignedUserId', userId),
-                    Query.limit(100),
-                ]
-            );
-            
-            documents = response.documents;
+            // console.log(`[/qr-codes/user_assigned] querying with ${queries.length} filters`);
 
-            const userQrCodes = documents.map(doc => ({
+            const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, queries);
+
+            // console.log(`[/qr-codes/user_assigned] found ${response.documents.length} QR codes`);
+
+            const userQrCodes = response.documents.map(doc => ({
+                $id: doc.$id,
                 qrId: doc.qrId,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
@@ -976,40 +950,50 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+            const yesterdayDate = new Date();
+            yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+            const yesterdayISO = yesterdayDate.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 
-            // Fetch the daily aggregate doc for today (only one document)
-            const dailySummaryDocs = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
-            [
-                Query.equal('date', todayISO),
-                Query.limit(1),
-            ]
-            );
+            const [dailySummaryDocs, yesterdaySummaryDocs] = await Promise.all([
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', todayISO), Query.limit(1),
+                ]),
+                databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [
+                    Query.equal('date', yesterdayISO), Query.limit(1),
+                ]),
+            ]);
 
-            let totalsObj = {};
+            let todayTotalsObj = {};
             if (dailySummaryDocs.total > 0) {
             try {
-                totalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
+                todayTotalsObj = JSON.parse(dailySummaryDocs.documents[0].totalsJson || '{}');
             } catch (e) {
                 console.error('WARNING: corrupted totalsJson in daily summary (read-only) —', e.message);
-                totalsObj = {};
             }
             }
 
-            // Map today totals to each QR code
-            const userQrCodesWithTodayTotal = userQrCodes.map(qr => {
-                const todayTotalPayIn = totalsObj[qr.qrId] || 0;
+            let yesterdayTotalsObj = {};
+            if (yesterdaySummaryDocs.total > 0) {
+            try {
+                yesterdayTotalsObj = JSON.parse(yesterdaySummaryDocs.documents[0].totalsJson || '{}');
+            } catch (e) {
+                console.error('WARNING: corrupted totalsJson in yesterday summary (read-only) —', e.message);
+            }
+            }
 
-                return {
-                    ...qr,
-                    todayTotalPayIn,
-                };
-            });
+            const qrCodesWithTotals = userQrCodes.map(qr => ({
+                ...qr,
+                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
+                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+            }));
 
-            return res.status(200).json(userQrCodesWithTodayTotal);
+            const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
+
+            // console.log(`[/qr-codes/user_assigned] returning ${qrCodesWithTotals.length} QRs, nextCursor=${nextCursor || 'null'}`);
+
+            return res.status(200).json({ qrCodes: qrCodesWithTotals, nextCursor });
         } catch (error) {
-            console.error('Error fetching QR codes for user:', error);
+            console.error('[/qr-codes/user_assigned] Error:', error);
             return res.status(500).json({ message: 'Failed to fetch user QR codes.', error: error.message });
         }
     });
@@ -1168,7 +1152,7 @@ module.exports = (databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_
         //     }
         // );
 
-      const istTime = moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+      const istTime = moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
 
         const newQrCode = await saveQrEntry({
             qrId: razorpayQr.id,

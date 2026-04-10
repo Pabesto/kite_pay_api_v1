@@ -1,11 +1,12 @@
 // server.js (CommonJS)
 const http = require('http');
-const { Client, Account, Databases, Query } = require('node-appwrite');
+const { Client, Account } = require('node-appwrite');
 const { Server } = require('socket.io');
+const userMetaCache = require('./userMetaCache');
 
 let io; // Declare io in outer scope for access in emit functions
 
-function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, appwriteDatabaseId, usersMetaCollectionId }) {
+function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
   // reuse the same HTTP server as Express
   const httpServer = http.createServer(app);
 
@@ -16,13 +17,6 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
     },
     transports: ['websocket'],
   });
-
-  // Appwrite admin client for querying users_meta
-  const adminClient = new Client()
-    .setEndpoint(appwriteEndpoint)
-    .setProject(appwriteProjectId)
-    .setKey(appwriteApiKey);
-  const databases = new Databases(adminClient);
 
   // Auth middleware: verify Appwrite JWT via account.get()
   io.use(async (socket, next) => {
@@ -43,15 +37,11 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
 
       if (!user.$id) return next(new Error('Unauthorized'));
 
-      // Fetch user metadata
-      const list = await databases.listDocuments(
-        appwriteDatabaseId,
-        usersMetaCollectionId,
-        [Query.equal('userId', user.$id)]
-      );
+      // Fetch user metadata — cached in Redis
+      const userMeta = await userMetaCache.getUserMeta(user.$id);
 
       socket.data.userId = user.$id;
-      socket.data.userMeta = list.documents[0] || null;
+      socket.data.userMeta = userMeta || null;
       return next();
     } catch (e) {
       console.error('Socket auth error:', e.message);
@@ -60,7 +50,8 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, appwriteApiKey, 
   });
 
   io.on('connection', (socket) => {
-    console.log('Socket connected:', socket.id, 'userId:', socket.data.userId);
+    // console.log('Socket connected:', socket.id, 'userId:', socket.data.userId);
+    console.log('Socket connected:');
     const userId = socket.data.userId;
     // join per-user room
     socket.join(`room:user:${userId}`);

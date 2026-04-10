@@ -5,6 +5,7 @@
 const express = require('express');
 const multer = require('multer');
 const moment = require('moment-timezone');
+const { Client, Account } = require('node-appwrite');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -18,6 +19,7 @@ const tz = require('dayjs/plugin/timezone');
 const { updateDashboardCounter } = require('./dashboardCounters');
 
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
+const userMetaCache = require('./userMetaCache');
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -25,17 +27,17 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
-        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+        return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     function isExportTimeAllowed() {
         const windows = [
-            { from: '10:00 AM', to: '02:00 PM' },
-            { from: '04:00 PM', to: '08:00 PM' },
+            { from: '09:00 AM', to: '10:00 AM' },
+            // { from: '04:00 PM', to: '08:00 PM' },
         ];
         const now = moment().tz('Asia/Kolkata');
         const nowMinutes = now.hours() * 60 + now.minutes();
@@ -87,7 +89,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // 🔥 List all users AppWrite Collections users_meta
-    router.get('/users', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
+    router.get('/users', authenticateAdminOrLabel('view_users', { isSubadminAllowed: true }), async (req, res) => {
         const {limit = 25, cursor} = req.query;
     
         const requestorId = req.user.userId;
@@ -278,12 +280,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // 🔐 Create new user (admin/sub-admin allowed)
-    router.post('/create-user', authenticateAdminOrSubAdmin, async (req, res) => {
+    router.post('/create-user', authenticateAdminOrLabel('create_subadmin', { isSubadminAllowed: true }), async (req, res) => {
         const { name, email, password, role } = req.body;
-        const creatorId = req.user.userId;
+        let creatorId = req.user.userId;
 
         if(role === 'admin'){
             return res.status(400).json({ error: 'admin cant be created' });
+        }
+
+        if (req.user.role === 'user') {
+            return res.status(403).json({ error: 'Users cannot create other users' });
         }
 
         if (!name || !email || !password || !role) {
@@ -292,6 +298,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         if (req.user.role === 'subadmin' && role !== 'user') {
             return res.status(403).json({ error: 'Sub-admins can only create users' });
+        }
+
+        if (req.user.role === 'employee' && role !== 'subadmin') {
+            return res.status(403).json({ error: 'Employees can only create sub-admins' });
         }
 
         if(req.user.role === 'admin'){
@@ -314,6 +324,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 parentId: creatorId,
                 status: true,
                 commission: 0,
+                assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
             // 3) Idempotent metadata write: use 1:1 docId = userId
@@ -339,6 +350,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     throw e;
                 }
             }
+            await userMetaCache.invalidate(userId);
 
             // Update dashboard counters in parallel
             const counterUpdates = [
@@ -364,7 +376,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    // 🔐 Assign employee to employee (admin-only or employee with all_users)
+    // 🔐 Assign subadmin to employee (admin-only or employee with all_users)
     router.put('/assign-subadmin/:employeeId', authenticateAdmin, async (req, res) => {
         const { employeeId } = req.params;
         const { userId, unassign = false } = req.body; // userId can be string; unassign=true clears parentId
@@ -392,23 +404,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // Step 1: Find document where userId matches
-            const documents = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [Query.equal('userId', userId)] // your provided userId value
-            );
+            const userDoc = await userMetaCache.getUserMeta(userId);
 
-            if (documents.documents.length === 0) {
+            if (!userDoc) {
             throw new Error('User document not found');
             }
 
-            const documentId = documents.documents[0].$id; // Get the actual document ID
+            const documentId = userDoc.$id; // Get the actual document ID
 
             const update = { assigned_to: unassign ? null : employeeId };
 
             console.log(`Updating user ${userId} assignment to employee ${employeeId}, unassign: ${unassign}`);
 
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, documentId, update);
+            await userMetaCache.invalidate(userId);
 
             return res.status(200).json({ message: 'Assignment updated.' });
         } catch (err) {
@@ -456,6 +465,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const update = { parentId: unassign ? null : subadminId };
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId, update);
+            await userMetaCache.invalidate(userId);
 
             return res.status(200).json({ message: 'Assignment updated.' });
         } catch (err) {
@@ -490,22 +500,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         return res.status(403).json({ error: 'Cannot edit admin users' });
         }
 
-        const list = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_USERS_META_COLLECTION_ID,
-        [Query.equal('userId', userIdtoEdit)]
-        );
-        if (list.documents.length === 0) {
+        const doc = await userMetaCache.getUserMeta(userIdtoEdit);
+        if (!doc) {
         return res.status(404).json({ error: 'User metadata document not found in users_mets' });
         }
 
         if (userRequested.role === 'subadmin') {
-        if (list.documents[0].parentId !== userRequested.userId) {
+        if (doc.parentId !== userRequested.userId) {
             return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
         }
         }
-
-        const doc = list.documents[0];
         const docId = doc.$id;
 
         const updatePayload = {};
@@ -532,6 +536,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             updatePayload
         ));
         await Promise.all(userUpdates);
+        await userMetaCache.invalidate(userIdtoEdit);
 
         return res.json({ message: 'User updated successfully' });
     } catch (err) {
@@ -542,28 +547,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // 🔐 Reset user password ( admin/sub-admin or employee with all_users allowed )
     router.post('/reset-password/:id', authenticateAdminOrSubAdmin, async (req, res) => {
         const userId = req.params.id;
-        const { password } = req.body;
+        const { password, logoutAll } = req.body;
 
         const userRequested = req.user; // set by your JWT middleware
 
-        // Find document in users_mets collection matching userId
-        const list = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [
-                Query.equal('userId', userId)
-            ]
-        );
-        if (list.documents.length === 0) {
-            return res.status(404).json({ error: 'User metadata document not found in users_mets' });
+        // Find document in users_meta collection matching userId
+        const userDoc = await userMetaCache.getUserMeta(userId);
+        if (!userDoc) {
+            return res.status(404).json({ error: 'User metadata document not found in users_meta' });
         }
 
         if(userRequested.role === 'subadmin'){
-            if(list.documents[0].parentId !== userRequested.userId){
+            if(userDoc.parentId !== userRequested.userId){
                 return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
-            }   
-        } else {    
-            // sub-admins can only edit users they created
+            }
         }
 
         if (!password || password.length < 6) {
@@ -579,10 +576,75 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             await users.updatePassword(userId, password);
 
-            return res.json({ message: 'Password reset successfully' });
+            if (logoutAll === true) {
+                try {
+                    await users.deleteSessions(userId);
+                } catch (sessionErr) {
+                    console.error('Failed to logout all sessions:', sessionErr.message);
+                }
+            }
+
+            return res.json({ message: 'Password reset successfully', loggedOutAll: logoutAll === true });
         } catch (err) {
             console.error(err);
             return res.status(500).json({ error: err.message || 'Failed to reset password' });
+        }
+    });
+
+    // POST /reset-password-own (self password reset with current password verification)
+    router.post('/reset-password-own', authenticateToken, async (req, res) => {
+        const { currentPassword, newPassword, logoutAll } = req.body;
+
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ error: 'currentPassword and newPassword are required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'New password must be at least 6 characters' });
+        }
+
+        if (currentPassword === newPassword) {
+            return res.status(400).json({ error: 'New password must be different from current password' });
+        }
+
+        try {
+            const token = req.headers['authorization']?.split(' ')[1];
+
+            const userClient = new Client()
+                .setEndpoint('https://fra.cloud.appwrite.io/v1')
+                .setProject('688c98fd002bfe3cf596')
+                .setJWT(token);
+
+            const account = new Account(userClient);
+
+            // This verifies the current password and updates to the new one
+            // await account.updatePassword(newPassword, currentPassword);
+
+            const result = await account.updatePassword({
+                password: newPassword,
+                oldPassword: currentPassword // optional
+            });
+
+            console.log('Password reset own result:', result);
+
+            // If logoutAll is true, delete all sessions for this user
+            if (logoutAll === true) {
+                try {
+                    await users.deleteSessions(req.user.userId);
+                } catch (sessionErr) {
+                    console.error('Failed to logout all sessions:', sessionErr.message);
+                }
+            }
+
+            return res.json({ message: 'Password updated successfully', loggedOutAll: logoutAll === true });
+        } catch (err) {
+            console.error('Reset password own error:', err.message);
+
+            if (err.code === 401 || err.type === 'user_invalid_credentials') {
+                return res.status(401).json({ error: 'Current password is incorrect' });
+            }
+
+            return res.status(500).json({ error: err.message || 'Failed to update password' });
         }
     });
 
@@ -604,27 +666,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const result = await users.updateStatus(userId, status);
 
-           // Update status in users_mets collection
-            const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('userId', userId)
-                ]
-            );
-            if (list.documents.length === 0) {
+           // Update status in users_meta collection
+            const doc = await userMetaCache.getUserMeta(userId);
+            if (!doc) {
                 return res.status(404).json({ error: 'User metadata document not found in users_meta' });
             }
 
              if(userRequested.role === 'subadmin'){
-                if(list.documents[0].parentId !== userRequested.userId){
+                if(doc.parentId !== userRequested.userId){
                     return res.status(403).json({ error: 'Forbidden: Cannot edit users not assigned to you' });
-                }   
-            } else {    
-                // sub-admins can only edit users they created
+                }
             }
 
-            const doc = list.documents[0];
             const docId = doc.$id;
 
             await databases.updateDocument(
@@ -633,6 +686,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 docId,
                 { status }
             );
+            await userMetaCache.invalidate(userId);
 
             const delta = status ? 1 : -1;
             if (doc.role === 'subadmin') {
@@ -673,24 +727,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             // Find and delete corresponding document in users_meta collection
-            const listOfUsersMeta = await databases.listDocuments(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_USERS_META_COLLECTION_ID,
-                [
-                    Query.equal('userId', userId)
-                ]
-            );
+            const userMetaDoc = await userMetaCache.getUserMeta(userId);
 
-            // console.log(`User metadata documents found for userId ${userId}:`, list.total);
+            if (userMetaDoc) {
 
-            if (listOfUsersMeta.documents.length > 0) {
-
-                if(listOfUsersMeta.documents[0].role == 'admin'){
+                if(userMetaDoc.role == 'admin'){
                     return res.status(403).json({ error: 'Cannot delete admin users' });
                 }
 
                 // Get the user ID of the user being deleted
-                const userIdofUserDeleting = listOfUsersMeta.documents[0].userId;
+                const userIdofUserDeleting = userMetaDoc.userId;
 
                 // Check if user has assigned QR codes before allowing deletion
                 const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, 
@@ -703,14 +749,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
                 }
 
-                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, listOfUsersMeta.documents[0].$id);
+                await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userMetaDoc.$id);
+                await userMetaCache.invalidate(userId);
 
                 // Delete user in Appwrite users service
                 await users.delete(userId);
 
                 // Update dashboard counters
-                const role = listOfUsersMeta.documents[0].role;
-                const status = listOfUsersMeta.documents[0].status;
+                const role = userMetaDoc.role;
+                const status = userMetaDoc.status;
                 const deleteCounterUpdates = [
                     updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1),
                 ];
@@ -790,7 +837,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const toPaise = (amt) => Math.round(amt * 100);
 
     // Admin-only: fetch all or filtered transactions
-    router.get('/transactions', authenticateAdminOrLabel('all_transactions', { isSubadminAllowed: true }), async (req, res) => {
+    router.get('/transactions', authenticateAdminOrLabel('view_transactions', { isSubadminAllowed: true }), async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
 
@@ -976,6 +1023,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) {
                 queries.push(Query.cursorAfter(cursor));
@@ -986,7 +1034,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
 
             const pickTxn = (d) => ({
-                $id: d.$id,   
+                $id: d.$id,
                 id: d.$id,                // keep if needed
                 qrCodeId: d.qrCodeId,
                 paymentId: d.paymentId,
@@ -996,14 +1044,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 created_at: d.created_at,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
             });
+
             const docs = transactions.documents.map(pickTxn);
 
             // const docs = transactions.documents;
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
             return res.status(200).json({ transactions: docs, nextCursor });
-            
+
         } catch (error) {
             if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching transactions:', error);
@@ -1011,7 +1062,89 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-        // Fetch transactions only for that user with optional one-field search
+    // Fetch only soft-deleted transactions (admin only)
+    router.get('/deleted_transactions_only', authenticateAdmin, async (req, res) => {
+        const { limit = 25, cursor, from, to, searchField, searchValue } = req.query;
+        const limitNum = Math.min(parseInt(limit) || 25, 100);
+
+        let filters = [Query.equal('deleted', true)];
+
+        try {
+            function toISTRange(dateStr) {
+                const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+                const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+                return { start, end };
+            }
+
+            if (from && to) {
+                if (from === to) {
+                    const { start, end } = toISTRange(from);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                } else {
+                    const { start } = toISTRange(from);
+                    const { end } = toISTRange(to);
+                    filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+                }
+            } else if (from && !to) {
+                const { start, end } = toISTRange(from);
+                filters.push(Query.between("created_at", start.toISOString(), end.toISOString()));
+            } else if (!from && to) {
+                const { end } = toISTRange(to);
+                filters.push(Query.lessThanEqual("created_at", end.toISOString()));
+            }
+
+            if (searchField && searchValue) {
+                const fulltextFields = ['vpa', 'paymentId', 'qrCodeId'];
+                if (fulltextFields.includes(searchField)) {
+                    filters.push(Query.search(searchField, searchValue));
+                } else if (searchField === 'amount') {
+                    const amountValue = parseInt(searchValue, 10);
+                    if (isNaN(amountValue)) {
+                        return res.status(400).json({ error: 'Amount must be an integer value' });
+                    }
+                    filters.push(Query.equal('amount', amountValue * 100));
+                } else if (searchField === 'rrnNumber') {
+                    filters.push(Query.equal('rrnNumber', searchValue));
+                } else {
+                    return res.status(400).json({ error: 'Invalid searchField parameter' });
+                }
+            }
+
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
+                return res.status(400).json({ error: 'Invalid cursor format' });
+            }
+            const queries = [...filters, Query.orderDesc('$updatedAt'), Query.limit(limitNum)];
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+
+            const pickTxn = (d) => ({
+                $id: d.$id,
+                id: d.$id,
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                rrnNumber: d.rrnNumber,
+                amount: d.amount,
+                vpa: d.vpa,
+                created_at: d.created_at,
+                status: d.status,
+                imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
+                updatedAt: d.$updatedAt || null,
+            });
+            const docs = transactions.documents.map(pickTxn);
+            const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
+
+            return res.status(200).json({ transactions: docs, nextCursor });
+        } catch (error) {
+            if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+            console.error('Error fetching deleted transactions:', error);
+            return res.status(500).json({ error: 'Failed to fetch deleted transactions' });
+        }
+    });
+
+    // Fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
         const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
@@ -1115,6 +1248,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) {
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
@@ -1131,6 +1265,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 created_at: d.created_at,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
+                deleted: d.deleted || false,
+                edited_by: d.edited_by || null,
             });
             const docs = transactions.documents.map(pickTxn);
 
@@ -1174,8 +1310,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 return res.status(403).json({ error: 'Export is only allowed during permitted time windows' });
             }
 
-            if (!userId) {
-                return res.status(400).json({ error: 'userId is required' });
+            if (!userId && !qrId) {
+                return res.status(400).json({ error: 'userId or qrId is required' });
             }
 
             if (isEmployee) {
@@ -1193,13 +1329,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     );
                     allowedIds.push(...usersRes.documents.map(d => d.userId));
                 }
-                if (!allowedIds.includes(userId)) {
+                if (userId && !allowedIds.includes(userId)) {
                     return res.status(403).json({ error: 'Forbidden: This user is not under your management' });
                 }
-            } else if (!isSubadmin && userRequested.userId !== userId) {
+                // If only qrId passed, verify the QR belongs to an allowed user
+                if (!userId && qrId) {
+                    const qrDoc = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [Query.equal('qrId', qrId), Query.limit(1)]);
+                    if (qrDoc.documents.length === 0 || !allowedIds.includes(qrDoc.documents[0].assignedUserId)) {
+                        return res.status(403).json({ error: 'Forbidden: This QR is not under your management' });
+                    }
+                }
+            } else if (!isSubadmin && userId && userRequested.userId !== userId) {
                 return res.status(403).json({ error: 'Forbidden: Cannot access other users\' transactions' });
             }
 
+        }
+
+        if (!userId && !qrId) {
+            return res.status(400).json({ error: 'userId or qrId is required' });
         }
 
         let allTxns = [];
@@ -1209,19 +1356,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const filters = [];
 
             try {
-            const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-            
-            if (qrId) {
-                if (userQrIds.includes(qrId) || isAdmin) {
+            if (!userId && qrId) {
+                // Only qrId passed — query directly by qrId
                 filters.push(Query.equal('qrCodeId', qrId));
-                } else {
-                return res.status(200).json({ transactions: [] });
-                }
             } else {
-                if (userQrIds.length === 0) {
-                return res.status(200).json({ transactions: [] });
+                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+
+                if (qrId) {
+                    if (userQrIds.includes(qrId) || isAdmin) {
+                    filters.push(Query.equal('qrCodeId', qrId));
+                    } else {
+                    return res.status(200).json({ transactions: [] });
+                    }
+                } else {
+                    if (userQrIds.length === 0) {
+                    return res.status(200).json({ transactions: [] });
+                    }
+                    filters.push(Query.equal('qrCodeId', userQrIds));
                 }
-                filters.push(Query.equal('qrCodeId', userQrIds));
             }
 
             // Date filter helper — timezone-safe, works on any server
@@ -1286,6 +1438,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 }
             }
 
+            filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
             const queries = [
                 ...filters,
                 Query.orderDesc('created_at'),
@@ -1330,19 +1483,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     });
 
-    router.post("/create-image-entry-in-transaction", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/create-image-entry-in-transaction", authenticateAdminOrLabel('transaction_image_upload'), async (req, res) => {
         try {   
             const { txnId, imageUrl } = req.body;
             if (!txnId || !imageUrl) {
                 return res.status(400).json({ error: 'txnId and imageUrl are required' });
             }   
-            const txDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
-                [Query.equal('$id', txnId), Query.limit(1)]
-            );
-            const tx = txDocs.documents[0];
-            if (!tx) {
-                return res.status(404).json({ error: 'Transaction not found' });
-            }
+            try { await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
             const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId, { imageUrl });
             return res.status(200).json({ success: true, transaction: updated });
         } catch (error) {
@@ -1351,7 +1499,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
     });
 
-    router.post("/delete-transaction-image", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/delete-transaction-image", authenticateAdminOrLabel('transaction_image_upload'), async (req, res) => {
         try { 
             const { txnId } = req.body;
             if (!txnId) {
@@ -1359,15 +1507,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }   
 
             // Step 1: Fetch transaction to get current imageUrl and fileId
-            const txDocs = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 
-                webhook_collectionId,
-                [Query.equal('$id', txnId), Query.limit(1)]
-            );
-            const tx = txDocs.documents[0];
-            if (!tx) {
-                return res.status(404).json({ error: 'Transaction not found' });
-            }
+            let tx;
+            try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, txnId); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
 
             // Step 2: Extract fileId from imageUrl or transaction data
             // Assuming imageUrl format: .../buckets/{bucketId}/files/{fileId}/view
@@ -1404,7 +1546,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Admin-only: update transaction status with reconciliation logic
-    router.patch('/transactions/:id/status', authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
+    router.patch('/transactions/:id/status', authenticateAdminOrLabel('change_transaction_status'), async (req, res) => {
         try {
             const { id: TxnID } = req.params;
             const { status } = req.body;
@@ -1420,10 +1562,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const nextStatus = status.toLowerCase();
 
             // 2) Load transaction
-            const txDocs = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
-            [Query.equal('$id', TxnID), Query.limit(1)]);
-            const tx = txDocs.documents[0];
-            if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+            let tx;
+            try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID); }
+            catch (e) { return res.status(404).json({ error: 'Transaction not found' }); }
 
             const prevStatus = ((tx.status || 'normal').trim().toLowerCase());
             if (prevStatus === nextStatus) {
@@ -1601,7 +1742,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // ✏️ Edit transaction endpoint
-    router.patch('/transactions/:id',  authenticateAdminOrLabel('edit_transactions'), async (req, res) => {
+    router.patch('/transactions/:id',  authenticateAdmin, async (req, res) => {
     try {
         const { id: TxnID } = req.params;
         const { qrCodeId, rrnNumber, amount, isoDate /* status removed */ } = req.body;
@@ -1612,13 +1753,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } // enforce separation of concerns [web:185][web:198]
 
         // 1) Fetch existing transaction
-        const Txndocuments = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        webhook_collectionId,
-        [Query.equal('$id', TxnID), Query.limit(1)]
-        );
-        const tx = Txndocuments.documents[0];
-        if (!tx) return res.status(404).json({ error: 'Transaction not found' }); // standard REST practice [web:185]
+        let tx;
+        try { tx = await databases.getDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID); }
+        catch (e) { return res.status(404).json({ error: 'Transaction not found' }); } // standard REST practice [web:185]
 
         // 2) Prepare validated updates (partial)
         const updates = {};
@@ -1693,16 +1830,22 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
         try {
 
+        // Fetch old QR doc once — reused in both 5A and 5B
+        let oldQrDoc = null;
+        if (oldQrId) {
+            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                Query.equal('qrId', oldQrId),
+                Query.limit(1),
+            ]);
+            if (oldQrList.documents.length) oldQrDoc = oldQrList.documents[0];
+        }
+
         // 5A) Same QR, amount changed: adjust based on existing status
         if (hasAmountChange && !movedQr) {
         const amountDiff = newAmountPaise - oldAmountPaise; // +/- delta [web:185]
 
-        const qrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-            Query.equal('qrId', oldQrId),
-            Query.limit(1),
-        ]);
-            if (qrList.documents.length) {
-                const qr = qrList.documents[0];
+            if (oldQrDoc) {
+                const qr = oldQrDoc;
 
                 if (isPrevNormal) {
                     // Normal: adjust ledger total; available derives from totals
@@ -1746,14 +1889,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         // 5B) QR changed: remove prior impact from old QR, add new impact to new QR, based on existing status
         if (movedQr) {
-        // Old QR: reverse prior impact
-        if (oldQrId) {
-            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
-            Query.equal('qrId', oldQrId),
-            Query.limit(1),
-            ]);
-            if (oldQrList.documents.length) {
-            const oldQr = oldQrList.documents[0];
+        // Old QR: reverse prior impact (reuse oldQrDoc fetched above)
+        if (oldQrId && oldQrDoc) {
+            const oldQr = oldQrDoc;
             if (isPrevNormal) {
                 const newTotal = Number(oldQr.totalPayInAmount || 0) - oldAmountPaise;
                 const newAvailableOldQr = recomputeAvailable({ ...oldQr, totalPayInAmount: newTotal });
@@ -1784,7 +1922,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
                 amountAvailableForWithdrawal: newAvailableOldQr,
                 }); // remove from hold for non-normal tx [web:170][web:176]
-            }
             }
         }
 
@@ -1914,6 +2051,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             id
             );
             if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+
+            if (tx.deleted === true) {
+                return res.status(400).json({ error: 'Transaction is already deleted' });
+            }
 
             const amountPaise = Number(tx.amount || 0); // paise
             const qrId = tx.qrCodeId;
@@ -2076,12 +2217,58 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
             await Promise.all(deleteCounters);
 
-            // 4) Delete the transaction document — counters are already decremented
-            await databases.deleteDocument(
+            // 4) Soft-delete the transaction document — counters are already decremented
+            await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
                 webhook_collectionId,
-                id
+                id,
+                { deleted: true ,
+                  edited_by: `admin | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
+                }
             );
+
+            // 5) Update daily_deleted_summary — same pattern as daily_qr_summaries
+            const delDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+
+            const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
+            try {
+                const existingDelSummary = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', delDayString), Query.limit(1)]
+                );
+
+                if (existingDelSummary.total > 0) {
+                    const doc = existingDelSummary.documents[0];
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(doc.totalsJson || '{}');
+                    } catch (e) {
+                        console.error('CORRUPT totalsJson in daily_deleted_summary doc', doc.$id, '— aborting');
+                        throw new Error('Daily deleted summary JSON is corrupted — manual fix required');
+                    }
+
+                    const currentTotal = Number(totalsObj[qrId || 'no_qr'] || 0);
+                    totalsObj[qrId || 'no_qr'] = currentTotal + amountPaise;
+
+                    await databases.updateDocument(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                        doc.$id,
+                        { totalsJson: JSON.stringify(totalsObj) }
+                    );
+                } else {
+                    const totalsObj = { [qrId || 'no_qr']: amountPaise };
+                    await databases.createDocument(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                        ID.unique(),
+                        { date: delDayString, totalsJson: JSON.stringify(totalsObj) }
+                    );
+                }
+            } finally {
+                await releaseLock(delDailyLock.key, delDailyLock.val);
+            }
 
             return res.status(200).json({ message: 'Transaction deleted', id });
             } finally {
@@ -2097,7 +2284,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     // Manual transaction creation endpoint
-    router.post("/transactions/manual", authenticateAdminOrLabel('manual_transactions'), async (req, res) => {
+    router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
         try {
             const { qrCodeId, rrnNumber, amount, isoDate } = req.body;
 
@@ -2285,31 +2472,25 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             // console.log('getMyMetaData for userId:', userId);
 
-            const result = await databases.listDocuments(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_USERS_META_COLLECTION_ID,
-            [Query.equal('userId', userId)] // must be in an array
-            );
+            const doc = await userMetaCache.getUserMeta(userId);
 
-            if (!result.documents.length) {
-            return res.status(404).json({ error: 'User metadata not found 2' });
+            if (!doc) {
+                return res.status(404).json({ error: 'User metadata not found' });
             }
-
-            const doc = result.documents[0];
 
             // console.log('getMyMetaData doc:', doc);
 
             // Optionally pick only safe fields
             const payload = {
-            id: doc.userId,
-            email: doc.email,
-            name: doc.name,
-            role: doc.role,
-            parentId: doc.parentId,
-            status: doc.status,
-            labels: doc.labels,
-            commission: doc.commission || 0,
-            // childrenCount: doc.childrenCount, // if you added counter cache
+                id: doc.userId,
+                email: doc.email,
+                name: doc.name,
+                role: doc.role,
+                parentId: doc.parentId,
+                status: doc.status,
+                labels: doc.labels,
+                commission: doc.commission || 0,
+                // childrenCount: doc.childrenCount, // if you added counter cache
             };
 
             // console.log('getMyMetaData payload:', payload);
@@ -2323,8 +2504,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // GET /commissions
     // Roles: admin and subadmin (optional narrowing by current user)
-    router.get('/commissions',authenticateAdminOrLabel('all_commissions', { isSubadminAllowed: true }),
-        async (req, res) => {
+    router.get('/commissions',authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
             const {
             userId,
             earningType,           // 'admin' | 'subadmin'
@@ -2844,7 +3024,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     });
 
     function istDateTimeNow(){
-        return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+        return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     // GET /dashboard/counters
@@ -3758,6 +3938,275 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } catch (err) {
             console.error('Payin summary error:', err);
             return res.status(500).json({ error: 'Failed to fetch payin summary' });
+        }
+    });
+
+    // Fetch daily deleted transaction summary (same pattern as payin-summary)
+    router.get('/deleted-summary', authenticateAdmin, async (req, res) => {
+        try {
+            const actor = req.user;
+            const isAdmin = actor.role === 'admin';
+            const isSubadmin = actor.role === 'subadmin';
+            const isEmployee = actor.role === 'employee';
+
+            const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+
+            const from = req.query.from || todayStr;
+            const to = req.query.to || todayStr;
+            const filterUserId = req.query.userId || null;
+            const filterQrId = req.query.qrId || null;
+
+            // 1) Determine which QR IDs the caller can see
+            let allowedQrIds = null; // null = all (admin)
+
+            if (isAdmin || isEmployee) {
+                if (filterUserId) {
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                }
+            } else if (isSubadmin) {
+                if (filterUserId) {
+                    const managedUsers = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                        [Query.equal('parentId', actor.userId)]
+                    );
+                    const managedUserIds = managedUsers.documents.map(u => u.userId);
+                    if (filterUserId !== actor.userId && !managedUserIds.includes(filterUserId)) {
+                        return res.status(403).json({ error: 'You can only view your own users' });
+                    }
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                } else {
+                    allowedQrIds = [...(await getQrIdsForSubadmin(actor.userId))];
+                }
+            } else {
+                allowedQrIds = await getQrIdsForUser(actor.userId);
+            }
+
+            if (filterQrId) {
+                if (allowedQrIds && !allowedQrIds.includes(filterQrId)) {
+                    return res.status(403).json({ error: 'You do not have access to this QR code' });
+                }
+                allowedQrIds = [filterQrId];
+            }
+
+            // 2) Fetch daily deleted summary docs for the date range
+            const startDate = moment.tz(from, 'Asia/Kolkata');
+            const endDate = moment.tz(to, 'Asia/Kolkata');
+            if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+                return res.status(400).json({ error: 'Invalid date range' });
+            }
+
+            const days = [];
+            let grandTotalPaise = 0;
+            let todayPaise = 0;
+            let yesterdayPaise = 0;
+
+            const cursor = startDate.clone();
+            while (cursor.isSameOrBefore(endDate, 'day')) {
+                const dateStr = cursor.format('YYYY-MM-DD');
+
+                const summaryDocs = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', dateStr), Query.limit(1)]
+                );
+
+                let dayTotal = 0;
+                let qrBreakdown = {};
+
+                if (summaryDocs.total > 0) {
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(summaryDocs.documents[0].totalsJson || '{}');
+                    } catch (e) {
+                        console.error('WARNING: corrupted totalsJson in deleted summary for date', dateStr, '—', e.message);
+                        totalsObj = {};
+                    }
+
+                    for (const [qrId, paise] of Object.entries(totalsObj)) {
+                        if (allowedQrIds && !allowedQrIds.includes(qrId)) continue;
+                        const amount = parseInt(paise || 0, 10);
+                        qrBreakdown[qrId] = amount;
+                        dayTotal += amount;
+                    }
+                }
+
+                days.push({
+                    date: dateStr,
+                    totalPaise: dayTotal,
+                    totalRs: dayTotal / 100,
+                    qrs: qrBreakdown,
+                });
+
+                grandTotalPaise += dayTotal;
+                if (dateStr === todayStr) todayPaise = dayTotal;
+                if (dateStr === yesterdayStr) yesterdayPaise = dayTotal;
+
+                cursor.add(1, 'day');
+            }
+
+            return res.json({
+                days,
+                grandTotalPaise,
+                grandTotalRs: grandTotalPaise / 100,
+                todayPaise,
+                todayRs: todayPaise / 100,
+                yesterdayPaise,
+                yesterdayRs: yesterdayPaise / 100,
+            });
+        } catch (err) {
+            console.error('Deleted summary error:', err);
+            return res.status(500).json({ error: 'Failed to fetch deleted summary' });
+        }
+    });
+
+    // ===================== Config Management (Admin Only) =====================
+
+    const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json'];
+
+    function validateConfigVal(type, val) {
+        if (typeof val !== 'string') return 'val must be a string';
+        if (type === 'integer') {
+            if (!/^-?\d+$/.test(val)) return 'val must be a valid integer (e.g. "100")';
+        } else if (type === 'double') {
+            if (isNaN(parseFloat(val))) return 'val must be a valid number (e.g. "10.5")';
+        } else if (type === 'boolean') {
+            if (!['true', 'false', '1', '0', 'yes', 'no'].includes(val.toLowerCase())) return 'val must be a boolean string (true/false/1/0/yes/no)';
+        } else if (type === 'json') {
+            try { JSON.parse(val); } catch (e) { return 'val must be valid JSON'; }
+        }
+        return null;
+    }
+
+    // GET all configs
+    router.get('/config', async (_req, res) => {
+        try {
+            await ConfigManager.refresh();
+            const rawDocs = ConfigManager.getRawDocs();
+            res.json({ success: true, configs: rawDocs.map(d => ({ id: d.$id, key: d.key, val: d.val ?? String(d.value ?? ''), type: d.type, description: d.description ?? '', $createdAt: d.$createdAt, $updatedAt: d.$updatedAt })) });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to fetch configs' });
+        }
+    });
+
+    // POST create new config
+    router.post('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key, val, type, description } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required and must be a non-empty string' });
+            }
+            if (!type || !ALLOWED_CONFIG_TYPES.includes(type)) {
+                return res.status(400).json({ error: `type is required and must be one of: ${ALLOWED_CONFIG_TYPES.join(', ')}` });
+            }
+            if (val == null) {
+                return res.status(400).json({ error: 'val is required' });
+            }
+            const valErr = validateConfigVal(type, val);
+            if (valErr) return res.status(400).json({ error: valErr });
+
+            // Check if key already exists
+            await ConfigManager.refresh();
+            const existing = ConfigManager.getRawDoc(key.trim());
+            if (existing) {
+                return res.status(409).json({ error: `Config key "${key.trim()}" already exists. Use PUT to update.` });
+            }
+
+            const createData = { key: key.trim(), val, type };
+            if (description != null) createData.description = String(description);
+
+            await databases.createDocument(
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
+                ID.unique(),
+                createData
+            );
+
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" created` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to create config' });
+        }
+    });
+
+    // PUT update existing config
+    router.put('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key, val, type, description } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required' });
+            }
+
+            await ConfigManager.refresh();
+            const doc = ConfigManager.getRawDoc(key.trim());
+            if (!doc) {
+                return res.status(404).json({ error: `Config key "${key.trim()}" not found` });
+            }
+
+            const updateData = {};
+            const effectiveType = type || doc.type;
+
+            if (type) {
+                if (!ALLOWED_CONFIG_TYPES.includes(type)) {
+                    return res.status(400).json({ error: `type must be one of: ${ALLOWED_CONFIG_TYPES.join(', ')}` });
+                }
+                updateData.type = type;
+            }
+
+            if (val != null) {
+                const valErr = validateConfigVal(effectiveType, val);
+                if (valErr) return res.status(400).json({ error: valErr });
+                updateData.val = val;
+            }
+
+            if (description != null) {
+                updateData.description = String(description);
+            }
+
+            if (Object.keys(updateData).length === 0) {
+                return res.status(400).json({ error: 'Nothing to update. Provide val, type, and/or description.' });
+            }
+
+            await databases.updateDocument(
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
+                doc.$id,
+                updateData
+            );
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" updated` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to update config' });
+        }
+    });
+
+    // DELETE config
+    router.delete('/config', authenticateAdmin, async (req, res) => {
+        try {
+            const { key } = req.body;
+            if (!key || typeof key !== 'string' || !key.trim()) {
+                return res.status(400).json({ error: 'key is required' });
+            }
+
+            await ConfigManager.refresh();
+            const doc = ConfigManager.getRawDoc(key.trim());
+            if (!doc) {
+                return res.status(404).json({ error: `Config key "${key.trim()}" not found` });
+            }
+
+            await databases.deleteDocument(
+                '688ca9f3003e593a6227',
+                '68a73217002ed987b246',
+                doc.$id
+            );
+            await ConfigManager.refresh();
+            res.json({ success: true, message: `Config "${key.trim()}" deleted` });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: err.message || 'Failed to delete config' });
         }
     });
 

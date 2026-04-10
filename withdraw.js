@@ -8,6 +8,7 @@ const moment = require('moment-timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
 const ConfigManager = require('./configManager');
+const userMetaCache = require('./userMetaCache');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -34,14 +35,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     return `${prefix}${timestamp}${random}`;
   }
 
-  // Helper to get user by userId
+  // Helper to get user by userId — cached in Redis
   async function getUserMeta(userId) {
-    const users = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_USERS_META_COLLECTION_ID,
-      [Query.equal("userId", userId), Query.limit(1)]
-    );
-    return users.documents[0];
+    return userMetaCache.getUserMeta(userId);
   }
 
   // Helper to get user by userId
@@ -552,7 +548,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
       try {
-        const {userId, qrId, status, limit: limitStr, cursor } = req.query;
+        const {userId, qrId, status, from, to, limit: limitStr, cursor } = req.query;
 
         // 1) Parse limit with sane default + cap
         const DEFAULT_LIMIT = 25;
@@ -665,6 +661,29 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           queries.push(Query.equal('status', status));
         }
 
+        // Date filters (IST-aware)
+        function toISTRange(dateStr) {
+            const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+            const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+            return { start, end };
+        }
+        if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            }
+        } else if (from && !to) {
+            const { start, end } = toISTRange(from);
+            queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+        } else if (!from && to) {
+            const { end } = toISTRange(to);
+            queries.push(Query.lessThanEqual('$createdAt', end.toISOString()));
+        }
+
         // Stable order by creation time (newest first)
         queries.push(Query.orderDesc('$createdAt'));
 
@@ -736,7 +755,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /user_withdrawals?userId=...&status=pending&limit=20&cursor=<docId>
     router.get('/user_withdrawals_paginated', async (req, res) => {
       try {
-        const { status, userId, limit: limitStr, cursor } = req.query;
+        const { status, userId, from, to, limit: limitStr, cursor } = req.query;
 
         // Parse and cap limit
         const DEFAULT_LIMIT = 25;
@@ -757,8 +776,31 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           queries.push(Query.equal('userId', userId));
         }
 
+        // Date filters (IST-aware)
+        function toISTRange(dateStr) {
+            const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
+            const end = moment.tz(dateStr, 'Asia/Kolkata').endOf('day').utc().toDate();
+            return { start, end };
+        }
+        if (from && to) {
+            if (from === to) {
+                const { start, end } = toISTRange(from);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            } else {
+                const { start } = toISTRange(from);
+                const { end } = toISTRange(to);
+                queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+            }
+        } else if (from && !to) {
+            const { start, end } = toISTRange(from);
+            queries.push(Query.between('$createdAt', start.toISOString(), end.toISOString()));
+        } else if (!from && to) {
+            const { end } = toISTRange(to);
+            queries.push(Query.lessThanEqual('$createdAt', end.toISOString()));
+        }
+
         // Order by $createdAt descending
-        queries.push(Query.orderDesc('$createdAt')); // ensure index on $createdAt for performance
+        queries.push(Query.orderDesc('$createdAt'));
 
         // Cursor-based pagination
         if (cursor) {
@@ -1331,8 +1373,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       return moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM'); // TZ-safe month key [web:51]
     }
 
+    // function istDateTimeNow(){
+    //   return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+    // }
+
     function istDateTimeNow(){
-      return moment().tz('Asia/Kolkata').format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
+      return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
     // One entrypoint after computing commissionTxs in your approval route
