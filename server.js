@@ -1576,6 +1576,29 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
   }
 }
 
+// ─── PineLabs transaction poller ─────────────────────────────────────────────
+// Mirrors the Razorpay /webhook pipeline for PineLabs: periodically pulls
+// SUCCESS transactions and persists them with dedup, QR totals, daily summary,
+// socket emit, and dashboard counters. TID is used as the QR doc's qrId.
+const { startPinelabPoller } = require('./pinelabPoller');
+startPinelabPoller(
+  {
+    databases,
+    Query,
+    ID,
+    redisClient,
+    acquireLock,
+    releaseLock,
+    emitTxnNew,
+    updateDailyQrTotal,
+    APPWRITE_DATABASE_ID,
+    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+    APPWRITE_QRCODE_COLLECTION_ID,
+    LOCK_TTL_SECONDS,
+  },
+  { env: 'production', intervalMs: 1 * 60 * 1000, overlapMinutes: 50, pageSize: 100 }
+);
+
 // Root endpoint for testing
 app.get('/', (req, res) => {
     res.send('KitePay API is running!');
