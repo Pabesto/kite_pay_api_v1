@@ -50,7 +50,8 @@ function startPinelabPoller(deps, opts = {}) {
 
   const env               = opts.env               || 'production';
   const intervalMs        = opts.intervalMs        || 2 * 60 * 1000; // 2 min
-  const overlapMin        = opts.overlapMinutes   ?? 30;             // lookback buffer
+  const overlapMin        = opts.overlapMinutes   ?? 30;             // lookback buffer for wall-clock ticks
+  const recoveryOverlapMin = opts.recoveryOverlapMinutes ?? 10;      // smaller buffer when DB has ground truth
   const pageSize          = opts.pageSize          || 100;
   const maxPagesPerTick   = opts.maxPagesPerTick   || 50;            // safety cap
   const dryRun            = !!opts.dryRun;
@@ -241,6 +242,9 @@ function startPinelabPoller(deps, opts = {}) {
   }
 
   // Resume point when Redis watermark is missing (fresh deploy, Redis flush, etc.).
+  // Returns { anchor, source } so the caller can choose the right overlap buffer:
+  //   source='db'        → latest processed txn is ground truth, use small buffer
+  //   source='coldstart' → no prior data, use normal buffer
   async function resolveResumeFromDb(now) {
     try {
       const result = await databases.listDocuments(
@@ -255,13 +259,13 @@ function startPinelabPoller(deps, opts = {}) {
       if (result.documents.length > 0 && result.documents[0].created_at) {
         const d = new Date(result.documents[0].created_at);
         log('RESUME', 'recovered from DB — latest pinelabs txn', { created_at: result.documents[0].created_at });
-        return d;
+        return { anchor: d, source: 'db' };
       }
       log('RESUME', 'no prior pinelabs txns in DB — cold start');
     } catch (e) {
       console.error('[PINELAB-POLL] resolveResumeFromDb failed:', e.message);
     }
-    return new Date(now.getTime() - overlapMin * 60 * 1000);
+    return { anchor: new Date(now.getTime() - overlapMin * 60 * 1000), source: 'coldstart' };
   }
 
   // Fetch and process a single explicit [from, to] window.
@@ -329,20 +333,38 @@ function startPinelabPoller(deps, opts = {}) {
     return { totalSeen, totalSaved, hitPageCap, durationMs, fromDate, toDate };
   }
 
+  // Resolve the [from, to] window for a scheduled / default run.
+  // Buffer logic:
+  //   - Redis watermark present → normal overlapMin (wall-clock anchor, fat buffer)
+  //   - DB recovery             → recoveryOverlapMin (real txn anchor, lean buffer)
+  //   - Cold start              → normal overlapMin (no ground truth, fat buffer)
+  async function resolveDefaultWindow() {
+    const now = new Date();
+    let lastIso = null;
+    try { lastIso = await redisClient.get(watermarkKey); }
+    catch (e) { console.error('[PINELAB-POLL] redis.get watermark failed:', e.message); }
+
+    let fromBase;
+    let bufferMin;
+    if (lastIso) {
+      fromBase = new Date(lastIso);
+      bufferMin = overlapMin;
+    } else {
+      const resume = await resolveResumeFromDb(now);
+      fromBase = resume.anchor;
+      bufferMin = resume.source === 'db' ? recoveryOverlapMin : overlapMin;
+    }
+
+    const from = new Date(fromBase.getTime() - bufferMin * 60 * 1000);
+    return { from, to: now, bufferMin };
+  }
+
   async function tick() {
     if (running) { log('SKIP', 'previous tick still running'); return; }
     if (stopped) return;
     running = true;
     try {
-      let lastIso = null;
-      try { lastIso = await redisClient.get(watermarkKey); }
-      catch (e) { console.error('[PINELAB-POLL] redis.get watermark failed:', e.message); }
-
-      const now = new Date();
-      const fromBase = lastIso ? new Date(lastIso) : await resolveResumeFromDb(now);
-      const from = new Date(fromBase.getTime() - overlapMin * 60 * 1000);
-      const to   = now;
-
+      const { from, to } = await resolveDefaultWindow();
       await fetchWindow(from, to, { advanceWatermark: true });
       try { await redisClient.set(mConsecFails, '0'); } catch (_) {}
     } catch (e) {
@@ -361,13 +383,8 @@ function startPinelabPoller(deps, opts = {}) {
     if (from && to) {
       return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false });
     }
-    // No window → behave like a scheduled tick
-    const now = new Date();
-    let lastIso = null;
-    try { lastIso = await redisClient.get(watermarkKey); } catch (_) {}
-    const fromBase = lastIso ? new Date(lastIso) : await resolveResumeFromDb(now);
-    const fromD = new Date(fromBase.getTime() - overlapMin * 60 * 1000);
-    return fetchWindow(fromD, now, { advanceWatermark: true });
+    const window = await resolveDefaultWindow();
+    return fetchWindow(window.from, window.to, { advanceWatermark: true });
   }
 
   function stop() {
