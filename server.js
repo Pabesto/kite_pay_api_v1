@@ -1479,7 +1479,7 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // SUCCESS transactions and persists them with dedup, QR totals, daily summary,
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
 const { startPinelabPoller } = require('./pinelabPoller');
-startPinelabPoller(
+const pinelabPoller = startPinelabPoller(
   {
     databases,
     Query,
@@ -1494,8 +1494,53 @@ startPinelabPoller(
     APPWRITE_QRCODE_COLLECTION_ID,
     LOCK_TTL_SECONDS,
   },
-  { env: 'production', intervalMs: 1 * 60 * 1000, overlapMinutes: 50, pageSize: 100 }
+  {
+    env: 'production',
+    intervalMs: 1 * 60 * 1000,
+    overlapMinutes: 50,
+    pageSize: 100,
+    maxPagesPerTick: 50,
+    dryRun: false,
+  }
 );
+
+// Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
+// normal watermark window; pass both for an explicit backfill window.
+// Body: { from?: ISOString, to?: ISOString }
+app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
+  try {
+    const { from, to } = req.body || {};
+    if ((from && !to) || (!from && to)) {
+      return res.status(400).json({ error: 'Provide both from and to, or neither' });
+    }
+    const result = await pinelabPoller.runOnce({ from, to });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[admin/pinelabs/poll] error:', e);
+    res.status(500).json({ error: e.message || 'poll failed' });
+  }
+});
+
+// Admin-only: read poller health/metrics from Redis
+app.get('/admin/pinelabs/status', authenticateAdmin, async (req, res) => {
+  try {
+    const keys = [
+      'pinelabs:poller:lastPolledAt',
+      'pinelabs:poller:lastRunAt',
+      'pinelabs:poller:lastTxnsSeen',
+      'pinelabs:poller:lastTxnsSaved',
+      'pinelabs:poller:lastDurationMs',
+      'pinelabs:poller:consecutiveFailures',
+      'pinelabs:poller:lastError',
+    ];
+    const values = await Promise.all(keys.map(k => redisClient.get(k).catch(() => null)));
+    const out = {};
+    keys.forEach((k, i) => { out[k.replace('pinelabs:poller:', '')] = values[i]; });
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'status failed' });
+  }
+});
 
 // Root endpoint for testing
 app.get('/', (req, res) => {
@@ -1512,6 +1557,7 @@ app.get('/', (req, res) => {
 // before closing DB/Redis connections, then exit cleanly.
 async function gracefulShutdown(signal) {
     console.log(`\n${signal} received — starting graceful shutdown`);
+    try { pinelabPoller.stop(); } catch (e) { console.error('Error stopping PineLabs poller:', e); }
     httpServer.close(async () => {
         console.log('HTTP server closed — no new connections accepted');
         try {
