@@ -411,7 +411,7 @@ function startPinelabPoller(deps, opts = {}) {
     log('STOP', 'poller stopped');
   }
 
-  log('BOOT', 'starting poller', { env, intervalMs, overlapMin, pageSize, maxPagesPerTick, dryRun });
+  log('BOOT', 'starting poller', { env, intervalMs, bufferMin, maxLookbackMin, pageSize, maxPagesPerTick, dryRun });
   bootTimeoutHandle = setTimeout(tick, 10_000);
   intervalHandle    = setInterval(tick, intervalMs);
 
