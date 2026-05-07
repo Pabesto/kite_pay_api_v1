@@ -1,6 +1,6 @@
 // copyAppwriteSchema.js — copies tables, columns, and indexes from one Appwrite
-// database into another. Does NOT copy any rows. Standalone — does not import
-// anything from this project. Fill in SOURCE and TARGET below, then:
+// database into another. Optionally also copies rows for tables you list in
+// TABLES_TO_COPY_ROWS. Standalone — does not import anything from this project.
 //     node scripts/copyAppwriteSchema.js
 
 // =====================  EDIT THESE  =====================
@@ -12,11 +12,21 @@ const SOURCE = {
 };
 
 const TARGET = {
-  endpoint:   'https://fra.cloud.appwrite.io/v1',
-  projectId:  '688c98fd002bfe3cf596',
-  apiKey:     'standard_b2443fedac19c0903a7a280fbb0d121ea52353d7d81533f1b8a76dab54721871a595a87624511da1ad635336e50946caf684a8650bfe4fd4f5d9839cb916e595314f8b2921cc78dcd477e468393bcd4932616d3412da4e5cc5d6d79a4b31e391d2d5e1172eaa08a2fafc3b2b8615bc9ec57b17d70884c7b48957ccdc7d8d803a',
-  databaseId: '69fbe5c00035ef79aae4',
+  endpoint:   'https://sgp.cloud.appwrite.io/v1',
+  projectId:  '69fbf3d100025d91e8d5',
+  apiKey:     'standard_cbe1d7b44195f9ddd89443d29adfdce5bce20bece882e0702037f71832c69915d5e6e89b1edfe1f944eac197b22289f7190895e2bd3dbca5fdf68d29123106ae70674ac2b0ba70b2b5bfa8eeeb504b39eca5054d81db7edcb27ca6ada6dc4ae93949d0fb1c623cc585090cfb21a3bb2c527ab6773037b837de2e33f11cdf3854',
+  databaseId: '69fbf49100207103019a',
 };
+
+// Tables for which rows should be copied (in addition to schema).
+// Paste the table IDs (the same value as $id, e.g. "users", "transactions").
+// Leave the array empty to skip row copying entirely.
+const TABLES_TO_COPY_ROWS = [
+  '68a73217002ed987b246',
+  'dashboard_counters',
+  // 'tableId1',
+  // 'tableId2',
+];
 // ========================================================
 
 const {
@@ -46,6 +56,16 @@ function isAlreadyExists(err) {
   return m.includes('already exists') || m.includes('attribute_already_exists') || m.includes('index_already_exists');
 }
 
+function describeErr(err) {
+  if (!err) return 'unknown error';
+  const parts = [];
+  if (err.code)     parts.push(`code=${err.code}`);
+  if (err.type)     parts.push(`type=${err.type}`);
+  if (err.message)  parts.push(err.message);
+  if (err.response) parts.push(`response=${JSON.stringify(err.response)}`);
+  return parts.join(' | ');
+}
+
 async function listAllTables(db, databaseId) {
   const out = [];
   let cursor;
@@ -73,7 +93,8 @@ async function listAllIndexes(db, databaseId, tableId) {
 
 const req = (col) => !!col.required;
 const arr = (col) => !!col.array;
-const def = (col) => col.default;
+const u   = (v) => (v === null ? undefined : v); // null -> undefined (Appwrite API rejects null on optional fields)
+const def = (col) => u(col.default);
 
 async function createColumn(db, databaseId, tableId, col) {
   const t   = (col.type   || '').toLowerCase();
@@ -106,14 +127,14 @@ async function createColumn(db, databaseId, tableId, col) {
     return db.createIntegerColumn({
       databaseId, tableId,
       key: col.key, required: req(col),
-      min: col.min, max: col.max, xdefault: def(col), array: arr(col),
+      min: u(col.min), max: u(col.max), xdefault: def(col), array: arr(col),
     });
   }
   if (t === 'double' || t === 'float') {
     return db.createFloatColumn({
       databaseId, tableId,
       key: col.key, required: req(col),
-      min: col.min, max: col.max, xdefault: def(col), array: arr(col),
+      min: u(col.min), max: u(col.max), xdefault: def(col), array: arr(col),
     });
   }
   if (t === 'boolean') {
@@ -220,7 +241,7 @@ async function copySchema(srcDb, srcDbId, dstDb, dstDbId) {
         console.log(`     [OK]   ${col.key}  (${col.type}${col.format ? '/' + col.format : ''}${arr(col) ? '[]' : ''})`);
       } catch (e) {
         if (isAlreadyExists(e)) console.log(`     [SKIP] ${col.key} already exists`);
-        else console.error(`     [ERR]  ${col.key}: ${e.message}`);
+        else console.error(`     [ERR]  ${col.key} (${col.type}${col.format ? '/' + col.format : ''}): ${describeErr(e)}`);
       }
     }
     await waitForColumns(dstDb, dstDbId, t.$id, nonRel.map((c) => c.key));
@@ -239,7 +260,7 @@ async function copySchema(srcDb, srcDbId, dstDb, dstDbId) {
         }
       } catch (e) {
         if (isAlreadyExists(e)) console.log(`     [SKIP] ${tableId}.${col.key} already exists`);
-        else console.error(`     [ERR]  ${tableId}.${col.key}: ${e.message}`);
+        else console.error(`     [ERR]  ${tableId}.${col.key}: ${describeErr(e)}`);
       }
     }
     for (const t of tables) {
@@ -272,15 +293,111 @@ async function copySchema(srcDb, srcDbId, dstDb, dstDbId) {
         console.log(`     [OK]   ${idx.key} (${idx.type}) on [${idx.columns.join(',')}]`);
       } catch (e) {
         if (isAlreadyExists(e)) console.log(`     [SKIP] ${idx.key} already exists`);
-        else console.error(`     [ERR]  ${idx.key}: ${e.message}`);
+        else console.error(`     [ERR]  ${idx.key}: ${describeErr(e)}`);
       }
     }
   }
 }
 
+// Strip Appwrite-managed system fields out of a row's data before writing it back.
+// Keep only the user-defined column values. $id and $permissions are passed
+// separately on createRow.
+const SYSTEM_FIELDS = new Set([
+  '$id', '$createdAt', '$updatedAt', '$permissions',
+  '$databaseId', '$tableId', '$collectionId', '$sequence',
+]);
+
+function stripSystemFields(row) {
+  const out = {};
+  for (const k of Object.keys(row)) {
+    if (SYSTEM_FIELDS.has(k)) continue;
+    const v = row[k];
+    // Skip resolved relationship payloads — they come back as nested row objects
+    // (or arrays of them). Recreating them on the target would fail because the
+    // related row doesn't exist yet; the relationship is rebuilt by the
+    // relationship column itself once both sides exist.
+    if (v && typeof v === 'object' && !Array.isArray(v) && '$id' in v) continue;
+    if (Array.isArray(v) && v.length && v[0] && typeof v[0] === 'object' && '$id' in v[0]) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+async function copyRows(srcDb, srcDbId, dstDb, dstDbId, tableIds) {
+  if (!tableIds || !tableIds.length) {
+    console.log('\n--- Step 5: copy rows --- (skipped, TABLES_TO_COPY_ROWS is empty)');
+    return;
+  }
+
+  console.log(`\n--- Step 5: copy rows for ${tableIds.length} table(s) ---`);
+
+  for (const tableId of tableIds) {
+    console.log(`\n  Table: ${tableId}`);
+
+    let total = 0;
+    try {
+      const head = await srcDb.listRows({ databaseId: srcDbId, tableId, queries: [Query.limit(1)] });
+      total = head.total || 0;
+    } catch (e) {
+      console.error(`     [ERR]  could not read source table "${tableId}": ${describeErr(e)}`);
+      continue;
+    }
+    console.log(`     source has ${total} row(s)`);
+
+    let copied = 0, skipped = 0, failed = 0;
+    let cursor;
+    const PAGE = 100;
+
+    while (true) {
+      const queries = [Query.limit(PAGE)];
+      if (cursor) queries.push(Query.cursorAfter(cursor));
+
+      let page;
+      try {
+        page = await srcDb.listRows({ databaseId: srcDbId, tableId, queries });
+      } catch (e) {
+        console.error(`     [ERR]  listRows failed: ${describeErr(e)}`);
+        break;
+      }
+      if (!page.rows || !page.rows.length) break;
+
+      for (const row of page.rows) {
+        const rowId = row.$id;
+        const data = stripSystemFields(row);
+        const permissions = Array.isArray(row.$permissions) ? row.$permissions : undefined;
+        try {
+          await dstDb.createRow({
+            databaseId: dstDbId,
+            tableId,
+            rowId,
+            data,
+            permissions,
+          });
+          copied++;
+        } catch (e) {
+          if (isAlreadyExists(e)) {
+            skipped++;
+          } else {
+            failed++;
+            console.error(`     [ERR]  row ${rowId}: ${describeErr(e)}`);
+          }
+        }
+      }
+
+      // progress every page
+      console.log(`     ...progress: copied=${copied} skipped=${skipped} failed=${failed} (of ${total})`);
+
+      if (page.rows.length < PAGE) break;
+      cursor = page.rows[page.rows.length - 1].$id;
+    }
+
+    console.log(`     done: copied=${copied} skipped=${skipped} failed=${failed}`);
+  }
+}
+
 (async () => {
   try {
-    console.log('Appwrite schema copy — tables + columns + indexes only (no rows).');
+    console.log('Appwrite schema copy — tables + columns + indexes (rows only for tables you list).');
 
     validateCreds('SOURCE', SOURCE);
     validateCreds('TARGET', TARGET);
@@ -301,6 +418,8 @@ async function copySchema(srcDb, srcDbId, dstDb, dstDbId) {
     const dstDb = buildClient(TARGET);
 
     await copySchema(srcDb, SOURCE.databaseId, dstDb, TARGET.databaseId);
+
+    await copyRows(srcDb, SOURCE.databaseId, dstDb, TARGET.databaseId, TABLES_TO_COPY_ROWS);
 
     console.log('\nDone.');
   } catch (e) {
