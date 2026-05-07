@@ -376,7 +376,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
         const { qrId, qrType, fileId, imageUrl , createdAt } = req.body;
 
-        console.log('Create QR Entry request body:', req.body);
+        // console.log('Create QR Entry request body:', req.body);
 
         if (!qrId || !fileId || !imageUrl) {
             return res.status(400).json({ message: "Missing required fields: qrId, fileId, or imageUrl." });
