@@ -16,7 +16,7 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 const router = express.Router();
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
 
     // Atomic lock helpers
     const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
@@ -44,7 +44,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 [Query.equal('merchantId', merchantId), Query.limit(1)]
             );
 
@@ -139,7 +139,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 2. Create pending request in DB
             const requestDoc = await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                'api_merchants_requests',
+                APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID,
                 ID.unique(),
                 {
                     merchantId,
@@ -167,7 +167,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 5. Update DB with QR
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                'api_merchants_requests',
+                APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID,
                 requestDoc.$id,
                 {
                     qrBase64,
@@ -244,7 +244,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 2. Find QR request
             const qrRequests = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants_requests',
+                APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID,
                 [
                     Query.equal('orderId', orderId),
                     Query.equal('merchantId', merchantId),
@@ -287,7 +287,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 4. Find webhook transaction
             const webhookTxns = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                '688cf5920023475022df', // webhook payments
+                APPWRITE_WEBHOOK_DATA_COLLECTION_ID, // webhook payments
                 [
                     Query.equal('rrnNumber', rrnNumber),
                     Query.equal('amount', amountPaise),
@@ -347,7 +347,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             try {
             // Re-check alreadyVerified under lock (fresh read)
-            const freshTxn = await databases.getDocument(APPWRITE_DATABASE_ID, '688cf5920023475022df', webhookTxnId);
+            const freshTxn = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, webhookTxnId);
             if (freshTxn.alreadyVerified) {
                 return res.status(200).json({ success: true, message: 'Payment already verified' });
             }
@@ -355,7 +355,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 8. Mark webhook as verified
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                '688cf5920023475022df',
+                APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
                 webhookTxnId,
                 {
                     api_merchants_request_id: qrRequestId,
@@ -368,7 +368,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                'api_merchants_requests',
+                APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID,
                 qrRequestId,
                 {
                     status: 'success',
@@ -420,7 +420,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/admin/merchants', authenticateAdmin, async (req, res) => {
         const { name, email, vpa, dailyLimit = 100 } = req.body;
         const creds = await generateMerchantCredentials();
-        await databases.createDocument(APPWRITE_DATABASE_ID, 'api_merchants', ID.unique(), {
+        await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, ID.unique(), {
             merchantId: creds.merchantId,
             apiSecret: creds.hash,  // Store bcrypt hash, not plain text
             name, email, vpa,
@@ -446,7 +446,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const merchants = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 queries
             );
 
@@ -470,7 +470,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // ✅ Step 1: Find document by merchant_id
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 [
                     Query.equal('merchantId', merchantId),  // ✅ Schema field
                     Query.limit(1)
@@ -503,7 +503,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Step 3: Update document
             const updatedMerchant = await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 docId,
                 updates
             );
@@ -529,7 +529,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // ✅ Find document by merchant_id (indexed field)
             const merchantDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 [
                     Query.equal('merchantId', merchantId),  // ✅ Fixed: merchant_id (schema field)
                     Query.limit(1)
@@ -547,7 +547,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // ✅ Update with toggled status
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                'api_merchants',
+                APPWRITE_API_MERCHANTS_COLLECTION_ID,
                 docId,
                 {
                     status: newStatus,                    // ✅ Toggled value

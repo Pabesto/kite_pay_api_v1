@@ -2,13 +2,15 @@
 let configCache = null;
 let rawDocsCache = null; // Store raw docs for update operations
 let databasesInstance = null; // Store reference
-const CONFIG_DB_ID = '688ca9f3003e593a6227';
-const CONFIG_COLLECTION_ID = '68a73217002ed987b246';
+let CONFIG_DB_ID = null;
+let CONFIG_COLLECTION_ID = null;
 
 class ConfigManager {
-    // ✅ Pass databases once during init
-    static init(databases) {
+    // ✅ Pass databases + collection refs once during init from server.js
+    static init({ databases, APPWRITE_DATABASE_ID, APPWRITE_CONFIG_COLLECTION_ID }) {
         databasesInstance = databases;
+        CONFIG_DB_ID = APPWRITE_DATABASE_ID;
+        CONFIG_COLLECTION_ID = APPWRITE_CONFIG_COLLECTION_ID;
         this.refresh(); // Load config immediately
     }
 

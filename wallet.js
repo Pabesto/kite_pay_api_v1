@@ -1,11 +1,9 @@
 const express = require('express');
 
 const router = express.Router();
-const WALLET_COLLECTION_ID = 'wallet'; // Replace with your actual collection ID
 
-const WALLET_TRANSACTIONS_COLLECTION_ID = 'walletTransactions'; // Replace with your actual collection ID
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_WALLET_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
 
     // Define your wallet routes here, using the passed dependencies and middleware
 
@@ -40,7 +38,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             console.log('📊 [Wallet API] Querying wallet for user:', userId);
 
             const walletResponse = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, WALLET_COLLECTION_ID,
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_COLLECTION_ID,
                 [Query.equal('userId', userId), Query.limit(1)]
             );
 
@@ -117,7 +115,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             console.log('📊 [Wallet API] Executing query with', queries.length, 'conditions');
 
             const response = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, WALLET_TRANSACTIONS_COLLECTION_ID,
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID,
                 queries
             );
 
@@ -175,7 +173,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 1. Get/create wallet
             console.log('📥 [Wallet API] Checking wallet for user:', userId);
             let walletResponse = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, WALLET_COLLECTION_ID,
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_COLLECTION_ID,
                 [Query.equal('userId', userId)]
             );
             let wallet = walletResponse.documents[0];
@@ -183,7 +181,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (!wallet) {
                 console.log('➕ [Wallet API] Creating new wallet for user:', userId);
                 wallet = await databases.createDocument(
-                    APPWRITE_DATABASE_ID, WALLET_COLLECTION_ID, ID.unique(),
+                    APPWRITE_DATABASE_ID, APPWRITE_WALLET_COLLECTION_ID, ID.unique(),
                     {
                         userId,
                         balance: 0,
@@ -199,7 +197,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // 2. Create pending transaction
             console.log('📝 [Wallet API] Creating pending transaction');
             const transaction = await databases.createDocument(
-                APPWRITE_DATABASE_ID, WALLET_TRANSACTIONS_COLLECTION_ID, ID.unique(),
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID, ID.unique(),
                 {
                     walletId: wallet.$id,
                     userId,
@@ -255,7 +253,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             console.log('📋 [Wallet API] Fetching transaction:', transactionId);
             const transaction = await databases.getDocument(
-                APPWRITE_DATABASE_ID, WALLET_TRANSACTIONS_COLLECTION_ID, transactionId
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID, transactionId
             );
 
             if (transaction.userId !== userId) {
@@ -269,7 +267,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
 
             await databases.updateDocument(
-                APPWRITE_DATABASE_ID, WALLET_TRANSACTIONS_COLLECTION_ID, transactionId,
+                APPWRITE_DATABASE_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID, transactionId,
                 { status: 'cancelled' }
             );
 

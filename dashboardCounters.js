@@ -7,6 +7,15 @@ const pendingDeltas = {};
 let flushTimer = null;
 let dbRef = null;
 let dbIdRef = null;
+let collectionIdRef = 'dashboard_counters';
+
+// Set the collection ID once from server.js so the module doesn't carry a
+// magic-string. Safe to call multiple times.
+function init({ APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID }) {
+    if (APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID) {
+        collectionIdRef = APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID;
+    }
+}
 
 async function updateDashboardCounter(databases, APPWRITE_DATABASE_ID, counterName, delta = 1) {
     // Ensure delta is a number
@@ -40,17 +49,17 @@ async function flushCounters() {
     for (const [counterName, delta] of Object.entries(snapshot)) {
         if (delta === 0) continue;
         try {
-            const list = await dbRef.listDocuments(dbIdRef, 'dashboard_counters', [
+            const list = await dbRef.listDocuments(dbIdRef, collectionIdRef, [
                 Query.equal('id', counterName),
                 Query.limit(1)
             ]);
             let doc = list.documents[0];
             if (doc) {
-                await dbRef.updateDocument(dbIdRef, 'dashboard_counters', doc.$id, {
+                await dbRef.updateDocument(dbIdRef, collectionIdRef, doc.$id, {
                     totals: (Number(doc.totals) || 0) + delta
                 });
             } else {
-                await dbRef.createDocument(dbIdRef, 'dashboard_counters', ID.unique(), {
+                await dbRef.createDocument(dbIdRef, collectionIdRef, ID.unique(), {
                     id: counterName,
                     totals: delta
                 });
@@ -68,4 +77,4 @@ async function flushCounters() {
     }
 }
 
-module.exports = { updateDashboardCounter };
+module.exports = { init, updateDashboardCounter };

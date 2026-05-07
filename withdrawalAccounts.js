@@ -15,17 +15,15 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 
 const router = express.Router();
 
-const WITHDRAWAL_ACCOUNTS_COLLECTION_ID = 'withdrawal_accounts'; // Replace with your actual collection ID
-
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole) => {
 
     // Define your withdrawalAccounts routes here, using the passed dependencies and middleware
 
     async function fetchAccounts(userId) {
         return databases.listDocuments(
             APPWRITE_DATABASE_ID,
-            WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+            APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
             [
                 Query.equal('userId', userId),
                 Query.orderDesc('$createdAt'),
@@ -90,7 +88,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const response = await databases.createDocument(
             APPWRITE_DATABASE_ID,
-            WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+            APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
             ID.unique(),
             document,
             // [
@@ -121,7 +119,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Fetch by document ID and verify ownership
             const existing = await databases.getDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId
             );
             if (!existing || existing.userId !== userId) {
@@ -135,7 +133,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const response = await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId,
                 updates
             );
@@ -160,7 +158,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // Verify ownership
             const existing = await databases.getDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId
             );
             if (!existing || existing.userId !== userId) {
@@ -169,7 +167,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             await databases.deleteDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId
             );
 
@@ -219,7 +217,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const response = await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 ID.unique(),
                 document
             );
@@ -248,7 +246,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             const response = await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId,
                 updates
             );
@@ -267,7 +265,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
             await databases.deleteDocument(
                 APPWRITE_DATABASE_ID,
-                WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
+                APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID,
                 accountId
             );
 

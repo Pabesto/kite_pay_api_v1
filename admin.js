@@ -27,7 +27,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -2834,8 +2834,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // ✅ Manual hold on QR — admin can add/remove hold amount (paise)
     // POST /manual-hold-on-qr { qrId, amountPaise, action: 'hold' | 'release', reason }
-    const MANUAL_HOLD_COLLECTION_ID = 'manual_hold_transactions';
-
     router.post('/manual-hold-on-qr', authenticateAdmin, async (req, res) => {
         const { qrId, amountPaise, action, reason } = req.body;
 
@@ -2914,7 +2912,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                MANUAL_HOLD_COLLECTION_ID,
+                APPWRITE_MANUAL_HOLD_COLLECTION_ID,
                 ID.unique(),
                 holdRecord
             );
@@ -2996,7 +2994,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             const result = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, MANUAL_HOLD_COLLECTION_ID, queries
+                APPWRITE_DATABASE_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, queries
             );
 
             const records = result.documents.map(doc => ({
@@ -3048,7 +3046,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const resp = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'dashboard_counters', // e.g., 'dashboard_counters'
+                APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID,
                 queries
             );
 
@@ -4117,8 +4115,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (description != null) createData.description = String(description);
 
             await databases.createDocument(
-                '688ca9f3003e593a6227',
-                '68a73217002ed987b246',
+                APPWRITE_DATABASE_ID,
+                APPWRITE_CONFIG_COLLECTION_ID,
                 ID.unique(),
                 createData
             );
@@ -4170,8 +4168,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             await databases.updateDocument(
-                '688ca9f3003e593a6227',
-                '68a73217002ed987b246',
+                APPWRITE_DATABASE_ID,
+                APPWRITE_CONFIG_COLLECTION_ID,
                 doc.$id,
                 updateData
             );
@@ -4198,8 +4196,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             await databases.deleteDocument(
-                '688ca9f3003e593a6227',
-                '68a73217002ed987b246',
+                APPWRITE_DATABASE_ID,
+                APPWRITE_CONFIG_COLLECTION_ID,
                 doc.$id
             );
             await ConfigManager.refresh();

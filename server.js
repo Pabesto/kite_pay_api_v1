@@ -37,6 +37,7 @@ const ConfigManager = require('./configManager');
 
 const { createClient } = require('redis');
 const userMetaCache = require('./userMetaCache');
+const dashboardCounters = require('./dashboardCounters');
 
 // --- Configuration & Initialization ---
 const app = express();
@@ -57,6 +58,15 @@ const APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID = 'daily_commission_summ
 const APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID = 'all_time_commission_total';
 const APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID = 'monthly_commission_totals';
 const APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID = 'commission_transactions';
+const APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID = 'dashboard_counters';
+const APPWRITE_MANUAL_HOLD_COLLECTION_ID = 'manual_hold_transactions';
+const APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID = 'walletTransactions';
+const APPWRITE_WALLET_COLLECTION_ID = 'wallet';
+const APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID = 'withdrawal_accounts';
+const APPWRITE_API_MERCHANTS_COLLECTION_ID = 'api_merchants';
+const APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID = 'api_merchants_requests';
+const APPWRITE_CONFIG_COLLECTION_ID = '68a73217002ed987b246';
+const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = 'test_dialy_qr_summaries';
 const APPWRITE_BUCKET_ID = '688d2517002810ac532b';
 
 // Your Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -116,7 +126,7 @@ const users = new Users(client);
 const tablesDB = new TablesDB(client);
 
 // 🔥 Initialize ConfigManager with your databases instance
-ConfigManager.init(databases);
+ConfigManager.init({ databases, APPWRITE_DATABASE_ID, APPWRITE_CONFIG_COLLECTION_ID });
 
 // Startup health check — verify critical Appwrite collection IDs are reachable
 (async () => {
@@ -201,7 +211,7 @@ async function syncCountersFromAppwrite() {
 
         // Single batch query instead of N individual queries
         const list = await databases.listDocuments(
-            APPWRITE_DATABASE_ID, 'dashboard_counters',
+            APPWRITE_DATABASE_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID,
             [Query.equal('id', missing), Query.limit(missing.length)]
         );
         for (const doc of list.documents) {
@@ -227,7 +237,7 @@ async function flushCountersToAppwrite() {
         try {
             const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
             const list = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, 'dashboard_counters',
+                APPWRITE_DATABASE_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID,
                 [Query.equal('id', counterNames), Query.limit(counterNames.length)]
             );
             for (const doc of list.documents) {
@@ -249,14 +259,14 @@ async function flushCountersToAppwrite() {
     try {
         // Single batch query to get all counter doc IDs
         const list = await databases.listDocuments(
-            APPWRITE_DATABASE_ID, 'dashboard_counters',
+            APPWRITE_DATABASE_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID,
             [Query.equal('id', counterNames), Query.limit(counterNames.length)]
         );
         for (const doc of list.documents) {
             const val = await redisClient.get(`counter:${doc.id}`);
             if (val === null) continue;
             await databases.updateDocument(
-                APPWRITE_DATABASE_ID, 'dashboard_counters', doc.$id,
+                APPWRITE_DATABASE_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, doc.$id,
                 { totals: Number(val) }
             );
         }
@@ -268,6 +278,7 @@ async function flushCountersToAppwrite() {
 
 // Init userMetaCache early so Appwrite fallback works even if Redis is down
 userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
+dashboardCounters.init({ APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID });
 
 // Connect Redis, seed counters, start periodic flush
 (async () => {
@@ -491,19 +502,19 @@ function requireRole(...roles) {
 app.use('/api', qrCodeRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew));
+app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Merchant API routes
-app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Withdrawal Accounts routes
-app.use('/api/withdrawal-accounts', withdrawalAccountsRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
+app.use('/api/withdrawal-accounts', withdrawalAccountsRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
 
 // Wallet routes
-app.use('/api/wallet', walletRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
+app.use('/api/wallet', walletRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_WALLET_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
 
 // Pinelabs QR routes
 app.use('/pinelabs', digiqrRoutes);
@@ -649,7 +660,7 @@ app.get('/inc_test', async (req, res) => {
         try {
             await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                'test_dialy_qr_summaries',
+                APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 ID.unique(),
                 {
                     qr_code_id: qr_code_id,
@@ -664,7 +675,7 @@ app.get('/inc_test', async (req, res) => {
 
             const existingDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                'test_dialy_qr_summaries',
+                APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 [
                     Query.equal('qr_code_id', qr_code_id),
                     Query.equal('date', dayString),
@@ -676,7 +687,7 @@ app.get('/inc_test', async (req, res) => {
 
             await tablesDB.incrementRowColumn(
                 APPWRITE_DATABASE_ID,
-                'test_dialy_qr_summaries',
+                APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 doc.$id,
                 'total_pay_in_amount',
                 100,
@@ -684,7 +695,7 @@ app.get('/inc_test', async (req, res) => {
 
             await tablesDB.incrementRowColumn(
                 APPWRITE_DATABASE_ID,
-                'test_dialy_qr_summaries',
+                APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID,
                 doc.$id,
                 'transaction_count',
                 1,
