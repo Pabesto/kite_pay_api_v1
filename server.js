@@ -1525,31 +1525,36 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // SUCCESS transactions and persists them with dedup, QR totals, daily summary,
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
 const { startPinelabPoller } = require('./pinelabPoller');
-const pinelabPoller = startPinelabPoller(
-  {
-    databases,
-    Query,
-    ID,
-    redisClient,
-    acquireLock,
-    releaseLock,
-    emitTxnNew,
-    updateDailyQrTotal,
-    APPWRITE_DATABASE_ID,
-    APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-    APPWRITE_QRCODE_COLLECTION_ID,
-    LOCK_TTL_SECONDS,
-  },
-  {
-    env: 'production',
-    intervalMs: 1 * 60 * 1000,
-    bufferMinutes: 5,        // small guard against micro-delays (txn anchor is ground truth)
-    maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
-    pageSize: 100,
-    maxPagesPerTick: 50,
-    dryRun: false,
-  }
-);
+
+const ENABLE_PINELAB_POLLER = false;
+
+const pinelabPoller = ENABLE_PINELAB_POLLER
+  ? startPinelabPoller(
+      {
+        databases,
+        Query,
+        ID,
+        redisClient,
+        acquireLock,
+        releaseLock,
+        emitTxnNew,
+        updateDailyQrTotal,
+        APPWRITE_DATABASE_ID,
+        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+        APPWRITE_QRCODE_COLLECTION_ID,
+        LOCK_TTL_SECONDS,
+      },
+      {
+        env: 'production',
+        intervalMs: 1 * 60 * 1000,
+        bufferMinutes: 5,        // small guard against micro-delays (txn anchor is ground truth)
+        maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
+        pageSize: 100,
+        maxPagesPerTick: 50,
+        dryRun: false,
+      }
+    )
+  : null;
 
 // Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
 // normal watermark window; pass both for an explicit backfill window.
@@ -1559,6 +1564,9 @@ app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
     const { from, to } = req.body || {};
     if ((from && !to) || (!from && to)) {
       return res.status(400).json({ error: 'Provide both from and to, or neither' });
+    }
+    if (!pinelabPoller) {
+      return res.status(503).json({ error: 'PineLabs poller is disabled' });
     }
     const result = await pinelabPoller.runOnce({ from, to });
     res.json({ ok: true, ...result });
@@ -1604,7 +1612,7 @@ app.get('/', (req, res) => {
 // before closing DB/Redis connections, then exit cleanly.
 async function gracefulShutdown(signal) {
     console.log(`\n${signal} received — starting graceful shutdown`);
-    try { pinelabPoller.stop(); } catch (e) { console.error('Error stopping PineLabs poller:', e); }
+    try { pinelabPoller?.stop(); } catch (e) { console.error('Error stopping PineLabs poller:', e); }
     httpServer.close(async () => {
         console.log('HTTP server closed — no new connections accepted');
         try {
