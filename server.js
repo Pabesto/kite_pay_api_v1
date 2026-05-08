@@ -173,28 +173,61 @@ const redisClient = createClient({
 redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
 redisClient.on('ready', () => console.log('Redis connected'));
 
-// Acquire a distributed lock. Returns true if lock was acquired.
+// Race a promise against a timeout (used for Redis ops that may hang on zombie connections)
+function withRedisTimeout(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`Redis op timed out after ${ms}ms`)), ms)),
+    ]);
+}
+
+// ─── In-memory lock fallback (single-instance, used when Redis is down) ─────
+const memLocks = new Map(); // key → { value, timer }
+
+function memAcquire(key, value, ttlSeconds) {
+    if (memLocks.has(key)) return false; // already held
+    const timer = setTimeout(() => memLocks.delete(key), ttlSeconds * 1000);
+    memLocks.set(key, { value, timer });
+    return true;
+}
+
+function memRelease(key, value) {
+    const entry = memLocks.get(key);
+    if (entry && entry.value === value) {
+        clearTimeout(entry.timer);
+        memLocks.delete(key);
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Acquire a distributed lock. Tries Redis first, falls back to in-memory.
 // Uses SET NX EX which is atomic in Redis — safe under concurrency.
 async function acquireLock(key, value, ttlSeconds = 15) {
     try {
-        const result = await redisClient.set(key, value, { NX: true, EX: ttlSeconds });
+        const result = await withRedisTimeout(
+            redisClient.set(key, value, { NX: true, EX: ttlSeconds }),
+            3000
+        );
         return result === 'OK';
     } catch (e) {
-        console.error('acquireLock error:', e);
-        return false; // fail safe — reject and let caller retry rather than proceed without lock
+        console.error('acquireLock Redis failed, using in-memory fallback:', e.message);
+        return memAcquire(key, value, ttlSeconds);
     }
 }
 
-// Release lock only if we are the owner (prevents releasing another process's lock).
-// Uses a Lua script for atomic compare-and-delete — eliminates the TOCTOU gap between
-// GET and DEL where a different process could acquire the key between the two commands.
+// Release lock — tries Redis first, always cleans up in-memory fallback.
 async function releaseLock(key, value) {
     const lua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
     try {
-        await redisClient.eval(lua, { keys: [key], arguments: [value] });
+        await withRedisTimeout(
+            redisClient.eval(lua, { keys: [key], arguments: [value] }),
+            3000
+        );
     } catch (e) {
-        console.error('releaseLock error:', e);
+        console.error('releaseLock Redis failed:', e.message);
     }
+    // Always clean up in-memory lock (no-op if not held there)
+    memRelease(key, value);
 }
 
 // On startup: seed Redis counters from Appwrite if Redis is empty (e.g. after a restart)
@@ -883,11 +916,11 @@ app.post("/paytm/payment-sync", async (req, res) => {
     }
 
     // Atomic dashboard counter increments via Redis INCRBY
-    await Promise.all([
+    withRedisTimeout(Promise.all([
       redisClient.incrBy('counter:totalTxCount', 1),
       redisClient.incrBy('counter:totalApiTx', 1),
       redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-    ]).then(() => { redisClient.countersDirty = true; })
+    ]), 3000).then(() => { redisClient.countersDirty = true; })
       .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
 
     console.log("✅ Received Paytm transaction:", data);
@@ -1265,11 +1298,11 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         await updateQrTotalAtomic(qrCodeId, amountPaise);
 
         // STEP 8: atomic Redis counter increments (non-critical, outside lock scope is fine)
-        await Promise.all([
+        withRedisTimeout(Promise.all([
             redisClient.incrBy('counter:totalTxCount', 1),
             redisClient.incrBy('counter:totalApiTx', 1),
             redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]).then(() => { redisClient.countersDirty = true; })
+        ]), 3000).then(() => { redisClient.countersDirty = true; })
           .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
 
         res.status(200).send('Webhook received and saved');
