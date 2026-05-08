@@ -43,7 +43,7 @@ const dashboardCounters = require('./dashboardCounters');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-console.log(process.env.APPWRITE_ENDPOINT, 'is the Redis URL being used');
+// console.log(process.env.APPWRITE_ENDPOINT, 'is the Redis URL being used');
 
 // Appwrite Configuration loaded from .env
 const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT;
@@ -166,7 +166,7 @@ const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests o
 
 // ─── Redis Client ────────────────────────────────────────────────────────────
 const redisClient = createClient({
-    url: process.env.REDIS_URL || 'redis://red-d6osqip4tr6s73d1ba50:6379',
+    url: process.env.REDIS_URL,
     socket: {
         reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
     },
