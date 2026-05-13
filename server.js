@@ -1330,7 +1330,7 @@ app.post('/webhook', async (req, res) => {
 
     const data = req.body;
 
-    if (LOG_RAZORPAY_WEBHOOK) console.log("📩 Razorpay Webhook Received /razorpay-webhook:", JSON.stringify(data, null, 2));
+    // if (LOG_RAZORPAY_WEBHOOK) console.log("📩 Razorpay Webhook Received /razorpay-webhook:", JSON.stringify(data, null, 2));
 
     // 1. Verify Razorpay signature
     // const razorpaySignature = req.headers['x-razorpay-signature'];
