@@ -164,6 +164,8 @@ const COUNTER_FLUSH_MS      = 1 * 60 * 1000; // how often Redis counters flush t
 const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests on shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
+console.log(`Server starting with Appwrite endpoint ${APPWRITE_ENDPOINT} and Redis URL ${process.env.REDIS_URL}`);
+
 // ─── Redis Client ────────────────────────────────────────────────────────────
 const redisClient = createClient({
     url: process.env.REDIS_URL,
