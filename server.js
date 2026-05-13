@@ -1326,7 +1326,9 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 // BEAST ARENA PVT LTD. RAZORPAY WEBHOOK HANDLER — MAIN ENTRY POINT FOR RAZORPAY QR CODE PAYMENTS
 app.post('/webhook', async (req, res) => {
 
-    //   console.log('Webhook Event Received at /webhook:', { ip: req.ip });
+    //console.log('Webhook Event Received at /webhook:', { ip: req.ip });
+
+    const data = req.body;
 
     if (LOG_RAZORPAY_WEBHOOK) console.log("📩 Razorpay Webhook Received /razorpay-webhook:", JSON.stringify(data, null, 2));
 
