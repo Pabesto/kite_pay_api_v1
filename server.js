@@ -1222,7 +1222,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
     const data = req.body;
 
-    if (LOG_RAZORPAY_WEBHOOK) console.log("📩 Razorpay Webhook Received /razorpay-webhook:", JSON.stringify(data, null, 2));
+    // if (LOG_RAZORPAY_WEBHOOK) console.log("📩 Razorpay Webhook Received /razorpay-webhook:", JSON.stringify(data, null, 2));
 
     // STEP 1: validate status field
     if (data?.status !== 'AUTHORIZED') {
