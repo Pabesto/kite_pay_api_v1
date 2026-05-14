@@ -1452,6 +1452,136 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+// UNIFIED WEBHOOK — accepts both payload shapes that /razorpay-webhook (Ezetap flat)
+// and /webhook (Razorpay nested qr_code.credited) handle, normalizes them, and runs
+// the same downstream pipeline. Auto-detects shape from the body; no caller change
+// required. The two legacy endpoints above remain functional.
+app.post('/payment-webhook', webhookParser, async (req, res) => {
+
+    const body = req.body || {};
+
+    // STEP 1: detect payload shape and extract normalized fields
+    let qrCodeId, paymentId, rrnNumber, amountPaise, vpa, isoDate, shape;
+
+    if (body.event === 'qr_code.credited') {
+        // Razorpay nested shape (mirrors /webhook)
+        shape = 'razorpay-nested';
+        const paymentEntity = body?.payload?.payment?.entity;
+        qrCodeId  = body?.payload?.qr_code?.entity?.id;
+        paymentId = paymentEntity?.id;
+        rrnNumber = paymentEntity?.acquirer_data?.rrn || null;
+        amountPaise = paymentEntity?.amount; // already paise
+        vpa = paymentEntity?.vpa || null;
+        const unixTimestamp = paymentEntity?.created_at;
+        if (unixTimestamp) {
+            isoDate = new Date(unixTimestamp * 1000).toISOString();
+        }
+    } else if (body.status === 'AUTHORIZED' && body.tid) {
+        // Ezetap/Pabesto flat shape (mirrors /razorpay-webhook)
+        shape = 'ezetap-flat';
+        qrCodeId  = body.tid;
+        paymentId = body.Id;
+        rrnNumber = body.rrNumber || null;
+        amountPaise = rupeesToPaiseStrict(body.amount);
+        vpa = body.customerName || null;
+        if (body.postingDate) {
+            isoDate = new Date(body.postingDate).toISOString();
+        }
+    } else {
+        // Neither shape matched — reject without locking or writing anything
+        if (body.event && body.event !== 'qr_code.credited') {
+            return res.status(400).send('Unsupported event type');
+        }
+        if (body.status && body.status !== 'AUTHORIZED') {
+            return res.status(400).send('Payment not authorized: ' + body.status);
+        }
+        return res.status(400).send('Unrecognized webhook payload');
+    }
+
+    // STEP 2: validate required normalized fields
+    if (!qrCodeId)    { return res.status(400).send('QR Code ID not found'); }
+    if (!paymentId)   { return res.status(400).send('Payment ID not found'); }
+    if (!amountPaise) { return res.status(400).send('Amount not found'); }
+    if (!isoDate)     { isoDate = new Date().toISOString(); }
+
+    const payloadString = JSON.stringify(req.body);
+
+    // STEP 3: acquire per-QR distributed lock — same pattern as the legacy endpoints
+    const lockKey = `lock:qr:${qrCodeId}`;
+    const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
+    if (!acquired) {
+        return res.status(503).send('Processing conflict, retry');
+    }
+
+    try {
+        // STEP 4: idempotency check — under lock
+        const existing = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            [Query.equal('paymentId', paymentId), Query.limit(1)]
+        );
+        if (existing.documents.length) {
+            return res.status(200).send('Duplicate webhook ignored');
+        }
+
+        // STEP 5: save raw webhook record (source of truth)
+        const created = await databases.createDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            ID.unique(),
+            {
+                payload:    payloadString,
+                qrCodeId,
+                paymentId,
+                rrnNumber,
+                amount:     amountPaise,
+                vpa,
+                provider:   'razorpay',
+                created_at: isoDate,
+                status:     'normal',
+            }
+        );
+
+        // STEP 6: update daily QR summary
+        try {
+            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
+        } catch (e) {
+            console.error('❌ Error updating daily QR total:', e?.message || e);
+        }
+
+        // STEP 7: emit real-time event
+        const eventPayload = {
+            $id:        created.$id,
+            qrCodeId,
+            paymentId,
+            amount:     amountPaise,
+            rrnNumber,
+            vpa,
+            provider:   'razorpay',
+            created_at: isoDate,
+        };
+        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+
+        // STEP 8: update QR totals — under lock
+        await updateQrTotalAtomic(qrCodeId, amountPaise);
+
+        // STEP 9: atomic Redis counter increments (non-critical, fire-and-forget)
+        withRedisTimeout(Promise.all([
+            redisClient.incrBy('counter:totalTxCount', 1),
+            redisClient.incrBy('counter:totalApiTx', 1),
+            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
+        ]), 3000).then(() => { redisClient.countersDirty = true; })
+          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
+
+        res.status(200).send('Webhook received and saved');
+    } catch (error) {
+        console.error(`❌ Failed to process payment-webhook (${shape}):`, error.message);
+        res.status(500).send('Error processing webhook');
+    } finally {
+        await releaseLock(lockKey, paymentId);
+    }
+});
+
 async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
   // Convert txnDate to IST date string "YYYY-MM-DD"
   const istDate = moment.tz(txnDate, 'Asia/Kolkata');
