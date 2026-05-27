@@ -1477,7 +1477,9 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
         // Razorpay nested shape (mirrors /webhook)
         shape = 'razorpay-nested';
         const paymentEntity = body?.payload?.payment?.entity;
-        qrCodeId  = body?.payload?.qr_code?.entity?.id;
+        // Use notes.username as the QR identifier (payment-level first, qr_code-level fallback)
+        qrCodeId  = paymentEntity?.notes?.username
+                 || body?.payload?.qr_code?.entity?.notes?.username;
         paymentId = paymentEntity?.id;
         rrnNumber = paymentEntity?.acquirer_data?.rrn || null;
         amountPaise = paymentEntity?.amount; // already paise
