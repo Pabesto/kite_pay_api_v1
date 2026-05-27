@@ -1677,7 +1677,9 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
 const { startPinelabPoller } = require('./pinelabPoller');
 
-const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
+// const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
+const ENABLE_PINELAB_POLLER = false; // default to disabled to avoid unintended consequences; enable explicitly with env var
+
 
 const pinelabPoller = ENABLE_PINELAB_POLLER
   ? startPinelabPoller(
