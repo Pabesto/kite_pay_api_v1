@@ -1216,6 +1216,16 @@ app.get('/test_websocket', (req, res) => {
 //     res.status(200).send("OK");
 // });
 
+app.post('/webhook-print', webhookParser, async (req, res) => {
+
+    const data = req.body;
+
+    // if (LOG_RAZORPAY_WEBHOOK) 
+    console.log("📩 Webhook Received /webhook-print:", JSON.stringify(data, null, 2));
+    return res.status(200).send('Webhook received');
+    
+});
+
 // Main For Pabesto Tech PVT Ltd. Razorpay Webhook Handler
 // PABESTO TECH PVT LTD. RAZORPAY WEBHOOK HANDLER — FULLY PRODUCTION-READY WITH IDEMPOTENCY, LOCKING, AND REAL-TIME EMIT
 app.post('/razorpay-webhook', webhookParser, async (req, res) => {
