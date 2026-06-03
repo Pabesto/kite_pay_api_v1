@@ -4060,7 +4060,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // ===================== Config Management (Admin Only) =====================
 
-    const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json'];
+    const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json', 'array'];
 
     function validateConfigVal(type, val) {
         if (typeof val !== 'string') return 'val must be a string';
@@ -4072,6 +4072,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (!['true', 'false', '1', '0', 'yes', 'no'].includes(val.toLowerCase())) return 'val must be a boolean string (true/false/1/0/yes/no)';
         } else if (type === 'json') {
             try { JSON.parse(val); } catch (e) { return 'val must be valid JSON'; }
+        } else if (type === 'array') {
+            try { JSON.parse(val); } catch (e) { return 'val must be valid JSON array'; }
         }
         return null;
     }
