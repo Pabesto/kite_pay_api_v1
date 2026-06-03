@@ -44,7 +44,23 @@ class ConfigManager {
                         console.error(`Invalid JSON for config key "${doc.key}":`, e.message);
                         continue;
                     }
-                } else {
+                } else if (doc.type === "array") {
+                    try {
+                        const arr = JSON.parse(rawValue);
+
+                        if (!Array.isArray(arr)) {
+                            throw new Error("Value is not an array");
+                        }
+
+                        parsedValue = arr.map(v => String(v));
+                    } catch (e) {
+                        console.error(
+                            `Invalid array for config key "${doc.key}":`,
+                            e.message
+                        );
+                        parsedValue = [];
+                    }
+                 } else {
                     parsedValue = rawValue;
                 }
                 config[doc.key] = parsedValue;
@@ -79,10 +95,30 @@ class ConfigManager {
             throw new Error('ConfigManager not initialized.');
         }
         const doc = this.getRawDoc(key);
+
+        const serialized =Array.isArray(value) || typeof value === "object"
+        ? JSON.stringify(value)
+        : String(value);
+
         if (doc) {
-            await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { val: String(value) });
+            // await databasesInstance.updateDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, doc.$id, { val: String(value) });
+            await databasesInstance.updateDocument(
+                CONFIG_DB_ID,
+                CONFIG_COLLECTION_ID,
+                doc.$id,
+                { val: serialized }
+            );
         } else {
-            await databasesInstance.createDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, 'unique()', { key, val: String(value) });
+            // await databasesInstance.createDocument(CONFIG_DB_ID, CONFIG_COLLECTION_ID, 'unique()', { key, val: String(value) });
+            await databasesInstance.createDocument(
+                CONFIG_DB_ID,
+                CONFIG_COLLECTION_ID,
+                'unique()',
+                {
+                    key,
+                    val: serialized,
+                }
+            );
         }
         // Refresh cache so subsequent get() calls return updated value
         await this.refresh();
