@@ -254,7 +254,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // Users can post a withdrawal request (new version with validations and balance checks)
     router.post('/withdraw_new', authenticateToken, async (req, res) => {
-      const { userId, qrId, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+      const { userId, qrId, companyName, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
       // If the requester is not an admin, check if withdrawal time windows are enabled and enforce them
       if (req.user.role != 'admin'){
@@ -437,6 +437,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             id: wdh_id,
             userId,
             qrId: qrId,
+            companyName: companyName || null,
             holderName,
             amount: amount, // Rs
             preAmount: preAmount, // Rs
@@ -714,6 +715,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             id: doc.id,
             userId: doc.userId,
             qrId: doc.qrId,
+            companyName: doc.companyName || null,
             holderName: doc.holderName,
             amount: doc.amount,
             preAmount: doc.preAmount || 0,
@@ -828,6 +830,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             id: doc.id,
             userId: doc.userId,
             qrId: doc.qrId,
+            companyName: doc.companyName || null,
             holderName: doc.holderName,
             amount: doc.amount,
             preAmount: doc.preAmount || 0,
