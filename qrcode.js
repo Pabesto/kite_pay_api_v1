@@ -14,6 +14,7 @@ const moment = require('moment-timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
 const { type } = require('os');
+const { compare } = require('bcrypt');
 
 // Production mode
 const razorpay = new Razorpay({
@@ -254,6 +255,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const qrCodes = resultAllQr.documents.map(doc => ({
                 $id: doc.$id,
                 qrId: doc.qrId,
+                companyName: doc.companyName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
@@ -323,6 +325,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     async function saveQrEntry({
         qrId,
         qrType,
+        companyName,
         fileId,
         imageUrl,
         createdByUserId,
@@ -332,7 +335,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             console.log('Saving QR Entry:', {
                 qrId,
-                qrType, 
+                qrType,
+                companyName,
             });
 
         // After successful creation:
@@ -361,6 +365,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             {
             qrId,
             type: qrType,
+            companyName,
             fileId,
             imageUrl,
             assignedUserId,
@@ -374,7 +379,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // POST a new QR code entry
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
-        const { qrId, qrType, fileId, imageUrl , createdAt } = req.body;
+        const { qrId, qrType, companyName, fileId, imageUrl , createdAt } = req.body;
 
         // console.log('Create QR Entry request body:', req.body);
 
@@ -398,6 +403,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const newQrCode = await saveQrEntry({
                 qrId,
                 qrType,
+                companyName,
                 fileId,
                 imageUrl,
                 createdByUserId: req.user.userId, // set by your JWT middleware
@@ -816,6 +822,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const userQrCodes = response.documents.map(doc => ({
                 $id: doc.$id,
                 qrId: doc.qrId,
+                companyName: doc.companyName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
@@ -935,6 +942,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const userQrCodes = response.documents.map(doc => ({
                 $id: doc.$id,
                 qrId: doc.qrId,
+                companyName: doc.companyName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
@@ -1156,6 +1164,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
         const newQrCode = await saveQrEntry({
             qrId: razorpayQr.id,
+            companyName: 'companyName',
             fileId: file.$id,
             imageUrl: imageUrl,
             createdByUserId: userId,
