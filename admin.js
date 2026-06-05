@@ -3485,6 +3485,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             refundAmount: get('refundAmount'),
             failedCount: get('failedCount'),
             failedAmount: get('failedAmount'),
+            suspiciousCount: get('suspiciousCount'),
+            suspiciousAmount: get('suspiciousAmount'),
+
 
             // Payouts
             totalAmountPaid: get('totalAmountPaid'),
