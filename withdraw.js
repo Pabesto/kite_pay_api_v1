@@ -193,9 +193,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     function isWithdrawTimeAllowed() {
         windows = [
               // { from: '04:00 AM', to: '05:30 AM' },
-              { from: '12:00 PM', to: '01:30 PM' },
-              { from: '03:30 PM', to: '04:30 PM' },
-              { from: '06:30 PM', to: '07:30 PM' },
+              { from: '12:01 PM', to: '07:00 PM' },
+              // { from: '03:30 PM', to: '04:30 PM' },
+              // { from: '06:30 PM', to: '07:30 PM' },
             ];
         const now = moment().tz('Asia/Kolkata');
         const nowMinutes = now.hours() * 60 + now.minutes();
