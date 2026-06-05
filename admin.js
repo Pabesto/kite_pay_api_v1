@@ -3063,9 +3063,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     function startCronJobs() {
         cron.schedule(
-            '0 3 * * *',
+            '05 3 * * *',
             async () => {
-                console.log('Running 2:00 AM settlement job');
+                console.log('Running 3:05 AM settlement job');
                 await getAllAssignedQRCodes();
             },
             {
