@@ -3053,12 +3053,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     }
 
-    // const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
-    // const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
-
-    // console.log(`Starting cron jobs with Qr_min_use_amount=${Qr_min_use_amount} and Qr_min_use_penality=${Qr_min_use_penality}...`);
-
-
+    // Added Cron job to auto hold QRs not meeting minimum usage criteria daily at 2:00 AM IST
     startCronJobs();
 
     function startCronJobs() {
@@ -3077,8 +3072,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     async function getAllAssignedQRCodes() {
 
         await ConfigManager.refresh(); // Ensure we have the latest config
-        Qr_min_use_amount = await ConfigManager.get('Qr_min_use_amount', 150000); // default 3L if not set
-        Qr_min_use_penality = await ConfigManager.get('Qr_min_use_penality', 500); // default 3L if not set
+        const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 150000); // default 3L if not set
+        const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 500); // default 3L if not set
+
+        if(Qr_min_use_amount <= 0 || Qr_min_use_penality <= 0) {
+            console.log(`Invalid config values: Qr_min_use_amount=${Qr_min_use_amount}, Qr_min_use_penality=${Qr_min_use_penality}. Skipping auto hold job.`);
+            return;
+        }
 
         const yesterdayDayString = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
 
@@ -3106,14 +3106,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             offset += limit;
         }
 
-        // console.log(`Found ${allDocs.length} assigned QRs`);
-
-        // allDocs.forEach(doc => {
-        //     console.log(doc.qrId);
-        // });
-
-        // console.log(`Fetching all assigned QR codes for ${yesterdayDayString}...`);
-
         const fetchSummary = (date) => databases.listDocuments(
                     APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
                     [Query.equal('date', date), Query.limit(1)]
@@ -3121,34 +3113,29 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
         const summaryResponse = await fetchSummary(yesterdayDayString);
 
-        // console.log(`Summary for ${yesterdayDayString}:`, summaryResponse.documents[0] || 'No summary found');
-
         const summaryDoc = summaryResponse.documents[0];
 
-        if (!summaryDoc) {
-            // console.log(`No summary found for ${yesterdayDayString}`);
-
-            // No summary at all => cut all assigned QRs
-            for (const qr of allDocs) {
-                try {
-                    await processManualHold({
-                        qrId: qr.qrId,
-                        amountPaise: (Qr_min_use_penality * 100), // convert to paise
-                        action: 'hold',
-                        reason: 'Penalty for not using Minimum 1.5L per Day as per policy',
-                        adminId: 'system',
-                        adminName: 'System AutoHold',
-                    });
-                } catch (err) {
-                    console.error(
-                        `[AutoHold] Failed for QR ${qr.qrId}:`,
-                        err.message
-                    );
-                }
-            }
-
-            return;
-        }
+        // if (!summaryDoc) {
+        //     // No summary at all => cut all assigned QRs
+        //     for (const qr of allDocs) {
+        //         try {
+        //             await processManualHold({
+        //                 qrId: qr.qrId,
+        //                 amountPaise: (Qr_min_use_penality * 100), // convert to paise
+        //                 action: 'hold',
+        //                 reason: 'Penalty for not using Minimum 1.5L per Day as per policy',
+        //                 adminId: 'system',
+        //                 adminName: 'System AutoHold',
+        //             });
+        //         } catch (err) {
+        //             console.error(
+        //                 `[AutoHold] Failed for QR ${qr.qrId}:`,
+        //                 err.message
+        //             );
+        //         }
+        //     }
+        //     return;
+        // }
 
         const totals = JSON.parse(summaryDoc.totalsJson);
 
@@ -3157,9 +3144,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // QR not present in summary
             if (!(qrId in totals)) {
-                // console.log(
-                //     `QR ${qrId} not found in yesterday summary. Running cutAmount().`
-                // );
                 try {
                     await processManualHold({
                         qrId: qr.qrId,
@@ -3175,7 +3159,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         err.message
                     );
                 }
-                // console.log(`QR ${qrId} cut due to missing summary entry.`);
                 continue;
             }
 
