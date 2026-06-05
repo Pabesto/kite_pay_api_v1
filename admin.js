@@ -2885,6 +2885,43 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }
     });
 
+    
+    // router.get('/test-hold', async (req, res) => {
+    //     try {            
+    //         const result = await test_processManualHold();
+    //         return res.json({ success: true, result });
+    //     } catch (err) {
+    //         console.error('Test hold error:', err);
+    //         return res.status(500).json({ success: false, error: err.message || 'Test failed' });
+    //     }
+    // });
+
+
+    // async function test_processManualHold() {
+    //         console.log('Testing processManualHold with dummy data...');
+
+    //         try {
+    //         await processManualHold({
+    //                 qrId: 'teat0890',
+    //                 amountPaise: 150000, // cut to zero available
+    //                 action: 'hold',
+    //                 reason: 'Penality for not using Minimum 1.5L per Day as per policy',
+    //                 adminId: 'system',
+    //                 adminName: 'System AutoHold',
+    //             });
+
+    //         console.log('processManualHold test completed successfully.');
+
+    //     } catch (err) {
+    //         console.error('processManualHold test error:', err);
+    //     }
+            
+    // }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
     async function processManualHold({
             qrId,
             amountPaise,
@@ -2899,15 +2936,35 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         let lockAcquired = false;
 
         try {
-            const r = await redisClient.set(lockKey, lockVal, {
-                NX: true,
-                EX: 20
-            });
+            const maxRetries = 30;      // wait up to 30 seconds
+            const retryDelay = 1000;    // 1 second
 
-            lockAcquired = r === 'OK';
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+
+                const r = await redisClient.set(lockKey, lockVal, {
+                    NX: true,
+                    EX: 20
+                });
+
+                lockAcquired = r === 'OK';
+
+                if (lockAcquired) {
+                    break;
+                }
+
+                console.log(
+                    `[AutoHold] Lock busy for QR ${qrId}. Attempt ${attempt}/${maxRetries}`
+                );
+
+                if (attempt < maxRetries) {
+                    await sleep(retryDelay);
+                }
+            }
 
             if (!lockAcquired) {
-                throw new Error('QR is currently being modified. Try again shortly.');
+                throw new Error(
+                    `Could not acquire lock for QR ${qrId} after ${maxRetries} attempts`
+                );
             }
 
             const qrResult = await databases.listDocuments(
@@ -2991,49 +3048,20 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     }
 
-    // startCronJobs();
+    const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
+    const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
 
-    // router.get('/test-hold', async (req, res) => {
-    //     try {            
-    //         const result = await test_processManualHold();
-    //         return res.json({ success: true, result });
-    //     } catch (err) {
-    //         console.error('Test hold error:', err);
-    //         return res.status(500).json({ success: false, error: err.message || 'Test failed' });
-    //     }
-    // });
+    console.log(`Starting cron jobs with Qr_min_use_amount=${Qr_min_use_amount} and Qr_min_use_penality=${Qr_min_use_penality}...`);
 
 
-    // async function test_processManualHold() {
-    //         console.log('Testing processManualHold with dummy data...');
-
-    //         try {
-    //         await processManualHold({
-    //                 qrId: 'teat0890',
-    //                 amountPaise: 150000, // cut to zero available
-    //                 action: 'hold',
-    //                 reason: 'Penality for not using Minimum 1.5L per Day as per policy',
-    //                 adminId: 'system',
-    //                 adminName: 'System AutoHold',
-    //             });
-
-    //         console.log('processManualHold test completed successfully.');
-
-    //     } catch (err) {
-    //         console.error('processManualHold test error:', err);
-    //     }
-            
-    // }
+    startCronJobs();
 
     function startCronJobs() {
         cron.schedule(
-            '18 16 * * *',
+            '0 2 * * *',
             async () => {
-                console.log('Running 4:18 PM settlement job');
-
-                // await processPendingWithdrawals();
-                // await releaseExpiredHolds();
-                // await processCommissions();
+                console.log('Running 2:00 AM settlement job');
+                await getAllAssignedQRCodes();
             },
             {
                 timezone: 'Asia/Kolkata',
@@ -3042,6 +3070,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }
 
     async function getAllAssignedQRCodes() {
+
+        await ConfigManager.refresh(); // Ensure we have the latest config
+        Qr_min_use_amount = await ConfigManager.get('Qr_min_use_amount', 150000); // default 3L if not set
+        Qr_min_use_penality = await ConfigManager.get('Qr_min_use_penality', 500); // default 3L if not set
 
         const yesterdayDayString = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
 
@@ -3093,16 +3125,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // No summary at all => cut all assigned QRs
             for (const qr of allDocs) {
-                // await cutAmount(qr.qrId);
-                await processManualHold({
-                    qrId: qr.qrId,
-                    amountPaise: 150000, // cut to zero available
-                    action: 'hold',
-                    reason: 'Penality for not using Minimum 1.5L per Day as per policy',
-                    adminId: 'system',
-                    adminName: 'System AutoHold',
-                });
-                // console.log(`No summary found, cutting QR ${qr.qrId}`);
+                try {
+                    await processManualHold({
+                        qrId: qr.qrId,
+                        amountPaise: (Qr_min_use_penality * 100), // convert to paise
+                        action: 'hold',
+                        reason: 'Penalty for not using Minimum 1.5L per Day as per policy',
+                        adminId: 'system',
+                        adminName: 'System AutoHold',
+                    });
+                } catch (err) {
+                    console.error(
+                        `[AutoHold] Failed for QR ${qr.qrId}:`,
+                        err.message
+                    );
+                }
             }
 
             return;
@@ -3118,21 +3155,45 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // console.log(
                 //     `QR ${qrId} not found in yesterday summary. Running cutAmount().`
                 // );
-
-                // await cutAmount(qrId);
+                try {
+                    await processManualHold({
+                        qrId: qr.qrId,
+                        amountPaise: (Qr_min_use_penality * 100), // convert to paise
+                        action: 'hold',
+                        reason: 'Penalty for not using Minimum 1.5L per Day as per policy',
+                        adminId: 'system',
+                        adminName: 'System AutoHold',
+                    });
+                } catch (err) {
+                    console.error(
+                        `[AutoHold] Failed for QR ${qr.qrId}:`,
+                        err.message
+                    );
+                }
                 // console.log(`QR ${qrId} cut due to missing summary entry.`);
                 continue;
             }
 
             const amount = Number(totals[qrId] || 0);
 
-            if (amount < 150000) {
-                // console.log(
-                //     `QR ${qrId} has only ${amount}. Below 150000. Running cutAmount().`
-                // );
+            if (amount < Qr_min_use_amount) {
 
-                // await cutAmount(qrId);
-                // console.log(`QR ${qrId} cut due to low amount.`);
+                try {
+                    await processManualHold({
+                        qrId: qr.qrId,
+                        amountPaise: (Qr_min_use_penality * 100), // convert to paise
+                        action: 'hold',
+                        reason: 'Penalty for not using Minimum 1.5L per Day as per policy',
+                        adminId: 'system',
+                        adminName: 'System AutoHold',
+                    });
+                } catch (err) {
+                    console.error(
+                        `[AutoHold] Failed for QR ${qr.qrId}:`,
+                        err.message
+                    );
+                }
+
             } else {
                 // console.log(
                 //     `QR ${qrId} has ${amount}. Requirement met.`
