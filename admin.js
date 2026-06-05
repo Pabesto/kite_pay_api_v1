@@ -2983,6 +2983,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             if (action === 'hold') {
                 newHold = currentHold + amountPaise;
+                await inc('manualHoldCount', 1);
+                await inc('manualHoldAmount', amountPaise);
+
             } else {
                 if (amountPaise > currentHold) {
                     throw new Error(
@@ -2991,6 +2994,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 }
 
                 newHold = currentHold - amountPaise;
+                await inc('manualHoldCount', -1);
+                await inc('manualHoldAmount', -amountPaise);
             }
 
             const total = Number(qrDoc.totalPayInAmount || 0);
@@ -3146,6 +3151,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         adminId: 'system',
                         adminName: 'System AutoHold',
                     });
+                    await inc('qrLessUsedPenaltyCount', 1);
+                    await inc('qrLessUsedPenaltyAmount', (Qr_min_use_penality * 100));
                 } catch (err) {
                     console.error(
                         `[AutoHold] Failed for QR ${qr.qrId}:`,
@@ -3168,6 +3175,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         adminId: 'system',
                         adminName: 'System AutoHold',
                     });
+                    await inc('qrLessUsedPenaltyCount', 1);
+                    await inc('qrLessUsedPenaltyAmount', (Qr_min_use_penality * 100));
                 } catch (err) {
                     console.error(
                         `[AutoHold] Failed for QR ${qr.qrId}:`,
