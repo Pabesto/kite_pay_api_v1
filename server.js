@@ -205,6 +205,7 @@ function memRelease(key, value) {
         memLocks.delete(key);
     }
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Acquire a distributed lock. Tries Redis first, falls back to in-memory.

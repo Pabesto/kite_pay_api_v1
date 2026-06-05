@@ -2991,11 +2991,45 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     }
 
+    // startCronJobs();
+
+    router.get('/test-hold', async (req, res) => {
+        try {            
+            const result = await test_processManualHold();
+            return res.json({ success: true, result });
+        } catch (err) {
+            console.error('Test hold error:', err);
+            return res.status(500).json({ success: false, error: err.message || 'Test failed' });
+        }
+    });
+
+
+    async function test_processManualHold() {
+            console.log('Testing processManualHold with dummy data...');
+
+            try {
+            await processManualHold({
+                    qrId: 'teat0890',
+                    amountPaise: 150000, // cut to zero available
+                    action: 'hold',
+                    reason: 'Penality for not using Minimum 1.5L per Day as per policy',
+                    adminId: 'system',
+                    adminName: 'System AutoHold',
+                });
+
+            console.log('processManualHold test completed successfully.');
+
+        } catch (err) {
+            console.error('processManualHold test error:', err);
+        }
+            
+    }
+
     function startCronJobs() {
         cron.schedule(
-            '0 1 * * *',
+            '18 16 * * *',
             async () => {
-                console.log('Running 1 AM settlement job');
+                console.log('Running 4:18 PM settlement job');
 
                 // await processPendingWithdrawals();
                 // await releaseExpiredHolds();
@@ -3006,6 +3040,109 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
         );
     }
+
+    async function getAllAssignedQRCodes() {
+
+        const yesterdayDayString = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+
+        let allDocs = [];
+        let offset = 0;
+        const limit = 100;
+
+        while (true) {
+            const response = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                [
+                    Query.isNotNull('assignedUserId'),
+                    Query.limit(limit),
+                    Query.offset(offset)
+                ]
+            );
+
+            allDocs.push(...response.documents);
+
+            if (response.documents.length < limit) {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        // console.log(`Found ${allDocs.length} assigned QRs`);
+
+        // allDocs.forEach(doc => {
+        //     console.log(doc.qrId);
+        // });
+
+        // console.log(`Fetching all assigned QR codes for ${yesterdayDayString}...`);
+
+        const fetchSummary = (date) => databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                    [Query.equal('date', date), Query.limit(1)]
+                );
+
+        const summaryResponse = await fetchSummary(yesterdayDayString);
+
+        // console.log(`Summary for ${yesterdayDayString}:`, summaryResponse.documents[0] || 'No summary found');
+
+        const summaryDoc = summaryResponse.documents[0];
+
+        if (!summaryDoc) {
+            // console.log(`No summary found for ${yesterdayDayString}`);
+
+            // No summary at all => cut all assigned QRs
+            for (const qr of allDocs) {
+                // await cutAmount(qr.qrId);
+                await processManualHold({
+                    qrId: qr.qrId,
+                    amountPaise: 150000, // cut to zero available
+                    action: 'hold',
+                    reason: 'Penality for not using Minimum 1.5L per Day as per policy',
+                    adminId: 'system',
+                    adminName: 'System AutoHold',
+                });
+                // console.log(`No summary found, cutting QR ${qr.qrId}`);
+            }
+
+            return;
+        }
+
+        const totals = JSON.parse(summaryDoc.totalsJson);
+
+        for (const qr of allDocs) {
+            const qrId = qr.qrId;
+
+            // QR not present in summary
+            if (!(qrId in totals)) {
+                // console.log(
+                //     `QR ${qrId} not found in yesterday summary. Running cutAmount().`
+                // );
+
+                // await cutAmount(qrId);
+                // console.log(`QR ${qrId} cut due to missing summary entry.`);
+                continue;
+            }
+
+            const amount = Number(totals[qrId] || 0);
+
+            if (amount < 150000) {
+                // console.log(
+                //     `QR ${qrId} has only ${amount}. Below 150000. Running cutAmount().`
+                // );
+
+                // await cutAmount(qrId);
+                // console.log(`QR ${qrId} cut due to low amount.`);
+            } else {
+                // console.log(
+                //     `QR ${qrId} has ${amount}. Requirement met.`
+                // );
+            }
+        }
+
+        return allDocs;
+    }
+    
 
     // ✅ Manual hold on QR — admin can add/remove hold amount (paise)
     // POST /manual-hold-on-qr { qrId, amountPaise, action: 'hold' | 'release', reason }
