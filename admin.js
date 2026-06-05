@@ -2886,20 +2886,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     });
 
     
-    router.get('/test-hold', async (req, res) => {
-        await ConfigManager.refresh(); // Ensure we have the latest config
-        const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
-        const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
-        console.log(`Config values: Qr_min_use_amount=${Qr_min_use_amount}, Qr_min_use_penality=${Qr_min_use_penality}`);
-        return res.json({ success: true, Qr_min_use_amount, Qr_min_use_penality });
-        // try {            
-        //     const result = await test_processManualHold();
-        //     return res.json({ success: true, result });
-        // } catch (err) {
-        //     console.error('Test hold error:', err);
-        //     return res.status(500).json({ success: false, error: err.message || 'Test failed' });
-        // }
-    });
+    // router.get('/test-hold', async (req, res) => {
+    //     await ConfigManager.refresh(); // Ensure we have the latest config
+    //     const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
+    //     const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
+    //     console.log(`Config values: Qr_min_use_amount=${Qr_min_use_amount}, Qr_min_use_penality=${Qr_min_use_penality}`);
+    //     return res.json({ success: true, Qr_min_use_amount, Qr_min_use_penality });
+    // });
 
 
     // async function test_processManualHold() {
