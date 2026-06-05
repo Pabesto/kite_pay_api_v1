@@ -7,6 +7,8 @@ const multer = require('multer');
 const moment = require('moment-timezone');
 const { Client, Account } = require('node-appwrite');
 
+const cron = require('node-cron');
+
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -1003,7 +1005,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             if(status){
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']); // enum gate [14]
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed', 'suspicious']); // enum gate [14]
                 if (!allowedStatuses.has(status.toLowerCase())) {
                     return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
                 }
@@ -1228,7 +1230,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             if(status){
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']); // enum gate [14]
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed', 'suspicious']); // enum gate [14]
                 if (!allowedStatuses.has(status.toLowerCase())) {
                     return res.status(400).json({ error: 'Invalid status filter' }); // 400 on bad input [14]
                 }
@@ -1421,7 +1423,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             if (status) {
-                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']);
+                const allowedStatuses = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed', 'suspicious']); // enum gate [14]
                 if (!allowedStatuses.has(status.toLowerCase())) {
                 return res.status(400).json({ error: 'Invalid status filter' });
                 }
@@ -1555,7 +1557,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (Object.keys(req.body).some(k => k !== 'status')) {
             return res.status(400).json({ error: 'Only status can be updated here' });
             }
-            const allowed = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed']);
+            const allowed = new Set(['normal', 'cyber', 'refund', 'chargeback', 'failed', 'suspicious']);
             if (typeof status !== 'string' || !allowed.has(status.toLowerCase())) {
             return res.status(400).json({ error: 'Invalid status' });
             }
@@ -1715,7 +1717,58 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             await inc('chargebackAmount', -amt);
             await inc('failedCount', 1);
             await inc('failedAmount', amt);
-            } else {
+            } else if (prev === 'normal' && next === 'suspicious') {
+                await inc('suspiciousCount', 1);
+                await inc('suspiciousAmount', amt);
+            } else if (prev === 'suspicious' && next === 'normal') {
+                await inc('suspiciousCount', -1);
+                await inc('suspiciousAmount', -amt);
+            }
+            else if (prev === 'suspicious' && next === 'cyber') {
+            await inc('suspiciousCount', -1);
+            await inc('suspiciousAmount', -amt);
+            await inc('cyberCount', 1);
+            await inc('cyberAmount', amt);
+            } else if (prev === 'cyber' && next === 'suspicious') {
+            await inc('cyberCount', -1);
+            await inc('cyberAmount', -amt);
+            await inc('suspiciousCount', 1);
+            await inc('suspiciousAmount', amt);
+            }
+            else if (prev === 'suspicious' && next === 'refund') {
+                await inc('suspiciousCount', -1);
+                await inc('suspiciousAmount', -amt);
+                await inc('refundCount', 1);
+                await inc('refundAmount', amt);
+            } else if (prev === 'refund' && next === 'suspicious') {
+                await inc('refundCount', -1);
+                await inc('refundAmount', -amt);
+                await inc('suspiciousCount', 1);
+                await inc('suspiciousAmount', amt);
+            }
+            else if (prev === 'suspicious' && next === 'chargeback') {
+                await inc('suspiciousCount', -1);
+                await inc('suspiciousAmount', -amt);
+                await inc('chargebackCount', 1);
+                await inc('chargebackAmount', amt);
+            } else if (prev === 'chargeback' && next === 'suspicious') {
+                await inc('chargebackCount', -1);
+                await inc('chargebackAmount', -amt);
+                await inc('suspiciousCount', 1);
+                await inc('suspiciousAmount', amt);
+            }
+            else if (prev === 'suspicious' && next === 'failed') {
+                await inc('suspiciousCount', -1);
+                await inc('suspiciousAmount', -amt);
+                await inc('failedCount', 1);
+                await inc('failedAmount', amt);
+            } else if (prev === 'failed' && next === 'suspicious') {
+                await inc('failedCount', -1);
+                await inc('failedAmount', -amt);
+                await inc('suspiciousCount', 1);
+                await inc('suspiciousAmount', amt);
+            }
+            else {
             console.log('Unhandled transition:', prev, '->', next, 'no counters changed');
             }
 
@@ -2832,6 +2885,128 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }
     });
 
+    async function processManualHold({
+            qrId,
+            amountPaise,
+            action,
+            reason,
+            adminId,
+            adminName
+        })  {
+        const lockKey = `lock:qr:${qrId}`;
+        const lockVal = `hold-${Date.now()}`;
+
+        let lockAcquired = false;
+
+        try {
+            const r = await redisClient.set(lockKey, lockVal, {
+                NX: true,
+                EX: 20
+            });
+
+            lockAcquired = r === 'OK';
+
+            if (!lockAcquired) {
+                throw new Error('QR is currently being modified. Try again shortly.');
+            }
+
+            const qrResult = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                [Query.equal('qrId', qrId), Query.limit(1)]
+            );
+
+            if (!qrResult.documents.length) {
+                throw new Error('QR not found');
+            }
+
+            const qrDoc = qrResult.documents[0];
+
+            const currentHold = Number(qrDoc.amountOnHold || 0);
+
+            let newHold;
+
+            if (action === 'hold') {
+                newHold = currentHold + amountPaise;
+            } else {
+                if (amountPaise > currentHold) {
+                    throw new Error(
+                        `Cannot release ${amountPaise} paise. Only ${currentHold} paise currently on hold.`
+                    );
+                }
+
+                newHold = currentHold - amountPaise;
+            }
+
+            const total = Number(qrDoc.totalPayInAmount || 0);
+            const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+            const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+            const commHold = Number(qrDoc.commissionOnHold || 0);
+            const commPaid = Number(qrDoc.commissionPaid || 0);
+
+            const newAvailable =
+                total -
+                approved -
+                requested -
+                newHold -
+                commHold -
+                commPaid;
+
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                Qr_collectionId,
+                qrDoc.$id,
+                {
+                    amountOnHold: newHold,
+                    amountAvailableForWithdrawal: newAvailable,
+                }
+            );
+
+            const holdRecord = {
+                qrId,
+                assignedUserId: qrDoc.assignedUserId || null,
+                action,
+                amountPaise,
+                previousHold: currentHold,
+                newHold,
+                newAvailable,
+                reason: reason || null,
+                adminId,
+                adminName,
+                createdAt: istDateTimeNow(),
+            };
+
+            await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_MANUAL_HOLD_COLLECTION_ID,
+                ID.unique(),
+                holdRecord
+            );
+
+            return holdRecord;
+        } finally {
+            if (lockAcquired) {
+                await releaseLock(lockKey, lockVal);
+            }
+        }
+    }
+
+    function startCronJobs() {
+        cron.schedule(
+            '0 1 * * *',
+            async () => {
+                console.log('Running 1 AM settlement job');
+
+                // await processPendingWithdrawals();
+                // await releaseExpiredHolds();
+                // await processCommissions();
+            },
+            {
+                timezone: 'Asia/Kolkata',
+            }
+        );
+    }
+
     // ✅ Manual hold on QR — admin can add/remove hold amount (paise)
     // POST /manual-hold-on-qr { qrId, amountPaise, action: 'hold' | 'release', reason }
     router.post('/manual-hold-on-qr', authenticateAdmin, async (req, res) => {
@@ -2844,92 +3019,27 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         if (!amountPaise || !Number.isInteger(amountPaise) || amountPaise <= 0)
             return res.status(400).json({ error: 'amountPaise must be a positive integer' });
 
-        // --- Acquire per-QR Redis lock ---
-        const lockKey = `lock:qr:${qrId}`;
-        const lockVal = `hold-${Date.now()}`;
-        let lockAcquired = false;
         try {
-            const r = await redisClient.set(lockKey, lockVal, { NX: true, EX: 20 });
-            lockAcquired = r === 'OK';
-        } catch (e) {
-            console.error('Redis lock error in manual-hold-on-qr:', e);
-        }
-        if (!lockAcquired)
-            return res.status(409).json({ error: 'QR is currently being modified. Try again shortly.' });
-
-        try {
-            // --- Fetch QR doc ---
-            const qrResult = await databases.listDocuments(
-                APPWRITE_DATABASE_ID, Qr_collectionId,
-                [Query.equal('qrId', qrId), Query.limit(1)]
-            );
-            if (!qrResult.documents.length)
-                return res.status(404).json({ error: 'QR not found' });
-
-            const qrDoc = qrResult.documents[0];
-            const currentHold = Number(qrDoc.amountOnHold || 0);
-
-            let newHold;
-            if (action === 'hold') {
-                newHold = currentHold + amountPaise;
-            } else {
-                if (amountPaise > currentHold)
-                    return res.status(400).json({ error: `Cannot release ${amountPaise} paise. Only ${currentHold} paise currently on hold.` });
-                newHold = currentHold - amountPaise;
-            }
-
-            // Recompute available
-            const total     = Number(qrDoc.totalPayInAmount || 0);
-            const approved  = Number(qrDoc.withdrawalApprovedAmount || 0);
-            const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-            const commHold  = Number(qrDoc.commissionOnHold || 0);
-            const commPaid  = Number(qrDoc.commissionPaid || 0);
-            const newAvailable = total - approved - requested - newHold - commHold - commPaid;
-
-            // Update QR balance
-            await databases.updateDocument(
-                APPWRITE_DATABASE_ID, Qr_collectionId, qrDoc.$id,
-                {
-                    amountOnHold: newHold,
-                    amountAvailableForWithdrawal: newAvailable,
-                }
-            );
-
-            // Save hold transaction record
-            const holdRecord = {
-                qrId,
-                assignedUserId: qrDoc.assignedUserId || null,
-                action,
-                amountPaise,
-                previousHold: currentHold,
-                newHold,
-                newAvailable,
-                reason: reason || null,
+            const record = await processManualHold({
+                qrId: req.body.qrId,
+                amountPaise: req.body.amountPaise,
+                action: req.body.action,
+                reason: req.body.reason,
                 adminId: req.user.userId,
-                adminName: req.user.name || null,
-                createdAt: istDateTimeNow(),
-            };
-
-            await databases.createDocument(
-                APPWRITE_DATABASE_ID,
-                APPWRITE_MANUAL_HOLD_COLLECTION_ID,
-                ID.unique(),
-                holdRecord
-            );
-
-            console.log(`✅ Manual ${action} on QR ${qrId}: ${amountPaise} paise by ${req.user.userId}. Reason: ${reason || 'N/A'}`);
-
-            return res.status(200).json({
-                success: true,
-                message: `${action === 'hold' ? 'Hold placed' : 'Hold released'} successfully`,
-                record: holdRecord,
+                adminName: req.user.name,
             });
+
+            return res.json({
+                success: true,
+                record,
+            });
+
         } catch (err) {
-            console.error('❌ Manual hold error:', err);
-            return res.status(500).json({ error: err.message || 'Failed to update hold' });
-        } finally {
-            await releaseLock(lockKey, lockVal);
+            return res.status(400).json({
+                error: err.message,
+            });
         }
+
     });
 
     // ✅ GET /manual-hold-on-qr — role-based hold history
