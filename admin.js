@@ -2993,37 +2993,37 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // startCronJobs();
 
-    router.get('/test-hold', async (req, res) => {
-        try {            
-            const result = await test_processManualHold();
-            return res.json({ success: true, result });
-        } catch (err) {
-            console.error('Test hold error:', err);
-            return res.status(500).json({ success: false, error: err.message || 'Test failed' });
-        }
-    });
+    // router.get('/test-hold', async (req, res) => {
+    //     try {            
+    //         const result = await test_processManualHold();
+    //         return res.json({ success: true, result });
+    //     } catch (err) {
+    //         console.error('Test hold error:', err);
+    //         return res.status(500).json({ success: false, error: err.message || 'Test failed' });
+    //     }
+    // });
 
 
-    async function test_processManualHold() {
-            console.log('Testing processManualHold with dummy data...');
+    // async function test_processManualHold() {
+    //         console.log('Testing processManualHold with dummy data...');
 
-            try {
-            await processManualHold({
-                    qrId: 'teat0890',
-                    amountPaise: 150000, // cut to zero available
-                    action: 'hold',
-                    reason: 'Penality for not using Minimum 1.5L per Day as per policy',
-                    adminId: 'system',
-                    adminName: 'System AutoHold',
-                });
+    //         try {
+    //         await processManualHold({
+    //                 qrId: 'teat0890',
+    //                 amountPaise: 150000, // cut to zero available
+    //                 action: 'hold',
+    //                 reason: 'Penality for not using Minimum 1.5L per Day as per policy',
+    //                 adminId: 'system',
+    //                 adminName: 'System AutoHold',
+    //             });
 
-            console.log('processManualHold test completed successfully.');
+    //         console.log('processManualHold test completed successfully.');
 
-        } catch (err) {
-            console.error('processManualHold test error:', err);
-        }
+    //     } catch (err) {
+    //         console.error('processManualHold test error:', err);
+    //     }
             
-    }
+    // }
 
     function startCronJobs() {
         cron.schedule(
