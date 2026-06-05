@@ -3151,6 +3151,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         const totals = JSON.parse(summaryDoc.totalsJson);
 
         for (const qr of allDocs) {
+
+            if(qrId.isActive === false) {
+                continue; // skip inactive QRs
+            }
+
             const qrId = qr.qrId;
 
             // QR not present in summary
