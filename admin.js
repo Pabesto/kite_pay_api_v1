@@ -2928,6 +2928,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             adminId,
             adminName
         })  {
+
+        // Helpers
+        const inc = (key, delta) =>
+        updateDashboardCounter(databases, APPWRITE_DATABASE_ID, key, delta).catch((e) =>
+            console.error(`Error updating ${key}:`, e)
+        );
+
         const lockKey = `lock:qr:${qrId}`;
         const lockVal = `hold-${Date.now()}`;
 
@@ -3068,6 +3075,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }
 
     async function getAllAssignedQRCodes() {
+
+        // Helpers
+            const inc = (key, delta) =>
+            updateDashboardCounter(databases, APPWRITE_DATABASE_ID, key, delta).catch((e) =>
+                console.error(`Error updating ${key}:`, e)
+            );
 
         await ConfigManager.refresh(); // Ensure we have the latest config
         const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 150000); // default 3L if not set
