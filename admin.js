@@ -3052,10 +3052,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     }
 
-    const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
-    const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
+    // const Qr_min_use_amount = ConfigManager.get('Qr_min_use_amount', 0); // default 3L if not set
+    // const Qr_min_use_penality = ConfigManager.get('Qr_min_use_penality', 0); // default 3L if not set
 
-    console.log(`Starting cron jobs with Qr_min_use_amount=${Qr_min_use_amount} and Qr_min_use_penality=${Qr_min_use_penality}...`);
+    // console.log(`Starting cron jobs with Qr_min_use_amount=${Qr_min_use_amount} and Qr_min_use_penality=${Qr_min_use_penality}...`);
 
 
     startCronJobs();
