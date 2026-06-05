@@ -3063,7 +3063,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     function startCronJobs() {
         cron.schedule(
-            '17 3 * * *',
+            '20 3 * * *',
             async () => {
                 console.log('Running 3:05 AM settlement job');
                 await getAllAssignedQRCodes();
@@ -3179,7 +3179,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             console.log(`QR ${qrId} had total amount ${amount} yesterday. Minimum required is ${Qr_min_use_amount}.`);
 
-            if (amount < Qr_min_use_amount) {
+            if (amount < (Qr_min_use_amount * 100) ) {
 
                 console.log(
                     `QR ${qrId} did not meet minimum usage. Applying penalty hold of ${Qr_min_use_penality}.`
