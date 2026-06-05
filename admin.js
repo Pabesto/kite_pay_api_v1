@@ -29,7 +29,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -741,7 +741,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 const userIdofUserDeleting = userMetaDoc.userId;
 
                 // Check if user has assigned QR codes before allowing deletion
-                const response = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, 
+                const response = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, 
                     [Query.equal('assignedUserId', userIdofUserDeleting)]
                 );
 
@@ -782,7 +782,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         try {
             const response = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
-            Qr_collectionId, // Ensure this matches your actual QR codes collection ID
+            APPWRITE_QRCODE_COLLECTION_ID, // Ensure this matches your actual QR codes collection ID
             [Query.equal('assignedUserId', userId)]
             );
             return response.documents.map(doc => doc.qrId);
@@ -800,7 +800,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // QRs created by the subadmin
             const createdQrs = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
-            Qr_collectionId,
+            APPWRITE_QRCODE_COLLECTION_ID,
             [Query.equal("createdByUserId", subadminId)]
             );
 
@@ -822,7 +822,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (managedUserIds.length > 0) {
             const qrDocs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                Qr_collectionId,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 [Query.equal("assignedUserId", managedUserIds)]
             );
             qrDocs.documents.forEach(q => qrIds.add(q.qrId));
@@ -912,7 +912,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 resultAllQr = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
+                    APPWRITE_QRCODE_COLLECTION_ID,
                     queries,
                 );
 
@@ -1336,7 +1336,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 }
                 // If only qrId passed, verify the QR belongs to an allowed user
                 if (!userId && qrId) {
-                    const qrDoc = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [Query.equal('qrId', qrId), Query.limit(1)]);
+                    const qrDoc = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.equal('qrId', qrId), Query.limit(1)]);
                     if (qrDoc.documents.length === 0 || !allowedIds.includes(qrDoc.documents[0].assignedUserId)) {
                         return res.status(403).json({ error: 'Forbidden: This QR is not under your management' });
                     }
@@ -1578,7 +1578,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // 4) Reconcile holds for the QR (boundary crossing only)
             if (tx.qrCodeId) {
-            const qrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId,
+            const qrList = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
                 [Query.equal('qrId', tx.qrCodeId), Query.limit(1)]);
             if (qrList.documents.length) {
                 const qr = qrList.documents[0];
@@ -1599,7 +1599,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 const commissionPaid = Number(qr.commissionPaid || 0);
                 const nextAvailable = total - approved - requested - nextHold - (commissionOnHold + commissionPaid);
 
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, qr.$id, {
                 amountOnHold: nextHold,
                 amountAvailableForWithdrawal: nextAvailable,
                 });
@@ -1886,7 +1886,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         // Fetch old QR doc once — reused in both 5A and 5B
         let oldQrDoc = null;
         if (oldQrId) {
-            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const oldQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
                 Query.equal('qrId', oldQrId),
                 Query.limit(1),
             ]);
@@ -1913,7 +1913,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                             withdrawalApproved: Number(qr.withdrawalApprovedAmount || 0),
                         });
                     }
-                    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, qr.$id, {
                         totalPayInAmount: newTotal,
                         amountAvailableForWithdrawal: newAvailable,
                     });
@@ -1930,7 +1930,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                             withdrawalApproved: Number(qr.withdrawalApprovedAmount || 0),
                         });
                     }
-                    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, qr.$id, {
                         totalPayInAmount: newTotal,
                         amountOnHold: newHold,
                         amountAvailableForWithdrawal: newAvailable,
@@ -1955,7 +1955,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         withdrawalApproved: Number(oldQr.withdrawalApprovedAmount || 0),
                     });
                 }
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+                await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, oldQr.$id, {
                 totalPayInAmount: newTotal,
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
                 amountAvailableForWithdrawal: newAvailableOldQr,
@@ -1970,7 +1970,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         withdrawalApproved: Number(oldQr.withdrawalApprovedAmount || 0),
                     });
                 }
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, oldQr.$id, {
+                await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, oldQr.$id, {
                 amountOnHold: newHold,
                 totalTransactions: Math.max(0, (oldQr.totalTransactions || 0) - 1),
                 amountAvailableForWithdrawal: newAvailableOldQr,
@@ -1980,7 +1980,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
         // New QR: apply current impact with existing status
         if (newQrId) {
-            const newQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const newQrList = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
             Query.equal('qrId', newQrId),
             Query.limit(1),
             ]);
@@ -1990,14 +1990,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             if (isPrevNormal) {
                 const newTotal = Number(newQr.totalPayInAmount || 0) + postAmount;
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, newQr.$id, {
+                await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, newQr.$id, {
                 totalPayInAmount: newTotal,
                 totalTransactions: (newQr.totalTransactions || 0) + 1,
                 amountAvailableForWithdrawal: recomputeAvailable({ ...newQr, totalPayInAmount: newTotal }),
                 }); // add to totals for normal tx [web:176][web:179]
             } else {
                 const newHold = Number(newQr.amountOnHold || 0) + postAmount;
-                await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, newQr.$id, {
+                await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, newQr.$id, {
                 amountOnHold: newHold,
                 totalTransactions: (newQr.totalTransactions || 0) + 1,
                 amountAvailableForWithdrawal: recomputeAvailable({ ...newQr, amountOnHold: newHold }),
@@ -2134,7 +2134,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (qrId) {
             const qrList = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                Qr_collectionId,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 [Query.equal('qrId', qrId), Query.limit(1)]
             );
 
@@ -2178,7 +2178,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                Qr_collectionId,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 qrDoc.$id,
                     {
                         totalPayInAmount: nextTotal,
@@ -2438,7 +2438,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 if (qrCodeId) {
                 const qrResult = await databases.listDocuments(
                     APPWRITE_DATABASE_ID,
-                    Qr_collectionId,
+                    APPWRITE_QRCODE_COLLECTION_ID,
                     [Query.equal('qrId', qrCodeId), Query.limit(1)]
                 );
 
@@ -2458,7 +2458,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                         await databases.updateDocument(
                         APPWRITE_DATABASE_ID,
-                        Qr_collectionId,
+                        APPWRITE_QRCODE_COLLECTION_ID,
                         qrDoc.$id,
                         {
                             totalTransactions: newTransactions,
@@ -2967,7 +2967,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const qrResult = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                Qr_collectionId,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 [Query.equal('qrId', qrId), Query.limit(1)]
             );
 
@@ -3014,7 +3014,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                Qr_collectionId,
+                APPWRITE_QRCODE_COLLECTION_ID,
                 qrDoc.$id,
                 {
                     amountOnHold: newHold,
@@ -3056,7 +3056,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     function startCronJobs() {
         cron.schedule(
-            '0 2 * * *',
+            '38 2 * * *',
             async () => {
                 console.log('Running 2:00 AM settlement job');
                 await getAllAssignedQRCodes();
@@ -3415,7 +3415,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 }, 0);
 
                 // 1) Fetch all QRs assigned to this user
-                const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+                const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
                     Query.equal('assignedUserId', actor.userId),
                     Query.limit(100),
                     Query.orderAsc('$id'),
@@ -3547,14 +3547,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             // 1) Fetch all QRs managed by merchantId (paginate)
-            const AllManagedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const AllManagedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
                 Query.equal('managedByUserId', merchantId),
                 Query.limit(100),
                 Query.orderAsc('$id'),
             ]);
 
             // 1) Fetch all QRs managed by merchantId (paginate)
-            const AllSelfAssignedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const AllSelfAssignedQrs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
                 Query.equal('assignedUserId', merchantId),
                 Query.limit(100),
                 Query.orderAsc('$id'),
@@ -3913,7 +3913,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             // 1) Fetch all QRs assigned to this user
-            const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [
+            const qrs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [
                 Query.equal('assignedUserId', userId),
                 Query.limit(100),
                 Query.orderAsc('$id'),
