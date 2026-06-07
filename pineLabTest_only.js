@@ -22,7 +22,7 @@ const CONFIG = {
     clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
   },
 
-  //   production: {
+  // production: {
   //   baseUrl: "https://api-c.pinelabs.com",
   //   clientId: "PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX",
   //   clientSecret: "MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V",
@@ -31,7 +31,7 @@ const CONFIG = {
 };
 
 // Set active environment: "test" or "production"
-const ACTIVE_ENV = "production";
+const ACTIVE_ENV = "test";
 
 // ─────────────────────────────────────────────
 // PINE ONE CLIENT

@@ -3063,7 +3063,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     function startCronJobs() {
         cron.schedule(
-            '20 3 * * *',
+            '16 10 * * *',
             async () => {
                 console.log('Running 3:05 AM settlement job');
                 await getAllAssignedQRCodes();
@@ -3152,7 +3152,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
         for (const qr of allDocs) {
 
-            if(qrId.isActive === false) {
+            if(qr.isActive === false) {
                 continue; // skip inactive QRs
             }
 
