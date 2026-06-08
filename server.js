@@ -1679,7 +1679,7 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 const { startPinelabPoller } = require('./pinelabPoller');
 
 // const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
-const ENABLE_PINELAB_POLLER = false; // default to disabled to avoid unintended consequences; enable explicitly with env var
+const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
 
 
 const pinelabPoller = ENABLE_PINELAB_POLLER
