@@ -223,6 +223,55 @@ async function acquireLock(key, value, ttlSeconds = 15) {
     }
 }
 
+// calucateQrs();
+
+async function calucateQrs() {
+    let allDocs = [];
+        let offset = 0;
+        const limit = 100;
+
+        while (true) {
+            const response = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                [
+                    // Query.isNotNull('assignedUserId'),
+                    Query.limit(limit),
+                    Query.offset(offset)
+                ]
+            );
+
+            allDocs.push(...response.documents);
+
+            if (response.documents.length < limit) {
+                break;
+            }
+
+            offset += limit;
+        }
+
+        withdrawalApprovedAmount = 0;
+        commissionPaid = 0;
+        totalPayInAmount = 0;
+
+        for (const qr of allDocs) {
+
+            // if(qr.isActive === false) {
+            //     continue; // skip inactive QRs
+            // }
+
+            withdrawalApprovedAmount += Number(qr.withdrawalApprovedAmount || 0);
+            commissionPaid += Number(qr.commissionPaid || 0);
+            totalPayInAmount += Number(qr.totalPayInAmount || 0);
+        }
+
+        console.log('Total active QR codes with assignedUserId:', allDocs.length);
+        console.log('Total approved withdrawal amount across all QRs:', withdrawalApprovedAmount);
+        console.log('Total commission paid across all QRs:', commissionPaid);
+        console.log('Total pay-in amount across all QRs:', totalPayInAmount);
+
+}
+
 // Release lock — tries Redis first, always cleans up in-memory fallback.
 async function releaseLock(key, value) {
     const lua = `if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;

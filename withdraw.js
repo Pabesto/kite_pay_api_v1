@@ -1176,6 +1176,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                   earningType: 'admin',
                   createdAt: new Date().toISOString(),
                 });
+
+                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
               }
 
             }
