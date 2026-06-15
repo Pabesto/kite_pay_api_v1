@@ -297,20 +297,21 @@ async function fetchAllTransactions() {
     // 1. Convert object to an array and sort by txnCount in descending order
     const sortedVpaArray = Object.entries(vpaSummary).sort((a, b) => {
         // b[1] represents the second element (the data object) of the next item
-        return b[1].txnCount - a[1].txnCount;
+        return b[1].totalAmount - a[1].totalAmount;
     });
 
     // 2. Output the sorted array
     console.log(sortedVpaArray);
 
     // 1. Format the sorted array data into a clean text string
-    let fileContent = "VPA SUMMARY REPORT (Sorted by Transaction Count - Descending)\n";
+    let fileContent = "VPA SUMMARY REPORT (Sorted by Total Amount - Descending)\n";
     fileContent += "============================================================\n\n";
 
     sortedVpaArray.forEach(([vpa, data], index) => {
+        const amount = (Number(data.totalAmount) || 0) / 100; // Only use /100 if stored as paise
         fileContent += `${index + 1}. VPA: ${vpa}\n`;
         fileContent += `   Total Transactions: ${data.txnCount}\n`;
-        fileContent += `   Total Amount: ${data.totalAmount}\n`;
+        fileContent += `   Total Amount: ${amount}\n`;
         fileContent += "------------------------------------------------------------\n";
     });
 
