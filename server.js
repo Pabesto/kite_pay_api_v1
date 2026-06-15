@@ -39,6 +39,9 @@ const { createClient } = require('redis');
 const userMetaCache = require('./userMetaCache');
 const dashboardCounters = require('./dashboardCounters');
 
+const fs = require('fs');
+const path = require('path');
+
 // --- Configuration & Initialization ---
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -224,6 +227,114 @@ async function acquireLock(key, value, ttlSeconds = 15) {
 }
 
 // calucateQrs();
+
+// import { Query } from 'appwrite'; // Make sure to import Query
+
+// const txns = await fetchAllTransactions();
+
+fetchAllTransactions().then((txns) => {
+    console.log(`Successfully fetched ${txns.length} transactions.`);
+});
+
+
+async function fetchAllTransactions() {
+    let allTxns = [];
+    let lastId = null;
+    let hasMore = true;
+
+    while (hasMore) {
+        console.log(`Fetching transactions batch after ID: ${lastId || 'start'}`);
+        // 1. Build queries array
+        const queries = [
+            Query.limit(100) // Fetch maximum allowed per batch
+        ];
+
+        // 2. If we have a lastId from the previous batch, look after it
+        if (lastId) {
+            queries.push(Query.cursorAfter(lastId));
+        }
+
+        // 3. Make the API call
+        const response = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            queries
+        );
+
+        // 4. Add the fetched documents to our main array
+        allTxns = allTxns.concat(response.documents);
+
+        // 5. Check if there are more documents to fetch
+        if (response.documents.length < 100) {
+            hasMore = false; // We fetched less than 100, meaning we reached the end
+        } else {
+            // Update the lastId to the last document in the current batch
+            lastId = response.documents[response.documents.length - 1].$id;
+        }
+    }
+
+    // Assuming 'txns' is the array containing all fetched documents from the previous step
+    const vpaSummary = {};
+
+    allTxns.forEach(txn => {
+        const vpa = txn.vpa;
+        // Ensure amount is treated as a number (and default to 0 if missing)
+        const amount = Number(txn.amount) || 0; 
+
+        // If we haven't seen this VPA yet, initialize it
+        if (!vpaSummary[vpa]) {
+            vpaSummary[vpa] = {
+                totalAmount: 0,
+                txnCount: 0
+            };
+        }
+
+        // Accumulate the data
+        vpaSummary[vpa].totalAmount += amount;
+        vpaSummary[vpa].txnCount += 1;
+    });
+
+    // 1. Convert object to an array and sort by txnCount in descending order
+    const sortedVpaArray = Object.entries(vpaSummary).sort((a, b) => {
+        // b[1] represents the second element (the data object) of the next item
+        return b[1].txnCount - a[1].txnCount;
+    });
+
+    // 2. Output the sorted array
+    console.log(sortedVpaArray);
+
+    // 1. Format the sorted array data into a clean text string
+    let fileContent = "VPA SUMMARY REPORT (Sorted by Transaction Count - Descending)\n";
+    fileContent += "============================================================\n\n";
+
+    sortedVpaArray.forEach(([vpa, data], index) => {
+        fileContent += `${index + 1}. VPA: ${vpa}\n`;
+        fileContent += `   Total Transactions: ${data.txnCount}\n`;
+        fileContent += `   Total Amount: ${data.totalAmount}\n`;
+        fileContent += "------------------------------------------------------------\n";
+    });
+
+    try {
+        // 2. Define the path to the root directory
+        // 'process.cwd()' gives you the current working directory (the root of your project)
+        const filePath = path.join(process.cwd(), 'vpa_report.txt');
+
+        // 3. Write the file locally
+        fs.writeFileSync(filePath, fileContent, 'utf8');
+        
+        console.log(`✅ File successfully saved to: ${filePath}`);
+    } catch (error) {
+        console.error("❌ Error writing the file:", error);
+    }
+
+    // Output the final dataset
+    // console.log(vpaSummary);
+
+    return allTxns;
+}
+
+// // Usage:
+// console.log(`Successfully fetched ${txns.length} transactions.`);
 
 async function calucateQrs() {
     let allDocs = [];
