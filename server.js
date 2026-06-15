@@ -232,9 +232,9 @@ async function acquireLock(key, value, ttlSeconds = 15) {
 
 // const txns = await fetchAllTransactions();
 
-fetchAllTransactions().then((txns) => {
-    console.log(`Successfully fetched ${txns.length} transactions.`);
-});
+// fetchAllTransactions().then((txns) => {
+//     console.log(`Successfully fetched ${txns.length} transactions.`);
+// });
 
 
 async function fetchAllTransactions() {
