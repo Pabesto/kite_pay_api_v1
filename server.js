@@ -1913,45 +1913,13 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
 
 
-// const { startPinelabPoller } = require('./pinelabPoller');
+const { startPinelabPoller } = require('./pinelabPoller');
 
-// // const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
-// const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
-
-// const pinelabPoller = ENABLE_PINELAB_POLLER
-//   ? startPinelabPoller(
-//       {
-//         databases,
-//         Query,
-//         ID,
-//         redisClient,
-//         acquireLock,
-//         releaseLock,
-//         emitTxnNew,
-//         updateDailyQrTotal,
-//         APPWRITE_DATABASE_ID,
-//         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//         APPWRITE_QRCODE_COLLECTION_ID,
-//         LOCK_TTL_SECONDS,
-//       },
-//       {
-//         env: 'production',
-//         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
-//         bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
-//         maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
-//         pageSize: 100,
-//         maxPagesPerTick: 50,
-//         dryRun: false,
-//       }
-//     )
-//   : null;
-
-const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
-
-const ENABLE_PINELAB_POLLER = true; 
+// const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
+const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
 
 const pinelabPoller = ENABLE_PINELAB_POLLER
-  ? startPinelabMultiPoller(
+  ? startPinelabPoller(
       {
         databases,
         Query,
@@ -1969,28 +1937,60 @@ const pinelabPoller = ENABLE_PINELAB_POLLER
       {
         env: 'production',
         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
-        bufferMinutes: 2,
-        maxLookbackMinutes: 60,
+        bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
+        maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
         pageSize: 100,
         maxPagesPerTick: 50,
         dryRun: false,
-        
-        // Pass multiple accounts here dynamically 
-        accounts: [
-          {
-            id: 'scanserve_ai',
-            clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
-            clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv'
-          },
-        //   {
-        //     id: 'pabesto_tech',
-        //     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
-        //     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V'
-        //   }
-        ]
       }
     )
   : null;
+
+// const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
+
+// const ENABLE_PINELAB_POLLER = true; 
+
+// const pinelabPoller = ENABLE_PINELAB_POLLER
+//   ? startPinelabMultiPoller(
+//       {
+//         databases,
+//         Query,
+//         ID,
+//         redisClient,
+//         acquireLock,
+//         releaseLock,
+//         emitTxnNew,
+//         updateDailyQrTotal,
+//         APPWRITE_DATABASE_ID,
+//         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+//         APPWRITE_QRCODE_COLLECTION_ID,
+//         LOCK_TTL_SECONDS,
+//       },
+//       {
+//         env: 'production',
+//         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
+//         bufferMinutes: 2,
+//         maxLookbackMinutes: 60,
+//         pageSize: 100,
+//         maxPagesPerTick: 50,
+//         dryRun: false,
+        
+//         // Pass multiple accounts here dynamically 
+//         accounts: [
+//           {
+//             id: 'scanserve_ai',
+//             clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
+//             clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv'
+//           },
+//         //   {
+//         //     id: 'pabesto_tech',
+//         //     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
+//         //     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V'
+//         //   }
+//         ]
+//       }
+//     )
+//   : null;
 
 // Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
 // normal watermark window; pass both for an explicit backfill window.
