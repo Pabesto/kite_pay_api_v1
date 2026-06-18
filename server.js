@@ -235,10 +235,6 @@ async function acquireLock(key, value, ttlSeconds = 15) {
 // fetchAllTransactions().then((txns) => {
 //     console.log(`Successfully fetched ${txns.length} transactions.`);
 // });
-<<<<<<< HEAD
-=======
-
->>>>>>> d5ad1305afdb6a073f00195dc7b16aa98b2380ad
 
 async function fetchAllTransactions() {
     let allTxns = [];
