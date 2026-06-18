@@ -234,6 +234,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     });
     
+    // 🔥 List all Employees
     router.get('/employees', authenticateAdmin, async (req, res) => {
     const requestorId = req.user.userId;
     const role = req.user.role; // 'admin' | 'subadmin'

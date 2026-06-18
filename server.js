@@ -209,7 +209,7 @@ function memRelease(key, value) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────-
 
 // Acquire a distributed lock. Tries Redis first, falls back to in-memory.
 // Uses SET NX EX which is atomic in Redis — safe under concurrency.
@@ -232,56 +232,59 @@ async function acquireLock(key, value, ttlSeconds = 15) {
 
 // const txns = await fetchAllTransactions();
 
-fetchAllTransactions().then((txns) => {
-    console.log(`Successfully fetched ${txns.length} transactions.`);
-});
-
+// fetchAllTransactions().then((txns) => {
+//     console.log(`Successfully fetched ${txns.length} transactions.`);
+// });
 
 async function fetchAllTransactions() {
     let allTxns = [];
     let lastId = null;
     let hasMore = true;
 
+    // const qrIds = ['9620580800', '9620580700', '9620580900', '9620580600'];  // RUVI QR codes
+
+    const qrIds = ['0096206462'];  // NICE QR codes
+
     while (hasMore) {
         console.log(`Fetching transactions batch after ID: ${lastId || 'start'}`);
-        // 1. Build queries array
+
+        // Rebuild queries array freshly on every iteration to avoid cursor accumulation
         const queries = [
-            Query.limit(100) // Fetch maximum allowed per batch
+            Query.limit(100), 
+            Query.equal('qrCodeId', qrIds) 
         ];
 
-        // 2. If we have a lastId from the previous batch, look after it
+        // Only add the cursor if we actually have a previous page's last ID
         if (lastId) {
             queries.push(Query.cursorAfter(lastId));
         }
 
-        // 3. Make the API call
+        // Make the API call
         const response = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             queries
         );
 
-        // 4. Add the fetched documents to our main array
+        // Add the fetched documents to our main array
         allTxns = allTxns.concat(response.documents);
 
-        // 5. Check if there are more documents to fetch
+        // Check if there are more documents to fetch
         if (response.documents.length < 100) {
-            hasMore = false; // We fetched less than 100, meaning we reached the end
+            hasMore = false; // Reached the end
         } else {
             // Update the lastId to the last document in the current batch
             lastId = response.documents[response.documents.length - 1].$id;
         }
     }
 
-    // Assuming 'txns' is the array containing all fetched documents from the previous step
+    // --- Data Processing & Aggregation ---
     const vpaSummary = {};
 
     allTxns.forEach(txn => {
         const vpa = txn.vpa;
-        // Ensure amount is treated as a number (and default to 0 if missing)
         const amount = Number(txn.amount) || 0; 
 
-        // If we haven't seen this VPA yet, initialize it
         if (!vpaSummary[vpa]) {
             vpaSummary[vpa] = {
                 totalAmount: 0,
@@ -289,53 +292,121 @@ async function fetchAllTransactions() {
             };
         }
 
-        // Accumulate the data
         vpaSummary[vpa].totalAmount += amount;
         vpaSummary[vpa].txnCount += 1;
     });
 
-    // 1. Convert object to an array and sort by txnCount in descending order
+    // Convert object to an array and sort by totalAmount descending
     const sortedVpaArray = Object.entries(vpaSummary).sort((a, b) => {
-        // b[1] represents the second element (the data object) of the next item
         return b[1].totalAmount - a[1].totalAmount;
     });
 
-    // 2. Output the sorted array
     console.log(sortedVpaArray);
 
-    // 1. Format the sorted array data into a clean text string
+    // --- File Generation ---
     let fileContent = "VPA SUMMARY REPORT (Sorted by Total Amount - Descending)\n";
     fileContent += "============================================================\n\n";
 
     sortedVpaArray.forEach(([vpa, data], index) => {
-        const amount = (Number(data.totalAmount) || 0) / 100; // Only use /100 if stored as paise
+        const amount = (Number(data.totalAmount) || 0) / 100; // (/100 assumed for Paise to INR conversion)
         fileContent += `${index + 1}. VPA: ${vpa}\n`;
         fileContent += `   Total Transactions: ${data.txnCount}\n`;
-        fileContent += `   Total Amount: ${amount}\n`;
+        fileContent += `   Total Amount: ${amount.toFixed(2)}\n`; // Added .toFixed(2) for clean currency formatting
         fileContent += "------------------------------------------------------------\n";
     });
 
     try {
-        // 2. Define the path to the root directory
-        // 'process.cwd()' gives you the current working directory (the root of your project)
-        const filePath = path.join(process.cwd(), 'vpa_report.txt');
-
-        // 3. Write the file locally
+        const filePath = path.join(process.cwd(), 'vpa_report_nice.txt');
         fs.writeFileSync(filePath, fileContent, 'utf8');
-        
         console.log(`✅ File successfully saved to: ${filePath}`);
     } catch (error) {
         console.error("❌ Error writing the file:", error);
     }
 
-    // Output the final dataset
-    // console.log(vpaSummary);
-
     return allTxns;
+}
+
+// fetchAllManualHolds().then((txns) => {
+//     console.log(`Successfully fetched ${txns.length} Manual Holds.`);
+// });
+
+async function fetchAllManualHolds(baseQueries = []) {
+    let allDocuments = [];
+    let lastId = null;
+    let hasMore = true;
+
+    while (hasMore) {
+        // 1. Clone your existing queries array and append the limit
+        baseQueries.push(Query.greaterThan('newAvailable', 0));
+        const currentQueries = [...baseQueries, Query.limit(100)];
+        
+        // 2. If we have a cursor from the previous batch, look AFTER it
+        if (lastId) {
+            currentQueries.push(Query.cursorAfter(lastId));
+        }
+
+        const result = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, 
+            APPWRITE_MANUAL_HOLD_COLLECTION_ID, 
+            currentQueries
+        );
+
+        // 3. Push the current batch into our main array
+        allDocuments.push(...result.documents);
+
+        // 4. Check if we need to keep fetching
+        if (result.documents.length < 100) {
+            hasMore = false; // We reached the end
+        } else {
+            // Set the cursor to the ID of the last document in this batch
+            lastId = result.documents[result.documents.length - 1].$id;
+        }
+
+        // Print final raw data metrics
+        console.log(`\n--- FETCH COMPLETE ---`);
+        console.log(`Total database documents fetched from Appwrite: ${allDocuments.length}`);
+
+    }
+
+    // 5. Map the full list of accumulated records
+    const records = allDocuments.map(doc => ({
+        $id: doc.$id,
+        qrId: doc.qrId,
+        assignedUserId: doc.assignedUserId,
+        action: doc.action,
+        amountPaise: doc.amountPaise,
+        previousHold: doc.previousHold,
+        newHold: doc.newHold,
+        newAvailable: doc.newAvailable,
+        reason: doc.reason,
+        adminId: doc.adminId,
+        adminName: doc.adminName,
+        createdAt: doc.createdAt,
+    }));
+
+    // 6. Filter for records where newAvailable > 0
+    const positiveAvailableRecords = records.filter(record => record.newAvailable > 0);
+
+    // 7. Log the count and the matching records
+    console.log(`Total records with newAvailable > 0: ${positiveAvailableRecords.length}`);
+    // console.log("Matching Records:", positiveAvailableRecords);
+
+    // Turn the records array into readable, indented text
+    const fileOutputText = JSON.stringify(positiveAvailableRecords, null, 4);
+    
+    // Save locally to your environment
+    fs.writeFileSync('positive_available_records.txt', fileOutputText, 'utf-8');
+    
+    console.log(`Saved ${positiveAvailableRecords.length} records to positive_available_records.txt`);
+    
+    // Optional: Return the filtered records if you need them outside this function
+    return positiveAvailableRecords;
 }
 
 // // Usage:
 // console.log(`Successfully fetched ${txns.length} transactions.`);
+
+// calucateQrs();
 
 async function calucateQrs() {
     let allDocs = [];
@@ -365,6 +436,7 @@ async function calucateQrs() {
         withdrawalApprovedAmount = 0;
         commissionPaid = 0;
         totalPayInAmount = 0;
+        AmountOnHold = 0;
 
         for (const qr of allDocs) {
 
@@ -375,11 +447,13 @@ async function calucateQrs() {
             withdrawalApprovedAmount += Number(qr.withdrawalApprovedAmount || 0);
             commissionPaid += Number(qr.commissionPaid || 0);
             totalPayInAmount += Number(qr.totalPayInAmount || 0);
+            AmountOnHold += Number(qr.amountOnHold || 0);
         }
 
         console.log('Total active QR codes with assignedUserId:', allDocs.length);
         console.log('Total approved withdrawal amount across all QRs:', withdrawalApprovedAmount);
         console.log('Total commission paid across all QRs:', commissionPaid);
+        console.log('Total amount on hold across all QRs:', AmountOnHold);
         console.log('Total pay-in amount across all QRs:', totalPayInAmount);
 
 }
@@ -1837,14 +1911,47 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // Mirrors the Razorpay /webhook pipeline for PineLabs: periodically pulls
 // SUCCESS transactions and persists them with dedup, QR totals, daily summary,
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
-const { startPinelabPoller } = require('./pinelabPoller');
 
-// const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
-const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
 
+// const { startPinelabPoller } = require('./pinelabPoller');
+
+// // const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
+// const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
+
+// const pinelabPoller = ENABLE_PINELAB_POLLER
+//   ? startPinelabPoller(
+//       {
+//         databases,
+//         Query,
+//         ID,
+//         redisClient,
+//         acquireLock,
+//         releaseLock,
+//         emitTxnNew,
+//         updateDailyQrTotal,
+//         APPWRITE_DATABASE_ID,
+//         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+//         APPWRITE_QRCODE_COLLECTION_ID,
+//         LOCK_TTL_SECONDS,
+//       },
+//       {
+//         env: 'production',
+//         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
+//         bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
+//         maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
+//         pageSize: 100,
+//         maxPagesPerTick: 50,
+//         dryRun: false,
+//       }
+//     )
+//   : null;
+
+const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
+
+const ENABLE_PINELAB_POLLER = true; 
 
 const pinelabPoller = ENABLE_PINELAB_POLLER
-  ? startPinelabPoller(
+  ? startPinelabMultiPoller(
       {
         databases,
         Query,
@@ -1862,11 +1969,25 @@ const pinelabPoller = ENABLE_PINELAB_POLLER
       {
         env: 'production',
         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
-        bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
-        maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
+        bufferMinutes: 2,
+        maxLookbackMinutes: 60,
         pageSize: 100,
         maxPagesPerTick: 50,
         dryRun: false,
+        
+        // Pass multiple accounts here dynamically 
+        accounts: [
+          {
+            id: 'scanserve_ai',
+            clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
+            clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv'
+          },
+        //   {
+        //     id: 'pabesto_tech',
+        //     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
+        //     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V'
+        //   }
+        ]
       }
     )
   : null;
