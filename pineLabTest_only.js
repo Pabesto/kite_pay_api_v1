@@ -16,22 +16,29 @@ const CONFIG = {
     clientId: "Utkarsh_Merchant__1_7263",
     clientSecret: "sFBhQSonzT3r1TDgwSlD9HFL9jBlnXZ5",
   },
-  production: {
-    baseUrl: "https://api-c.pinelabs.com",
-    clientId: "SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI",
-    clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
-  },
-
   // production: {
   //   baseUrl: "https://api-c.pinelabs.com",
-  //   clientId: "PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX",
-  //   clientSecret: "MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V",
+  //   clientId: "SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI",
+  //   clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
   // },
+
+  //   production: {
+  //   baseUrl: "https://api-c.pinelabs.com",
+  //   clientId: "SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI",
+  //   clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
+  // },
+
+
+  production: {
+    baseUrl: "https://api-c.pinelabs.com",
+    clientId: "PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX",
+    clientSecret: "MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V",
+  },
 
 };
 
 // Set active environment: "test" or "production"
-const ACTIVE_ENV = "test";
+const ACTIVE_ENV = "production";
 
 // ─────────────────────────────────────────────
 // PINE ONE CLIENT
@@ -188,10 +195,11 @@ async function main() {
 
   // 3. Transaction summary - all successful transactions
   console.log("\n📊 Fetching transaction summary (SUCCESS, last 3 months)...");
+  // 2026-04-11 00:22:58.347
   const summary = await client.getTransactionSummary(
     {
-      fromDate: "2026-04-01T00:00:00",
-      toDate: "2026-04-12T00:00:00",
+      fromDate: "2026-04-11T00:20:00",
+      toDate: "2026-04-11T04:25:00",
       txnStatus: ["SUCCESS"],
     },
     0,  // page
@@ -220,8 +228,8 @@ async function main() {
   if (txnId == "1388368104") {
     console.log(`\n🔍 Fetching details for transaction: ${txnId}...`);
     const details = await client.getTransactionDetails(txnId, "UPI", {
-      fromDate: "2026-04-01T00:00:00",
-      toDate: "2026-04-31T00:00:00",
+      fromDate: "2026-06-19T04:20:00",
+      toDate: "2026-06-19T04:25:00",
     });
     console.log("Transaction Details:", JSON.stringify(details.data, null, 2));
   } else {

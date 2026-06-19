@@ -398,6 +398,7 @@ function startPinelabPoller(deps, opts = {}) {
   // when given an explicit window (so it can't poison the live schedule).
   async function runOnce({ from, to } = {}) {
     if (from && to) {
+      console.log(`*************[PINELAB-POLL] runOnce explicit window: ${from.toISOString()} → ${to.toISOString()}`);
       return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false });
     }
     const window = await resolveDefaultWindow();
