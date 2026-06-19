@@ -298,6 +298,9 @@ function startPinelabPoller(deps, opts = {}) {
         pageSize
       );
 
+      if(isRunOnce)
+      console.log("***********Summary:", JSON.stringify(resp.data, null, 2));
+
       if (resp.statusCode !== 200) {
         const err = `HTTP ${resp.statusCode}`;
         log('RUN', '⚠️  non-200 from PineLab — aborting run', { statusCode: resp.statusCode, data: resp.data });
@@ -310,8 +313,7 @@ function startPinelabPoller(deps, opts = {}) {
       const txns = Array.isArray(data.transactions) ? data.transactions : [];
       totalSeen += txns.length;
 
-      if(isRunOnce)
-      console.log("***********Summary:", JSON.stringify(data, null, 2));
+
 
       for (const txn of txns) {
         const ts = parsePineDate(txn.transactionDate).getTime();
