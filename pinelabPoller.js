@@ -398,7 +398,13 @@ function startPinelabPoller(deps, opts = {}) {
   // when given an explicit window (so it can't poison the live schedule).
   async function runOnce({ from, to } = {}) {
     if (from && to) {
-      console.log(`*************[PINELAB-POLL] runOnce explicit window: ${from.toISOString()} → ${to.toISOString()}`);
+      // 1. Instantly parse them into real Date objects
+      const fromDateObj = new Date(from);
+      const toDateObj   = new Date(to);
+
+      // 2. Now you can safely call .toISOString() on them
+      console.log(`*************[PINELAB-POLL] runOnce explicit window: ${fromDateObj.toISOString()} → ${toDateObj.toISOString()}`);
+      // console.log(`*************[PINELAB-POLL] runOnce explicit window: ${from.toISOString()} → ${to.toISOString()}`);
       return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false });
     }
     const window = await resolveDefaultWindow();
