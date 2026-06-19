@@ -404,14 +404,20 @@ function startPinelabPoller(deps, opts = {}) {
   // when given an explicit window (so it can't poison the live schedule).
   async function runOnce({ from, to } = {}) {
     if (from && to) {
-      // 1. Instantly parse them into real Date objects
-      const fromDateObj = new Date(from);
-      const toDateObj   = new Date(to);
+      // Explicit window strings are naive IST wall-time (e.g. "2026-06-19T04:20:00").
+      // A bare date-time with no offset is parsed by `new Date()` in the SERVER's
+      // local timezone — IST locally but UTC on Render — which then double-shifts
+      // through fmtIst(). Pin a naive string to IST so the result is server-TZ-independent.
+      const toIstDate = (v) =>
+        typeof v === 'string' && !/[zZ]|[+\-]\d{2}:?\d{2}$/.test(v)
+          ? new Date(v.replace(' ', 'T') + '+05:30')
+          : new Date(v);
 
-      // 2. Now you can safely call .toISOString() on them
-      console.log(`*************[PINELAB-POLL] runOnce explicit window: ${fromDateObj.toISOString()} → ${toDateObj.toISOString()}`);
-      // console.log(`*************[PINELAB-POLL] runOnce explicit window: ${from.toISOString()} → ${to.toISOString()}`);
-      return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false }, isRunOnce = true);
+      const fromDateObj = toIstDate(from);
+      const toDateObj   = toIstDate(to);
+
+      console.log(`*************[PINELAB-POLL] runOnce explicit window (IST): ${fromDateObj.toISOString()} → ${toDateObj.toISOString()}`);
+      return fetchWindow(fromDateObj, toDateObj, { advanceWatermark: false }, isRunOnce = true);
     }
     const window = await resolveDefaultWindow();
     return fetchWindow(window.from, window.to, { advanceWatermark: true });
