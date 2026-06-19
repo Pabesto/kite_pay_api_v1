@@ -16,11 +16,11 @@ const CONFIG = {
     clientId: "Utkarsh_Merchant__1_7263",
     clientSecret: "sFBhQSonzT3r1TDgwSlD9HFL9jBlnXZ5",
   },
-  // production: {
-  //   baseUrl: "https://api-c.pinelabs.com",
-  //   clientId: "SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI",
-  //   clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
-  // },
+  production: {
+    baseUrl: "https://api-c.pinelabs.com",
+    clientId: "SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI",
+    clientSecret: "d3tR9f3SDVK5ipmKVQan3YbdR2amGFqv",
+  },
 
   //   production: {
   //   baseUrl: "https://api-c.pinelabs.com",
@@ -29,11 +29,11 @@ const CONFIG = {
   // },
 
 
-  production: {
-    baseUrl: "https://api-c.pinelabs.com",
-    clientId: "PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX",
-    clientSecret: "MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V",
-  },
+  // production: {
+  //   baseUrl: "https://api-c.pinelabs.com",
+  //   clientId: "PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX",
+  //   clientSecret: "MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V",
+  // },
 
 };
 
@@ -198,8 +198,8 @@ async function main() {
   // 2026-04-11 00:22:58.347
   const summary = await client.getTransactionSummary(
     {
-      fromDate: "2026-04-11T00:20:00",
-      toDate: "2026-04-11T04:25:00",
+      fromDate: "2026-06-19T04:20:00",
+      toDate: "2026-06-19T04:25:00",
       txnStatus: ["SUCCESS"],
     },
     0,  // page

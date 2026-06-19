@@ -90,6 +90,7 @@ function startPinelabPoller(deps, opts = {}) {
   }
 
   async function processTransaction(txn) {
+    console.log(`[PINELAB-POLL] processing txn: ${txn.transactionId} (tid: ${txn.tid})`);
     const transactionId = txn.transactionId;
     const tid           = txn.tid;
 
@@ -275,7 +276,7 @@ function startPinelabPoller(deps, opts = {}) {
   // Watermark model: tracks the max `created_at` of every txn SEEN in this
   // window (saved or dedup'd — both represent points we've processed).
   // On success, advances the Redis watermark to max(existing, maxSeen).
-  async function fetchWindow(from, to, { advanceWatermark } = { advanceWatermark: true }) {
+  async function fetchWindow(from, to, { advanceWatermark } = { advanceWatermark: true }, isRunOnce = false) {
     const startedAt = Date.now();
     const fromDate = fmtIst(from);
     const toDate   = fmtIst(to);
@@ -308,6 +309,9 @@ function startPinelabPoller(deps, opts = {}) {
       totalPages = parseInt(data.totalPages || '1', 10) || 1;
       const txns = Array.isArray(data.transactions) ? data.transactions : [];
       totalSeen += txns.length;
+
+      if(isRunOnce)
+      console.log("***********Summary:", JSON.stringify(data, null, 2));
 
       for (const txn of txns) {
         const ts = parsePineDate(txn.transactionDate).getTime();
@@ -405,7 +409,7 @@ function startPinelabPoller(deps, opts = {}) {
       // 2. Now you can safely call .toISOString() on them
       console.log(`*************[PINELAB-POLL] runOnce explicit window: ${fromDateObj.toISOString()} → ${toDateObj.toISOString()}`);
       // console.log(`*************[PINELAB-POLL] runOnce explicit window: ${from.toISOString()} → ${to.toISOString()}`);
-      return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false });
+      return fetchWindow(new Date(from), new Date(to), { advanceWatermark: false }, isRunOnce = true);
     }
     const window = await resolveDefaultWindow();
     return fetchWindow(window.from, window.to, { advanceWatermark: true });
