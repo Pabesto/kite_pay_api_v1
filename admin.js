@@ -2337,6 +2337,230 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     });
 
+    // POST /admin/transactions/:id/un_delete
+    // Reverses a soft-delete: restores QR aggregates, daily summaries and counters
+    // that were rolled back by DELETE /transactions/:id, then clears the deleted flag.
+    router.post('/transactions/:id/un_delete', authenticateAdmin, async (req, res) => {
+        try {
+            const { id } = req.params;
+
+            // 1) Load transaction by $id
+            const tx = await databases.getDocument(
+            APPWRITE_DATABASE_ID,
+            webhook_collectionId,
+            id
+            );
+            if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+
+            if (tx.deleted !== true) {
+                return res.status(400).json({ error: 'Transaction is not deleted' });
+            }
+
+            const amountPaise = Number(tx.amount || 0); // paise
+            const qrId = tx.qrCodeId;
+
+            // Acquire per-QR lock before balance read-modify-write
+            const undeleteLockKey = `lock:qr:${qrId}`;
+            const undeleteLockVal = id;
+            if (qrId) {
+                let undeleteLockAcquired = false;
+                try {
+                    const r = await redisClient.set(undeleteLockKey, undeleteLockVal, { NX: true, EX: 20 });
+                    undeleteLockAcquired = r === 'OK';
+                } catch (e) {
+                    console.error('Redis lock error in transaction un_delete:', e);
+                    undeleteLockAcquired = false; // fail safe
+                }
+                if (!undeleteLockAcquired) {
+                    return res.status(409).json({ error: 'QR is currently being modified by another operation. Please try again in a moment.' });
+                }
+            }
+            try {
+
+            // 2) Reconcile QR aggregates (if linked) — add the amount back
+            if (qrId) {
+            const qrList = await databases.listDocuments(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                [Query.equal('qrId', qrId), Query.limit(1)]
+            );
+
+            if (qrList.documents.length) {
+                const qrDoc = qrList.documents[0];
+
+                // Determine status classification (mirror of delete reconciliation)
+                const prevStatus = ((tx.status || 'normal').trim().toLowerCase());
+                const isPrevNormal = prevStatus === 'normal';
+
+                // Start from current values
+                const currentTotal = Number(qrDoc.totalPayInAmount || 0);
+                const currentHold = Number(qrDoc.amountOnHold || 0);
+
+                // Re-apply the amount based on status (inverse of delete)
+                const nextTotal = currentTotal + amountPaise; // restore ledger total in all cases
+                const nextHold = isPrevNormal
+                ? currentHold
+                : currentHold + amountPaise; // restore holds for non-normal
+
+                // Recompute available as a derived field — all values in paise (1 rupee = 100 paise)
+                const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
+                const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
+                const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
+                const commissionPaid = Number(qrDoc.commissionPaid || 0);
+                const nextAvailable = nextTotal - approved - requested - nextHold - commissionOnHold - commissionPaid;
+
+                await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_QRCODE_COLLECTION_ID,
+                qrDoc.$id,
+                    {
+                        totalPayInAmount: nextTotal,
+                        amountOnHold: nextHold,
+                        totalTransactions: (qrDoc.totalTransactions || 0) + 1,
+                        amountAvailableForWithdrawal: nextAvailable,
+                    }
+                );
+
+            const istDate = moment.tz(tx.created_at, 'Asia/Kolkata');
+            const dayString = istDate.format('YYYY-MM-DD'); // direct date format
+            console.log('un_delete dayString:', dayString, 'qrId:', qrId);
+
+            // Restore daily_qr_summaries totals for the transaction's original day
+            const dailyLock = await acquireDailyLock(dayString);
+            try {
+            const existingQrSummary = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+            [
+                Query.equal('date', dayString),
+                Query.limit(1),
+            ]
+            );
+
+            if (existingQrSummary.total > 0) {
+            const doc = existingQrSummary.documents[0];
+
+            // Parse totalsJson — abort if corrupted to prevent wiping other QRs' data
+            let totalsObj = {};
+            try {
+                totalsObj = JSON.parse(doc.totalsJson || '{}');
+            } catch (e) {
+                console.error('CORRUPT totalsJson for doc', doc.$id, '— aborting to prevent data loss');
+                throw new Error('Daily summary JSON is corrupted — manual fix required');
+            }
+
+            const currentDayTotal = Number(totalsObj[qrId] || 0);
+            totalsObj[qrId] = currentDayTotal + amountPaise;
+
+            // Serialize updated object and save
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                doc.$id,
+                {
+                    totalsJson: JSON.stringify(totalsObj),
+                }
+            );
+            } else {
+            // Summary doc for that day no longer exists — recreate it with this amount
+            await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID,
+                ID.unique(),
+                { date: dayString, totalsJson: JSON.stringify({ [qrId]: amountPaise }) }
+            );
+            }
+            } finally { await releaseLock(dailyLock.key, dailyLock.val); }
+
+
+            } else {
+                    console.warn(`QR ${qrId} not found during un_delete reconciliation`);
+                }
+            }
+
+            // 3) Restore counters BEFORE clearing the deleted flag.
+            // If Redis fails here, the transaction is still flagged deleted — admin can retry.
+            // amountPaise is in paise (1 rupee = 100 paise)
+            const undeleteCounters = [
+                redisClient.incrBy('counter:totalTxCount', 1)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (un_delete tx):', e); }),
+                redisClient.incrBy('counter:totalAmountReceived', amountPaise)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed (un_delete tx):', e); }),
+            ];
+            if (tx.provider === 'manual') {
+                undeleteCounters.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalManualTx', 1)
+                    .catch((e) => { console.error('Error updating totalManualTx counter:', e); }));
+            } else {
+                undeleteCounters.push(redisClient.incrBy('counter:totalApiTx', 1)
+                    .then(() => { redisClient.countersDirty = true; })
+                    .catch((e) => { redisClient.countersStale = true; console.error('Error updating totalApiTx counter:', e); }));
+            }
+            await Promise.all(undeleteCounters);
+
+            // 4) Clear the soft-delete flag — counters are already restored
+            await databases.updateDocument(
+                APPWRITE_DATABASE_ID,
+                webhook_collectionId,
+                id,
+                { deleted: false ,
+                  edited_by: `admin | un_delete | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
+                }
+            );
+
+            // 5) Roll back daily_deleted_summary — subtract the amount that delete added.
+            // The deleted summary is bucketed by the day the deletion happened, which is not
+            // stored on the transaction, so we adjust today's bucket (the original delete most
+            // commonly happens same-day). Guarded against going negative.
+            const delDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+
+            const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
+            try {
+                const existingDelSummary = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', delDayString), Query.limit(1)]
+                );
+
+                if (existingDelSummary.total > 0) {
+                    const doc = existingDelSummary.documents[0];
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(doc.totalsJson || '{}');
+                    } catch (e) {
+                        console.error('CORRUPT totalsJson in daily_deleted_summary doc', doc.$id, '— aborting');
+                        throw new Error('Daily deleted summary JSON is corrupted — manual fix required');
+                    }
+
+                    const currentDelTotal = Number(totalsObj[qrId || 'no_qr'] || 0);
+                    totalsObj[qrId || 'no_qr'] = Math.max(0, currentDelTotal - amountPaise);
+
+                    await databases.updateDocument(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                        doc.$id,
+                        { totalsJson: JSON.stringify(totalsObj) }
+                    );
+                }
+                // If no deleted-summary doc exists for today, there is nothing to roll back.
+            } finally {
+                await releaseLock(delDailyLock.key, delDailyLock.val);
+            }
+
+            return res.status(200).json({ message: 'Transaction restored', id });
+            } finally {
+                // Release the QR lock acquired for this un_delete
+                if (qrId) {
+                    await releaseLock(undeleteLockKey, undeleteLockVal);
+                }
+            }
+        } catch (err) {
+            console.error('❌ Un_delete transaction error:', err.message || err);
+            return res.status(500).json({ error: err.message || 'Un_delete failed' });
+        }
+    });
+
     // Manual transaction creation endpoint
     router.post("/transactions/manual", authenticateAdmin, async (req, res) => {
         try {
