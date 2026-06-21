@@ -29,7 +29,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -1771,6 +1771,67 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             else {
             console.log('Unhandled transition:', prev, '->', next, 'no counters changed');
+            }
+
+            // 5) Maintain daily_flagged_summary — per-status, per-QR record, same JSON pattern as
+            // daily_deleted_summary. Bucketed by the transaction's created_at date (like daily_qr_summaries),
+            // so flagging and later un-flagging always touch the same bucket — fully reversible even days apart.
+            // When a txn enters a non-normal status we add its amount under that status; when it leaves one we
+            // subtract it. A normal->normal change never reaches here (it early-returns as "No status change").
+            // Shape: { qrId: { cyber, refund, chargeback, failed, suspicious } }.
+            const FLAGGED_STATUSES = ['cyber', 'refund', 'chargeback', 'failed', 'suspicious'];
+            const prevFlagged = FLAGGED_STATUSES.includes(prev);
+            const nextFlagged = FLAGGED_STATUSES.includes(next);
+
+            if (prevFlagged || nextFlagged) {
+                const qrKey = tx.qrCodeId || 'no_qr';
+                const flagDayString = moment.tz(tx.created_at, 'Asia/Kolkata').format('YYYY-MM-DD');
+
+                // Apply the transition delta to the per-QR status bucket inside totalsObj.
+                const applyFlagDelta = (totalsObj) => {
+                    const bucket = (totalsObj[qrKey] && typeof totalsObj[qrKey] === 'object') ? totalsObj[qrKey] : {};
+                    if (prevFlagged) bucket[prev] = Math.max(0, Number(bucket[prev] || 0) - amt);
+                    if (nextFlagged) bucket[next] = Number(bucket[next] || 0) + amt;
+                    totalsObj[qrKey] = bucket;
+                    return totalsObj;
+                };
+
+                const flagDailyLock = await acquireDailyLock(`flag:${flagDayString}`);
+                try {
+                    const existingFlagSummary = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID,
+                        [Query.equal('date', flagDayString), Query.limit(1)]
+                    );
+
+                    if (existingFlagSummary.total > 0) {
+                        const doc = existingFlagSummary.documents[0];
+                        let totalsObj = {};
+                        try {
+                            totalsObj = JSON.parse(doc.totalsJson || '{}');
+                        } catch (e) {
+                            console.error('CORRUPT totalsJson in daily_flagged_summary doc', doc.$id, '— aborting');
+                            throw new Error('Daily flagged summary JSON is corrupted — manual fix required');
+                        }
+
+                        await databases.updateDocument(
+                            APPWRITE_DATABASE_ID,
+                            APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID,
+                            doc.$id,
+                            { totalsJson: JSON.stringify(applyFlagDelta(totalsObj)) }
+                        );
+                    } else if (nextFlagged) {
+                        // No doc for today yet — only create one when we're actually adding a flag.
+                        await databases.createDocument(
+                            APPWRITE_DATABASE_ID,
+                            APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID,
+                            ID.unique(),
+                            { date: flagDayString, totalsJson: JSON.stringify(applyFlagDelta({})) }
+                        );
+                    }
+                } finally {
+                    await releaseLock(flagDailyLock.key, flagDailyLock.val);
+                }
             }
 
             // Emit status change event to user/QR rooms
@@ -4605,6 +4666,144 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         } catch (err) {
             console.error('Deleted summary error:', err);
             return res.status(500).json({ error: 'Failed to fetch deleted summary' });
+        }
+    });
+
+    // Fetch daily flagged transaction summary (same pattern as deleted-summary).
+    // totalsJson here is nested per status: { "<qrId>": { cyber, refund, chargeback, failed, suspicious } }.
+    router.get('/flagged-summary', authenticateAdmin, async (req, res) => {
+        try {
+            const FLAGGED_STATUSES = ['cyber', 'refund', 'chargeback', 'failed', 'suspicious'];
+            const zeroByStatus = () => FLAGGED_STATUSES.reduce((o, s) => (o[s] = 0, o), {});
+
+            const actor = req.user;
+            const isAdmin = actor.role === 'admin';
+            const isSubadmin = actor.role === 'subadmin';
+            const isEmployee = actor.role === 'employee';
+
+            const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+
+            const from = req.query.from || todayStr;
+            const to = req.query.to || todayStr;
+            const filterUserId = req.query.userId || null;
+            const filterQrId = req.query.qrId || null;
+
+            // 1) Determine which QR IDs the caller can see
+            let allowedQrIds = null; // null = all (admin)
+
+            if (isAdmin || isEmployee) {
+                if (filterUserId) {
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                }
+            } else if (isSubadmin) {
+                if (filterUserId) {
+                    const managedUsers = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                        [Query.equal('parentId', actor.userId)]
+                    );
+                    const managedUserIds = managedUsers.documents.map(u => u.userId);
+                    if (filterUserId !== actor.userId && !managedUserIds.includes(filterUserId)) {
+                        return res.status(403).json({ error: 'You can only view your own users' });
+                    }
+                    allowedQrIds = await getQrIdsForUser(filterUserId);
+                } else {
+                    allowedQrIds = [...(await getQrIdsForSubadmin(actor.userId))];
+                }
+            } else {
+                allowedQrIds = await getQrIdsForUser(actor.userId);
+            }
+
+            if (filterQrId) {
+                if (allowedQrIds && !allowedQrIds.includes(filterQrId)) {
+                    return res.status(403).json({ error: 'You do not have access to this QR code' });
+                }
+                allowedQrIds = [filterQrId];
+            }
+
+            // 2) Fetch daily flagged summary docs for the date range
+            const startDate = moment.tz(from, 'Asia/Kolkata');
+            const endDate = moment.tz(to, 'Asia/Kolkata');
+            if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+                return res.status(400).json({ error: 'Invalid date range' });
+            }
+
+            const days = [];
+            let grandTotalPaise = 0;
+            let todayPaise = 0;
+            let yesterdayPaise = 0;
+            const grandByStatus = zeroByStatus();
+
+            const cursor = startDate.clone();
+            while (cursor.isSameOrBefore(endDate, 'day')) {
+                const dateStr = cursor.format('YYYY-MM-DD');
+
+                const summaryDocs = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', dateStr), Query.limit(1)]
+                );
+
+                let dayTotal = 0;
+                const dayByStatus = zeroByStatus();
+                const qrBreakdown = {};
+
+                if (summaryDocs.total > 0) {
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(summaryDocs.documents[0].totalsJson || '{}');
+                    } catch (e) {
+                        console.error('WARNING: corrupted totalsJson in flagged summary for date', dateStr, '—', e.message);
+                        totalsObj = {};
+                    }
+
+                    for (const [qrId, bucket] of Object.entries(totalsObj)) {
+                        if (allowedQrIds && !allowedQrIds.includes(qrId)) continue;
+                        if (!bucket || typeof bucket !== 'object') continue; // guard against malformed entries
+
+                        const qrEntry = zeroByStatus();
+                        let qrTotal = 0;
+                        for (const status of FLAGGED_STATUSES) {
+                            const amount = parseInt(bucket[status] || 0, 10);
+                            qrEntry[status] = amount;
+                            qrTotal += amount;
+                            dayByStatus[status] += amount;
+                            grandByStatus[status] += amount;
+                        }
+                        qrEntry.total = qrTotal;
+                        qrBreakdown[qrId] = qrEntry;
+                        dayTotal += qrTotal;
+                    }
+                }
+
+                days.push({
+                    date: dateStr,
+                    totalPaise: dayTotal,
+                    totalRs: dayTotal / 100,
+                    byStatus: dayByStatus,
+                    qrs: qrBreakdown,
+                });
+
+                grandTotalPaise += dayTotal;
+                if (dateStr === todayStr) todayPaise = dayTotal;
+                if (dateStr === yesterdayStr) yesterdayPaise = dayTotal;
+
+                cursor.add(1, 'day');
+            }
+
+            return res.json({
+                days,
+                grandTotalPaise,
+                grandTotalRs: grandTotalPaise / 100,
+                grandByStatus,
+                todayPaise,
+                todayRs: todayPaise / 100,
+                yesterdayPaise,
+                yesterdayRs: yesterdayPaise / 100,
+            });
+        } catch (err) {
+            console.error('Flagged summary error:', err);
+            return res.status(500).json({ error: 'Failed to fetch flagged summary' });
         }
     });
 
