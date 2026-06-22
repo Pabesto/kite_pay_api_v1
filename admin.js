@@ -841,8 +841,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // Admin-only: fetch all or filtered transactions
     router.get('/transactions', authenticateAdminOrLabel('view_transactions', { isSubadminAllowed: true }), async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
+        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue, isSortByUpdatedAt } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
+        const sortByUpdatedAt = isSortByUpdatedAt === true || isSortByUpdatedAt === 'true';
 
         let filters = [];
 
@@ -1027,7 +1028,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
             filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
-            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            const sortField = sortByUpdatedAt ? '$updatedAt' : 'created_at';
+            const queries = [...filters, Query.orderDesc(sortField), Query.limit(limitNum)];
             if (cursor) {
                 queries.push(Query.cursorAfter(cursor));
             }
@@ -1150,8 +1152,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // Fetch transactions only for that user with optional one-field search
     router.get('/user/transactions', authenticateToken, async (req, res) => {
-        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue } = req.query;
+        const { userId, qrId, limit = 25, cursor, from, to, status, searchField, searchValue, isSortByUpdatedAt } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 50);
+        const sortByUpdatedAt = isSortByUpdatedAt === true || isSortByUpdatedAt === 'true';
 
         // console.log('Transaction query params:', req.query);
 
@@ -1253,7 +1256,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 return res.status(400).json({ error: 'Invalid cursor format' });
             }
             filters.push(Query.or([Query.equal('deleted', false), Query.isNull('deleted')]));
-            const queries = [...filters, Query.orderDesc('created_at'), Query.limit(limitNum)];
+            const sortField = sortByUpdatedAt ? '$updatedAt' : 'created_at';
+            const queries = [...filters, Query.orderDesc(sortField), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
 
             const transactions = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
@@ -1267,6 +1271,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 amount: d.amount,
                 vpa: d.vpa,
                 created_at: d.created_at,
+                updatedAt: d.$updatedAt,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
                 deleted: d.deleted || false,
@@ -1474,6 +1479,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             vpa: d.vpa,
             created_at: d.created_at,
             status: d.status,
+            updatedAt: d.$updatedAt,
         });
 
         const docs = allTxns.map(pickTxn);
