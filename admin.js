@@ -1045,7 +1045,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 amount: d.amount,
                 vpa: d.vpa,
                 created_at: d.created_at,
-                updated_at: d.$updatedAt,
+                updatedAt: d.$updatedAt,
                 status: d.status,
                 imageUrl: d.imageUrl || null,
                 deleted: d.deleted || false,
