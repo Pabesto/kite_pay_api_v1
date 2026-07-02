@@ -390,14 +390,35 @@ function startPinelabMultiPoller(deps, opts = {}) {
     }
   }
 
+  // Manual run for admin backfill / testing. Accepts explicit window OR uses each
+  // account's default watermark window. Runs accounts one-by-one and returns a
+  // per-account results map. Does NOT advance watermarks for an explicit window
+  // (so a backfill can't poison the live schedule).
   async function runOnce({ from, to } = {}) {
+    // Explicit window strings are naive IST wall-time (e.g. "2026-06-19T04:20:00").
+    // A bare date-time with no offset is parsed by `new Date()` in the SERVER's
+    // local timezone — IST locally but UTC on Render — which then double-shifts
+    // through fmtIst(). Pin a naive string to IST so the result is server-TZ-independent.
+    const toIstDate = (v) =>
+      typeof v === 'string' && !/[zZ]|[+\-]\d{2}:?\d{2}$/.test(v)
+        ? new Date(v.replace(' ', 'T') + '+05:30')
+        : new Date(v);
+
     const results = {};
     for (const accountObj of activeAccounts) {
-      if (from && to) {
-        results[accountObj.id] = await fetchWindowForAccount(accountObj, new Date(from), new Date(to), { advanceWatermark: false });
-      } else {
-        const window = await resolveWindowForAccount(accountObj);
-        results[accountObj.id] = await fetchWindowForAccount(accountObj, window.from, window.to, { advanceWatermark: true });
+      if (stopped) break;
+      try {
+        if (from && to) {
+          results[accountObj.id] = await fetchWindowForAccount(
+            accountObj, toIstDate(from), toIstDate(to), { advanceWatermark: false });
+        } else {
+          const window = await resolveWindowForAccount(accountObj);
+          results[accountObj.id] = await fetchWindowForAccount(
+            accountObj, window.from, window.to, { advanceWatermark: true });
+        }
+      } catch (e) {
+        console.error(`[PINELAB-POLL][${accountObj.id}] runOnce error:`, e);
+        results[accountObj.id] = { error: e.message || String(e) };
       }
     }
     return results;
@@ -424,7 +445,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
   bootTimeoutHandle = setTimeout(tick, 10_000);
   intervalHandle    = setInterval(tick, intervalMs);
 
-  return { stop, runOnce };
+  return { stop, runOnce, accountIds: activeAccounts.map(a => a.id) };
 }
 
 module.exports = { startPinelabMultiPoller };

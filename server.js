@@ -245,7 +245,11 @@ async function fetchAllTransactions() {
 
     // const qrIds = ['9620580800', '9620580700', '9620580900', '9620580600'];  // RUVI QR codes
 
-    const qrIds = ['0096206462'];  // NICE QR codes
+    // const qrIds = ['0096206465', '0096206464', '0096206463', '0096206462', '0096206461', '0096206460', '0096206459',
+    //     '0096206458', '0096206457', '0096206456', '0096206455', '0096206454', '0096206453'];  // NICE QR codes
+
+    const qrIds = [ '0096206459','0096206458', '0096206457', '0096206456', '0096206455', '0096206454', '0096206453'];  // NICE QR codes
+
 
     while (hasMore) {
         console.log(`Fetching transactions batch after ID: ${lastId || 'start'}`);
@@ -1914,14 +1918,28 @@ async function updateDailyQrTotal(qrCodeId, txnDate, amountDelta) {
 // SUCCESS transactions and persists them with dedup, QR totals, daily summary,
 // socket emit, and dashboard counters. TID is used as the QR doc's qrId.
 
-
-const { startPinelabPoller } = require('./pinelabPoller');
+const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
 
 // const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
 const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
 
+// Accounts are polled one-by-one each tick. Metrics/watermarks are isolated per
+// `id` in Redis (pinelabs:poller:<id>:*). Add/remove creds here.
+const PINELAB_ACCOUNTS = [
+  {
+    id: 'scanserve_ai',
+    clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
+    clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv',
+  },
+//   {
+//     id: 'pabesto_tech',
+//     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
+//     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V',
+//   },
+];
+
 const pinelabPoller = ENABLE_PINELAB_POLLER
-  ? startPinelabPoller(
+  ? startPinelabMultiPoller(
       {
         databases,
         Query,
@@ -1944,55 +1962,10 @@ const pinelabPoller = ENABLE_PINELAB_POLLER
         pageSize: 100,
         maxPagesPerTick: 50,
         dryRun: false,
+        accounts: PINELAB_ACCOUNTS,
       }
     )
   : null;
-
-// const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
-
-// const ENABLE_PINELAB_POLLER = true; 
-
-// const pinelabPoller = ENABLE_PINELAB_POLLER
-//   ? startPinelabMultiPoller(
-//       {
-//         databases,
-//         Query,
-//         ID,
-//         redisClient,
-//         acquireLock,
-//         releaseLock,
-//         emitTxnNew,
-//         updateDailyQrTotal,
-//         APPWRITE_DATABASE_ID,
-//         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-//         APPWRITE_QRCODE_COLLECTION_ID,
-//         LOCK_TTL_SECONDS,
-//       },
-//       {
-//         env: 'production',
-//         intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
-//         bufferMinutes: 2,
-//         maxLookbackMinutes: 60,
-//         pageSize: 100,
-//         maxPagesPerTick: 50,
-//         dryRun: false,
-        
-//         // Pass multiple accounts here dynamically 
-//         accounts: [
-//           {
-//             id: 'scanserve_ai',
-//             clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
-//             clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv'
-//           },
-//         //   {
-//         //     id: 'pabesto_tech',
-//         //     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
-//         //     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V'
-//         //   }
-//         ]
-//       }
-//     )
-//   : null;
 
 // Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
 // normal watermark window; pass both for an explicit backfill window.
@@ -2017,18 +1990,25 @@ app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
 // Admin-only: read poller health/metrics from Redis
 app.get('/admin/pinelabs/status', authenticateAdmin, async (req, res) => {
   try {
-    const keys = [
-      'pinelabs:poller:latestTxnAt',
-      'pinelabs:poller:lastRunAt',
-      'pinelabs:poller:lastTxnsSeen',
-      'pinelabs:poller:lastTxnsSaved',
-      'pinelabs:poller:lastDurationMs',
-      'pinelabs:poller:consecutiveFailures',
-      'pinelabs:poller:lastError',
+    const metrics = [
+      'latestTxnAt',
+      'lastRunAt',
+      'lastTxnsSeen',
+      'lastTxnsSaved',
+      'lastDurationMs',
+      'consecutiveFailures',
+      'lastError',
     ];
-    const values = await Promise.all(keys.map(k => redisClient.get(k).catch(() => null)));
+    const accountIds = pinelabPoller?.accountIds || [];
     const out = {};
-    keys.forEach((k, i) => { out[k.replace('pinelabs:poller:', '')] = values[i]; });
+    await Promise.all(accountIds.map(async (id) => {
+      const values = await Promise.all(
+        metrics.map(m => redisClient.get(`pinelabs:poller:${id}:${m}`).catch(() => null))
+      );
+      const acct = {};
+      metrics.forEach((m, i) => { acct[m] = values[i]; });
+      out[id] = acct;
+    }));
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message || 'status failed' });
