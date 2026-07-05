@@ -37,7 +37,9 @@ const ConfigManager = require('./configManager');
 
 const { createClient } = require('redis');
 const userMetaCache = require('./userMetaCache');
+const qrOwnerCache = require('./qrOwnerCache');
 const dashboardCounters = require('./dashboardCounters');
+const partnerApiRoutes = require('./partnerApi');
 
 const fs = require('fs');
 const path = require('path');
@@ -70,6 +72,7 @@ const APPWRITE_WALLET_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_WALLET_T
 const APPWRITE_WALLET_COLLECTION_ID = process.env.APPWRITE_WALLET_COLLECTION_ID;
 const APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID;
 const APPWRITE_API_MERCHANTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_COLLECTION_ID;
+const APPWRITE_API_PARTNERS_COLLECTION_ID = process.env.APPWRITE_API_PARTNERS_COLLECTION_ID || 'api_partners';
 const APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID;
 const APPWRITE_CONFIG_COLLECTION_ID = process.env.APPWRITE_CONFIG_COLLECTION_ID;
 const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID;
@@ -562,6 +565,20 @@ async function flushCountersToAppwrite() {
 userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
 dashboardCounters.init({ APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID });
 
+// Init qrOwnerCache — maps each QR code to the single subadmin who owns it, so every
+// transaction can be stamped with `ownerSubadminId` at write time and partners can
+// fetch their transactions with a single indexed query.
+qrOwnerCache.init({ databases, Query, APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_USERS_META_COLLECTION_ID });
+const QR_OWNER_REFRESH_MS = Number(process.env.QR_OWNER_REFRESH_MS) || 10 * 60 * 1000; // 10 min
+(async () => {
+    try {
+        await qrOwnerCache.buildAll();
+        setInterval(() => { qrOwnerCache.refresh().catch(e => console.error('qrOwnerCache refresh failed:', e.message)); }, QR_OWNER_REFRESH_MS);
+    } catch (e) {
+        console.error('qrOwnerCache initial build failed — will self-heal lazily:', e.message);
+    }
+})();
+
 // Connect Redis, seed counters, start periodic flush
 (async () => {
     try {
@@ -791,6 +808,9 @@ app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRI
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+
+// Partner API routes — external systems fetch the transactions under their subadmin
+app.use('/api/partner', partnerApiRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_USERS_META_COLLECTION_ID, authenticateAdmin));
 
 // Withdrawal Accounts routes
 app.use('/api/withdrawal-accounts', withdrawalAccountsRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -1072,6 +1092,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
           provider: 'paytm',
           created_at: isoString,
           status: 'normal',
+          ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
         }
       );
     } catch (e) {
@@ -1531,6 +1552,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
                 provider:    'razorpay',
                 created_at:  isoDate,
                 status:      'normal',
+                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
             }
         );
 
@@ -1661,6 +1683,7 @@ app.post('/webhook', async (req, res) => {
                 provider: 'razorpay',
                 created_at: isoDate,
                 status: 'normal',
+                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
             }
         );
 
@@ -1793,6 +1816,7 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
                 provider:   'razorpay',
                 created_at: isoDate,
                 status:     'normal',
+                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
             }
         );
 

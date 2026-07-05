@@ -18,6 +18,7 @@
  */
 
 const { PineOneMultiClient } = require('./pineLabMulti');
+const qrOwnerCache = require('./qrOwnerCache');
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -159,6 +160,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
           provider: 'pinelabs',
           created_at: isoDate,
           status: 'normal',
+          ownerSubadminId: await qrOwnerCache.resolve(tid),
         }
       );
       log(accountSpec, 'TXN', 'saved ✅', { docId: created.$id, transactionId, tid, amountPaise });
