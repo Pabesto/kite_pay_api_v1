@@ -8,6 +8,7 @@ const moment = require('moment-timezone');
 const { Client, Account } = require('node-appwrite');
 
 const cron = require('node-cron');
+const partnerWebhooks = require('./partnerWebhooks');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -1583,6 +1584,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // 3) Update status field on transaction
             const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID, { status: nextStatus });
+
+            // Notify partners of the status change (fire-and-forget outbound webhook).
+            partnerWebhooks.dispatch(updated, 'payment.updated', { previousStatus: prevStatus });
 
             // 4) Reconcile holds for the QR (boundary crossing only)
             if (tx.qrCodeId) {

@@ -16,6 +16,7 @@ const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const moment = require('moment-timezone');
+const partnerWebhooks = require('./partnerWebhooks');
 
 // Per-partner-key rate limit for the public data endpoints. Keyed by the partner's public
 // id (parsed from the API key) so one partner can't throttle another or hammer the DB; falls
@@ -44,6 +45,7 @@ module.exports = (
     APPWRITE_API_PARTNERS_COLLECTION_ID,
     APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
     APPWRITE_USERS_META_COLLECTION_ID,
+    APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID,
     authenticateAdmin
 ) => {
     const router = express.Router();
@@ -231,16 +233,23 @@ module.exports = (
         return { partnerId, secret, apiKeyHash, apiKey };
     }
 
-    // Create a partner linked to a subadmin userId. Returns the API key ONCE.
+    // Create a partner linked to a subadmin userId. Returns the API key + webhookSecret ONCE.
+    // Optional: webhookUrl (https), webhookEnabled.
     router.post('/admin/partners', authenticateAdmin, async (req, res) => {
         try {
-            const { name, userId } = req.body || {};
+            const { name, userId, webhookUrl, webhookEnabled } = req.body || {};
             if (!name || !userId) return res.status(400).json({ error: 'name and userId are required' });
 
             const subadmin = await findSubadmin(userId);
             if (!subadmin) return res.status(400).json({ error: 'userId must be an existing subadmin' });
 
+            if (webhookUrl && !partnerWebhooks.isSafeUrl(webhookUrl)) {
+                return res.status(400).json({ error: 'webhookUrl must be a valid public https URL' });
+            }
+
             const creds = await generatePartnerCredentials();
+            const webhookSecret = partnerWebhooks.generateSecret();
+
             const doc = await databases.createDocument(
                 APPWRITE_DATABASE_ID,
                 APPWRITE_API_PARTNERS_COLLECTION_ID,
@@ -251,8 +260,13 @@ module.exports = (
                     userId,
                     name,
                     status: true,
+                    webhookUrl: webhookUrl || null,
+                    webhookSecret,
+                    webhookEnabled: !!webhookEnabled,
                 }
             );
+
+            partnerWebhooks.reloadIndex().catch(() => {});
 
             res.status(201).json({
                 success: true,
@@ -260,8 +274,11 @@ module.exports = (
                 name,
                 userId,
                 status: true,
-                // Shown once — the partner must store it; we only keep the hash.
-                apiKey: creds.apiKey,
+                webhookUrl: webhookUrl || null,
+                webhookEnabled: !!webhookEnabled,
+                // Both secrets shown once — store them now.
+                apiKey: creds.apiKey,        // for X-API-Key auth
+                webhookSecret,               // for verifying X-Kitepay-Signature on webhooks
                 _id: doc.$id,
             });
         } catch (e) {
@@ -284,6 +301,8 @@ module.exports = (
                 name: d.name,
                 userId: d.userId,
                 status: d.status,
+                webhookUrl: d.webhookUrl || null,
+                webhookEnabled: !!d.webhookEnabled,
                 createdAt: d.$createdAt,
             }));
             res.json({
@@ -298,11 +317,11 @@ module.exports = (
         }
     });
 
-    // Rotate a partner's secret and/or update fields.
+    // Rotate a partner's secret and/or update fields (incl. webhook config).
     router.put('/admin/partners/:partnerId', authenticateAdmin, async (req, res) => {
         try {
             const { partnerId } = req.params;
-            const { name, userId, status, rotateKey } = req.body || {};
+            const { name, userId, status, rotateKey, webhookUrl, webhookEnabled, rotateWebhookSecret } = req.body || {};
 
             const docs = await databases.listDocuments(
                 APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID,
@@ -320,6 +339,15 @@ module.exports = (
             }
             if (status !== undefined) updates.status = status;
 
+            // Webhook config
+            if (webhookUrl !== undefined) {
+                if (webhookUrl && !partnerWebhooks.isSafeUrl(webhookUrl)) {
+                    return res.status(400).json({ error: 'webhookUrl must be a valid public https URL' });
+                }
+                updates.webhookUrl = webhookUrl || null;
+            }
+            if (webhookEnabled !== undefined) updates.webhookEnabled = !!webhookEnabled;
+
             let newApiKey = null;
             if (rotateKey === true) {
                 const secret = crypto.randomBytes(32).toString('hex');
@@ -327,18 +355,84 @@ module.exports = (
                 newApiKey = `${partner.partnerId}.${secret}`;
             }
 
+            let newWebhookSecret = null;
+            if (rotateWebhookSecret === true) {
+                newWebhookSecret = partnerWebhooks.generateSecret();
+                updates.webhookSecret = newWebhookSecret;
+            }
+
             const updated = await databases.updateDocument(
                 APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, partner.$id, updates
             );
 
+            // Keep the webhook dispatch index in sync with any change.
+            partnerWebhooks.reloadIndex().catch(() => {});
+
             res.json({
                 success: true,
-                partner: { partnerId: updated.partnerId, name: updated.name, userId: updated.userId, status: updated.status },
+                partner: {
+                    partnerId: updated.partnerId, name: updated.name, userId: updated.userId, status: updated.status,
+                    webhookUrl: updated.webhookUrl || null, webhookEnabled: !!updated.webhookEnabled,
+                },
                 ...(newApiKey && { newApiKey }),
+                ...(newWebhookSecret && { newWebhookSecret }),
             });
         } catch (e) {
             console.error('Update partner error:', e);
             res.status(500).json({ error: 'Failed to update partner' });
+        }
+    });
+
+    // ── Webhook delivery log + manual retry (admin) ──────────────────────────
+    // List a partner's webhook deliveries, newest first. Optional ?status=failed|dead|success|pending
+    router.get('/admin/partners/:partnerId/deliveries', authenticateAdmin, async (req, res) => {
+        try {
+            const { partnerId } = req.params;
+            const { status, limit = 25, cursor } = req.query;
+
+            const queries = [Query.equal('partnerId', partnerId)];
+            if (status) queries.push(Query.equal('status', String(status).toLowerCase()));
+            queries.push(Query.orderDesc('$createdAt'));
+            queries.push(Query.limit(Math.min(parseInt(limit) || 25, 100)));
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const list = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID, queries);
+            const deliveries = list.documents.map(d => ({
+                _id: d.$id,
+                deliveryId: d.deliveryId,
+                eventType: d.eventType,
+                txnId: d.txnId,
+                status: d.status,
+                attempts: d.attempts,
+                maxAttempts: d.maxAttempts,
+                responseCode: d.responseCode ?? null,
+                error: d.error || null,
+                nextAttemptAt: d.nextAttemptAt || null,
+                lastAttemptAt: d.lastAttemptAt || null,
+                createdAt: d.createdAt || d.$createdAt,
+            }));
+            res.json({
+                success: true,
+                deliveries,
+                total: list.total,
+                nextCursor: deliveries.length ? deliveries[deliveries.length - 1]._id : null,
+            });
+        } catch (e) {
+            console.error('List deliveries error:', e);
+            res.status(500).json({ error: 'Failed to list deliveries' });
+        }
+    });
+
+    // Manually re-send a delivery now (e.g. after a partner fixed their endpoint).
+    router.post('/admin/deliveries/:deliveryId/retry', authenticateAdmin, async (req, res) => {
+        try {
+            const { deliveryId } = req.params;
+            const result = await partnerWebhooks.requeue(deliveryId);
+            if (!result) return res.status(404).json({ error: 'Delivery not found' });
+            res.json({ success: true, deliveryId, status: result.status, attempts: result.attempts, responseCode: result.responseCode ?? null });
+        } catch (e) {
+            console.error('Retry delivery error:', e);
+            res.status(500).json({ error: 'Failed to retry delivery' });
         }
     });
 

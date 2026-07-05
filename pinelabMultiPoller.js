@@ -19,6 +19,7 @@
 
 const { PineOneMultiClient } = require('./pineLabMulti');
 const qrOwnerCache = require('./qrOwnerCache');
+const partnerWebhooks = require('./partnerWebhooks');
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -164,6 +165,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
         }
       );
       log(accountSpec, 'TXN', 'saved ✅', { docId: created.$id, transactionId, tid, amountPaise });
+      partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
 
       const cachedNotFoundAt = tidNotFoundCache.get(tid);
       let qrDoc = null;

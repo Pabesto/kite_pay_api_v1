@@ -226,7 +226,93 @@ up to ~12,000 rows/min. If you need a higher limit for a specific integration, a
 
 ---
 
-## 6. Errors
+## 6. Webhooks (push, instead of polling)
+
+Instead of (or in addition to) polling `GET /transactions`, you can have us **push** events to
+your server the moment they happen — like Razorpay's webhooks.
+
+### Setup
+Give the admin an **https** URL to receive events. You'll be issued a **webhook signing
+secret** (`whsec_...`, shown once) used to verify each delivery. The admin can enable/disable
+webhooks and rotate the secret at any time.
+
+### The request we send
+For each event we `POST` JSON to your URL with these headers:
+
+| Header | Purpose |
+|--------|---------|
+| `X-Kitepay-Event` | Event type — `payment.created` or `payment.updated`. |
+| `X-Kitepay-Delivery` | Unique delivery id — **use it to dedupe** (we deliver at-least-once). |
+| `X-Kitepay-Signature` | `sha256=<hmac>` — HMAC-SHA256 of the **raw request body** with your webhook secret. |
+
+Body:
+```json
+{
+  "event": "payment.created",
+  "deliveryId": "whd_...",
+  "createdAt": "2026-07-06T09:15:00.000Z",
+  "data": {
+    "transaction": {
+      "id": "6543ab...",
+      "qrCodeId": "TID12345",
+      "paymentId": "pay_abc123",
+      "rrnNumber": "123456789012",
+      "amount": 150000,
+      "vpa": "customer@okhdfcbank",
+      "provider": "razorpay",
+      "created_at": "2026-07-06T09:15:00.000Z",
+      "updatedAt": "2026-07-06T09:15:02.000Z",
+      "status": "normal"
+    }
+  }
+}
+```
+For `payment.updated`, `data` also includes `previousStatus`. The `transaction` object is
+identical to the one returned by `GET /transactions` (amounts in **paise**).
+
+### Events
+| Event | When |
+|-------|------|
+| `payment.created` | A new payment is received for one of your QR codes. |
+| `payment.updated` | A transaction's status changes (e.g. `normal` → `refund`/`chargeback`/`failed`). |
+
+### Verifying the signature (required)
+Compute HMAC-SHA256 over the **exact raw body bytes** with your secret and compare, in
+constant time, to the `X-Kitepay-Signature` value (minus the `sha256=` prefix). Reject on mismatch.
+
+```js
+// Node.js / Express — use the RAW body, not the parsed object
+const crypto = require('crypto');
+
+app.post('/kitepay/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const secret = process.env.KITEPAY_WEBHOOK_SECRET;      // "whsec_..."
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(req.body).digest('hex');
+  const got = req.header('X-Kitepay-Signature') || '';
+
+  const ok = expected.length === got.length &&
+             crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(got));
+  if (!ok) return res.status(401).send('bad signature');
+
+  const event = JSON.parse(req.body.toString());
+  // TODO: dedupe on event.deliveryId, then handle event.event / event.data.transaction
+  res.sendStatus(200);   // 2xx = success. Anything else = we retry.
+});
+```
+
+### Delivery, retries & acknowledgement
+- **Acknowledge with any `2xx`** within ~10 seconds. Any non-2xx, a timeout, or a network
+  error is treated as a failure.
+- **Retries with backoff:** on failure we retry up to 5 more times at roughly
+  **1m → 5m → 30m → 2h → 6h**. After that the delivery is marked *dead* (an admin can
+  manually re-send it once your endpoint is healthy).
+- **At-least-once:** you may occasionally receive the same event twice — **dedupe on
+  `deliveryId`** and make your handler idempotent.
+- Respond fast and do heavy work asynchronously; a slow endpoint causes timeouts and retries.
+- Only `https` URLs are accepted.
+
+---
+
+## 7. Errors
 
 | HTTP | Body | Cause |
 |------|------|-------|
@@ -242,7 +328,7 @@ Always check the HTTP status; error bodies are `{ "error": "..." }`.
 
 ---
 
-## 7. Examples
+## 8. Examples
 
 ### 6.1 cURL
 
@@ -334,7 +420,7 @@ print(f"Fetched {len(txns)} transactions")
 
 ---
 
-## 8. Best practices
+## 9. Best practices
 
 - **Store the key securely** (env var / secrets manager), never in client-side code or git.
 - **Use `limit=100`** for bulk pulls to minimize round-trips; smaller pages for interactive UIs.

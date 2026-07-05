@@ -40,6 +40,7 @@ const userMetaCache = require('./userMetaCache');
 const qrOwnerCache = require('./qrOwnerCache');
 const dashboardCounters = require('./dashboardCounters');
 const partnerApiRoutes = require('./partnerApi');
+const partnerWebhooks = require('./partnerWebhooks');
 
 const fs = require('fs');
 const path = require('path');
@@ -73,6 +74,7 @@ const APPWRITE_WALLET_COLLECTION_ID = process.env.APPWRITE_WALLET_COLLECTION_ID;
 const APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID;
 const APPWRITE_API_MERCHANTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_COLLECTION_ID;
 const APPWRITE_API_PARTNERS_COLLECTION_ID = process.env.APPWRITE_API_PARTNERS_COLLECTION_ID || 'api_partners';
+const APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID = process.env.APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID || 'partner_webhook_deliveries';
 const APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID;
 const APPWRITE_CONFIG_COLLECTION_ID = process.env.APPWRITE_CONFIG_COLLECTION_ID;
 const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID;
@@ -579,6 +581,31 @@ const QR_OWNER_REFRESH_MS = Number(process.env.QR_OWNER_REFRESH_MS) || 10 * 60 *
     }
 })();
 
+// Init the outbound partner-webhook system: build the enabled-partner index and start the
+// retry worker that redelivers failed webhooks with exponential backoff.
+partnerWebhooks.init({ databases, Query, ID, APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID });
+const PARTNER_WEBHOOK_INDEX_REFRESH_MS = Number(process.env.PARTNER_WEBHOOK_INDEX_REFRESH_MS) || 10 * 60 * 1000;
+const PARTNER_WEBHOOK_WORKER_MS = Number(process.env.PARTNER_WEBHOOK_WORKER_MS) || 60 * 1000;
+const PARTNER_WEBHOOK_SUCCESS_RETENTION_DAYS = Number(process.env.PARTNER_WEBHOOK_SUCCESS_RETENTION_DAYS) || 30;
+const PARTNER_WEBHOOK_DEAD_RETENTION_DAYS = Number(process.env.PARTNER_WEBHOOK_DEAD_RETENTION_DAYS) || 90;
+(async () => {
+    try {
+        await partnerWebhooks.reloadIndex();
+        setInterval(() => { partnerWebhooks.reloadIndex().catch(e => console.error('partnerWebhooks index refresh failed:', e.message)); }, PARTNER_WEBHOOK_INDEX_REFRESH_MS);
+        partnerWebhooks.startWorker(PARTNER_WEBHOOK_WORKER_MS);
+
+        // Prune old terminal deliveries daily so the log stays bounded (not infinite growth).
+        const runPrune = () => partnerWebhooks.pruneOld({
+            successDays: PARTNER_WEBHOOK_SUCCESS_RETENTION_DAYS,
+            deadDays: PARTNER_WEBHOOK_DEAD_RETENTION_DAYS,
+        }).catch(e => console.error('partnerWebhooks prune failed:', e.message));
+        setInterval(runPrune, 24 * 60 * 60 * 1000);
+        setTimeout(runPrune, 60 * 1000); // once, shortly after boot
+    } catch (e) {
+        console.error('partnerWebhooks init failed:', e.message);
+    }
+})();
+
 // Connect Redis, seed counters, start periodic flush
 (async () => {
     try {
@@ -810,7 +837,7 @@ app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRI
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
 
 // Partner API routes — external systems fetch the transactions under their subadmin
-app.use('/api/partner', partnerApiRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_USERS_META_COLLECTION_ID, authenticateAdmin));
+app.use('/api/partner', partnerApiRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID, authenticateAdmin));
 
 // Withdrawal Accounts routes
 app.use('/api/withdrawal-accounts', withdrawalAccountsRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_WITHDRAWAL_ACCOUNTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole));
@@ -1180,6 +1207,7 @@ app.post("/paytm/payment-sync", async (req, res) => {
       } else {
         console.warn(`⚠️ QR Code with qrId ${qrCodeId} not found — skipping QR totals`);
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
       }
     } finally {
       await releaseLock(lockKey, paymentId);
@@ -1575,6 +1603,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             created_at: new Date(isoDate).toISOString(),
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
         // STEP 7: update QR totals — under lock so no concurrent reads on same QR doc
         await updateQrTotalAtomic(qrCodeId, amountPaise);
 
@@ -1706,6 +1735,7 @@ app.post('/webhook', async (req, res) => {
             created_at: isoDate,
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
 
         // 8. Update QR totals — under lock so no concurrent reads on same QR doc
         await updateQrTotalAtomic(qrCodeId, amountPaise);
@@ -1839,6 +1869,7 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
             created_at: isoDate,
         };
         emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
+        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
 
         // STEP 8: update QR totals — under lock
         await updateQrTotalAtomic(qrCodeId, amountPaise);
