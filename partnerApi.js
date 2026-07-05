@@ -263,7 +263,8 @@ module.exports = (
                 }
             );
 
-            partnerWebhooks.reloadIndex().catch(() => {});
+            // Rebuild the webhook dispatch cache so the new partner's config takes effect now.
+            await partnerWebhooks.reloadIndex().catch(e => console.error('partnerWebhooks reloadIndex (create) failed:', e.message));
 
             res.status(201).json({
                 success: true,
@@ -362,8 +363,9 @@ module.exports = (
                 APPWRITE_DATABASE_ID, APPWRITE_API_PARTNERS_COLLECTION_ID, partner.$id, updates
             );
 
-            // Keep the webhook dispatch index in sync with any change.
-            partnerWebhooks.reloadIndex().catch(() => {});
+            // Any change (webhookUrl / webhookSecret / webhookEnabled / status / userId) can
+            // affect dispatch — clear and refetch the cache so it takes effect immediately.
+            await partnerWebhooks.reloadIndex().catch(e => console.error('partnerWebhooks reloadIndex (update) failed:', e.message));
 
             res.json({
                 success: true,
