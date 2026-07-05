@@ -12,9 +12,31 @@
 // Mounted at /api/partner in server.js.
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const moment = require('moment-timezone');
+
+// Per-partner-key rate limit for the public data endpoints. Keyed by the partner's public
+// id (parsed from the API key) so one partner can't throttle another or hammer the DB; falls
+// back to IP for requests with no/malformed key (brute-force guard on auth). Default 120/min.
+const PARTNER_RATE_LIMIT_PER_MIN = Number(process.env.PARTNER_RATE_LIMIT_PER_MIN) || 120;
+const partnerLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: PARTNER_RATE_LIMIT_PER_MIN,
+    standardHeaders: true,   // adds RateLimit-* and Retry-After headers
+    legacyHeaders: false,
+    validate: false,         // custom keyGenerator; skip the trust-proxy validation warnings
+    keyGenerator: (req) => {
+        const raw = req.headers['x-api-key'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+        if (raw && raw.includes('.')) return 'partner:' + raw.slice(0, raw.indexOf('.'));
+        return 'ip:' + (req.ip || 'unknown');
+    },
+    handler: (req, res) => res.status(429).json({
+        error: 'Rate limit exceeded. Slow down and retry shortly.',
+        retryAfterSeconds: Math.ceil(60),
+    }),
+});
 
 module.exports = (
     databases, ID, Query,
@@ -88,7 +110,7 @@ module.exports = (
     // ── GET /api/partner/transactions ────────────────────────────────────────
     // Cursor-paginated, filterable list of the partner's transactions.
     // Query params: limit, cursor, from, to, status, qrId, searchField, searchValue, isSortByUpdatedAt
-    router.get('/transactions', authenticatePartner, async (req, res) => {
+    router.get('/transactions', partnerLimiter, authenticatePartner, async (req, res) => {
         const { qrId, limit = 25, cursor, from, to, status, searchField, searchValue, isSortByUpdatedAt } = req.query;
         const limitNum = Math.min(parseInt(limit) || 25, 100);
         const sortByUpdatedAt = isSortByUpdatedAt === true || isSortByUpdatedAt === 'true';
@@ -195,7 +217,7 @@ module.exports = (
     });
 
     // Lightweight identity/health check for the calling partner.
-    router.get('/me', authenticatePartner, (req, res) => {
+    router.get('/me', partnerLimiter, authenticatePartner, (req, res) => {
         res.json({ success: true, partner: req.partner });
     });
 
