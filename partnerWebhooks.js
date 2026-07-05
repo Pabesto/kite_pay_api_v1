@@ -104,10 +104,7 @@ function txnView(txn) {
         rrnNumber: txn.rrnNumber,
         amount: txn.amount,
         vpa: txn.vpa,
-        provider: txn.provider,
         created_at: txn.created_at,
-        updatedAt: txn.$updatedAt,
-        status: txn.status,
     };
 }
 

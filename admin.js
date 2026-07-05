@@ -1586,7 +1586,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, TxnID, { status: nextStatus });
 
             // Notify partners of the status change (fire-and-forget outbound webhook).
-            partnerWebhooks.dispatch(updated, 'payment.updated', { previousStatus: prevStatus });
+            // status is carried in the envelope (not the txn object, which is trimmed).
+            // partnerWebhooks.dispatch(updated, 'payment.updated', { previousStatus: prevStatus, newStatus: nextStatus });
 
             // 4) Reconcile holds for the QR (boundary crossing only)
             if (tx.qrCodeId) {

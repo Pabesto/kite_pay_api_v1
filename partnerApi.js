@@ -201,10 +201,7 @@ module.exports = (
                 rrnNumber: d.rrnNumber,
                 amount: d.amount,
                 vpa: d.vpa,
-                provider: d.provider,
                 created_at: d.created_at,
-                updatedAt: d.$updatedAt,
-                status: d.status,
             });
 
             const docs = result.documents.map(pickTxn);

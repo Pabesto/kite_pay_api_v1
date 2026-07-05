@@ -103,10 +103,7 @@ transactions on/after 1 Jul.
       "rrnNumber": "123456789012",
       "amount": 150000,
       "vpa": "customer@okhdfcbank",
-      "provider": "razorpay",
-      "created_at": "2026-07-06T09:15:00.000Z",
-      "updatedAt": "2026-07-06T09:15:02.000Z",
-      "status": "normal"
+      "created_at": "2026-07-06T09:15:00.000Z"
     }
   ],
   "nextCursor": "6543ab...",
@@ -124,10 +121,7 @@ transactions on/after 1 Jul.
 | `rrnNumber` | string | Bank RRN / UTR reference (may be empty for some providers). |
 | `amount` | integer | Amount in **paise**. Divide by 100 for rupees (`150000` = ₹1,500.00). |
 | `vpa` | string | Payer UPI id, when available. |
-| `provider` | string | `razorpay`, `paytm`, `pinelabs`, etc. |
 | `created_at` | string | Payment time, ISO-8601 UTC. |
-| `updatedAt` | string | Last modification time, ISO-8601 UTC. |
-| `status` | string | `normal` for a clean payment; others (`refund`, `chargeback`, `failed`, `cyber`, `suspicious`) are flagged states. |
 
 **Top-level fields**
 
@@ -259,16 +253,23 @@ Body:
       "rrnNumber": "123456789012",
       "amount": 150000,
       "vpa": "customer@okhdfcbank",
-      "provider": "razorpay",
-      "created_at": "2026-07-06T09:15:00.000Z",
-      "updatedAt": "2026-07-06T09:15:02.000Z",
-      "status": "normal"
+      "created_at": "2026-07-06T09:15:00.000Z"
     }
   }
 }
 ```
-For `payment.updated`, `data` also includes `previousStatus`. The `transaction` object is
-identical to the one returned by `GET /transactions` (amounts in **paise**).
+The `transaction` object is identical to the one returned by `GET /transactions` (amounts in
+**paise**). For `payment.updated`, `data` also includes `previousStatus` and `newStatus`
+(e.g. `"normal"` → `"refund"`) so you know what changed:
+```json
+"data": {
+  "transaction": { "id": "6543ab...", "qrCodeId": "TID12345", "paymentId": "pay_abc123",
+                   "rrnNumber": "123456789012", "amount": 150000, "vpa": "customer@okhdfcbank",
+                   "created_at": "2026-07-06T09:15:00.000Z" },
+  "previousStatus": "normal",
+  "newStatus": "refund"
+}
+```
 
 ### Events
 | Event | When |
