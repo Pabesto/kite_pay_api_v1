@@ -152,7 +152,16 @@ async function resolve(qrCodeId) {
 // Drop a QR from the cache so the next resolve() re-reads it (use after reassignment).
 function invalidateQr(qrCodeId) { qrToSubadmin.delete(qrCodeId); }
 
+// Invalidate AND immediately re-fetch a QR's owner from Appwrite. Call this from the QR
+// mutation endpoints (create / delete / reassign) so the cache is corrected right away
+// instead of waiting for the periodic refresh. Returns the new owner id (or null).
+async function reload(qrCodeId) {
+    if (!qrCodeId) return null;
+    qrToSubadmin.delete(qrCodeId);
+    return resolve(qrCodeId);
+}
+
 function isReady() { return _ready; }
 function size() { return qrToSubadmin.size; }
 
-module.exports = { init, buildAll, refresh, get, resolve, invalidateQr, isReady, size, _ownerFor };
+module.exports = { init, buildAll, refresh, get, resolve, reload, invalidateQr, isReady, size, _ownerFor };

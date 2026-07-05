@@ -9,6 +9,7 @@ const fs = require("fs");
 const axios = require("axios");
 const { File } = require('buffer');
 const userMetaCache = require('./userMetaCache');
+const qrOwnerCache = require('./qrOwnerCache');
 const path = require('path');
 const moment = require('moment-timezone');
 
@@ -418,6 +419,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             //     });
             // }
 
+            // Refresh this QR's owner in the cache so new payments are attributed immediately.
+            qrOwnerCache.reload(qrId).catch(e => console.error('qrOwnerCache.reload (create) failed:', e.message));
+
             return res.status(201).json({ message: "QR Code entry created successfully.", qrCode: newQrCode });
         } catch (error) {
             console.error('Error creating QR code entry:', error);
@@ -450,6 +454,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             await storage.deleteFile(bucketId, fileId);
             await databases.deleteDocument(APPWRITE_DATABASE_ID, Qr_collectionId, docId);
+
+            // Drop this QR from the owner cache (no longer exists).
+            qrOwnerCache.invalidateQr(qrId);
 
             // Decrement dashboard counters
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsUploaded', -1).catch(console.error);
@@ -675,6 +682,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
             }
 
+            // Assignee changed → recompute this QR's owner in the cache.
+            qrOwnerCache.reload(qrId).catch(e => console.error('qrOwnerCache.reload (assign-user) failed:', e.message));
+
             return res.status(200).json({ message: 'Assignee updated.' });
         } catch (e) {
             console.error(e);
@@ -720,6 +730,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const updated = await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, {
                 managedByUserId: null
             });
+            qrOwnerCache.reload(qrId).catch(e => console.error('qrOwnerCache.reload (unlink-manager) failed:', e.message));
             return res.status(200).json({ message: 'Manager unlinked.', updated });
             }
 
@@ -778,6 +789,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             } else if (prevAssigned && !newAssigned) {
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsAssignedToMerchant', -1).catch(console.error);
             }
+
+            // Manager (and possibly assignee) changed → recompute this QR's owner in the cache.
+            qrOwnerCache.reload(qrId).catch(e => console.error('qrOwnerCache.reload (assign-manager) failed:', e.message));
 
             return res.status(200).json({ message: 'Manager updated.', updated });
         } catch (e) {
