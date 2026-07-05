@@ -2,6 +2,13 @@
 // Redis-backed cache for users_meta lookups.
 // Reads: cached with short TTL. Writes: invalidate immediately.
 //
+// Resilience: every call checks `_redisClient?.isReady`. When Redis is unavailable
+// (down, mid-reconnect, or never connected) that is false, so the call goes straight to
+// Appwrite — the cache is a pure accelerator, never a hard dependency. The moment the
+// shared client becomes ready again (node-redis auto-reconnects on drops, and server.js
+// runs a periodic reconnect for boot-time outages), the very next call transparently
+// resumes using Redis — no state to flip here.
+//
 // Toggle via env: set USE_USER_META_CACHE=false to disable Redis caching
 // entirely. All calls fall through to direct Appwrite reads — useful for
 // local dev when Redis isn't running. Default: enabled.
@@ -40,7 +47,7 @@ async function getUserMeta(userId) {
 
     // Try cache (with 2s timeout to prevent hanging on broken Redis connections)
     try {
-        if (ENABLED && _redisClient?.isOpen) {
+        if (ENABLED && _redisClient?.isReady) {
             const cached = await withTimeout(_redisClient.get(cacheKey), 2000);
             if (cached) return JSON.parse(cached);
         }
@@ -67,7 +74,7 @@ async function getUserMeta(userId) {
     }
 
     // Populate cache (best-effort, don't block on write)
-    if (doc && ENABLED && _redisClient?.isOpen) {
+    if (doc && ENABLED && _redisClient?.isReady) {
         withTimeout(_redisClient.set(cacheKey, JSON.stringify(doc), { EX: CACHE_TTL }), 2000)
             .catch(e => console.error('userMetaCache write error:', e.message));
     }
@@ -77,7 +84,7 @@ async function getUserMeta(userId) {
 
 // Invalidate cache after create/update/delete
 async function invalidate(userId) {
-    if (!userId || !ENABLED || !_redisClient?.isOpen) return;
+    if (!userId || !ENABLED || !_redisClient?.isReady) return;
     try { await _redisClient.del(KEY_PREFIX + userId); }
     catch (e) { console.error('userMetaCache invalidate error:', e.message); }
 }

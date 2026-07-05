@@ -186,7 +186,11 @@ const redisClient = createClient({
         reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
     },
 });
-// redisClient.on('error', (e) => console.error('Redis error:', e));
+// REQUIRED — do not remove. Without an 'error' listener, node-redis re-throws 'error'
+// events as uncaught exceptions and the process exits. During a Redis outage these fire
+// continuously, which would crash-loop this payment-critical server. This listener keeps
+// the app alive; it already degrades to Appwrite / in-memory fallbacks while Redis is down.
+redisClient.on('error', (e) => console.error('Redis error:', e?.message || e));
 redisClient.on('reconnecting', () => console.log('Redis reconnecting...'));
 redisClient.on('ready', () => console.log('Redis connected'));
 
@@ -617,6 +621,28 @@ const PARTNER_WEBHOOK_DEAD_RETENTION_DAYS = Number(process.env.PARTNER_WEBHOOK_D
         console.error('Redis connect failed — continuing without Redis:', e);
     }
 })();
+
+// Redis availability watchdog.
+// node-redis auto-reconnects after a connection DROPS, but not when the INITIAL connect
+// failed (Redis was down at boot) or the client fully closed. This periodic check retries
+// connect() in that case. While Redis is down, all cache callers (userMetaCache, etc.)
+// already fall through to Appwrite via their `isReady` guards; once this reconnects, they
+// transparently resume using Redis on their next call — nothing else to toggle.
+const REDIS_RECONNECT_CHECK_MS = Number(process.env.REDIS_RECONNECT_CHECK_MS) || 5 * 60 * 1000;
+let _redisReconnecting = false;
+setInterval(async () => {
+    if (redisClient.isOpen || _redisReconnecting) return; // already connected / connecting
+    _redisReconnecting = true;
+    try {
+        await redisClient.connect();
+        console.log('Redis reconnected — cache re-enabled');
+        await syncCountersFromAppwrite(); // reseed counters from source of truth
+    } catch (e) {
+        console.error('Redis reconnect attempt failed — staying on Appwrite direct:', e.message);
+    } finally {
+        _redisReconnecting = false;
+    }
+}, REDIS_RECONNECT_CHECK_MS);
 // ─────────────────────────────────────────────────────────────────────────────
 
 const globalLimiter = rateLimit({
