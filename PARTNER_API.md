@@ -13,6 +13,7 @@ response format, error handling, and complete code examples.
 - The API is **read-only**. There is a single data endpoint: `GET /api/partner/transactions`.
 - Results are returned newest-first and paginated with an opaque **cursor**.
 - All timestamps are ISO-8601 UTC. All money amounts are integers in **paise** (₹1 = 100 paise).
+- Each API key is rate-limited to **120 requests per minute**. See [Rate limits](#5-rate-limits).
 
 **Base URL**
 
@@ -82,13 +83,11 @@ Returns your transactions, newest first, one page at a time.
 | `cursor` | string | — | Pagination cursor. Omit for the first page; then pass the `nextCursor` from the previous response. See [Pagination](#4-pagination). |
 | `from` | date `YYYY-MM-DD` | — | Start date (inclusive), interpreted in **IST (Asia/Kolkata)**. See [Date filtering](#33-date-filtering). |
 | `to` | date `YYYY-MM-DD` | — | End date (inclusive), IST. |
-| `status` | string | — | Filter by transaction status. One of `normal`, `cyber`, `refund`, `chargeback`, `failed`, `suspicious`. |
 | `qrId` | string | — | Restrict to a single QR code id. |
 | `searchField` | string | — | Field to search. Must be paired with `searchValue`. See [Search](#34-search). |
 | `searchValue` | string | — | Value to search for. |
-| `isSortByUpdatedAt` | boolean | `false` | `true` sorts by last-updated instead of creation time. See [Sorting](#35-sorting). |
 
-Parameters combine with **AND** — e.g. `status=normal&from=2026-07-01` returns normal
+Parameters combine with **AND** — e.g. `qrId=TID12345&from=2026-07-01` returns that QR's
 transactions on/after 1 Jul.
 
 ### 3.2 Response
@@ -162,12 +161,7 @@ A non-numeric `amount` → `400 { "error": "Amount must be an integer value" }`.
 
 ### 3.5 Sorting
 
-- Default: newest **created** first (`created_at` descending).
-- `isSortByUpdatedAt=true`: newest **updated** first — useful to poll for records that
-  recently changed status (e.g. a payment that later became a `refund`).
-
-> Keep the sort order **consistent across a pagination run**. Don't change
-> `isSortByUpdatedAt` midway through walking cursors, or pages may overlap/skip.
+Transactions are always returned **newest first** (`created_at` descending).
 
 ---
 
@@ -184,7 +178,7 @@ Pagination is **cursor-based** (not page numbers). The flow:
 Notes:
 - A page is "full" when it returns exactly `limit` rows; only then is `nextCursor` set.
 - The cursor is the `id` of the last transaction on the page — opaque; don't construct it yourself.
-- Cursors are only valid against the **same filter set**. Changing `from`/`status`/etc.
+- Cursors are only valid against the **same filter set**. Changing `from`/`to`/etc.
   means starting again without a cursor.
 - An expired/invalid cursor → `400 { "error": "Invalid or expired pagination cursor" }`.
   On that error, restart from page one.
@@ -235,7 +229,7 @@ For each event we `POST` JSON to your URL with these headers:
 
 | Header | Purpose |
 |--------|---------|
-| `X-Kitepay-Event` | Event type — `payment.created` or `payment.updated`. |
+| `X-Kitepay-Event` | Event type — `payment.created`. |
 | `X-Kitepay-Delivery` | Unique delivery id — **use it to dedupe** (we deliver at-least-once). |
 | `X-Kitepay-Signature` | `sha256=<hmac>` — HMAC-SHA256 of the **raw request body** with your webhook secret. |
 
@@ -259,23 +253,12 @@ Body:
 }
 ```
 The `transaction` object is identical to the one returned by `GET /transactions` (amounts in
-**paise**). For `payment.updated`, `data` also includes `previousStatus` and `newStatus`
-(e.g. `"normal"` → `"refund"`) so you know what changed:
-```json
-"data": {
-  "transaction": { "id": "6543ab...", "qrCodeId": "TID12345", "paymentId": "pay_abc123",
-                   "rrnNumber": "123456789012", "amount": 150000, "vpa": "customer@okhdfcbank",
-                   "created_at": "2026-07-06T09:15:00.000Z" },
-  "previousStatus": "normal",
-  "newStatus": "refund"
-}
-```
+**paise**).
 
 ### Events
 | Event | When |
 |-------|------|
 | `payment.created` | A new payment is received for one of your QR codes. |
-| `payment.updated` | A transaction's status changes (e.g. `normal` → `refund`/`chargeback`/`failed`). |
 
 ### Verifying the signature (required)
 Compute HMAC-SHA256 over the **exact raw body bytes** with your secret and compare, in
@@ -317,7 +300,6 @@ app.post('/kitepay/webhook', express.raw({ type: 'application/json' }), (req, re
 
 | HTTP | Body | Cause |
 |------|------|-------|
-| 400 | `{ "error": "Invalid status filter" }` | `status` not in the allowed set |
 | 400 | `{ "error": "Invalid searchField parameter" }` | Unsupported `searchField` |
 | 400 | `{ "error": "Amount must be an integer value" }` | `searchField=amount` with non-numeric `searchValue` |
 | 400 | `{ "error": "Invalid cursor format" }` | `cursor` contains illegal characters |
@@ -333,15 +315,15 @@ Always check the HTTP status; error bodies are `{ "error": "..." }`.
 
 ### 6.1 cURL
 
-First page — normal transactions in July, 50 per page:
+First page — transactions in July, 50 per page:
 ```bash
-curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?status=normal&from=2026-07-01&to=2026-07-31&limit=50" \
+curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50" \
   -H "X-API-Key: pk_AB12CD34.<secret>"
 ```
 
 Next page (using the returned `nextCursor`):
 ```bash
-curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?status=normal&from=2026-07-01&to=2026-07-31&limit=50&cursor=6543ab..." \
+curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50&cursor=6543ab..." \
   -H "X-API-Key: pk_AB12CD34.<secret>"
 ```
 
@@ -381,8 +363,8 @@ async function fetchAllTransactions(filters = {}) {
   return all;
 }
 
-// Usage: all normal transactions for July
-fetchAllTransactions({ status: 'normal', from: '2026-07-01', to: '2026-07-31' })
+// Usage: all transactions for July
+fetchAllTransactions({ from: '2026-07-01', to: '2026-07-31' })
   .then(txns => console.log(`Fetched ${txns.length} transactions`))
   .catch(console.error);
 ```
@@ -415,7 +397,7 @@ def fetch_all_transactions(**filters):
             return out
 
 # `from` is a Python keyword, so pass the filters as a dict:
-txns = fetch_all_transactions(**{"status": "normal", "from": "2026-07-01", "to": "2026-07-31"})
+txns = fetch_all_transactions(**{"from": "2026-07-01", "to": "2026-07-31"})
 print(f"Fetched {len(txns)} transactions")
 ```
 
@@ -425,8 +407,7 @@ print(f"Fetched {len(txns)} transactions")
 
 - **Store the key securely** (env var / secrets manager), never in client-side code or git.
 - **Use `limit=100`** for bulk pulls to minimize round-trips; smaller pages for interactive UIs.
-- **Poll incrementally**: to catch new payments, request `from=<today>` sorted by default
-  (`created_at`); to catch status changes on older payments, use `isSortByUpdatedAt=true`.
+- **Poll incrementally**: to catch new payments, request `from=<today>` (results are newest-first by `created_at`).
 - **Handle `nextCursor: null`** as the definitive end of results.
 - **Respect rate limits**: watch `RateLimit-Remaining`; on `429`, back off for `Retry-After` seconds. Don't fire parallel bursts — sequential paged requests stay within quota.
 - **Retry 5xx** with exponential backoff; **do not retry 4xx** without fixing the request.
