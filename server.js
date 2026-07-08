@@ -1373,7 +1373,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
-        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
         const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
 
         // STEP 4: save raw webhook record (source of truth) — under lock
@@ -1512,7 +1512,7 @@ app.post('/webhook', async (req, res) => {
         // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
-        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
         const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
 
         // 5. Save raw webhook record (source of truth) — under lock
@@ -1652,11 +1652,11 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
         // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
-        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
         const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
 
         // STEP 5: save raw webhook record (source of truth)
-        const created = await databases.createDocument(
+        const created = await databases.createDocument( 
             APPWRITE_DATABASE_ID,
             APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
             ID.unique(),
