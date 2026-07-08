@@ -50,6 +50,12 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Behind a reverse proxy (Render/Nginx) that sets X-Forwarded-For. Trust exactly ONE
+// proxy hop so express-rate-limit keys on the real client IP — not the proxy, and not a
+// spoofable header (which `trust proxy: true` would allow). Override via TRUST_PROXY if
+// your infra has a different number of proxies in front.
+app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
+
 // console.log(process.env.APPWRITE_ENDPOINT, 'is the Redis URL being used');
 
 // Appwrite Configuration loaded from .env
