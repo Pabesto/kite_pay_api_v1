@@ -5244,6 +5244,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     const TXN_JOB_LOCK_TTL = 600;                 // refreshed every batch; auto-expires if the process dies
     const txnJobStateKey = (qid) => `holdreset:txnjob:${qid}`;
     const txnJobLockKey = (qid) => `holdreset:txnjob:lock:${qid}`;
+    const TXN_JOB_INDEX_KEY = 'holdreset:txnjob:index'; // Redis SET of every qrId that has a job (for the list endpoint)
 
     async function readTxnJob(qid) {
         try { const raw = await redisClient.get(txnJobStateKey(qid)); return raw ? JSON.parse(raw) : null; }
@@ -5379,6 +5380,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const base = { sourceQrId, holdQrId, cutoff, total, startedAt: getISTDateTime(), startedBy: req.user.userId };
             await writeTxnJob(sourceQrId, { ...base, status: 'running', done: false, moved: 0, failed: 0, updatedAt: getISTDateTime() });
+            // Register this qrId so the list endpoint can enumerate all jobs without knowing ids up front.
+            await redisClient.sAdd(TXN_JOB_INDEX_KEY, sourceQrId).catch(e => console.error('txn job index sAdd failed:', e.message));
 
             // Fire-and-forget — do NOT await. The request returns now; the worker runs in the background.
             runTxnMigration(sourceQrId, holdQrId, cutoff, lockVal, base)
@@ -5459,6 +5462,58 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         } catch (err) {
             console.error('❌ move-transactions status error:', err.message || err);
             return res.status(500).json({ error: err.message || 'Failed to read migration status' });
+        }
+    });
+
+    // GET /admin/hold-and-reset/move-transactions/jobs
+    // Lists every QR that has a transaction-migration job, with summary progress — so the UI can show an
+    // overview list ("193893 — 10%", "204551 — 15%", ...) and then drill into the per-qrId status endpoint.
+    // Query: ?active=true → only jobs that are not done yet. Prunes index entries whose state has expired.
+    router.get('/hold-and-reset/move-transactions/jobs', authenticateAdmin, async (req, res) => {
+        const activeOnly = String(req.query.active || '').toLowerCase() === 'true';
+        try {
+            let ids = [];
+            try { ids = await redisClient.sMembers(TXN_JOB_INDEX_KEY); } catch (e) { console.error('txn job index read failed:', e.message); }
+
+            const jobs = [];
+            for (const qid of ids) {
+                const state = await readTxnJob(qid);
+                if (!state) {
+                    // State expired (7-day TTL) — drop the stale index entry.
+                    await redisClient.sRem(TXN_JOB_INDEX_KEY, qid).catch(() => {});
+                    continue;
+                }
+                const lockHeld = (await redisClient.get(txnJobLockKey(qid))) !== null;
+                const total = Number(state.total || 0);
+                const moved = Number(state.moved || 0);
+                const failed = Number(state.failed || 0);
+                const done = !!state.done;
+                // running but no lock held and not finished → the worker died; cron will pick it up within ~5 min.
+                const status = (state.status === 'running' && !lockHeld && !done) ? 'stalled' : state.status;
+                if (activeOnly && done) continue;
+                jobs.push({
+                    sourceQrId: state.sourceQrId || qid,
+                    holdQrId: state.holdQrId || `${qid}_hold`,
+                    status, done,
+                    percent: total > 0 ? Math.min(100, Math.round((moved / total) * 100)) : (done ? 100 : 0),
+                    moved, failed, total,
+                    remaining: Math.max(0, total - moved - failed),
+                    startedAt: state.startedAt || null,
+                    updatedAt: state.updatedAt || null,
+                    finishedAt: state.finishedAt || null,
+                    startedBy: state.startedBy || null,
+                    error: state.error || null,
+                });
+            }
+
+            // Active (running/stalled) first, then most-recently-updated first.
+            const rank = (s) => (s === 'running' ? 0 : s === 'stalled' ? 1 : s === 'error' ? 2 : 3);
+            jobs.sort((a, b) => rank(a.status) - rank(b.status) || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+
+            return res.status(200).json({ count: jobs.length, jobs });
+        } catch (err) {
+            console.error('❌ move-transactions jobs list error:', err.message || err);
+            return res.status(500).json({ error: err.message || 'Failed to list migration jobs' });
         }
     });
 
