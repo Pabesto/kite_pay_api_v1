@@ -4983,24 +4983,37 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // deliberate trade-off that keeps the endpoint synchronous and fast.
     //
     // Body: { confirm: true (required for real run), dryRun: true (preview counts, no writes),
-    //         resume: true (continue an interrupted run — see below) }
+    //         allowIncrement: true (acknowledge a REPEAT reset — see below) }
+    //
+    // Repeat resets: if the QR was already archived once ("<qrId>_hold" exists) and the fresh QR is live again,
+    // a new reset archives to the next free slot ("<qrId>_hold2", "_hold3", …). The real run refuses this with
+    // 409 { needsHoldConfirmation, existingHoldId, nextHoldId } unless allowIncrement:true is passed, so the UI
+    // can confirm first. A dry run reports the resolved target + needsHoldConfirmation without writing.
+    //
+    // Recovery is automatic (no resume flag): if a run died after renaming the original but before recreating
+    // the fresh QR, the fresh QR is simply missing — a plain retry detects that and FINISHES the interrupted
+    // run into the existing hold slot instead of starting a new one.
     //
     // Safety: holds lock:qr:<qrId> (the same lock the payment webhook uses) for the whole operation, so no
     // payment for this QR can write a summary bucket concurrently — the fresh QR's post-reset activity can't
-    // be swept into _hold. Every move is idempotent ("value == <qrId> → <qrId>_hold"), so a failed run can be
-    // re-run with resume:true. Balances are MOVED, not zeroed, so no merchant money is lost.
+    // be swept into the hold. Every move is idempotent ("value == <qrId> → <holdQrId>"). Balances are MOVED,
+    // not zeroed, so no merchant money is lost.
     router.post('/qr/:qrId/hold-and-reset', authenticateAdmin, async (req, res) => {
         const sourceQrId = String(req.params.qrId || '').trim();
         const dryRun = req.body?.dryRun === true;
-        const resume = req.body?.resume === true;
+        // When the QR was already archived once (a "<qrId>_hold" exists) and the fresh QR is live again,
+        // a repeat reset must archive to the NEXT slot ("_hold2", "_hold3", …). We only do that if the client
+        // explicitly acknowledges via allowIncrement:true — otherwise we return needsHoldConfirmation so the UI
+        // can ask "already held; archive again to <next>?".
+        const allowIncrement = req.body?.allowIncrement === true;
 
         if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
-        if (sourceQrId.endsWith('_hold')) return res.status(400).json({ error: 'qrId is already a _hold id' });
+        if (/_hold\d*$/.test(sourceQrId)) return res.status(400).json({ error: 'qrId is already a _hold id' });
         if (!dryRun && req.body?.confirm !== true) {
             return res.status(400).json({ error: 'Refusing to run without confirm:true. Use dryRun:true to preview.' });
         }
 
-        const holdQrId = `${sourceQrId}_hold`;
+        let holdQrId = null; // resolved from current state below (base "_hold", or "_holdN" for repeat resets)
         const PAGE = 100;
         const MAX_PAGES = 100000; // runaway guard for the mutate-the-filter-field loops
 
@@ -5010,6 +5023,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 [Query.equal('qrId', id), Query.limit(1)]);
             return r.documents[0] || null;
         };
+
 
         // Count rows referencing sourceQrId in a collection by the given field (uses Appwrite's .total).
         const countBy = async (collectionId, field) => {
@@ -5089,19 +5103,52 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         };
 
         try {
-            let holdDoc = await findQr(holdQrId);
+            // ---- Resolve current state → decide the target hold id and what to do. ----
+            // Three cases:
+            //   fresh QR missing            → an earlier run was interrupted; FINISH it into the highest hold slot.
+            //   fresh QR present, no hold   → first-ever reset; archive to "<src>_hold".
+            //   fresh QR present, hold(s)   → repeat reset; archive to the NEXT slot, but only if allowIncrement.
             let srcDoc = await findQr(sourceQrId);
+            const { highest, nextId } = await resolveHoldSlots(sourceQrId);
 
-            if (!resume && holdDoc) {
-                return res.status(409).json({
-                    error: `A QR with id "${holdQrId}" already exists. If a previous run was interrupted, retry with resume:true; otherwise this id has already been archived.`,
-                });
-            }
-            if (resume && !holdDoc) {
-                return res.status(400).json({ error: `Nothing to resume — no QR with id "${holdQrId}" exists.` });
-            }
-            if (!resume && !srcDoc) {
-                return res.status(404).json({ error: `QR "${sourceQrId}" not found.` });
+            let holdDoc = null;      // set when finishing an interrupted run (its hold doc already exists)
+            let isRepeatReset = false;
+
+            if (!srcDoc) {
+                if (!highest) {
+                    return res.status(404).json({ error: `QR "${sourceQrId}" not found.` });
+                }
+                // Interrupted earlier run: the fresh QR was never (re)created. Finish into the existing hold slot.
+                holdQrId = highest.id;
+                holdDoc = highest.doc;
+            } else if (!highest) {
+                // First-ever reset → slot 1 ("<src>_hold").
+                holdQrId = nextId;
+            } else {
+                // Fresh QR is live AND a prior archive exists → this is a repeat reset.
+                isRepeatReset = true;
+                holdQrId = nextId;
+                if (!dryRun && !allowIncrement) {
+                    return res.status(409).json({
+                        needsHoldConfirmation: true,
+                        message: `QR "${sourceQrId}" was already archived to "${highest.id}". To reset it again, its current history will be archived to "${nextId}".`,
+                        existingHoldId: highest.id,
+                        nextHoldId: nextId,
+                        hint: 'Re-send with { confirm:true, allowIncrement:true } to proceed.',
+                    });
+                }
+                // Don't start a new generation while the previous generation's transaction migration is still
+                // moving txns into the current hold — otherwise the cutoff/target math for the two generations
+                // would overlap. Make them finish (or it can be skipped entirely) before resetting again.
+                if (!dryRun) {
+                    const prevJob = await readTxnJob(sourceQrId);
+                    if (prevJob && !prevJob.done && (prevJob.status === 'running' || prevJob.status === 'stalled')) {
+                        return res.status(409).json({
+                            error: `A transaction migration into "${highest.id}" is still in progress. Let it finish before resetting "${sourceQrId}" again.`,
+                            migrationStatusUrl: `/api/admin/qr/${encodeURIComponent(sourceQrId)}/hold-and-reset/move-transactions/status`,
+                        });
+                    }
+                }
             }
 
             // ---- Dry run: report what WOULD move, mutate nothing. ----
@@ -5112,8 +5159,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     countBy(APPWRITE_MANUAL_HOLD_COLLECTION_ID, 'qrId'),
                 ]);
                 return res.status(200).json({
-                    dryRun: true, sourceQrId, holdQrId, resume,
-                    state: { holdExists: !!holdDoc, sourceExists: !!srcDoc },
+                    dryRun: true, sourceQrId, holdQrId,
+                    state: { finishingInterruptedRun: !srcDoc, isRepeatReset,
+                        needsHoldConfirmation: isRepeatReset && !allowIncrement,
+                        existingHoldId: highest ? highest.id : null },
                     willMove: { withdrawalRequests: withdrawals, manualHolds,
                         note: 'summary date-docs (qr/deleted/flagged) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
                     willNOTMove: { transactions: txns,
@@ -5138,11 +5187,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 return res.status(423).json({ error: `QR ${sourceQrId} is busy (locked) — try again shortly.` });
             }
 
-            const report = { sourceQrId, holdQrId, resume, steps: {} };
+            const report = { sourceQrId, holdQrId, isRepeatReset, finishingInterruptedRun: !srcDoc, steps: {} };
             try {
                 // A + B) Archive the original QR doc and stand up the fresh one. Skipped on resume once done.
                 if (!holdDoc) {
-                    // Fresh run: rename the original -> _hold and deactivate it (keeps counters/balances/assignment).
+                    // Fresh run: rename the original -> _hold and deactivate it. We update ONLY qrId + isActive,
+                    // so assignedUserId / managedByUserId (and all counters/balances) are left exactly as they were
+                    // — the archived _hold QR keeps its original assignment. Only the fresh QR starts unassigned.
                     await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, srcDoc.$id,
                         { qrId: holdQrId, isActive: false });
                     holdDoc = { ...srcDoc, qrId: holdQrId, isActive: false };
@@ -5166,7 +5217,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         report.steps.copiedFileId = freshFileId;
                     } catch (e) {
                         console.error(`hold-and-reset: failed to copy QR image file ${holdDoc.fileId}:`, e.message);
-                        throw new Error(`Failed to copy QR image file — aborting. Retry with resume:true. (${e.message})`);
+                        throw new Error(`Failed to copy QR image file — aborting. Retry the request to finish the interrupted run. (${e.message})`);
                     }
 
                     // Create the fresh, empty, UNASSIGNED, active QR reusing the original id. Template from holdDoc.
@@ -5224,7 +5275,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             console.error('❌ hold-and-reset error:', err.message || err);
             return res.status(500).json({
                 error: err.message || 'hold-and-reset failed',
-                hint: 'The operation is idempotent — retry with resume:true to continue from where it stopped.',
+                hint: 'The operation is idempotent — just retry the same request; a missing fresh QR is auto-detected and the interrupted run is finished.',
             });
         }
     });
@@ -5245,6 +5296,26 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     const txnJobStateKey = (qid) => `holdreset:txnjob:${qid}`;
     const txnJobLockKey = (qid) => `holdreset:txnjob:lock:${qid}`;
     const TXN_JOB_INDEX_KEY = 'holdreset:txnjob:index'; // Redis SET of every qrId that has a job (for the list endpoint)
+
+    // Resolve the "<src>_hold[N]" slots for a source qrId: the highest existing slot (the most recent archive)
+    // and the next free slot. Shared by hold-and-reset (to pick the archive target) and move-transactions
+    // (to re-point txns into the CURRENT generation's hold). Function declaration → hoisted, usable anywhere.
+    async function resolveHoldSlots(sourceQrId) {
+        const slotId = (n) => (n <= 1 ? `${sourceQrId}_hold` : `${sourceQrId}_hold${n}`);
+        const findOne = async (id) => {
+            const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
+                [Query.equal('qrId', id), Query.limit(1)]);
+            return r.documents[0] || null;
+        };
+        let highest = null, n = 1;
+        while (n < 1000) {
+            const doc = await findOne(slotId(n));
+            if (!doc) break;
+            highest = { n, id: slotId(n), doc };
+            n++;
+        }
+        return { highest, nextId: slotId(n) };
+    }
 
     async function readTxnJob(qid) {
         try { const raw = await redisClient.get(txnJobStateKey(qid)); return raw ? JSON.parse(raw) : null; }
@@ -5341,27 +5412,31 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }, { timezone: 'Asia/Kolkata' });
 
     // POST /admin/qr/:qrId/hold-and-reset/move-transactions
-    // Starts (or restarts after a crash) the background move of pre-reset transactions to "<qrId>_hold".
-    // Returns 202 immediately. Requires confirm:true. 409 if a job is already actively running.
+    // Starts (or restarts after a crash) the background move of pre-reset transactions into the CURRENT
+    // generation's hold slot (the highest "<qrId>_hold[N]"). Returns 202 immediately. Requires confirm:true.
+    // 409 if a job is already actively running.
     router.post('/qr/:qrId/hold-and-reset/move-transactions', authenticateAdmin, async (req, res) => {
         const sourceQrId = String(req.params.qrId || '').trim();
         if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
-        if (sourceQrId.endsWith('_hold')) return res.status(400).json({ error: 'Pass the live qrId, not the _hold id' });
+        if (/_hold\d*$/.test(sourceQrId)) return res.status(400).json({ error: 'Pass the live qrId, not the _hold id' });
         if (req.body?.confirm !== true) return res.status(400).json({ error: 'Refusing to run without confirm:true' });
 
-        const holdQrId = `${sourceQrId}_hold`;
         try {
             const findQr = async (id) => {
                 const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
                     [Query.equal('qrId', id), Query.limit(1)]);
                 return r.documents[0] || null;
             };
-            const [holdDoc, freshDoc] = await Promise.all([findQr(holdQrId), findQr(sourceQrId)]);
-            if (!holdDoc) return res.status(400).json({ error: `No archived QR "${holdQrId}" — run hold-and-reset first.` });
+            const [{ highest }, freshDoc] = await Promise.all([resolveHoldSlots(sourceQrId), findQr(sourceQrId)]);
+            if (!highest) return res.status(400).json({ error: `No archived QR "${sourceQrId}_hold" — run hold-and-reset first.` });
             if (!freshDoc) return res.status(404).json({ error: `Fresh QR "${sourceQrId}" not found.` });
+            // Target = the most recent hold slot, so this generation's leftover txns land with THIS generation's
+            // summaries (e.g. after a 2nd reset they go to "<qrId>_hold2", matching where its summaries went).
+            const holdQrId = highest.id;
 
-            // Cutoff = the fresh QR's createdAt (the reset moment). Only txns older than this are pre-reset history;
-            // anything newer is the fresh QR's own activity and must stay put.
+            // Cutoff = the current fresh QR's createdAt (this reset moment). Only txns older than this are pre-reset
+            // history; anything newer is the fresh QR's own activity and must stay put. (Txns from prior
+            // generations already carry an older hold id, so they no longer match qrCodeId==sourceQrId.)
             const cutoff = freshDoc.createdAt;
             if (!cutoff) return res.status(409).json({ error: `Fresh QR "${sourceQrId}" has no createdAt — cannot derive a safe cutoff.` });
 
