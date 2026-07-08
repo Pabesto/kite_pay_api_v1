@@ -38,7 +38,7 @@ const CONFIG = {
 };
 
 // Set active environment: "test" or "production"
-const ACTIVE_ENV = "production";
+const ACTIVE_ENV = "test";
 
 // ─────────────────────────────────────────────
 // PINE ONE CLIENT

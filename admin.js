@@ -22,6 +22,7 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
 const userMetaCache = require('./userMetaCache');
+const qrOwnerCache = require('./qrOwnerCache'); // shared singleton, initialized in server.js
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -29,7 +30,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -4964,6 +4965,256 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         } catch (err) {
             console.error(err);
             res.status(500).json({ error: err.message || 'Failed to delete config' });
+        }
+    });
+
+    // -----------------------------------------------------------------------------------------------------
+    // POST /admin/qr/:qrId/hold-and-reset
+    // Archive an existing QR (e.g. "193893") together with ALL of its history under a "<qrId>_hold" id,
+    // then stand up a fresh, empty, UNASSIGNED, active QR that reuses the original "193893" id — as if the
+    // QR started over from zero. Everything that references the qrId is moved to the "_hold" id:
+    //   • QR doc            — qrId renamed, isActive:false (counters/balances kept on the archived record)
+    //   • transactions      — qrCodeId re-pointed
+    //   • daily_qr_summaries / daily_deleted_summary / daily_flagged_summary — totalsJson key renamed
+    //   • withdrawal requests + manual-hold audit — qrId re-pointed
+    // The fresh QR has no summary/txn/withdrawal rows, so it reads 0 everywhere.
+    //
+    // Body: { confirm: true (required for real run), dryRun: true (preview counts, no writes),
+    //         resume: true (continue an interrupted run — see below) }
+    //
+    // Safety: holds lock:qr:<qrId> (the same lock the payment webhook uses) so no payment races the swap;
+    // every reference move is idempotent ("value == <qrId> → <qrId>_hold"), so a failed run can be re-run
+    // with resume:true. Balances are MOVED, not zeroed, so no merchant money is lost.
+    router.post('/qr/:qrId/hold-and-reset', authenticateAdmin, async (req, res) => {
+        const sourceQrId = String(req.params.qrId || '').trim();
+        const dryRun = req.body?.dryRun === true;
+        const resume = req.body?.resume === true;
+
+        if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
+        if (sourceQrId.endsWith('_hold')) return res.status(400).json({ error: 'qrId is already a _hold id' });
+        if (!dryRun && req.body?.confirm !== true) {
+            return res.status(400).json({ error: 'Refusing to run without confirm:true. Use dryRun:true to preview.' });
+        }
+
+        const holdQrId = `${sourceQrId}_hold`;
+        const PAGE = 100;
+        const MAX_PAGES = 100000; // runaway guard for the mutate-the-filter-field loops
+
+        // Look up a QR doc by its business qrId (not $id).
+        const findQr = async (id) => {
+            const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
+                [Query.equal('qrId', id), Query.limit(1)]);
+            return r.documents[0] || null;
+        };
+
+        // Count rows referencing sourceQrId in a collection by the given field (uses Appwrite's .total).
+        const countBy = async (collectionId, field) => {
+            if (!collectionId) return null;
+            const r = await databases.listDocuments(APPWRITE_DATABASE_ID, collectionId,
+                [Query.equal(field, sourceQrId), Query.limit(1)]);
+            return r.total;
+        };
+
+        // Re-point every doc whose <field> === sourceQrId to holdQrId. Because we mutate the very field we
+        // filter on, each updated doc drops out of the next query — so we just keep querying until none match.
+        // Idempotent and resumable. Returns the number of docs moved.
+        const repointField = async (collectionId, field, label) => {
+            if (!collectionId) return 0;
+            let moved = 0;
+            for (let page = 0; page < MAX_PAGES; page++) {
+                const r = await databases.listDocuments(APPWRITE_DATABASE_ID, collectionId,
+                    [Query.equal(field, sourceQrId), Query.limit(PAGE)]);
+                if (r.documents.length === 0) break;
+                let progressed = 0;
+                for (const doc of r.documents) {
+                    try {
+                        await databases.updateDocument(APPWRITE_DATABASE_ID, collectionId, doc.$id, { [field]: holdQrId });
+                        moved++; progressed++;
+                    } catch (e) {
+                        console.error(`hold-and-reset: failed to re-point ${label} doc ${doc.$id}:`, e.message);
+                    }
+                }
+                // Whole page errored — stop rather than spin forever on the same failing docs.
+                if (progressed === 0) throw new Error(`Could not re-point any ${label} docs (all updates failing) — aborting`);
+            }
+            return moved;
+        };
+
+        // Move the sourceQrId key to holdQrId inside every date doc's totalsJson of a summary collection.
+        // lockArg maps a date -> the acquireDailyLock argument the live writer uses, so we serialize with it.
+        // mergeFn combines an existing hold value with the moved value (numbers add; flagged objects add per status).
+        const moveSummaryKey = async (collectionId, lockArg, mergeFn) => {
+            if (!collectionId) return 0;
+            let moved = 0, cursor = null;
+            for (let page = 0; page < MAX_PAGES; page++) {
+                const q = [Query.orderAsc('$id'), Query.limit(PAGE)];
+                if (cursor) q.push(Query.cursorAfter(cursor));
+                const r = await databases.listDocuments(APPWRITE_DATABASE_ID, collectionId, q);
+                if (r.documents.length === 0) break;
+                for (const doc of r.documents) {
+                    let obj;
+                    try { obj = JSON.parse(doc.totalsJson || '{}'); }
+                    catch (e) { console.error(`hold-and-reset: CORRUPT totalsJson in ${collectionId} doc ${doc.$id} — skipping`); continue; }
+                    if (!Object.prototype.hasOwnProperty.call(obj, sourceQrId)) continue;
+
+                    const lock = await acquireDailyLock(lockArg(doc.date));
+                    try {
+                        // Re-read under the lock so we don't clobber a concurrent writer's change.
+                        const fresh = await databases.getDocument(APPWRITE_DATABASE_ID, collectionId, doc.$id);
+                        let f;
+                        try { f = JSON.parse(fresh.totalsJson || '{}'); }
+                        catch (e) { console.error(`hold-and-reset: CORRUPT totalsJson (locked) in ${collectionId} doc ${doc.$id} — skipping`); continue; }
+                        if (!Object.prototype.hasOwnProperty.call(f, sourceQrId)) continue;
+                        f[holdQrId] = mergeFn(f[holdQrId], f[sourceQrId]);
+                        delete f[sourceQrId];
+                        await databases.updateDocument(APPWRITE_DATABASE_ID, collectionId, doc.$id, { totalsJson: JSON.stringify(f) });
+                        moved++;
+                    } finally { await releaseLock(lock.key, lock.val); }
+                }
+                cursor = r.documents[r.documents.length - 1].$id;
+                if (r.documents.length < PAGE) break;
+            }
+            return moved;
+        };
+        const mergeNumbers = (existing, incoming) => Number(existing || 0) + Number(incoming || 0);
+        const mergeFlagged = (existing, incoming) => {
+            const out = (existing && typeof existing === 'object') ? { ...existing } : {};
+            const inc = (incoming && typeof incoming === 'object') ? incoming : {};
+            for (const k of Object.keys(inc)) out[k] = Number(out[k] || 0) + Number(inc[k] || 0);
+            return out;
+        };
+
+        try {
+            let holdDoc = await findQr(holdQrId);
+            let srcDoc = await findQr(sourceQrId);
+
+            if (!resume && holdDoc) {
+                return res.status(409).json({
+                    error: `A QR with id "${holdQrId}" already exists. If a previous run was interrupted, retry with resume:true; otherwise this id has already been archived.`,
+                });
+            }
+            if (resume && !holdDoc) {
+                return res.status(400).json({ error: `Nothing to resume — no QR with id "${holdQrId}" exists.` });
+            }
+            if (!resume && !srcDoc) {
+                return res.status(404).json({ error: `QR "${sourceQrId}" not found.` });
+            }
+
+            // ---- Dry run: report what WOULD move, mutate nothing. ----
+            if (dryRun) {
+                const [txns, withdrawals, manualHolds] = await Promise.all([
+                    countBy(webhook_collectionId, 'qrCodeId'),
+                    countBy(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'qrId'),
+                    countBy(APPWRITE_MANUAL_HOLD_COLLECTION_ID, 'qrId'),
+                ]);
+                return res.status(200).json({
+                    dryRun: true, sourceQrId, holdQrId, resume,
+                    state: { holdExists: !!holdDoc, sourceExists: !!srcDoc },
+                    willMove: { transactions: txns, withdrawalRequests: withdrawals, manualHolds,
+                        note: 'summary date-docs are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
+                    sourceQr: srcDoc ? {
+                        assignedUserId: srcDoc.assignedUserId || null,
+                        totalTransactions: srcDoc.totalTransactions || 0,
+                        totalPayInAmount: srcDoc.totalPayInAmount || 0,
+                        amountAvailableForWithdrawal: srcDoc.amountAvailableForWithdrawal || 0,
+                        amountOnHold: srcDoc.amountOnHold || 0,
+                    } : null,
+                });
+            }
+
+            // ---- Real run: serialize with live payment processing for this qrId. ----
+            const qrLockKey = `lock:qr:${sourceQrId}`;
+            const qrLockVal = `hold-reset:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+            if (!await acquireLock(qrLockKey, qrLockVal, 60)) {
+                return res.status(423).json({ error: `QR ${sourceQrId} is busy (locked) — try again shortly.` });
+            }
+
+            const report = { sourceQrId, holdQrId, resume, steps: {} };
+            try {
+                // A + B) Archive the original QR doc and stand up the fresh one. Skipped on resume once done.
+                if (!holdDoc) {
+                    // Fresh run: rename the original -> _hold and deactivate it (keeps counters/balances/assignment).
+                    await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, srcDoc.$id,
+                        { qrId: holdQrId, isActive: false });
+                    holdDoc = { ...srcDoc, qrId: holdQrId, isActive: false };
+                    srcDoc = null; // the old doc is now the hold doc
+                    report.steps.archivedQrDoc = true;
+                }
+                if (!srcDoc) {
+                    // Copy the QR image into a NEW storage file so the fresh QR owns its own file. Otherwise both
+                    // records would share one fileId, and later deleting the _hold QR (delete-qr removes the file
+                    // from the bucket) would break the fresh QR's image. On failure we abort — the operation is
+                    // resumable, and we never want the fresh QR silently sharing the archived file.
+                    let freshFileId = null, freshImageUrl = null;
+                    try {
+                        const meta = await storage.getFile(bucketId, holdDoc.fileId);
+                        const bytes = await storage.getFileDownload(bucketId, holdDoc.fileId); // ArrayBuffer
+                        const copyObj = new File([Buffer.from(bytes)], meta.name || `${sourceQrId}.png`,
+                            { type: meta.mimeType || 'image/png' });
+                        const copied = await storage.createFile(bucketId, ID.unique(), copyObj);
+                        freshFileId = copied.$id;
+                        freshImageUrl = `${APPWRITE_ENDPOINT}/storage/buckets/${bucketId}/files/${copied.$id}/view?project=${APPWRITE_PROJECT_ID}`;
+                        report.steps.copiedFileId = freshFileId;
+                    } catch (e) {
+                        console.error(`hold-and-reset: failed to copy QR image file ${holdDoc.fileId}:`, e.message);
+                        throw new Error(`Failed to copy QR image file — aborting. Retry with resume:true. (${e.message})`);
+                    }
+
+                    // Create the fresh, empty, UNASSIGNED, active QR reusing the original id. Template from holdDoc.
+                    srcDoc = await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, ID.unique(), {
+                        qrId: sourceQrId,
+                        type: holdDoc.type,
+                        companyName: holdDoc.companyName,
+                        fileId: freshFileId,
+                        imageUrl: freshImageUrl,
+                        assignedUserId: null,
+                        managedByUserId: null,
+                        createdByUserId: req.user.userId,
+                        isActive: true,
+                        createdAt: getISTDateTime(),
+                        totalTransactions: 0,
+                        totalPayInAmount: 0,
+                        withdrawalRequestedAmount: 0,
+                        withdrawalApprovedAmount: 0,
+                        amountAvailableForWithdrawal: 0,
+                        amountOnHold: 0,
+                        commissionOnHold: 0,
+                        commissionPaid: 0,
+                    });
+                    report.steps.createdFreshQrDoc = true;
+                }
+
+                // Refresh owner cache for both ids so live attribution reflects the swap immediately.
+                await Promise.all([
+                    qrOwnerCache.reload(sourceQrId).catch(e => console.error('qrOwnerCache.reload(source) failed:', e.message)),
+                    qrOwnerCache.reload(holdQrId).catch(e => console.error('qrOwnerCache.reload(hold) failed:', e.message)),
+                ]);
+
+                // C) Move all history references to the _hold id (each step idempotent/resumable).
+                report.steps.transactionsMoved = await repointField(webhook_collectionId, 'qrCodeId', 'transaction');
+                report.steps.dailyQrSummaryDocsMoved = await moveSummaryKey(
+                    APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, (d) => d, mergeNumbers);
+                report.steps.deletedSummaryDocsMoved = await moveSummaryKey(
+                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, (d) => `del:${d}`, mergeNumbers);
+                report.steps.flaggedSummaryDocsMoved = await moveSummaryKey(
+                    APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, (d) => `flag:${d}`, mergeFlagged);
+                report.steps.withdrawalRequestsMoved = await repointField(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'qrId', 'withdrawal-request');
+                report.steps.manualHoldsMoved = await repointField(APPWRITE_MANUAL_HOLD_COLLECTION_ID, 'qrId', 'manual-hold');
+            } finally {
+                await releaseLock(qrLockKey, qrLockVal);
+            }
+
+            return res.status(200).json({
+                success: true,
+                message: `QR "${sourceQrId}" archived to "${holdQrId}" and reset to a fresh, unassigned QR.`,
+                ...report,
+            });
+        } catch (err) {
+            console.error('❌ hold-and-reset error:', err.message || err);
+            return res.status(500).json({
+                error: err.message || 'hold-and-reset failed',
+                hint: 'The operation is idempotent — retry with resume:true to continue from where it stopped.',
+            });
         }
     });
 
