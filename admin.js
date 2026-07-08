@@ -2428,6 +2428,18 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 return res.status(400).json({ error: 'Transaction is not deleted' });
             }
 
+            // A pending-review txn hasn't been decided yet — it must go through approve/reject,
+            // not un_delete (which would reveal/credit it before a decision).
+            if (tx.reviewStatus === 'pending_review') {
+                return res.status(400).json({ error: 'Transaction is pending review — approve or reject it instead of un-deleting' });
+            }
+
+            // A REJECTED txn was real money we withheld from the user; it was never counted and was
+            // logged in daily_rejected_summary (not daily_deleted_summary). Un-deleting it REVEALS it:
+            // the increments below are correct (first-time credit), but the summary rollback must hit
+            // the rejected summary, and its rejected_transactions log entry must be removed.
+            const isRejected = tx.reviewStatus === 'rejected';
+
             const amountPaise = Number(tx.amount || 0); // paise
             const qrId = tx.qrCodeId;
 
@@ -2577,50 +2589,103 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 webhook_collectionId,
                 id,
                 { deleted: false ,
+                  // A revealed rejected txn is now live — clear the 'rejected' status so it isn't
+                  // both live and labelled rejected, and record who revealed it.
+                  ...(isRejected ? { reviewStatus: 'approved', reviewedBy: `un_delete:${req.user?.userId || 'admin'}`, reviewedAt: istDateTimeNow() } : {}),
                   edited_by: `admin | un_delete | ip:${req.body.ipAddress || 'N/A'} | device:${req.body.deviceInfo || 'N/A'}`,
                 }
             );
 
-            // 5) Roll back daily_deleted_summary — subtract the amount that delete added.
-            // The deleted summary is bucketed by the day the deletion happened, which is not
-            // stored on the transaction, so we adjust today's bucket (the original delete most
-            // commonly happens same-day). Guarded against going negative.
-            const delDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            // 5) Roll back whichever summary the txn was actually counted in.
+            const rollbackKey = qrId || 'no_qr';
 
-            const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
-            try {
-                const existingDelSummary = await databases.listDocuments(
-                    APPWRITE_DATABASE_ID,
-                    APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
-                    [Query.equal('date', delDayString), Query.limit(1)]
-                );
-
-                if (existingDelSummary.total > 0) {
-                    const doc = existingDelSummary.documents[0];
-                    let totalsObj = {};
-                    try {
-                        totalsObj = JSON.parse(doc.totalsJson || '{}');
-                    } catch (e) {
-                        console.error('CORRUPT totalsJson in daily_deleted_summary doc', doc.$id, '— aborting');
-                        throw new Error('Daily deleted summary JSON is corrupted — manual fix required');
+            if (isRejected) {
+                // Revealing a rejected txn → remove it from daily_rejected_summary, bucketed by its
+                // rejection day (reviewedAt), which we have on the doc — more accurate than "today".
+                const rejDayString = moment.tz(tx.reviewedAt || tx.created_at, 'Asia/Kolkata').format('YYYY-MM-DD');
+                const rejDailyLock = await acquireDailyLock(`rej:${rejDayString}`);
+                try {
+                    const existingRejSummary = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID,
+                        [Query.equal('date', rejDayString), Query.limit(1)]
+                    );
+                    if (existingRejSummary.total > 0) {
+                        const doc = existingRejSummary.documents[0];
+                        let totalsObj = {};
+                        try {
+                            totalsObj = JSON.parse(doc.totalsJson || '{}');
+                        } catch (e) {
+                            console.error('CORRUPT totalsJson in daily_rejected_summary doc', doc.$id, '— aborting');
+                            throw new Error('Daily rejected summary JSON is corrupted — manual fix required');
+                        }
+                        const currentRejTotal = Number(totalsObj[rollbackKey] || 0);
+                        totalsObj[rollbackKey] = Math.max(0, currentRejTotal - amountPaise);
+                        await databases.updateDocument(
+                            APPWRITE_DATABASE_ID,
+                            APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID,
+                            doc.$id,
+                            { totalsJson: JSON.stringify(totalsObj) }
+                        );
                     }
+                    // If no rejected-summary doc exists for that day, there is nothing to roll back.
+                } finally {
+                    await releaseLock(rejDailyLock.key, rejDailyLock.val);
+                }
 
-                    const currentDelTotal = Number(totalsObj[qrId || 'no_qr'] || 0);
-                    totalsObj[qrId || 'no_qr'] = Math.max(0, currentDelTotal - amountPaise);
-
-                    await databases.updateDocument(
+                // Remove the detailed rejected_transactions log entry — it's no longer rejected.
+                try {
+                    const rejLogs = await databases.listDocuments(
+                        APPWRITE_DATABASE_ID,
+                        APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID,
+                        [Query.equal('txnId', id), Query.limit(25)]
+                    );
+                    for (const logDoc of rejLogs.documents) {
+                        await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, logDoc.$id);
+                    }
+                } catch (e) {
+                    console.error('un_delete: failed to delete rejected_transactions log for', id, '—', e.message);
+                }
+            } else {
+                // Normal deleted txn → subtract the amount that delete added to daily_deleted_summary.
+                // Bucketed by the deletion day, which isn't stored, so we adjust today's bucket
+                // (deletes are usually undone same-day). Guarded against going negative.
+                const delDayString = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+                const delDailyLock = await acquireDailyLock(`del:${delDayString}`);
+                try {
+                    const existingDelSummary = await databases.listDocuments(
                         APPWRITE_DATABASE_ID,
                         APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
-                        doc.$id,
-                        { totalsJson: JSON.stringify(totalsObj) }
+                        [Query.equal('date', delDayString), Query.limit(1)]
                     );
+
+                    if (existingDelSummary.total > 0) {
+                        const doc = existingDelSummary.documents[0];
+                        let totalsObj = {};
+                        try {
+                            totalsObj = JSON.parse(doc.totalsJson || '{}');
+                        } catch (e) {
+                            console.error('CORRUPT totalsJson in daily_deleted_summary doc', doc.$id, '— aborting');
+                            throw new Error('Daily deleted summary JSON is corrupted — manual fix required');
+                        }
+
+                        const currentDelTotal = Number(totalsObj[rollbackKey] || 0);
+                        totalsObj[rollbackKey] = Math.max(0, currentDelTotal - amountPaise);
+
+                        await databases.updateDocument(
+                            APPWRITE_DATABASE_ID,
+                            APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID,
+                            doc.$id,
+                            { totalsJson: JSON.stringify(totalsObj) }
+                        );
+                    }
+                    // If no deleted-summary doc exists for today, there is nothing to roll back.
+                } finally {
+                    await releaseLock(delDailyLock.key, delDailyLock.val);
                 }
-                // If no deleted-summary doc exists for today, there is nothing to roll back.
-            } finally {
-                await releaseLock(delDailyLock.key, delDailyLock.val);
             }
 
-            return res.status(200).json({ message: 'Transaction restored', id });
+            return res.status(200).json({ message: 'Transaction restored', id, revealed: isRejected });
             } finally {
                 // Release the QR lock acquired for this un_delete
                 if (qrId) {
