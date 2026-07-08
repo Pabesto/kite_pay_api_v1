@@ -23,6 +23,8 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
 const userMetaCache = require('./userMetaCache');
 const qrOwnerCache = require('./qrOwnerCache'); // shared singleton, initialized in server.js
+const reviewMode = require('./reviewMode'); // in-memory manual-review-mode registry (single-process)
+const createReviewResolve = require('./reviewResolve'); // pending-review exactly-once state machine
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -30,7 +32,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -3635,6 +3637,280 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         } catch (err) {
             console.error('❌ List hold records error:', err);
             return res.status(500).json({ error: 'Failed to fetch hold records' });
+        }
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MANUAL REVIEW-MODE CONTROL PLANE
+    //
+    // Default is AUTO. An admin turns on MANUAL mode for a bounded window
+    // (1–reviewMode.MAX_MINUTES) scoped global / per-QR / per-user. Windows live
+    // in process memory (reviewMode.js) and are wiped on restart → the system
+    // always boots in AUTO. These endpoints only manage the windows; the ingest
+    // gate and pending-review resolution are wired in later steps.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // POST /admin/manual-mode — activate OR reset/extend a manual window
+    // Body: { scope:'global'|'qr'|'user', qrId?, userId?, minutes:1-10 }
+    router.post('/manual-mode', authenticateAdmin, async (req, res) => {
+        try {
+            const { scope, qrId, userId, minutes } = req.body || {};
+            const window = reviewMode.setManual({
+                scope,
+                qrId,
+                userId,
+                minutes,
+                setBy: req.user?.userId || null,
+            });
+            console.log(`[ReviewMode] MANUAL set by ${req.user?.userId || 'unknown'} →`, window);
+            return res.status(200).json({
+                success: true,
+                mode: 'manual',
+                window,
+                active: reviewMode.listActive(),
+            });
+        } catch (err) {
+            return res.status(400).json({ error: err.message });
+        }
+    });
+
+    // DELETE /admin/manual-mode — deactivate (back to auto)
+    // Body: { scope, qrId?, userId? }  OR  { all:true }
+    router.delete('/manual-mode', authenticateAdmin, async (req, res) => {
+        try {
+            // Accept params from body or query (some clients/proxies drop DELETE bodies)
+            const { scope, qrId, userId, all } = { ...req.query, ...(req.body || {}) };
+            const cleared = reviewMode.clearManual({ scope, qrId, userId, all: !!all });
+            console.log(`[ReviewMode] MANUAL cleared by ${req.user?.userId || 'unknown'} →`, cleared);
+            return res.status(200).json({
+                success: true,
+                cleared,
+                active: reviewMode.listActive(),
+            });
+        } catch (err) {
+            return res.status(400).json({ error: err.message });
+        }
+    });
+
+    // GET /admin/manual-mode — current active windows + remaining time
+    router.get('/manual-mode', authenticateAdmin, async (req, res) => {
+        const active = reviewMode.listActive();
+        return res.status(200).json({
+            success: true,
+            manualActive: active.length > 0,
+            globalManual: active.some(w => w.scope === 'global'),
+            active,
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PENDING-REVIEW RESOLUTION (approve / reject) + rejection reporting
+    //
+    // resolveReview is the exactly-once state machine (reviewResolve.js), shared by
+    // these admin endpoints and — later — the durable timeout sweeper.
+    // ─────────────────────────────────────────────────────────────────────────
+    const { resolveReview } = createReviewResolve({
+        databases, Query, ID,
+        DB: APPWRITE_DATABASE_ID,
+        WEBHOOK_COL: webhook_collectionId,
+        REJECTED_COL: APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID,
+        DAILY_REJECTED_COL: APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID,
+        finalizeTransaction,
+        acquireLock, releaseLock, acquireDailyLock,
+        nowIso: istDateTimeNow,
+        todayStr: () => moment.tz('Asia/Kolkata').format('YYYY-MM-DD'),
+        emitReviewResolved,
+    });
+
+    // Durable timeout sweeper — auto-approves held txns whose per-txn backstop elapsed.
+    // In-process, single instance; a `running` guard prevents overlapping ticks. This is
+    // what makes "timeout → approve" durable: the in-memory manual windows vanish on
+    // restart, but pending docs persist with reviewExpiresAt and get swept here.
+    let sweeperRunning = false;
+    async function sweepExpiredReviews() {
+        if (sweeperRunning) return;
+        sweeperRunning = true;
+        try {
+            const nowIso = istDateTimeNow();
+            // Query only by the indexed reviewStatus; filter the (string) deadline in JS so we
+            // don't depend on Appwrite range-query support for string attributes. Oldest first
+            // (createdAt ≈ expiry order, since the window is a constant offset).
+            const pending = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, [
+                Query.equal('reviewStatus', 'pending_review'),
+                Query.orderAsc('$createdAt'),
+                Query.limit(100),
+            ]);
+            const due = pending.documents.filter(d => d.reviewExpiresAt && d.reviewExpiresAt <= nowIso);
+            for (const doc of due) {
+                try {
+                    const r = await resolveReview(doc.$id, 'approve', 'system-timeout');
+                    if (r.status === 'approved') {
+                        console.log(`[ReviewSweeper] auto-approved ${doc.$id} qr=${doc.qrCodeId} amount=${doc.amount}`);
+                    }
+                } catch (e) {
+                    console.error(`[ReviewSweeper] failed to resolve ${doc.$id}:`, e.message);
+                }
+            }
+        } catch (e) {
+            console.error('[ReviewSweeper] sweep error:', e.message);
+        } finally {
+            sweeperRunning = false;
+        }
+    }
+
+    // Skip in tests (Jest builds this router; a live interval would leak an open handle).
+    if (process.env.NODE_ENV !== 'test') {
+        const sweepMs = Number(process.env.REVIEW_SWEEP_MS) || 5000;
+        setInterval(() => { sweepExpiredReviews().catch(() => {}); }, sweepMs);
+        console.log(`[ReviewSweeper] started — every ${sweepMs}ms`);
+    }
+
+    function respondResolve(res, r) {
+        if (r.status === 'not_found') return res.status(404).json({ error: 'Transaction not found' });
+        if (r.status === 'locked') return res.status(503).json({ error: 'Busy resolving, retry' });
+        if (r.status === 'already_resolved') return res.status(409).json({ error: `Already ${r.reviewStatus}`, reviewStatus: r.reviewStatus });
+        return res.status(200).json({ success: true, status: r.status });
+    }
+
+    // POST /admin/transactions/:id/review-approve — approve a held txn (→ finalize/increment)
+    router.post('/transactions/:id/review-approve', authenticateAdmin, async (req, res) => {
+        try {
+            const r = await resolveReview(req.params.id, 'approve', { id: req.user.userId, name: req.user.name });
+            return respondResolve(res, r);
+        } catch (err) {
+            console.error('review-approve error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    // POST /admin/transactions/:id/review-reject — reject a held txn (stays deleted; logged)
+    router.post('/transactions/:id/review-reject', authenticateAdmin, async (req, res) => {
+        try {
+            const r = await resolveReview(req.params.id, 'reject', { id: req.user.userId, name: req.user.name, reason: req.body?.reason || null });
+            return respondResolve(res, r);
+        } catch (err) {
+            console.error('review-reject error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    // GET /admin/pending-review — live queue of held transactions
+    router.get('/pending-review', authenticateAdmin, async (req, res) => {
+        try {
+            const { qrId, cursor, limit } = req.query;
+            const limitNum = Math.min(Number(limit) || 25, 100);
+            const queries = [Query.equal('reviewStatus', 'pending_review'), Query.orderDesc('$createdAt'), Query.limit(limitNum)];
+            if (qrId) queries.unshift(Query.equal('qrCodeId', qrId));
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, queries);
+            const records = result.documents.map(d => ({
+                $id: d.$id,
+                qrCodeId: d.qrCodeId,
+                paymentId: d.paymentId,
+                amount: d.amount,
+                provider: d.provider,
+                vpa: d.vpa,
+                rrnNumber: d.rrnNumber,
+                created_at: d.created_at,
+                reviewExpiresAt: d.reviewExpiresAt,
+                ownerSubadminId: d.ownerSubadminId,
+            }));
+            const nextCursor = records.length === limitNum ? result.documents[records.length - 1].$id : null;
+            return res.status(200).json({ success: true, records, total: result.total, nextCursor });
+        } catch (err) {
+            console.error('pending-review list error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    // GET /admin/rejected-transactions — detailed rejection log (filters: qrId, provider)
+    router.get('/rejected-transactions', authenticateAdmin, async (req, res) => {
+        try {
+            const { qrId, provider, cursor, limit } = req.query;
+            const limitNum = Math.min(Number(limit) || 25, 100);
+            const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
+            if (qrId) queries.unshift(Query.equal('qrId', qrId));
+            if (provider) queries.unshift(Query.equal('provider', provider));
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+
+            const result = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, queries);
+            const records = result.documents.map(d => ({
+                $id: d.$id,
+                txnId: d.txnId,
+                qrId: d.qrId,
+                paymentId: d.paymentId,
+                amount: d.amount,
+                provider: d.provider,
+                vpa: d.vpa,
+                rrnNumber: d.rrnNumber,
+                ownerSubadminId: d.ownerSubadminId,
+                originalCreatedAt: d.originalCreatedAt,
+                rejectedAt: d.rejectedAt,
+                adminId: d.adminId,
+                adminName: d.adminName,
+                reason: d.reason,
+            }));
+            const nextCursor = records.length === limitNum ? result.documents[records.length - 1].$id : null;
+            return res.status(200).json({ success: true, records, total: result.total, nextCursor });
+        } catch (err) {
+            console.error('rejected-transactions list error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+    });
+
+    // GET /admin/rejected-summary — daily × QR rollup of rejections (same shape as /deleted-summary)
+    router.get('/rejected-summary', authenticateAdmin, async (req, res) => {
+        try {
+            const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const from = req.query.from || todayStr;
+            const to = req.query.to || todayStr;
+            const filterQrId = req.query.qrId || null;
+
+            const startDate = moment.tz(from, 'Asia/Kolkata');
+            const endDate = moment.tz(to, 'Asia/Kolkata');
+            if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+                return res.status(400).json({ error: 'Invalid date range' });
+            }
+
+            const days = [];
+            let grandTotalPaise = 0;
+            const cursor = startDate.clone();
+            while (cursor.isSameOrBefore(endDate, 'day')) {
+                const dateStr = cursor.format('YYYY-MM-DD');
+                const summaryDocs = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID,
+                    [Query.equal('date', dateStr), Query.limit(1)]
+                );
+
+                let dayTotal = 0;
+                let qrBreakdown = {};
+                if (summaryDocs.total > 0) {
+                    let totalsObj = {};
+                    try {
+                        totalsObj = JSON.parse(summaryDocs.documents[0].totalsJson || '{}');
+                    } catch (e) {
+                        console.error('WARNING: corrupted totalsJson in rejected summary for date', dateStr, '—', e.message);
+                        totalsObj = {};
+                    }
+                    for (const [qrId, paise] of Object.entries(totalsObj)) {
+                        if (filterQrId && qrId !== filterQrId) continue;
+                        const amount = parseInt(paise || 0, 10);
+                        qrBreakdown[qrId] = amount;
+                        dayTotal += amount;
+                    }
+                }
+
+                days.push({ date: dateStr, totalPaise: dayTotal, totalRs: dayTotal / 100, qrs: qrBreakdown });
+                grandTotalPaise += dayTotal;
+                cursor.add(1, 'day');
+            }
+
+            return res.json({ days, grandTotalPaise, grandTotalRs: grandTotalPaise / 100 });
+        } catch (err) {
+            console.error('Rejected summary error:', err);
+            return res.status(500).json({ error: 'Failed to fetch rejected summary' });
         }
     });
 

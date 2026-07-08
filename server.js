@@ -38,6 +38,7 @@ const ConfigManager = require('./configManager');
 const { createClient } = require('redis');
 const userMetaCache = require('./userMetaCache');
 const qrOwnerCache = require('./qrOwnerCache');
+const reviewMode = require('./reviewMode'); // in-memory manual-review-mode registry (single-process)
 const dashboardCounters = require('./dashboardCounters');
 const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
@@ -63,6 +64,9 @@ const APPWRITE_USERS_META_COLLECTION_ID = process.env.APPWRITE_USERS_META_COLLEC
 const APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID;
 const APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID = process.env.APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID;
 const APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID = process.env.APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID;
+// Manual-review feature: rejected transactions log + daily rejected rollup (defaults match setup-review-schema.js)
+const APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID || 'rejected_transactions';
+const APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID = process.env.APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID || 'daily_rejected_summary';
 const APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID;
 const APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID = process.env.APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID;
 const APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID;
@@ -86,7 +90,7 @@ const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
 // Set LOG_RAZORPAY_WEBHOOK=false in .env to silence the full webhook payload log.
 const LOG_RAZORPAY_WEBHOOK = String(process.env.LOG_RAZORPAY_WEBHOOK ?? 'true').toLowerCase() !== 'false';
 
-const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew } = initSocket(app, {
+const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved } = initSocket(app, {
   appwriteEndpoint: APPWRITE_ENDPOINT,
   appwriteProjectId: APPWRITE_PROJECT_ID,
 });
@@ -849,12 +853,26 @@ function requireRole(...roles) {
     };
 }
 
+// Centralized "increment everywhere" finalize pipeline — extracted to its own module
+// (transactionFinalize.js) so it is unit-testable in isolation and reusable from
+// admin.js (the manual-review approve path). Built here — BEFORE the route mounts
+// below — so it can be passed into adminRoutes(). updateQrTotalAtomic /
+// updateDailyQrTotal are hoisted function declarations, so referencing them is safe.
+const finalizeTransaction = require('./transactionFinalize')({
+    updateQrTotalAtomic,
+    updateDailyQrTotal,
+    emitTxnNew,
+    partnerWebhooks,
+    withRedisTimeout,
+    redisClient,
+});
+
 // Pass Appwrite and authentication dependencies to the route handlers
 // QR code routes use the admin authentication middleware
 app.use('/api', qrCodeRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID));
+app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved));
 
 // Admin routes use the admin authentication middleware
 app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
@@ -1139,19 +1157,35 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
     }
 }
 
-// Centralized "increment everywhere" finalize pipeline — extracted to its own module
-// (transactionFinalize.js) so it is unit-testable in isolation and reusable from
-// admin.js (the manual-review approve path). Built once here with the live deps;
-// updateQrTotalAtomic / updateDailyQrTotal are hoisted function declarations, so
-// referencing them at this point is safe.
-const finalizeTransaction = require('./transactionFinalize')({
-    updateQrTotalAtomic,
-    updateDailyQrTotal,
-    emitTxnNew,
-    partnerWebhooks,
-    withRedisTimeout,
-    redisClient,
-});
+// Look up a QR's direct assignedUserId (the operator user). Used only by the review
+// gate, and only when a 'user'-scope manual window is active, so it stays off the
+// normal auto hot path. Returns the userId or null.
+async function resolveAssignedUserId(qrCodeId) {
+    try {
+        const r = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal('qrId', qrCodeId), Query.limit(1)]
+        );
+        return r.documents[0]?.assignedUserId || null;
+    } catch (e) {
+        console.error('resolveAssignedUserId error:', e?.message || e);
+        return null;
+    }
+}
+
+// Resolve the owner ids the review gate should match a 'user'-scope window against:
+// always the managing subadmin (ownerSubadminId, cached/free), plus the QR's direct
+// assignedUserId when — and only when — a user-scope window is active.
+async function resolveReviewOwners(qrCodeId) {
+    const ownerSubadminId = await qrOwnerCache.resolve(qrCodeId);
+    const ownerIds = ownerSubadminId ? [ownerSubadminId] : [];
+    if (reviewMode.hasActiveUserWindows()) {
+        const assignedUserId = await resolveAssignedUserId(qrCodeId);
+        if (assignedUserId && assignedUserId !== ownerSubadminId) ownerIds.push(assignedUserId);
+    }
+    return { ownerSubadminId, ownerIds };
+}
 
 app.get('/test_force_refresh', (req, res) => {
   const eventPayload = {
@@ -1336,6 +1370,12 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             return res.status(200).send('Duplicate webhook ignored');
         }
 
+        // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
+        // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
+        const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+
         // STEP 4: save raw webhook record (source of truth) — under lock
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
@@ -1351,23 +1391,41 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
                 provider:    'razorpay',
                 created_at:  isoDate,
                 status:      'normal',
-                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
+                ownerSubadminId,
+                ...reviewFields,
             }
         );
 
-        // STEPS 5–8: centralized finalize — daily total, QR totals, emit, partner webhook, counters
-        await finalizeTransaction(created, {
-            emitPayload: {
-                $id:        created.$id,
+        if (manual) {
+            // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
+            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            emitPendingReview({
+                $id: created.$id,
                 qrCodeId,
                 paymentId,
-                amount:     amountPaise,
-                rrnNumber,
+                amount: amountPaise,
+                provider: created.provider,
                 vpa,
-                provider:   'razorpay',
-                created_at: new Date(isoDate).toISOString(),
-            },
-        });
+                rrnNumber,
+                created_at: isoDate,
+                reviewExpiresAt: reviewFields.reviewExpiresAt,
+                ownerSubadminId,
+            });
+        } else {
+            // STEPS 5–8: centralized finalize — daily total, QR totals, emit, partner webhook, counters
+            await finalizeTransaction(created, {
+                emitPayload: {
+                    $id:        created.$id,
+                    qrCodeId,
+                    paymentId,
+                    amount:     amountPaise,
+                    rrnNumber,
+                    vpa,
+                    provider:   'razorpay',
+                    created_at: new Date(isoDate).toISOString(),
+                },
+            });
+        }
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -1451,6 +1509,12 @@ app.post('/webhook', async (req, res) => {
             return res.status(200).send('Already processed');
         }
 
+        // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
+        // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
+        const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+
         // 5. Save raw webhook record (source of truth) — under lock
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
@@ -1466,23 +1530,41 @@ app.post('/webhook', async (req, res) => {
                 provider: 'razorpay',
                 created_at: isoDate,
                 status: 'normal',
-                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
+                ownerSubadminId,
+                ...reviewFields,
             }
         );
 
-        // 6–9. Centralized finalize — daily total, QR totals, emit, partner webhook, counters
-        await finalizeTransaction(created, {
-            emitPayload: {
+        if (manual) {
+            // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
+            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            emitPendingReview({
                 $id: created.$id,
                 qrCodeId,
                 paymentId,
                 amount: amountPaise,
-                rrnNumber: rrnNumber || null,
-                vpa: vpa || null,
-                provider: 'razorpay',
+                provider: created.provider,
+                vpa,
+                rrnNumber,
                 created_at: isoDate,
-            },
-        });
+                reviewExpiresAt: reviewFields.reviewExpiresAt,
+                ownerSubadminId,
+            });
+        } else {
+            // 6–9. Centralized finalize — daily total, QR totals, emit, partner webhook, counters
+            await finalizeTransaction(created, {
+                emitPayload: {
+                    $id: created.$id,
+                    qrCodeId,
+                    paymentId,
+                    amount: amountPaise,
+                    rrnNumber: rrnNumber || null,
+                    vpa: vpa || null,
+                    provider: 'razorpay',
+                    created_at: isoDate,
+                },
+            });
+        }
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -1567,6 +1649,12 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
             return res.status(200).send('Duplicate webhook ignored');
         }
 
+        // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
+        // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
+        const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
+        const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+
         // STEP 5: save raw webhook record (source of truth)
         const created = await databases.createDocument(
             APPWRITE_DATABASE_ID,
@@ -1582,23 +1670,41 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
                 provider:   'razorpay',
                 created_at: isoDate,
                 status:     'normal',
-                ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
+                ownerSubadminId,
+                ...reviewFields,
             }
         );
 
-        // STEPS 6–9: centralized finalize — daily total, QR totals, emit, partner webhook, counters
-        await finalizeTransaction(created, {
-            emitPayload: {
-                $id:        created.$id,
+        if (manual) {
+            // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
+            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            emitPendingReview({
+                $id: created.$id,
                 qrCodeId,
                 paymentId,
-                amount:     amountPaise,
-                rrnNumber,
+                amount: amountPaise,
+                provider: created.provider,
                 vpa,
-                provider:   'razorpay',
+                rrnNumber,
                 created_at: isoDate,
-            },
-        });
+                reviewExpiresAt: reviewFields.reviewExpiresAt,
+                ownerSubadminId,
+            });
+        } else {
+            // STEPS 6–9: centralized finalize — daily total, QR totals, emit, partner webhook, counters
+            await finalizeTransaction(created, {
+                emitPayload: {
+                    $id:        created.$id,
+                    qrCodeId,
+                    paymentId,
+                    amount:     amountPaise,
+                    rrnNumber,
+                    vpa,
+                    provider:   'razorpay',
+                    created_at: isoDate,
+                },
+            });
+        }
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -1721,6 +1827,7 @@ const pinelabPoller = ENABLE_PINELAB_POLLER
         acquireLock,
         releaseLock,
         emitTxnNew,
+        emitPendingReview,
         updateDailyQrTotal,
         finalizeTransaction,
         APPWRITE_DATABASE_ID,

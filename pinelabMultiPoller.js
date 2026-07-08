@@ -20,6 +20,8 @@
 const { PineOneMultiClient } = require('./pineLabMulti');
 const qrOwnerCache = require('./qrOwnerCache');
 const partnerWebhooks = require('./partnerWebhooks');
+const reviewMode = require('./reviewMode');       // in-memory manual-review-mode registry (single-process)
+const ConfigManager = require('./configManager'); // for txn_review_window_ms
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -41,6 +43,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
     acquireLock,
     releaseLock,
     emitTxnNew,
+    emitPendingReview,
     updateDailyQrTotal,
     finalizeTransaction,
     APPWRITE_DATABASE_ID,
@@ -145,6 +148,25 @@ function startPinelabMultiPoller(deps, opts = {}) {
         return true;
       }
 
+      // Review gate: hold for admin review if a manual window covers this txn, else finalize now.
+      // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
+      const ownerSubadminId = await qrOwnerCache.resolve(tid);
+      const ownerIds = ownerSubadminId ? [ownerSubadminId] : [];
+      if (reviewMode.hasActiveUserWindows()) {
+        try {
+          const qrRes = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal('qrId', tid), Query.limit(1)]
+          );
+          const assignedUserId = qrRes.documents[0]?.assignedUserId;
+          if (assignedUserId && assignedUserId !== ownerSubadminId) ownerIds.push(assignedUserId);
+        } catch (e) {
+          log(accountSpec, 'TXN', 'assignedUserId resolve failed (non-fatal)', { tid, err: e.message });
+        }
+      }
+      const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
+      const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(tid, ownerIds, reviewWindowMs);
+
       const created = await databases.createDocument(
         APPWRITE_DATABASE_ID,
         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
@@ -159,14 +181,35 @@ function startPinelabMultiPoller(deps, opts = {}) {
           provider: 'pinelabs',
           created_at: isoDate,
           status: 'normal',
-          ownerSubadminId: await qrOwnerCache.resolve(tid),
+          ownerSubadminId,
+          ...reviewFields,
         }
       );
       log(accountSpec, 'TXN', 'saved ✅', { docId: created.$id, transactionId, tid, amountPaise });
-      // Centralized finalize — QR totals, daily summary, real-time emit, partner webhook,
-      // and dashboard counters. The default emit payload built from `created` reproduces
-      // the previous pinelabs payload exactly (qrCodeId=tid, paymentId=transactionId, …).
-      await finalizeTransaction(created);
+
+      if (manual) {
+        // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
+        log(accountSpec, 'TXN', 'HELD pending review ⏸️', { docId: created.$id, tid, amountPaise, until: reviewFields.reviewExpiresAt });
+        if (typeof emitPendingReview === 'function') {
+          emitPendingReview({
+            $id: created.$id,
+            qrCodeId: tid,
+            paymentId: transactionId,
+            amount: amountPaise,
+            provider: 'pinelabs',
+            vpa,
+            rrnNumber,
+            created_at: isoDate,
+            reviewExpiresAt: reviewFields.reviewExpiresAt,
+            ownerSubadminId,
+          });
+        }
+      } else {
+        // Centralized finalize — QR totals, daily summary, real-time emit, partner webhook,
+        // and dashboard counters. The default emit payload built from `created` reproduces
+        // the previous pinelabs payload exactly (qrCodeId=tid, paymentId=transactionId, …).
+        await finalizeTransaction(created);
+      }
       return true;
     } catch (e) {
       console.error(`[PINELAB-POLL][${accountSpec}] processTransaction error:`, e);

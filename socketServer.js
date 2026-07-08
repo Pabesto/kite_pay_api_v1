@@ -56,6 +56,11 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
     // join per-user room
     socket.join(`room:user:${userId}`);
 
+    // Admins join the shared admin room — receives manual-review pending/resolved events.
+    if (socket.data.userMeta?.role === 'admin') {
+      socket.join('room:admins');
+    }
+
     // client asks to subscribe to specific QR codes it owns
     socket.on('subscribe:qrs', async ({ qrIds }) => {
       // console.log('User subscribing to QR rooms:', qrIds);
@@ -96,7 +101,26 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
     });
   });
 
-  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew };
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved };
+}
+
+// Manual-review events — admins only (room:admins).
+function emitPendingReview(payload) {
+  try {
+    if (!io || !payload) return;
+    io.to('room:admins').emit('review:pending', payload);
+  } catch (e) {
+    console.error('emitPendingReview error:', e.message);
+  }
+}
+
+function emitReviewResolved(payload) {
+  try {
+    if (!io || !payload) return;
+    io.to('room:admins').emit('review:resolved', payload);
+  } catch (e) {
+    console.error('emitReviewResolved error:', e.message);
+  }
 }
 
 // Helper: emit a new transaction event to intended audiences
@@ -157,5 +181,5 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
     }
   }
 
-module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew };
+module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved };
 
