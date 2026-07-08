@@ -1055,6 +1055,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 imageUrl: d.imageUrl || null,
                 deleted: d.deleted || false,
                 edited_by: d.edited_by || null,
+                reviewStatus: d.reviewStatus || null,
+                reviewedBy: d.reviewedBy || null,
+                reviewedAt: d.reviewedAt || null,
             });
 
             const docs = transactions.documents.map(pickTxn);
@@ -1141,6 +1144,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 deleted: d.deleted || false,
                 edited_by: d.edited_by || null,
                 updatedAt: d.$updatedAt || null,
+                reviewStatus: d.reviewStatus || null,
+                reviewedBy: d.reviewedBy || null,
+                reviewedAt: d.reviewedAt || null,
             });
             const docs = transactions.documents.map(pickTxn);
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
