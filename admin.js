@@ -4970,21 +4970,25 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     // -----------------------------------------------------------------------------------------------------
     // POST /admin/qr/:qrId/hold-and-reset
-    // Archive an existing QR (e.g. "193893") together with ALL of its history under a "<qrId>_hold" id,
-    // then stand up a fresh, empty, UNASSIGNED, active QR that reuses the original "193893" id — as if the
-    // QR started over from zero. Everything that references the qrId is moved to the "_hold" id:
+    // Archive an existing QR (e.g. "193893") under a "<qrId>_hold" id, then stand up a fresh, empty,
+    // UNASSIGNED, active QR that reuses the original "193893" id — as if the QR started over from zero.
+    // These references are moved to the "_hold" id (all BOUNDED work, so the request stays fast):
     //   • QR doc            — qrId renamed, isActive:false (counters/balances kept on the archived record)
-    //   • transactions      — qrCodeId re-pointed
     //   • daily_qr_summaries / daily_deleted_summary / daily_flagged_summary — totalsJson key renamed
     //   • withdrawal requests + manual-hold audit — qrId re-pointed
-    // The fresh QR has no summary/txn/withdrawal rows, so it reads 0 everywhere.
+    //
+    // Transactions (webhook_data.qrCodeId) are INTENTIONALLY NOT moved — that set is unbounded and would
+    // make the request time out. So reporting/summaries reset to 0 for the fresh QR, but the raw transaction
+    // list filtered by "193893" still shows the pre-reset history mixed with new activity. This is the
+    // deliberate trade-off that keeps the endpoint synchronous and fast.
     //
     // Body: { confirm: true (required for real run), dryRun: true (preview counts, no writes),
     //         resume: true (continue an interrupted run — see below) }
     //
-    // Safety: holds lock:qr:<qrId> (the same lock the payment webhook uses) so no payment races the swap;
-    // every reference move is idempotent ("value == <qrId> → <qrId>_hold"), so a failed run can be re-run
-    // with resume:true. Balances are MOVED, not zeroed, so no merchant money is lost.
+    // Safety: holds lock:qr:<qrId> (the same lock the payment webhook uses) for the whole operation, so no
+    // payment for this QR can write a summary bucket concurrently — the fresh QR's post-reset activity can't
+    // be swept into _hold. Every move is idempotent ("value == <qrId> → <qrId>_hold"), so a failed run can be
+    // re-run with resume:true. Balances are MOVED, not zeroed, so no merchant money is lost.
     router.post('/qr/:qrId/hold-and-reset', authenticateAdmin, async (req, res) => {
         const sourceQrId = String(req.params.qrId || '').trim();
         const dryRun = req.body?.dryRun === true;
@@ -5110,8 +5114,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 return res.status(200).json({
                     dryRun: true, sourceQrId, holdQrId, resume,
                     state: { holdExists: !!holdDoc, sourceExists: !!srcDoc },
-                    willMove: { transactions: txns, withdrawalRequests: withdrawals, manualHolds,
-                        note: 'summary date-docs are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
+                    willMove: { withdrawalRequests: withdrawals, manualHolds,
+                        note: 'summary date-docs (qr/deleted/flagged) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
+                    willNOTMove: { transactions: txns,
+                        note: 'Transactions keep qrCodeId="' + sourceQrId + '" by design (unbounded → would time out). The fresh QR\'s summary/reporting resets to 0, but its raw txn list still shows pre-reset history.' },
                     sourceQr: srcDoc ? {
                         assignedUserId: srcDoc.assignedUserId || null,
                         totalTransactions: srcDoc.totalTransactions || 0,
@@ -5125,7 +5131,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // ---- Real run: serialize with live payment processing for this qrId. ----
             const qrLockKey = `lock:qr:${sourceQrId}`;
             const qrLockVal = `hold-reset:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-            if (!await acquireLock(qrLockKey, qrLockVal, 60)) {
+            // TTL must outlast the whole bounded operation (summary moves can be many locked writes). If it
+            // expired mid-run, a payment could grab lock:qr and write today's summary while we're still moving
+            // keys — sweeping post-reset activity into _hold. It auto-expires so a crash can't block forever.
+            if (!await acquireLock(qrLockKey, qrLockVal, 180)) {
                 return res.status(423).json({ error: `QR ${sourceQrId} is busy (locked) — try again shortly.` });
             }
 
@@ -5190,8 +5199,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     qrOwnerCache.reload(holdQrId).catch(e => console.error('qrOwnerCache.reload(hold) failed:', e.message)),
                 ]);
 
-                // C) Move all history references to the _hold id (each step idempotent/resumable).
-                report.steps.transactionsMoved = await repointField(webhook_collectionId, 'qrCodeId', 'transaction');
+                // C) Move the BOUNDED history references to the _hold id (each step idempotent/resumable).
+                // NOTE: transactions (webhook_data.qrCodeId) are intentionally left untouched — that set is
+                // unbounded and would time the request out. See the header comment for the trade-off.
+                report.steps.transactionsMoved = 'skipped (intentional)';
                 report.steps.dailyQrSummaryDocsMoved = await moveSummaryKey(
                     APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, (d) => d, mergeNumbers);
                 report.steps.deletedSummaryDocsMoved = await moveSummaryKey(
