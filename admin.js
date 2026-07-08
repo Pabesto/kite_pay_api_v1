@@ -5229,6 +5229,239 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     });
 
+    // -----------------------------------------------------------------------------------------------------
+    // Background transaction migration for a hold-and-reset QR.
+    //
+    // hold-and-reset intentionally leaves transactions on the original qrId (unbounded → would time out).
+    // These two endpoints move that history to "<qrId>_hold" OUT OF BAND: a POST kicks off a background job
+    // that returns immediately (never blocks the client / request thread), and a GET reports detailed progress.
+    // State + a single-runner lock live in Redis. Idempotent & restart-safe: every move is
+    // "qrCodeId == <qrId> → <qrId>_hold", and a cutoff (the fresh QR's createdAt) excludes post-reset payments
+    // so new activity is never swept into _hold. Re-POST after a crash simply continues.
+    const TXN_JOB_PAGE = 100;
+    const TXN_JOB_MAX_PAGES = 1000000;           // runaway guard
+    const TXN_JOB_STATE_TTL = 7 * 24 * 3600;     // keep status readable for 7 days
+    const TXN_JOB_LOCK_TTL = 600;                 // refreshed every batch; auto-expires if the process dies
+    const txnJobStateKey = (qid) => `holdreset:txnjob:${qid}`;
+    const txnJobLockKey = (qid) => `holdreset:txnjob:lock:${qid}`;
+
+    async function readTxnJob(qid) {
+        try { const raw = await redisClient.get(txnJobStateKey(qid)); return raw ? JSON.parse(raw) : null; }
+        catch (e) { console.error('readTxnJob failed:', e.message); return null; }
+    }
+    async function writeTxnJob(qid, state) {
+        try { await redisClient.set(txnJobStateKey(qid), JSON.stringify(state), { EX: TXN_JOB_STATE_TTL }); }
+        catch (e) { console.error('writeTxnJob failed:', e.message); }
+    }
+
+    // The actual worker — fire-and-forget (never awaited by the request). Never throws out; all outcomes land
+    // in the Redis state doc so the GET status endpoint can report them.
+    async function runTxnMigration(sourceQrId, holdQrId, cutoff, lockVal, base, startMoved = 0, startFailed = 0) {
+        const startedMs = Date.now();
+        let moved = startMoved, failed = startFailed; // carry forward prior progress on resume
+        const refreshLock = async () => {
+            try { await redisClient.set(txnJobLockKey(sourceQrId), lockVal, { XX: true, EX: TXN_JOB_LOCK_TTL }); }
+            catch (e) { console.error('txn job lock refresh failed:', e.message); }
+        };
+        try {
+            for (let page = 0; page < TXN_JOB_MAX_PAGES; page++) {
+                const r = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId, [
+                    Query.equal('qrCodeId', sourceQrId),
+                    Query.lessThan('created_at', cutoff),
+                    Query.limit(TXN_JOB_PAGE),
+                ]);
+                if (r.documents.length === 0) break;
+                let progressed = 0;
+                for (const doc of r.documents) {
+                    try {
+                        await databases.updateDocument(APPWRITE_DATABASE_ID, webhook_collectionId, doc.$id, { qrCodeId: holdQrId });
+                        moved++; progressed++;
+                    } catch (e) {
+                        failed++;
+                        console.error(`txn migration: failed to move txn ${doc.$id}:`, e.message);
+                    }
+                }
+                await refreshLock();
+                await writeTxnJob(sourceQrId, { ...base, status: 'running', done: false, moved, failed,
+                    updatedAt: getISTDateTime(), durationSec: Math.round((Date.now() - startedMs) / 1000) });
+                // A full page that moved nothing means every update is erroring — stop instead of spinning.
+                if (progressed === 0) throw new Error('A full page of transactions failed to move — aborting');
+            }
+            await writeTxnJob(sourceQrId, { ...base, status: failed > 0 ? 'completed_with_errors' : 'done', done: true,
+                moved, failed, updatedAt: getISTDateTime(), finishedAt: getISTDateTime(),
+                durationSec: Math.round((Date.now() - startedMs) / 1000) });
+        } catch (e) {
+            console.error('txn migration job error:', e.message);
+            await writeTxnJob(sourceQrId, { ...base, status: 'error', done: false, moved, failed,
+                error: e.message, updatedAt: getISTDateTime(), finishedAt: getISTDateTime(),
+                durationSec: Math.round((Date.now() - startedMs) / 1000) });
+        } finally {
+            await releaseLock(txnJobLockKey(sourceQrId), lockVal);
+        }
+    }
+
+    // Auto-resume sweep: every 5 minutes, find transaction migrations whose worker died mid-run (state still
+    // says 'running' with no runner lock held) and continue them. Only crash-stalled jobs are resumed — jobs
+    // that ended in 'error' are left alone so a persistently failing job can't loop forever; those need a
+    // manual re-POST. Prior progress (moved/failed) is carried forward so the percentage stays accurate.
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            const jobQrIds = [];
+            let cursor = 0;
+            do {
+                const scan = await redisClient.scan(cursor, { MATCH: 'holdreset:txnjob:*', COUNT: 100 });
+                cursor = Number(scan.cursor);
+                for (const key of scan.keys) {
+                    if (key.includes(':lock:')) continue; // skip lock keys
+                    jobQrIds.push(key.substring('holdreset:txnjob:'.length));
+                }
+            } while (cursor !== 0);
+
+            for (const qid of jobQrIds) {
+                const state = await readTxnJob(qid);
+                if (!state || state.done || state.status !== 'running') continue; // only crash-stalled jobs
+                const lockHeld = (await redisClient.get(txnJobLockKey(qid))) !== null;
+                if (lockHeld) continue; // still actively running elsewhere
+
+                const lockVal = `txnjob-cron:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+                const got = await redisClient.set(txnJobLockKey(qid), lockVal, { NX: true, EX: TXN_JOB_LOCK_TTL });
+                if (got !== 'OK') continue; // someone else grabbed it first
+
+                const base = { sourceQrId: state.sourceQrId, holdQrId: state.holdQrId, cutoff: state.cutoff,
+                    total: state.total, startedAt: state.startedAt, startedBy: state.startedBy, resumedByCron: getISTDateTime() };
+                console.log(`[cron] resuming stalled txn migration for ${qid} (moved so far: ${state.moved || 0})`);
+                runTxnMigration(state.sourceQrId, state.holdQrId, state.cutoff, lockVal, base,
+                    Number(state.moved || 0), Number(state.failed || 0))
+                    .catch(e => console.error('[cron] runTxnMigration resume failed:', e?.message || e));
+            }
+        } catch (e) {
+            console.error('[cron] txn migration auto-resume sweep failed:', e.message);
+        }
+    }, { timezone: 'Asia/Kolkata' });
+
+    // POST /admin/qr/:qrId/hold-and-reset/move-transactions
+    // Starts (or restarts after a crash) the background move of pre-reset transactions to "<qrId>_hold".
+    // Returns 202 immediately. Requires confirm:true. 409 if a job is already actively running.
+    router.post('/qr/:qrId/hold-and-reset/move-transactions', authenticateAdmin, async (req, res) => {
+        const sourceQrId = String(req.params.qrId || '').trim();
+        if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
+        if (sourceQrId.endsWith('_hold')) return res.status(400).json({ error: 'Pass the live qrId, not the _hold id' });
+        if (req.body?.confirm !== true) return res.status(400).json({ error: 'Refusing to run without confirm:true' });
+
+        const holdQrId = `${sourceQrId}_hold`;
+        try {
+            const findQr = async (id) => {
+                const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
+                    [Query.equal('qrId', id), Query.limit(1)]);
+                return r.documents[0] || null;
+            };
+            const [holdDoc, freshDoc] = await Promise.all([findQr(holdQrId), findQr(sourceQrId)]);
+            if (!holdDoc) return res.status(400).json({ error: `No archived QR "${holdQrId}" — run hold-and-reset first.` });
+            if (!freshDoc) return res.status(404).json({ error: `Fresh QR "${sourceQrId}" not found.` });
+
+            // Cutoff = the fresh QR's createdAt (the reset moment). Only txns older than this are pre-reset history;
+            // anything newer is the fresh QR's own activity and must stay put.
+            const cutoff = freshDoc.createdAt;
+            if (!cutoff) return res.status(409).json({ error: `Fresh QR "${sourceQrId}" has no createdAt — cannot derive a safe cutoff.` });
+
+            // Single-runner lock. If present, a job is already active for this qrId.
+            const lockVal = `txnjob:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+            const gotLock = await redisClient.set(txnJobLockKey(sourceQrId), lockVal, { NX: true, EX: TXN_JOB_LOCK_TTL });
+            if (gotLock !== 'OK') {
+                const running = await readTxnJob(sourceQrId);
+                return res.status(409).json({ error: 'A transaction migration is already running for this QR.', status: running || null });
+            }
+
+            // Snapshot the total to move (for progress %). Live count is also recomputed on each status poll.
+            const totalRes = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
+                [Query.equal('qrCodeId', sourceQrId), Query.lessThan('created_at', cutoff), Query.limit(1)]);
+            const total = totalRes.total;
+
+            const base = { sourceQrId, holdQrId, cutoff, total, startedAt: getISTDateTime(), startedBy: req.user.userId };
+            await writeTxnJob(sourceQrId, { ...base, status: 'running', done: false, moved: 0, failed: 0, updatedAt: getISTDateTime() });
+
+            // Fire-and-forget — do NOT await. The request returns now; the worker runs in the background.
+            runTxnMigration(sourceQrId, holdQrId, cutoff, lockVal, base)
+                .catch(e => console.error('runTxnMigration unhandled:', e?.message || e));
+
+            return res.status(202).json({
+                accepted: true,
+                message: `Transaction migration started for "${sourceQrId}" → "${holdQrId}".`,
+                sourceQrId, holdQrId, cutoff, total,
+                statusUrl: `/api/admin/qr/${encodeURIComponent(sourceQrId)}/hold-and-reset/move-transactions/status`,
+            });
+        } catch (err) {
+            console.error('❌ move-transactions start error:', err.message || err);
+            // Best-effort: don't leave a lock behind if we failed before firing the worker.
+            return res.status(500).json({ error: err.message || 'Failed to start transaction migration' });
+        }
+    });
+
+    // GET /admin/qr/:qrId/hold-and-reset/move-transactions/status
+    // Detailed progress for the background migration. Safe to poll frequently.
+    router.get('/qr/:qrId/hold-and-reset/move-transactions/status', authenticateAdmin, async (req, res) => {
+        const sourceQrId = String(req.params.qrId || '').trim();
+        if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
+        const holdQrId = `${sourceQrId}_hold`;
+        try {
+            const state = await readTxnJob(sourceQrId);
+            const lockHeld = (await redisClient.get(txnJobLockKey(sourceQrId))) !== null;
+
+            // Live "how many are still on the original id and older than the cutoff" — the ground truth for
+            // remaining work, independent of the stored counters.
+            let pendingNow = null;
+            const cutoff = state?.cutoff;
+            if (cutoff) {
+                try {
+                    const r = await databases.listDocuments(APPWRITE_DATABASE_ID, webhook_collectionId,
+                        [Query.equal('qrCodeId', sourceQrId), Query.lessThan('created_at', cutoff), Query.limit(1)]);
+                    pendingNow = r.total;
+                } catch (e) { console.error('pendingNow count failed:', e.message); }
+            }
+
+            if (!state) {
+                return res.status(200).json({
+                    sourceQrId, holdQrId, status: lockHeld ? 'running' : 'not_started', done: false,
+                    total: null, moved: 0, failed: 0, remaining: null, pendingNow,
+                    message: lockHeld ? 'A job is running but has not written state yet.' : 'No migration has been started for this QR.',
+                });
+            }
+
+            const total = Number(state.total || 0);
+            const moved = Number(state.moved || 0);
+            const failed = Number(state.failed || 0);
+            const remaining = Math.max(0, total - moved - failed);
+            const percent = total > 0 ? Math.min(100, Math.round((moved / total) * 100)) : (state.done ? 100 : 0);
+            const durationSec = Number(state.durationSec || 0);
+            const ratePerSec = durationSec > 0 ? Number((moved / durationSec).toFixed(2)) : null;
+            // If the state claims running but no lock is held, the worker died — surface it as stalled so the
+            // client knows a re-POST is needed to resume.
+            const status = (state.status === 'running' && !lockHeld && !state.done) ? 'stalled' : state.status;
+
+            return res.status(200).json({
+                sourceQrId, holdQrId,
+                status,                 // running | stalled | done | completed_with_errors | error
+                done: !!state.done,
+                total, moved, failed, remaining,
+                pendingNow,             // live re-count — the authoritative "how many left"
+                percent,
+                cutoff: state.cutoff,
+                startedAt: state.startedAt || null,
+                updatedAt: state.updatedAt || null,
+                finishedAt: state.finishedAt || null,
+                durationSec, ratePerSec,
+                etaSec: (ratePerSec && remaining > 0) ? Math.round(remaining / ratePerSec) : (state.done ? 0 : null),
+                startedBy: state.startedBy || null,
+                error: state.error || null,
+                lockHeld,
+                resumable: status === 'stalled' || status === 'error',
+            });
+        } catch (err) {
+            console.error('❌ move-transactions status error:', err.message || err);
+            return res.status(500).json({ error: err.message || 'Failed to read migration status' });
+        }
+    });
+
     return router;
 
 };
