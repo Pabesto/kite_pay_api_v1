@@ -42,6 +42,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
     releaseLock,
     emitTxnNew,
     updateDailyQrTotal,
+    finalizeTransaction,
     APPWRITE_DATABASE_ID,
     APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
     APPWRITE_QRCODE_COLLECTION_ID,
@@ -55,7 +56,6 @@ function startPinelabMultiPoller(deps, opts = {}) {
   const pageSize          = opts.pageSize          || 100;
   const maxPagesPerTick   = opts.maxPagesPerTick   || 50;
   const dryRun            = !!opts.dryRun;
-  const notFoundCacheMs   = opts.notFoundCacheMs   || 5 * 60 * 1000;
 
   // Expecting an array of accounts in opts: 
   // accounts: [{ id: 'merchant_a', clientId: '...', clientSecret: '...' }]
@@ -85,8 +85,6 @@ function startPinelabMultiPoller(deps, opts = {}) {
   let stopped  = false;
   let intervalHandle = null;
   let bootTimeoutHandle = null;
-
-  const tidNotFoundCache = new Map();
 
   const log = (accountSpec, step, msg, extra) => {
     const ts = new Date().toISOString();
@@ -165,84 +163,10 @@ function startPinelabMultiPoller(deps, opts = {}) {
         }
       );
       log(accountSpec, 'TXN', 'saved ✅', { docId: created.$id, transactionId, tid, amountPaise });
-      partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
-
-      const cachedNotFoundAt = tidNotFoundCache.get(tid);
-      let qrDoc = null;
-
-      if (cachedNotFoundAt && cachedNotFoundAt > Date.now()) {
-        log(accountSpec, 'TXN', '⚠️  tid in not-found cache — raw saved, totals skipped', { tid });
-      } else {
-        const qrResult = await databases.listDocuments(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_QRCODE_COLLECTION_ID,
-          [Query.equal('qrId', tid), Query.limit(1)]
-        );
-        if (qrResult.documents.length > 0) {
-          qrDoc = qrResult.documents[0];
-          tidNotFoundCache.delete(tid);
-        } else {
-          tidNotFoundCache.set(tid, Date.now() + notFoundCacheMs);
-          log(accountSpec, 'TXN', '⚠️  no QR doc for tid — raw saved, totals skipped', { tid });
-        }
-      }
-
-      if (qrDoc) {
-        const newCount = (qrDoc.totalTransactions || 0) + 1;
-        const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-        const approved         = Number(qrDoc.withdrawalApprovedAmount || 0);
-        const requested        = Number(qrDoc.withdrawalRequestedAmount || 0);
-        const onHold           = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-        const commissionPaid   = Number(qrDoc.commissionPaid || 0);
-        const newAvailable     = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_QRCODE_COLLECTION_ID,
-          qrDoc.$id,
-          {
-            totalTransactions: newCount,
-            totalPayInAmount: newTotal,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-        try {
-          await updateDailyQrTotal(tid, isoDate, amountPaise);
-        } catch (e) {
-          console.error(`[PINELAB-POLL][${accountSpec}] updateDailyQrTotal failed (non-fatal):`, e.message);
-        }
-
-        const assignedUserId = qrDoc.assignedUserId || '';
-        emitTxnNew({
-          assignedUserId,
-          qrCodeId: tid,
-          payload: {
-            $id: created.$id,
-            qrCodeId: tid,
-            paymentId: transactionId,
-            amount: amountPaise,
-            rrnNumber,
-            vpa,
-            provider: 'pinelabs',
-            created_at: isoDate,
-          },
-        });
-      }
-
-      try {
-        await Promise.all([
-          redisClient.incrBy('counter:totalTxCount', 1),
-          redisClient.incrBy('counter:totalApiTx', 1),
-          redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]);
-        redisClient.countersDirty = true;
-      } catch (e) {
-        redisClient.countersStale = true;
-        console.error(`[PINELAB-POLL][${accountSpec}] counter update failed:`, e.message);
-      }
+      // Centralized finalize — QR totals, daily summary, real-time emit, partner webhook,
+      // and dashboard counters. The default emit payload built from `created` reproduces
+      // the previous pinelabs payload exactly (qrCodeId=tid, paymentId=transactionId, …).
+      await finalizeTransaction(created);
       return true;
     } catch (e) {
       console.error(`[PINELAB-POLL][${accountSpec}] processTransaction error:`, e);

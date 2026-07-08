@@ -1083,276 +1083,6 @@ app.get("/api/get_app_config", async (req, res) => {
     }
 });
 
-// Rate limiter specifically for webhook endpoints
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.use('/paytm/payment-sync', webhookLimiter);
-// Endpoint to receive Paytm transaction
-
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.post("/paytm/payment-sync", async (req, res) => {
-  try {
-    const data = req.body;
-
-    // Basic validation
-    if (!data.amount || !data.orderId) {
-      return res.status(400).json({ error: "Missing amount or orderId" });
-    }
-
-    const amount = data?.amount || {};
-    const paymentId = data?.orderId || {};
-    const qrCodeId = data?.accountOf || {};
-    const fromUpi = data?.fromUpi || {};
-    const timestamp = data?.timestamp || {};
-    const txn_time = data?.txn_time || {};
-
-    const amountRupees = amount;
-    const amountPaise = rupeesToPaiseStrict(amountRupees);
-
-    // 1. Convert to Date Object (Multiply by 1000)
-    const dateObj = new Date(txn_time * 1000);
-
-    // 2. Convert to ISO String
-    const isoString = dateObj.toISOString();
-    
-    if (!qrCodeId) return res.status(400).json({ error: 'QR Code ID not found' });
-
-    // Idempotency guard
-    const existing = await databases.listDocuments(
-      APPWRITE_DATABASE_ID,
-      APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-      [Query.equal('paymentId', paymentId), Query.limit(1)]
-    );
-
-    if (existing.documents.length) {
-      return res.status(200).json({ message: 'Duplicate webhook ignored' });
-    }
-
-    // Persist webhook
-    const payloadString = JSON.stringify(req.body);
-    let created;
-    try {
-      created = await databases.createDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-        ID.unique(),
-        {
-          payload: '',
-          qrCodeId: qrCodeId,
-          paymentId: paymentId,
-          rrnNumber: '',
-          amount: amountPaise,
-          vpa: fromUpi,
-          provider: 'paytm',
-          created_at: isoString,
-          status: 'normal',
-          ownerSubadminId: await qrOwnerCache.resolve(qrCodeId),
-        }
-      );
-    } catch (e) {
-      console.error('❌ Persist webhook error:', e?.message || e);
-      return res.status(500).json({ error: 'Error saving webhook', details: e?.message });
-    }
-
-    // Update daily QR total (async, no await)
-    // (async () => {
-    //   try {
-    //     await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-    //     console.log('✅ Daily QR total updated successfully.');
-    //   } catch (error) {
-    //     console.error('❌ Error updating daily QR total:', error?.message || error);
-    //   }
-    // })();
-
-    const eventPayload = {
-      $id: created.$id,
-      qrCodeId,
-      paymentId,
-      amount: amountPaise,
-      rrnNumber: null,
-      vpa: fromUpi || null,
-      provider: 'paytm',
-      created_at: new Date(isoString).toISOString(),
-    };
-
-    // Acquire per-QR distributed lock — same pattern as Razorpay webhook
-    const lockKey = `lock:qr:${qrCodeId}`;
-    const acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
-    if (!acquired) {
-      console.warn(`Lock busy for QR ${qrCodeId}, payment ${paymentId} — will retry`);
-      return res.status(503).json({ message: 'Processing conflict, retry' });
-    }
-
-    try {
-      // Update daily QR summary under lock (no race on same-day same-QR)
-      try {
-        await updateDailyQrTotal(qrCodeId, isoString, amountPaise);
-      } catch (e) {
-        console.error('❌ Error updating daily QR total:', e?.message || e);
-      }
-
-      // Fetch fresh QR doc under lock
-      const qrResult = await databases.listDocuments(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_QRCODE_COLLECTION_ID,
-        [Query.equal('qrId', qrCodeId), Query.limit(1)]
-      );
-
-      if (qrResult.documents.length > 0) {
-        const qrDoc = qrResult.documents[0];
-        const qrDocId = qrDoc.$id;
-        const newCount = (qrDoc.totalTransactions || 0) + 1;
-        const newTotal = (qrDoc.totalPayInAmount || 0) + amountPaise;
-
-        // Recompute amountAvailableForWithdrawal from fresh fields under lock — no race possible
-        const approved = Number(qrDoc.withdrawalApprovedAmount || 0);
-        const requested = Number(qrDoc.withdrawalRequestedAmount || 0);
-        const onHold = Number(qrDoc.amountOnHold || 0);
-        const commissionOnHold = Number(qrDoc.commissionOnHold || 0);
-        const commissionPaid = Number(qrDoc.commissionPaid || 0);
-        const newAvailable = newTotal - approved - requested - onHold - commissionOnHold - commissionPaid;
-
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_QRCODE_COLLECTION_ID,
-          qrDocId,
-          {
-            totalTransactions: newCount,
-            totalPayInAmount: newTotal,
-            amountAvailableForWithdrawal: newAvailable,
-          }
-        );
-
-
-        // Emit with real assignedUserId from QR doc
-        emitTxnNew({
-          assignedUserId: qrDoc.assignedUserId || '',
-          qrCodeId,
-          payload: eventPayload,
-        });
-        
-      } else {
-        console.warn(`⚠️ QR Code with qrId ${qrCodeId} not found — skipping QR totals`);
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
-      }
-    } finally {
-      await releaseLock(lockKey, paymentId);
-    }
-
-    // Atomic dashboard counter increments via Redis INCRBY
-    withRedisTimeout(Promise.all([
-      redisClient.incrBy('counter:totalTxCount', 1),
-      redisClient.incrBy('counter:totalApiTx', 1),
-      redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-    ]), 3000).then(() => { redisClient.countersDirty = true; })
-      .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
-
-    console.log("✅ Received Paytm transaction:", data);
-    res.status(200).json({ message: "Transaction processed successfully" });
-
-  } catch (err) {
-    console.error("❌ Error processing transaction:", err?.message || err);
-    res.status(500).json({ error: "Internal server error", details: err?.message });
-  }
-});
-
-// GET last timestamp (per company)
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.get("/paytm/last-timestamp-company", async (req, res) => {
-  try {
-    const { company } = req.query;
-
-    if (!company) {
-      return res.status(400).json({ error: "Missing company parameter" });
-    }
-
-    const keyName = `gmail_paytm_sync_timestamp_${company}`;
-
-    await ConfigManager.refresh();
-    const value = ConfigManager.get(keyName);
-
-    if (value !== null) {
-      console.log(`[${company}] Found timestamp:`, value);
-      return res.json({ last_mail_timestamp: value });
-    }
-
-    console.log(`[${company}] No timestamp found, sending default`);
-    return res.json({ last_mail_timestamp: 1764272304 });
-
-  } catch (err) {
-    console.error("GET timestamp error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// UPDATE last timestamp (per company)
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.post("/paytm/update-last-timestamp-company", async (req, res) => {
-  try {
-    const { company, last_mail_timestamp } = req.body;
-
-    if (!company) {
-      return res.status(400).json({ error: "Missing company in body" });
-    }
-
-    if (!last_mail_timestamp) {
-      return res.status(400).json({ error: "Missing last_mail_timestamp in body" });
-    }
-
-    const keyName = `gmail_paytm_sync_timestamp_${company}`;
-    const timestampInt = parseInt(last_mail_timestamp, 10);
-    await ConfigManager.set(keyName, timestampInt);
-
-    console.log(`[${company}] Timestamp saved → ${timestampInt}`);
-    return res.json({ success: true, message: "Timestamp saved" });
-
-  } catch (error) {
-    console.error("POST timestamp error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Endpoint to Send Paytm transaction last timestamp
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.get("/paytm/last-timestamp", async (req, res) => {
-  // const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
-
-      await ConfigManager.refresh();
-      const value = ConfigManager.get('gmail_paytm_sync_timestamp');
-
-      if (value !== null) {
-        console.log('Found timestamp:', value);
-        return res.json({ last_mail_timestamp: value });
-      }
-
-      console.log('No timestampDoc key found');
-      res.json({ last_mail_timestamp: "1764272304" });
-});
-
-// Endpoint to UPDATE the Paytm transaction timestamp
-// NOT USING ENDPOINT NOW SO SKIP THIS CHECK FOR NOW 
-app.post("/paytm/update-last-timestamp", async (req, res) => {
-    try {
-        // 1. Get the new timestamp from the request body
-        const { last_mail_timestamp } = req.body;
-
-        if (!last_mail_timestamp) {
-            return res.status(400).json({ error: "Missing last_mail_timestamp in body" });
-        }
-
-        const timestampInt = parseInt(last_mail_timestamp, 10);
-        await ConfigManager.set('gmail_paytm_sync_timestamp', timestampInt);
-
-        console.log(`Updated timestamp to: ${timestampInt}`);
-        return res.json({ success: true, message: "Timestamp updated" });
-
-    } catch (error) {
-        console.error("Database Update Failed:", error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-
 async function updateQrTotalAtomic(qrCodeId, amountPaise) {
     let attempts = 0;
     const maxAttempts = 3;
@@ -1368,7 +1098,7 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
 
             if (!qrResult.documents.length) {
                 console.log(`QR ${qrCodeId} not found`);
-                return;
+                return null;
             }
 
             const qrDoc = qrResult.documents[0];
@@ -1395,19 +1125,33 @@ async function updateQrTotalAtomic(qrCodeId, amountPaise) {
             );
 
             console.log(`✅ QR ${qrCodeId} → ${newTotal} (attempt ${attempts + 1})`);
-            return; // SUCCESS
+            return qrDoc; // SUCCESS — return the QR doc so callers can emit to the assigned user
 
         } catch (error) {
             attempts++;
             if (attempts >= maxAttempts) {
                 console.error(`❌ QR ${qrCodeId} failed after ${attempts} attempts`);
-                return;
+                return null;
             }
             // 50ms backoff (proven safe)
             await new Promise(r => setTimeout(r, 50));
         }
     }
 }
+
+// Centralized "increment everywhere" finalize pipeline — extracted to its own module
+// (transactionFinalize.js) so it is unit-testable in isolation and reusable from
+// admin.js (the manual-review approve path). Built once here with the live deps;
+// updateQrTotalAtomic / updateDailyQrTotal are hoisted function declarations, so
+// referencing them at this point is safe.
+const finalizeTransaction = require('./transactionFinalize')({
+    updateQrTotalAtomic,
+    updateDailyQrTotal,
+    emitTxnNew,
+    partnerWebhooks,
+    withRedisTimeout,
+    redisClient,
+});
 
 app.get('/test_force_refresh', (req, res) => {
   const eventPayload = {
@@ -1611,36 +1355,19 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
             }
         );
 
-        // STEP 5: update daily QR summary
-        try {
-            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-        } catch (e) {
-            console.error('❌ Error updating daily QR total:', e?.message || e);
-        }
-
-        // STEP 6: emit real-time event
-        const eventPayload = {
-            $id:        created.$id,
-            qrCodeId,
-            paymentId,
-            amount:     amountPaise,
-            rrnNumber,
-            vpa,
-            provider:   'razorpay',
-            created_at: new Date(isoDate).toISOString(),
-        };
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
-        // STEP 7: update QR totals — under lock so no concurrent reads on same QR doc
-        await updateQrTotalAtomic(qrCodeId, amountPaise);
-
-        // STEP 8: atomic Redis counter increments (non-critical, outside lock scope is fine)
-        withRedisTimeout(Promise.all([
-            redisClient.incrBy('counter:totalTxCount', 1),
-            redisClient.incrBy('counter:totalApiTx', 1),
-            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]), 3000).then(() => { redisClient.countersDirty = true; })
-          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
+        // STEPS 5–8: centralized finalize — daily total, QR totals, emit, partner webhook, counters
+        await finalizeTransaction(created, {
+            emitPayload: {
+                $id:        created.$id,
+                qrCodeId,
+                paymentId,
+                amount:     amountPaise,
+                rrnNumber,
+                vpa,
+                provider:   'razorpay',
+                created_at: new Date(isoDate).toISOString(),
+            },
+        });
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -1743,37 +1470,19 @@ app.post('/webhook', async (req, res) => {
             }
         );
 
-        // 6. Update daily QR summary
-        try {
-            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-        } catch (e) {
-            console.error('❌ Error updating daily QR total:', e?.message || e);
-        }
-
-        // 7. Emit real-time event
-        const eventPayload = {
-            $id: created.$id,
-            qrCodeId,
-            paymentId,
-            amount: amountPaise,
-            rrnNumber: rrnNumber || null,
-            vpa: vpa || null,
-            provider: 'razorpay',
-            created_at: isoDate,
-        };
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
-
-        // 8. Update QR totals — under lock so no concurrent reads on same QR doc
-        await updateQrTotalAtomic(qrCodeId, amountPaise);
-
-        // 9. Atomic Redis counter increments (non-critical)
-        await Promise.all([
-            redisClient.incrBy('counter:totalTxCount', 1),
-            redisClient.incrBy('counter:totalApiTx', 1),
-            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]).then(() => { redisClient.countersDirty = true; })
-          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e); });
+        // 6–9. Centralized finalize — daily total, QR totals, emit, partner webhook, counters
+        await finalizeTransaction(created, {
+            emitPayload: {
+                $id: created.$id,
+                qrCodeId,
+                paymentId,
+                amount: amountPaise,
+                rrnNumber: rrnNumber || null,
+                vpa: vpa || null,
+                provider: 'razorpay',
+                created_at: isoDate,
+            },
+        });
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -1877,37 +1586,19 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
             }
         );
 
-        // STEP 6: update daily QR summary
-        try {
-            await updateDailyQrTotal(qrCodeId, isoDate, amountPaise);
-        } catch (e) {
-            console.error('❌ Error updating daily QR total:', e?.message || e);
-        }
-
-        // STEP 7: emit real-time event
-        const eventPayload = {
-            $id:        created.$id,
-            qrCodeId,
-            paymentId,
-            amount:     amountPaise,
-            rrnNumber,
-            vpa,
-            provider:   'razorpay',
-            created_at: isoDate,
-        };
-        emitTxnNew({ assignedUserId: '', qrCodeId, payload: eventPayload });
-        partnerWebhooks.dispatch(created, 'payment.created'); // fire-and-forget outbound webhook
-
-        // STEP 8: update QR totals — under lock
-        await updateQrTotalAtomic(qrCodeId, amountPaise);
-
-        // STEP 9: atomic Redis counter increments (non-critical, fire-and-forget)
-        withRedisTimeout(Promise.all([
-            redisClient.incrBy('counter:totalTxCount', 1),
-            redisClient.incrBy('counter:totalApiTx', 1),
-            redisClient.incrBy('counter:totalAmountReceived', amountPaise),
-        ]), 3000).then(() => { redisClient.countersDirty = true; })
-          .catch((e) => { redisClient.countersStale = true; console.error('Redis counter update failed:', e?.message || e); });
+        // STEPS 6–9: centralized finalize — daily total, QR totals, emit, partner webhook, counters
+        await finalizeTransaction(created, {
+            emitPayload: {
+                $id:        created.$id,
+                qrCodeId,
+                paymentId,
+                amount:     amountPaise,
+                rrnNumber,
+                vpa,
+                provider:   'razorpay',
+                created_at: isoDate,
+            },
+        });
 
         res.status(200).send('Webhook received and saved');
     } catch (error) {
@@ -2031,6 +1722,7 @@ const pinelabPoller = ENABLE_PINELAB_POLLER
         releaseLock,
         emitTxnNew,
         updateDailyQrTotal,
+        finalizeTransaction,
         APPWRITE_DATABASE_ID,
         APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
         APPWRITE_QRCODE_COLLECTION_ID,
