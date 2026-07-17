@@ -54,7 +54,9 @@ Request body:
   "scope": "global" | "qr" | "user",  // required
   "qrId": "QR123",                     // required only when scope = "qr"
   "userId": "u1",                      // required only when scope = "user"
-  "minutes": 5                         // required, 1–10
+  "minutes": 5,                        // required, 1–60
+  "minAmount": 5000000                 // OPTIONAL, paise. 0/omitted = hold every amount.
+                                       //   Only txns with amount >= minAmount are held.
 }
 ```
 Re-POSTing the same scope **replaces/extends** its timer (this is how "reset time" works).
@@ -68,12 +70,13 @@ Response `200`:
     "scope": "qr", "qrId": "QR123", "userId": null,
     "until": 1751967630000, "untilIso": "2026-07-08T10:20:30.000Z",
     "remainingMs": 300000,
+    "minAmount": 5000000, "minAmountRs": 50000,   // threshold (paise) + rupees; 0 = holds all
     "setBy": "admin1", "setAt": 1751967330000, "setAtIso": "2026-07-08T10:15:30.000Z"
   },
   "active": [ /* every active window, same shape */ ]
 }
 ```
-Errors: `400 { "error": "minutes must be a number between 1 and 10" }` (also for bad scope / missing qrId/userId).
+Errors: `400 { "error": "minutes must be a number between 1 and 60" }` (also for bad scope, missing qrId/userId, or negative `minAmount`).
 
 #### `DELETE /api/admin/manual-mode` — turn off (back to auto)
 Body **or** query params (both accepted):
@@ -94,6 +97,7 @@ Response `200`:
   "active": [
     { "scope": "qr", "qrId": "QR123", "userId": null,
       "until": 1751967630000, "untilIso": "...", "remainingMs": 247000,
+      "minAmount": 5000000, "minAmountRs": 50000,
       "setBy": "admin1", "setAt": 1751967330000, "setAtIso": "..." }
   ]
 }

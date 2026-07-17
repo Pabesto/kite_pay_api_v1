@@ -1380,7 +1380,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
         const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
-        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, amountPaise, reviewWindowMs);
 
         // STEP 4: save raw webhook record (source of truth) — under lock
         const created = await databases.createDocument(
@@ -1519,7 +1519,7 @@ app.post('/webhook', async (req, res) => {
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
         const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
-        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, amountPaise, reviewWindowMs);
 
         // 5. Save raw webhook record (source of truth) — under lock
         const created = await databases.createDocument(
@@ -1659,7 +1659,7 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
         // 'user'-scope matches the QR's managing subadmin OR its direct assignedUserId.
         const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
         const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 10000)) || 10000;
-        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, reviewWindowMs);
+        const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(qrCodeId, ownerIds, amountPaise, reviewWindowMs);
 
         // STEP 5: save raw webhook record (source of truth)
         const created = await databases.createDocument( 

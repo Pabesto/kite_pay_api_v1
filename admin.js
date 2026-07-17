@@ -3725,12 +3725,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // Body: { scope:'global'|'qr'|'user', qrId?, userId?, minutes:1-10 }
     router.post('/manual-mode', authenticateAdmin, async (req, res) => {
         try {
-            const { scope, qrId, userId, minutes } = req.body || {};
+            const { scope, qrId, userId, minutes, minAmount } = req.body || {};
             const window = reviewMode.setManual({
                 scope,
                 qrId,
                 userId,
                 minutes,
+                minAmount: minAmount || 0, // paise; 0 = hold every amount
                 setBy: req.user?.userId || null,
             });
             console.log(`[ReviewMode] MANUAL set by ${req.user?.userId || 'unknown'} →`, window);

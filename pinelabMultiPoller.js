@@ -165,7 +165,7 @@ function startPinelabMultiPoller(deps, opts = {}) {
         }
       }
       const reviewWindowMs = Number(ConfigManager.get('txn_review_window_ms', 60000)) || 60000;
-      const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(tid, ownerIds, reviewWindowMs);
+      const { manual, fields: reviewFields } = reviewMode.reviewFieldsFor(tid, ownerIds, amountPaise, reviewWindowMs);
 
       const created = await databases.createDocument(
         APPWRITE_DATABASE_ID,

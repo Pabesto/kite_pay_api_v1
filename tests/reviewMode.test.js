@@ -117,15 +117,16 @@ describe('clearing', () => {
 });
 
 describe('reviewFieldsFor (ingest gate helper)', () => {
+    // signature: reviewFieldsFor(qrId, ownerUserId, amountPaise, windowMs)
     test('auto: manual=false and no fields (no schema dependency)', () => {
-        const r = reviewMode.reviewFieldsFor('QR1', 'S1', 60000);
+        const r = reviewMode.reviewFieldsFor('QR1', 'S1', 5000, 60000);
         expect(r.manual).toBe(false);
         expect(r.fields).toEqual({});
     });
 
     test('manual: returns held fields with a computed reviewExpiresAt', () => {
         reviewMode.setManual({ scope: 'qr', qrId: 'QR1', minutes: 5 });
-        const r = reviewMode.reviewFieldsFor('QR1', 'S1', 60000);
+        const r = reviewMode.reviewFieldsFor('QR1', 'S1', 5000, 60000);
         expect(r.manual).toBe(true);
         expect(r.fields).toMatchObject({
             deleted: true,
@@ -137,8 +138,34 @@ describe('reviewFieldsFor (ingest gate helper)', () => {
 
     test('manual by owner (user scope) also holds', () => {
         reviewMode.setManual({ scope: 'user', userId: 'S9', minutes: 5 });
-        expect(reviewMode.reviewFieldsFor('QRx', 'S9', 30000).manual).toBe(true);
-        expect(reviewMode.reviewFieldsFor('QRx', 'S8', 30000).manual).toBe(false);
+        expect(reviewMode.reviewFieldsFor('QRx', 'S9', 1000, 60000).manual).toBe(true);
+        expect(reviewMode.reviewFieldsFor('QRx', 'S8', 1000, 60000).manual).toBe(false);
+    });
+});
+
+describe('min-amount threshold (per window)', () => {
+    test('holds only txns at/above the window minAmount', () => {
+        reviewMode.setManual({ scope: 'qr', qrId: 'QR1', minutes: 5, minAmount: 10000 }); // ₹100
+        expect(reviewMode.isManual('QR1', null, 5000)).toBe(false);   // below → auto
+        expect(reviewMode.isManual('QR1', null, 10000)).toBe(true);   // at → manual
+        expect(reviewMode.isManual('QR1', null, 25000)).toBe(true);   // above → manual
+    });
+
+    test('reviewFieldsFor respects the threshold', () => {
+        reviewMode.setManual({ scope: 'global', minutes: 5, minAmount: 50000 }); // ₹500
+        expect(reviewMode.reviewFieldsFor('ANY', null, 49999, 60000).manual).toBe(false);
+        expect(reviewMode.reviewFieldsFor('ANY', null, 50000, 60000).manual).toBe(true);
+    });
+
+    test('minAmount 0 (default) holds every amount', () => {
+        reviewMode.setManual({ scope: 'global', minutes: 5 }); // no threshold
+        expect(reviewMode.isManual('X', null, 1)).toBe(true);
+    });
+
+    test('descriptor exposes minAmount + minAmountRs', () => {
+        reviewMode.setManual({ scope: 'qr', qrId: 'QR1', minutes: 5, minAmount: 12345 });
+        const [w] = reviewMode.listActive();
+        expect(w).toMatchObject({ minAmount: 12345, minAmountRs: 123.45 });
     });
 });
 
@@ -148,8 +175,11 @@ describe('validation', () => {
     });
     test('rejects out-of-range minutes', () => {
         expect(() => reviewMode.setManual({ scope: 'global', minutes: 0 })).toThrow(/minutes/);
-        expect(() => reviewMode.setManual({ scope: 'global', minutes: 11 })).toThrow(/minutes/);
+        expect(() => reviewMode.setManual({ scope: 'global', minutes: 61 })).toThrow(/minutes/);
         expect(() => reviewMode.setManual({ scope: 'global', minutes: 'x' })).toThrow(/minutes/);
+    });
+    test('rejects negative minAmount', () => {
+        expect(() => reviewMode.setManual({ scope: 'global', minutes: 5, minAmount: -1 })).toThrow(/minAmount/);
     });
     test('requires qrId / userId for their scopes', () => {
         expect(() => reviewMode.setManual({ scope: 'qr', minutes: 5 })).toThrow(/qrId/);
