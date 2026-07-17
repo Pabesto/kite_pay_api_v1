@@ -9,7 +9,8 @@
 ## 1. What this feature is (mental model)
 
 The backend normally auto-processes every incoming payment ("**auto mode**"). An **admin can
-switch on "manual mode"** for a short, timed window (**1–10 minutes**), scoped to:
+switch on "manual mode"** for a short, timed window (**1–60 minutes**, optionally only for
+payments **above an amount threshold**), scoped to:
 
 - **global** — every incoming payment,
 - **qr** — one specific QR code,
@@ -164,6 +165,20 @@ Query params: `from` (`YYYY-MM-DD`), `to` (`YYYY-MM-DD`), `qrId`. Defaults to to
 }
 ```
 
+### 3.4 Review fields on the general transaction lists
+The existing `GET /api/admin/transactions` (live) and `GET /api/admin/deleted_transactions_only`
+(soft-deleted) endpoints now return three extra fields on **every** transaction:
+```jsonc
+"reviewStatus": "approved" | "rejected" | "pending_review" | "normal" | null,
+"reviewedBy":  "admin1" | "system-timeout" | "un_delete:admin1" | null,
+"reviewedAt":  "2026-07-09T..." | null
+```
+`null` = a legacy/auto txn that never went through review. Use them to **label rows**:
+- **Deleted list:** show **"Rejected"** for `reviewStatus:'rejected'` vs a plain deletion. This matters
+  because un-deleting a **rejected** txn *reveals the money to the user* (it gets credited), whereas
+  un-deleting a normal one just restores an accidental delete — make that distinction visible.
+- **Live list:** optionally badge manually-**approved** txns (`reviewStatus:'approved'`) vs auto (`null`/`'normal'`).
+
 ---
 
 ## 4. Realtime — Socket.IO events
@@ -188,20 +203,23 @@ Recommended: one **"Transaction Review"** area with 3 tabs.
 │  Manual Review Mode              ● AUTO / MANUAL│  ← big status pill (green AUTO / amber MANUAL)
 ├──────────────────────────────────────────────┤
 │  Active windows                                │
-│   🌐 Global           04:12 left      [ Stop ] │  ← live countdown from remainingMs
-│   🔳 QR QR123         02:47 left      [ Stop ] │
-│   👤 User u1          00:31 left      [ Stop ] │
+│   🌐 Global · ≥₹50,000   04:12 left   [ Stop ] │  ← countdown + threshold (if minAmount>0)
+│   🔳 QR QR123            02:47 left    [ Stop ] │  ← no threshold shown when minAmount=0
+│   👤 User u1             00:31 left    [ Stop ] │
 │                                                │
 │  Turn on manual mode:                          │
 │   Scope:  ( Global ) ( This QR ) ( A User )    │  ← segmented control
 │   [ QR / User picker shown for qr|user scope ] │
-│   Duration:  [1]───●──── [10] min   (slider)   │
+│   Duration:  [1]───●──── [60] min   (slider)   │
+│   Only review txns ≥ ₹ [        ]  (optional)  │  ← blank = review all amounts
 │              [   Activate manual mode   ]       │
 │                                    [ Stop all ] │
 └──────────────────────────────────────────────┘
 ```
 - On open: `GET /manual-mode`; tick countdowns locally each second; re-fetch every ~15s.
 - Activate → `POST /manual-mode`. Stop → `DELETE /manual-mode {scope,...}`. Stop all → `DELETE {all:true}`.
+- **Duration is 1–60 min.** The "Only review txns ≥ ₹X" field is optional: collect **rupees**, send **`minAmount` in paise** (`rupees * 100`); blank → omit or send `0` (holds all amounts).
+- Show each active window's threshold when `minAmount > 0` (use `minAmountRs`); hide it when `0`.
 - Show a persistent banner whenever `manualActive` so the admin never forgets it's on.
 
 ### Tab 2 — Pending Review (main action screen) ⭐
