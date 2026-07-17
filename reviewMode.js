@@ -14,7 +14,7 @@
 // pending are recovered separately by the durable sweeper (they are NOT tracked
 // here).
 
-const MAX_MINUTES = 10;
+const MAX_MINUTES = 60;
 
 // Active windows. `until` is an epoch-ms deadline.
 const manualWindows = {
