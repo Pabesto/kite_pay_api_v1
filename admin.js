@@ -814,6 +814,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const subadminAssignedQrs = await getQrIdsForUser(subadminId);
             subadminAssignedQrs.forEach(id => qrIds.add(id));
 
+            // QRs the subadmin manages (managedByUserId) — the /qr-codes listing shows these,
+            // so they must be included here or their transactions come back empty.
+            const managedQrs = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal("managedByUserId", subadminId), Query.limit(100)]
+            );
+            managedQrs.documents.forEach(q => qrIds.add(q.qrId));
+
             // Users under the subadmin
             const managedUsers = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
@@ -945,8 +954,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             
             if (userId && qrId) {
-                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
-                if (userQrIds.includes(qrId) || isAdmin) {
+                const userQrIds = await getQrIdsForUser(userId);
+                if (userQrIds.includes(qrId)) {
                     filters.push(Query.equal('qrCodeId', qrId));
                 } else {
                     return res.status(200).json({ transactions: [] });
@@ -954,7 +963,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             } else if (qrId) {
                 filters.push(Query.equal('qrCodeId', qrId));
             } else if (userId) {
-                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+                const userQrIds = await getQrIdsForUser(userId);
                 if (userQrIds.length > 0) {
                     filters.push(Query.equal('qrCodeId', userQrIds));
                 } else {
