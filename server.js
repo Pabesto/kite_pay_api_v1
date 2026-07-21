@@ -1404,7 +1404,7 @@ app.post('/razorpay-webhook', webhookParser, async (req, res) => {
 
         if (manual) {
             // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
-            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            // console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
             emitPendingReview({
                 $id: created.$id,
                 qrCodeId,
@@ -1543,7 +1543,7 @@ app.post('/webhook', async (req, res) => {
 
         if (manual) {
             // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
-            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            // console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
             emitPendingReview({
                 $id: created.$id,
                 qrCodeId,
@@ -1683,7 +1683,7 @@ app.post('/payment-webhook', webhookParser, async (req, res) => {
 
         if (manual) {
             // HELD for admin review — no increments. Notify admins; resolution (approve/reject/timeout) comes later.
-            console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
+            // console.log(`[ReviewMode] HELD pending ${created.$id} qr=${qrCodeId} amount=${amountPaise} until=${reviewFields.reviewExpiresAt}`);
             emitPendingReview({
                 $id: created.$id,
                 qrCodeId,
