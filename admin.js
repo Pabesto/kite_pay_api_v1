@@ -945,8 +945,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             
             if (userId && qrId) {
-                const userQrIds = await getQrIdsForUser(userId);
-                if (userQrIds.includes(qrId)) {
+                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
+                if (userQrIds.includes(qrId) || isAdmin) {
                     filters.push(Query.equal('qrCodeId', qrId));
                 } else {
                     return res.status(200).json({ transactions: [] });
@@ -954,7 +954,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             } else if (qrId) {
                 filters.push(Query.equal('qrCodeId', qrId));
             } else if (userId) {
-                const userQrIds = await getQrIdsForUser(userId);
+                const userQrIds = isSubadmin ? await getQrIdsForSubadmin(userId) : await getQrIdsForUser(userId);
                 if (userQrIds.length > 0) {
                     filters.push(Query.equal('qrCodeId', userQrIds));
                 } else {
