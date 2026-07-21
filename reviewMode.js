@@ -14,7 +14,7 @@
 // pending are recovered separately by the durable sweeper (they are NOT tracked
 // here).
 
-const MAX_MINUTES = 10;
+const MAX_MINUTES = 60;
 
 // Active windows. `until` is an epoch-ms deadline.
 const manualWindows = {
@@ -35,10 +35,23 @@ function describe(scope, qrId, userId, w) {
         until: w.until,
         untilIso: new Date(w.until).toISOString(),
         remainingMs: Math.max(0, w.until - Date.now()),
+        minAmount: w.minAmount || 0,          // paise; 0 = hold every amount
+        minAmountRs: (w.minAmount || 0) / 100,
         setBy: w.setBy || null,
         setAt: w.setAt || null,
         setAtIso: w.setAt ? new Date(w.setAt).toISOString() : null,
     };
+}
+
+// Does this window hold a txn of `amountPaise`? Active AND at/above its min-amount
+// threshold. A threshold of 0 holds everything; an unknown amount is held (cautious).
+function windowHolds(w, amountPaise) {
+    if (!isActive(w)) return false;
+    const min = Number(w.minAmount || 0);
+    if (min <= 0) return true;
+    const amt = Number(amountPaise);
+    if (!Number.isFinite(amt)) return true;
+    return amt >= min;
 }
 
 // Normalize an owner argument (string | array | null) to a clean array of ids.
@@ -47,14 +60,16 @@ function toOwnerList(ownerUserIds) {
     return (Array.isArray(ownerUserIds) ? ownerUserIds : [ownerUserIds]).filter(Boolean);
 }
 
-// True if a matching, non-expired manual window covers this transaction.
-// `ownerUserIds` may be a single id or an array — a 'user' window matches if it
-// targets ANY of them (e.g. the QR's direct assignedUserId OR its managing subadmin).
-function isManual(qrId, ownerUserIds) {
-    if (isActive(manualWindows.global)) return true;
-    if (qrId && isActive(manualWindows.qr.get(qrId))) return true;
+// True if a matching, non-expired manual window covers this transaction of `amountPaise`.
+// `ownerUserIds` may be a single id or an array — a 'user' window matches if it targets
+// ANY of them (e.g. the QR's direct assignedUserId OR its managing subadmin). A window
+// only holds when the amount is at/above its own min-amount threshold (0 = any amount).
+// `amountPaise` is optional; when omitted, thresholds are treated as met (cautious).
+function isManual(qrId, ownerUserIds, amountPaise) {
+    if (windowHolds(manualWindows.global, amountPaise)) return true;
+    if (qrId && windowHolds(manualWindows.qr.get(qrId), amountPaise)) return true;
     for (const uid of toOwnerList(ownerUserIds)) {
-        if (isActive(manualWindows.user.get(uid))) return true;
+        if (windowHolds(manualWindows.user.get(uid), amountPaise)) return true;
     }
     return false;
 }
@@ -70,8 +85,8 @@ function hasActiveUserWindows() {
 }
 
 // 'manual' | 'auto' for a given transaction context.
-function effectiveMode(qrId, ownerUserId) {
-    return isManual(qrId, ownerUserId) ? 'manual' : 'auto';
+function effectiveMode(qrId, ownerUserId, amountPaise) {
+    return isManual(qrId, ownerUserId, amountPaise) ? 'manual' : 'auto';
 }
 
 // Ingest-gate helper — single source of truth shared by every ingest path.
@@ -79,9 +94,10 @@ function effectiveMode(qrId, ownerUserId) {
 // review and, if so, the extra fields to merge into the WEBHOOK_DATA document.
 // In AUTO mode `fields` is empty, so normal ingest writes exactly the same document
 // as before (no schema dependency on the review attributes).
-//   windowMs = per-transaction auto-approve backstop (ms).
-function reviewFieldsFor(qrId, ownerUserId, windowMs) {
-    if (!isManual(qrId, ownerUserId)) {
+//   amountPaise = this txn's amount (checked against each window's min-amount threshold).
+//   windowMs    = per-transaction auto-approve backstop (ms).
+function reviewFieldsFor(qrId, ownerUserId, amountPaise, windowMs) {
+    if (!isManual(qrId, ownerUserId, amountPaise)) {
         return { manual: false, fields: {} };
     }
     return {
@@ -97,7 +113,7 @@ function reviewFieldsFor(qrId, ownerUserId, windowMs) {
 
 // Activate OR reset/extend a manual window. Throws on invalid input.
 // Returns the stored window descriptor.
-function setManual({ scope, qrId = null, userId = null, minutes, setBy = null }) {
+function setManual({ scope, qrId = null, userId = null, minutes, minAmount = 0, setBy = null }) {
     if (!['global', 'qr', 'user'].includes(scope)) {
         throw new Error("scope must be 'global', 'qr', or 'user'");
     }
@@ -105,10 +121,14 @@ function setManual({ scope, qrId = null, userId = null, minutes, setBy = null })
     if (!Number.isFinite(mins) || mins <= 0 || mins > MAX_MINUTES) {
         throw new Error(`minutes must be a number between 1 and ${MAX_MINUTES}`);
     }
+    const min = Number(minAmount);
+    if (!Number.isFinite(min) || min < 0) {
+        throw new Error('minAmount must be a non-negative number (paise); 0 = hold every amount');
+    }
     if (scope === 'qr' && !qrId) throw new Error('qrId is required for scope "qr"');
     if (scope === 'user' && !userId) throw new Error('userId is required for scope "user"');
 
-    const win = { until: Date.now() + mins * 60 * 1000, setBy, setAt: Date.now() };
+    const win = { until: Date.now() + mins * 60 * 1000, minAmount: Math.round(min), setBy, setAt: Date.now() };
 
     if (scope === 'global') manualWindows.global = win;
     else if (scope === 'qr') manualWindows.qr.set(qrId, win);
