@@ -3743,7 +3743,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 minAmount: minAmount || 0, // paise; 0 = hold every amount
                 setBy: req.user?.userId || null,
             });
-            console.log(`[ReviewMode] MANUAL set by ${req.user?.userId || 'unknown'} →`, window);
+            // console.log(`[ReviewMode] MANUAL set by ${req.user?.userId || 'unknown'} →`, window);
             return res.status(200).json({
                 success: true,
                 mode: 'manual',
@@ -3762,7 +3762,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // Accept params from body or query (some clients/proxies drop DELETE bodies)
             const { scope, qrId, userId, all } = { ...req.query, ...(req.body || {}) };
             const cleared = reviewMode.clearManual({ scope, qrId, userId, all: !!all });
-            console.log(`[ReviewMode] MANUAL cleared by ${req.user?.userId || 'unknown'} →`, cleared);
+            // console.log(`[ReviewMode] MANUAL cleared by ${req.user?.userId || 'unknown'} →`, cleared);
             return res.status(200).json({
                 success: true,
                 cleared,
