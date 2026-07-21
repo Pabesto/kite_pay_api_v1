@@ -1816,6 +1816,11 @@ const PINELAB_ACCOUNTS = [
     clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
     clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv',
   },
+  {
+    id: 'beast_arena_club',
+    clientId: 'BEASTARENA_CLUB_PRIVATE_LI_WMFZBIAE',
+    clientSecret: 'sl5RGyPE826uir63tGb7SmosDWRGsiOQ',
+  },
 //   {
 //     id: 'pabesto_tech',
 //     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
