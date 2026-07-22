@@ -1312,7 +1312,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // Export endpoint with same filters but returns all matching transactions (up to a reasonable max limit) for CSV export
     router.get('/user/transactions/export', authenticateToken, async (req, res) => {
         const { userId, qrId, from, to, status, searchField, searchValue, maxTxns = 50 } = req.query;
-        const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 500);  // safety limit
+        const maxTxnsNum = Math.min(parseInt(maxTxns) || 50, 5000);  // safety limit
 
         // console.log('Export transaction query params:', req.query);
 
