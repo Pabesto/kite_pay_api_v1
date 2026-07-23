@@ -3436,7 +3436,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     }
 
     // Added Cron job to auto hold QRs not meeting minimum usage criteria daily at 2:00 AM IST
-    startCronJobs();
+    // startCronJobs();
 
     function startCronJobs() {
         cron.schedule(
