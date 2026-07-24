@@ -3,6 +3,8 @@
 // This file contains the API endpoints for user management.
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const multer = require('multer');
 const moment = require('moment-timezone');
 const { Client, Account } = require('node-appwrite');
@@ -26,6 +28,11 @@ const qrOwnerCache = require('./qrOwnerCache'); // shared singleton, initialized
 const reviewMode = require('./reviewMode'); // in-memory manual-review-mode registry (single-process)
 const createReviewResolve = require('./reviewResolve'); // pending-review exactly-once state machine
 const { sendMerchantHoldEmail } = require('./scripts/transactionStatusMailer'); // standalone Hostinger mailer
+
+// Inline logo for the merchant hold email. Resolved via __dirname so it works regardless of process cwd;
+// undefined when the file is missing so a missing image degrades to "no image" instead of blocking the send.
+const HOLD_EMAIL_IMAGE_PATH = path.join(__dirname, 'image', 'razorpay_img.png');
+const HOLD_EMAIL_IMAGE = fs.existsSync(HOLD_EMAIL_IMAGE_PATH) ? HOLD_EMAIL_IMAGE_PATH : undefined;
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -1886,7 +1893,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         console.log(`[hold-notice] suspicious txn ${TxnID} -> no email configured for company "${merchantName || '?'}" (POS ${tx.qrCodeId}); skipped`);
                         return;
                     }
-                    await sendMerchantHoldEmail({ posId: tx.qrCodeId, paymentIds: [tx.paymentId], to, merchantName });
+                    await sendMerchantHoldEmail({ posId: tx.qrCodeId, paymentIds: [tx.paymentId], to, merchantName, image: HOLD_EMAIL_IMAGE });
                     console.log(`[hold-notice] suspicious txn ${TxnID} -> emailed ${to} (POS ${tx.qrCodeId})`);
                 })().catch((e) => console.error('[hold-notice] email failed for txn', TxnID, e.message || e));
             }
@@ -5224,7 +5231,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (!to) {
                 return res.status(422).json({ sent: false, posId, merchantName: merchantName || null, error: 'No email configured for this company; not sent' });
             }
-            await sendMerchantHoldEmail({ posId, paymentIds: ids, to, merchantName });
+            await sendMerchantHoldEmail({ posId, paymentIds: ids, to, merchantName, image: HOLD_EMAIL_IMAGE });
             return res.json({ sent: true, posId, merchantName: merchantName || null, recipient: to });
         } catch (err) {
             console.error('hold-notice email failed:', err.message || err);
