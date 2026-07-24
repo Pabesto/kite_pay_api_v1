@@ -1886,6 +1886,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // On transition to `suspicious`, notify the company that owns the POS ID (fire-and-forget:
             // email latency/failure must never affect the status response). prev===next already early-returned.
             if (next === 'suspicious' && tx.qrCodeId && tx.paymentId
+                && String(tx.provider || '').toLowerCase() === 'razorpay'
                 && ConfigManager.get('send_hold_email_on_suspicious', true)) {
                 (async () => {
                     const { to, merchantName } = await resolveCompanyRecipient(tx.qrCodeId);
