@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c scripts/migrate-company-names-to-json.js)",
+      "Bash(node scripts/migrate-company-names-to-json.js)"
+    ]
+  }
+}

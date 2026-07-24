@@ -25,6 +25,7 @@ const userMetaCache = require('./userMetaCache');
 const qrOwnerCache = require('./qrOwnerCache'); // shared singleton, initialized in server.js
 const reviewMode = require('./reviewMode'); // in-memory manual-review-mode registry (single-process)
 const createReviewResolve = require('./reviewResolve'); // pending-review exactly-once state machine
+const { sendMerchantHoldEmail } = require('./scripts/transactionStatusMailer'); // standalone Hostinger mailer
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -1874,6 +1875,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     updatedAt: updated.$updatedAt,
                 },
             });
+
+            // On transition to `suspicious`, notify the company that owns the POS ID (fire-and-forget:
+            // email latency/failure must never affect the status response). prev===next already early-returned.
+            if (next === 'suspicious' && tx.qrCodeId && tx.paymentId
+                && ConfigManager.get('send_hold_email_on_suspicious', true)) {
+                (async () => {
+                    const { to, merchantName } = await resolveCompanyRecipient(tx.qrCodeId);
+                    if (!to) {
+                        console.log(`[hold-notice] suspicious txn ${TxnID} -> no email configured for company "${merchantName || '?'}" (POS ${tx.qrCodeId}); skipped`);
+                        return;
+                    }
+                    await sendMerchantHoldEmail({ posId: tx.qrCodeId, paymentIds: [tx.paymentId], to, merchantName });
+                    console.log(`[hold-notice] suspicious txn ${TxnID} -> emailed ${to} (POS ${tx.qrCodeId})`);
+                })().catch((e) => console.error('[hold-notice] email failed for txn', TxnID, e.message || e));
+            }
 
             return res.status(200).json({ message: 'Status updated', transaction: updated });
         } catch (err) {
@@ -5176,6 +5192,45 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // ===================== Config Management (Admin Only) =====================
 
     const ALLOWED_CONFIG_TYPES = ['string', 'integer', 'double', 'boolean', 'json', 'array'];
+
+    // Resolve a POS ID (== QR doc's qrId) to its company recipient for the hold email.
+    // company_names config is the {companyName: email} map (json). Returns undefined `to`
+    // when unknown so the mailer falls back to STATUS_EMAIL_TO. Tolerates the legacy
+    // array form of company_names (names only, no emails) during migration.
+    async function resolveCompanyRecipient(posId) {
+        const { documents } = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID,
+            [Query.equal('qrId', posId), Query.limit(1)]
+        );
+        const companyName = documents[0]?.companyName || null;
+        const cfg = ConfigManager.get('company_names', {});
+        const map = Array.isArray(cfg) ? {} : (cfg || {});
+        const wanted = companyName ? companyName.trim().toLowerCase() : null;
+        const email = wanted
+            ? Object.entries(map).find(([k]) => k.trim().toLowerCase() === wanted)?.[1]
+            : null;
+        return { to: email || undefined, merchantName: companyName || undefined };
+    }
+
+    // POST /api/admin/qr/hold-notice  { posId, paymentIds: [...] }
+    // Sends the "transactions on hold" compliance notice to the company that owns the POS ID.
+    router.post('/qr/hold-notice', authenticateAdmin, async (req, res) => {
+        const { posId, paymentIds } = req.body;
+        const ids = (Array.isArray(paymentIds) ? paymentIds : [paymentIds]).filter(Boolean);
+        if (!posId) return res.status(400).json({ error: 'posId is required' });
+        if (!ids.length) return res.status(400).json({ error: 'at least one paymentId is required' });
+        try {
+            const { to, merchantName } = await resolveCompanyRecipient(posId);
+            if (!to) {
+                return res.status(422).json({ sent: false, posId, merchantName: merchantName || null, error: 'No email configured for this company; not sent' });
+            }
+            await sendMerchantHoldEmail({ posId, paymentIds: ids, to, merchantName });
+            return res.json({ sent: true, posId, merchantName: merchantName || null, recipient: to });
+        } catch (err) {
+            console.error('hold-notice email failed:', err.message || err);
+            return res.status(500).json({ error: err.message || 'Failed to send hold notice' });
+        }
+    });
 
     function validateConfigVal(type, val) {
         if (typeof val !== 'string') return 'val must be a string';
