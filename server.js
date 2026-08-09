@@ -88,6 +88,9 @@ const APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID = process.env.APPWRITE_P
 const APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID;
 const APPWRITE_CONFIG_COLLECTION_ID = process.env.APPWRITE_CONFIG_COLLECTION_ID;
 const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID;
+// PineLabs merchant credentials (default matches setup-pinelab-accounts-schema.js).
+// Secret-bearing collection — server API key only, never exposed to client SDKs.
+const APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID || 'pinelab_accounts';
 const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
 
 // Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -184,8 +187,14 @@ ConfigManager.init({ databases, APPWRITE_DATABASE_ID, APPWRITE_CONFIG_COLLECTION
 // ─── Constants ───────────────────────────────────────────────────────────────
 const LOCK_TTL_SECONDS      = 15;   // Redis lock TTL for webhook/QR operations
 const COUNTER_FLUSH_MS      = 1 * 60 * 1000; // how often Redis counters flush to Appwrite (1 min)
-const GRACEFUL_SHUTDOWN_MS  = 10_000; // max ms to wait for in-flight requests on shutdown
+const GRACEFUL_SHUTDOWN_MS  = 15_000; // max ms to wait for in-flight requests on shutdown (includes DRAIN_MS)
+const DRAIN_MS              = 5_000;  // how long /health reports 503 before we stop accepting connections
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Flipped by gracefulShutdown so /health can report 503 while draining. Providers
+// retry on 503 (same contract as lock contention), so a webhook that arrives during
+// a deploy is retried rather than lost to a connection-refused.
+let isShuttingDown = false;
 
 console.log(`Server starting with Appwrite endpoint ${APPWRITE_ENDPOINT} and Redis URL ${process.env.REDIS_URL}`);
 
@@ -660,6 +669,9 @@ const globalLimiter = rateLimit({
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
+  // Never throttle the liveness probe — a 429 would read as "unhealthy" to Render
+  // and restart a service whose only problem is that it is busy.
+  skip: (req) => req.path === '/health',
 });
 
 // Rate limiter specifically for webhook endpoints
@@ -1088,8 +1100,54 @@ app.get('/inc_test', async (req, res) => {
     }
 });
 
+// Liveness probe — this is the path Render polls.
+// Deliberately checks NOTHING but the process itself. Redis and Appwrite are
+// optional-at-runtime (every feature degrades without them), so reporting them here
+// would let a transient dependency blip restart a healthy single-instance payments
+// process mid-webhook. Dependency detail belongs in /health/deep.
 app.get('/health', (req, res) => {
+    // 503 while draining so Render stops routing and providers retry their webhooks.
+    if (isShuttingDown) return res.status(503).json({ status: 'shutting_down' });
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Diagnostics — admin only, and NOT the Render health path.
+// Always returns 200 even when a dependency is down: the body carries the detail.
+// A non-200 here would tempt someone to point Render at it and reintroduce exactly
+// the spurious-restart hazard /health avoids.
+app.get('/health/deep', authenticateAdmin, async (req, res) => {
+    let appwriteReachable = false;
+    let appwriteError = null;
+    try {
+        await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, [Query.limit(1)]);
+        appwriteReachable = true;
+    } catch (e) {
+        appwriteError = e?.message || String(e);
+    }
+
+    const mem = process.memoryUsage();
+    return res.status(200).json({
+        success: true,
+        status: isShuttingDown ? 'shutting_down' : 'ok',
+        shuttingDown: isShuttingDown,
+        uptimeSec: Math.round(process.uptime()),
+        memoryMb: {
+            rss: Math.round(mem.rss / 1048576),
+            heapUsed: Math.round(mem.heapUsed / 1048576),
+        },
+        redis: {
+            // Never report the connection URL — it carries credentials.
+            connected: !!redisClient?.isOpen,
+            countersDirty: !!redisClient?.countersDirty,
+            countersStale: !!redisClient?.countersStale,
+        },
+        appwrite: { reachable: appwriteReachable, error: appwriteError },
+        pinelabs: {
+            enabled: !!pinelabPoller,
+            accountIds: pinelabPoller?.accountIds || [],   // ids only, never credentials
+        },
+        timestamp: new Date().toISOString(),
+    });
 });
 
 function toInt(value) {
@@ -1808,56 +1866,99 @@ const { startPinelabMultiPoller } = require('./pinelabMultiPoller');
 // const ENABLE_PINELAB_POLLER = process.env.ENABLE_PINELAB_POLLER;
 const ENABLE_PINELAB_POLLER = true; // default to disabled to avoid unintended consequences; enable explicitly with env var
 
-// Accounts are polled one-by-one each tick. Metrics/watermarks are isolated per
-// `id` in Redis (pinelabs:poller:<id>:*). Add/remove creds here.
-const PINELAB_ACCOUNTS = [
-  {
-    id: 'scanserve_ai',
-    clientId: 'SCANSERVE_AI_PRIVATE_LIMIT_SV1ZSIAI',
-    clientSecret: 'd3tR9f3SDVK5ipmKVQan3YbdR2amGFqv',
-  },
-  {
-    id: 'beast_arena_club',
-    clientId: 'BEASTARENA_CLUB_PRIVATE_LI_WMFZBIAE',
-    clientSecret: 'sl5RGyPE826uir63tGb7SmosDWRGsiOQ',
-  },
-//   {
-//     id: 'pabesto_tech',
-//     clientId: 'PABESTO_TECH_PRIVATE_LIMITED_M69N1IPX',
-//     clientSecret: 'MWTzNft5GvY00sGcSV67VRj5Xa9vgy4V',
-//   },
-];
+// Accounts live in the `pinelab_accounts` collection (server-API-key only, secrets
+// encrypted at rest) rather than in this file. Metrics/watermarks stay isolated per
+// `accountId` in Redis (pinelabs:poller:<id>:*), so enabling/disabling an account
+// never disturbs another account's watermark.
+//
+// `let`, not `const`: POST /admin/pinelabs/reload stops and replaces this handle.
+let pinelabPoller = null;
+let pinelabLoadError = null;      // surfaced by /admin/pinelabs/status when a load fails
+let pinelabLoadedAt = null;
 
-const pinelabPoller = ENABLE_PINELAB_POLLER
-  ? startPinelabMultiPoller(
-      {
-        databases,
-        Query,
-        ID,
-        redisClient,
-        acquireLock,
-        releaseLock,
-        emitTxnNew,
-        emitPendingReview,
-        updateDailyQrTotal,
-        finalizeTransaction,
+// Reads enabled accounts. Shape matches what startPinelabMultiPoller expects:
+// [{ id, clientId, clientSecret }]
+async function loadPinelabAccounts() {
+    const res = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
-        APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
-        APPWRITE_QRCODE_COLLECTION_ID,
-        LOCK_TTL_SECONDS,
-      },
-      {
-        env: 'production',
-        intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
-        bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
-        maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
-        pageSize: 100,
-        maxPagesPerTick: 50,
-        dryRun: false,
-        accounts: PINELAB_ACCOUNTS,
-      }
-    )
-  : null;
+        APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID,
+        [Query.equal('enabled', true), Query.limit(100)]
+    );
+    return res.documents
+        .filter(d => d.accountId && d.clientId && d.clientSecret)
+        .map(d => ({ id: d.accountId, clientId: d.clientId, clientSecret: d.clientSecret }));
+}
+
+function buildPinelabPoller(accounts) {
+    return startPinelabMultiPoller(
+        {
+            databases,
+            Query,
+            ID,
+            redisClient,
+            acquireLock,
+            releaseLock,
+            emitTxnNew,
+            emitPendingReview,
+            updateDailyQrTotal,
+            finalizeTransaction,
+            APPWRITE_DATABASE_ID,
+            APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
+            APPWRITE_QRCODE_COLLECTION_ID,
+            LOCK_TTL_SECONDS,
+        },
+        {
+            env: 'production',
+            intervalMs: Number(process.env.PINELAB_POLLER_INTERVAL_MS) || 1 * 60 * 1000,
+            bufferMinutes: 2,        // small guard against micro-delays (txn anchor is ground truth)
+            maxLookbackMinutes: 60,  // ceiling on window size during quiet periods
+            pageSize: 100,
+            maxPagesPerTick: 50,
+            dryRun: false,
+            accounts,
+        }
+    );
+}
+
+// Stops any running poller and starts a fresh one from the current collection state.
+// Always stops first so a failed reload can never leave two pollers polling the same
+// account — that would double the API load and race on the same watermark keys.
+async function reloadPinelabPoller() {
+    try { pinelabPoller?.stop(); } catch (e) { console.error('[pinelabs] error stopping poller:', e); }
+    pinelabPoller = null;
+
+    if (!ENABLE_PINELAB_POLLER) {
+        pinelabLoadError = 'poller disabled (ENABLE_PINELAB_POLLER=false)';
+        return { started: false, accountIds: [], reason: pinelabLoadError };
+    }
+
+    try {
+        const accounts = await loadPinelabAccounts();
+        pinelabLoadError = null;
+        pinelabLoadedAt = new Date().toISOString();
+
+        if (!accounts.length) {
+            console.warn('[pinelabs] no enabled accounts found — poller not started');
+            return { started: false, accountIds: [], reason: 'no enabled accounts' };
+        }
+
+        pinelabPoller = buildPinelabPoller(accounts);
+        console.log(`[pinelabs] poller started with ${accounts.length} account(s): ${accounts.map(a => a.id).join(', ')}`);
+        return { started: true, accountIds: pinelabPoller.accountIds };
+    } catch (e) {
+        // Polling is the only crediting path for PineLabs, so a failure here is
+        // serious — but if Appwrite is unreachable the poller could not persist
+        // anything anyway. Stay stopped, make it visible, and let an admin call
+        // /admin/pinelabs/reload once Appwrite is back (no redeploy needed).
+        pinelabLoadError = e?.message || String(e);
+        console.error('[pinelabs] CRITICAL: could not load accounts — poller NOT running:', pinelabLoadError);
+        return { started: false, accountIds: [], reason: pinelabLoadError };
+    }
+}
+
+// Boot. Not awaited — a slow Appwrite must not block the HTTP server from binding
+// (Render's health check would fail and restart us into the same stall).
+reloadPinelabPoller().catch(e => console.error('[pinelabs] boot reload failed:', e));
 
 // Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
 // normal watermark window; pass both for an explicit backfill window.
@@ -1877,6 +1978,129 @@ app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
     console.error('[admin/pinelabs/poll] error:', e);
     res.status(500).json({ error: e.message || 'poll failed' });
   }
+});
+
+// ─── PineLabs account management ─────────────────────────────────────────────
+// All admin-only. `clientSecret` is never returned by any of these — it is
+// write-only from the API's point of view. Rotate it by PATCHing a new value.
+
+const pickPinelabAccount = (d) => ({
+    $id: d.$id,
+    accountId: d.accountId,
+    clientId: d.clientId,
+    label: d.label || null,
+    enabled: d.enabled !== false,
+    // clientSecret deliberately omitted — never expose it, not even to admins.
+    clientSecretSet: !!d.clientSecret,
+});
+
+// Is the poller actually running, and on which accounts?
+app.get('/admin/pinelabs/running', authenticateAdmin, (req, res) => {
+    res.json({
+        running: !!pinelabPoller,
+        enabledByFlag: !!ENABLE_PINELAB_POLLER,
+        accountIds: pinelabPoller?.accountIds || [],
+        loadedAt: pinelabLoadedAt,
+        loadError: pinelabLoadError,
+    });
+});
+
+app.get('/admin/pinelabs/accounts', authenticateAdmin, async (req, res) => {
+    try {
+        const result = await databases.listDocuments(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID,
+            [Query.limit(100), Query.orderAsc('accountId')]
+        );
+        res.json({ success: true, accounts: result.documents.map(pickPinelabAccount) });
+    } catch (e) {
+        console.error('[admin/pinelabs/accounts] list error:', e);
+        res.status(500).json({ error: e.message || 'failed to list accounts' });
+    }
+});
+
+app.post('/admin/pinelabs/accounts', authenticateAdmin, async (req, res) => {
+    try {
+        const { accountId, clientId, clientSecret, label, enabled } = req.body || {};
+        if (!accountId || !clientId || !clientSecret) {
+            return res.status(400).json({ error: 'accountId, clientId and clientSecret are required' });
+        }
+        // accountId becomes a Redis key segment (pinelabs:poller:<id>:*), so keep it
+        // to a safe charset — a stray ':' would silently collide with another key.
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(accountId)) {
+            return res.status(400).json({ error: 'accountId must match ^[a-zA-Z0-9_-]{1,64}$' });
+        }
+
+        const dupe = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID,
+            [Query.equal('accountId', accountId), Query.limit(1)]
+        );
+        if (dupe.documents.length) {
+            return res.status(409).json({ error: `Account "${accountId}" already exists` });
+        }
+
+        const created = await databases.createDocument(
+            APPWRITE_DATABASE_ID, APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID, ID.unique(),
+            { accountId, clientId, clientSecret, label: label || null, enabled: enabled !== false }
+        );
+        console.log(`[pinelabs] account "${accountId}" created by ${req.user?.userId || 'admin'}`);
+        res.status(201).json({
+            success: true,
+            account: pickPinelabAccount(created),
+            note: 'Call POST /admin/pinelabs/reload to apply this to the running poller.',
+        });
+    } catch (e) {
+        console.error('[admin/pinelabs/accounts] create error:', e);
+        res.status(500).json({ error: e.message || 'failed to create account' });
+    }
+});
+
+// Enable/disable, relabel, or rotate credentials. Only the keys present are changed.
+app.patch('/admin/pinelabs/accounts/:accountId', authenticateAdmin, async (req, res) => {
+    try {
+        const { accountId } = req.params;
+        const found = await databases.listDocuments(
+            APPWRITE_DATABASE_ID, APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID,
+            [Query.equal('accountId', accountId), Query.limit(1)]
+        );
+        if (!found.documents.length) return res.status(404).json({ error: 'Account not found' });
+
+        // Whitelist — never mass-assign req.body onto a credential document.
+        const patch = {};
+        const { clientId, clientSecret, label, enabled } = req.body || {};
+        if (clientId !== undefined)     patch.clientId = clientId;
+        if (clientSecret !== undefined) patch.clientSecret = clientSecret;
+        if (label !== undefined)        patch.label = label;
+        if (enabled !== undefined)      patch.enabled = !!enabled;
+        if (!Object.keys(patch).length) {
+            return res.status(400).json({ error: 'Provide at least one of clientId, clientSecret, label, enabled' });
+        }
+
+        const updated = await databases.updateDocument(
+            APPWRITE_DATABASE_ID, APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID, found.documents[0].$id, patch
+        );
+        console.log(`[pinelabs] account "${accountId}" updated (${Object.keys(patch).join(', ')}) by ${req.user?.userId || 'admin'}`);
+        res.json({
+            success: true,
+            account: pickPinelabAccount(updated),
+            note: 'Call POST /admin/pinelabs/reload to apply this to the running poller.',
+        });
+    } catch (e) {
+        console.error('[admin/pinelabs/accounts] update error:', e);
+        res.status(500).json({ error: e.message || 'failed to update account' });
+    }
+});
+
+// Re-read the collection and restart the poller with the new account list.
+app.post('/admin/pinelabs/reload', authenticateAdmin, async (req, res) => {
+    try {
+        const result = await reloadPinelabPoller();
+        console.log(`[pinelabs] reload requested by ${req.user?.userId || 'admin'} — started=${result.started}`);
+        res.json({ success: true, ...result });
+    } catch (e) {
+        console.error('[admin/pinelabs/reload] error:', e);
+        res.status(500).json({ error: e.message || 'reload failed' });
+    }
 });
 
 // Admin-only: read poller health/metrics from Redis
@@ -1921,8 +2145,24 @@ app.get('/', (req, res) => {
 // Render sends SIGTERM on deploys/restarts. Give in-flight requests time to finish
 // before closing DB/Redis connections, then exit cleanly.
 async function gracefulShutdown(signal) {
+    if (isShuttingDown) return;              // SIGTERM then SIGINT must not drain twice
+    isShuttingDown = true;                   // /health starts reporting 503 immediately
     console.log(`\n${signal} received — starting graceful shutdown`);
     try { pinelabPoller?.stop(); } catch (e) { console.error('Error stopping PineLabs poller:', e); }
+
+    // Armed before the drain so the deadline is measured from the signal, not from
+    // the end of draining — GRACEFUL_SHUTDOWN_MS is the whole budget, DRAIN_MS included.
+    setTimeout(() => {
+        console.error('Graceful shutdown timed out — forcing exit');
+        process.exit(1);
+    }, GRACEFUL_SHUTDOWN_MS).unref(); // .unref() so this timer doesn't keep the process alive on its own
+
+    // Keep accepting requests for a moment so Render sees the 503 and drains traffic
+    // before the socket closes — a webhook arriving now gets a retryable 503 instead
+    // of connection-refused.
+    console.log(`Draining for ${DRAIN_MS}ms before closing the HTTP server`);
+    await new Promise((r) => setTimeout(r, DRAIN_MS));
+
     httpServer.close(async () => {
         console.log('HTTP server closed — no new connections accepted');
         try {
@@ -1933,11 +2173,6 @@ async function gracefulShutdown(signal) {
         }
         process.exit(0);
     });
-    // Force-kill after 10 s if requests haven't drained
-    setTimeout(() => {
-        console.error('Graceful shutdown timed out — forcing exit');
-        process.exit(1);
-    }, GRACEFUL_SHUTDOWN_MS).unref(); // .unref() so this timer doesn't keep the process alive on its own
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
