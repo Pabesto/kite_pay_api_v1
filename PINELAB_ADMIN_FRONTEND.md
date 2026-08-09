@@ -311,10 +311,27 @@ Response — note the per-account results are spread **flat at the top level**, 
 }
 ```
 
-Iterate the keys excluding `ok`. A per-account entry is either a result object **or** `{ "error": … }` —
-one account failing does not fail the request, so check for `error` on each entry individually.
+Iterate the keys excluding `ok` and `window`. A per-account entry is either a result object **or**
+`{ "error": … }` — one account failing does not fail the request, so check for `error` on each entry
+individually.
 
 **Unlike `/status`, these are real JSON numbers**, not strings.
+
+#### `hitPageCap: true` means the result is INCOMPLETE
+
+A single run fetches at most **50 pages × 100 = 5,000 transactions per account**. If the window holds
+more, the poller stops there and sets `hitPageCap: true`.
+
+For a normal watermark poll that is harmless — the watermark advanced, and the next tick picks up
+where it left off.
+
+**For an explicit `from`/`to` backfill it is not harmless.** A ranged run deliberately does not
+advance the watermark, so nothing resumes: the transactions past the 5,000 cut-off are simply never
+fetched. The response still says `ok: true` with a healthy-looking `totalSaved`.
+
+So whenever `hitPageCap` is `true` on a ranged poll, the UI **must** tell the user the backfill was
+truncated and that they need to re-run with a narrower window — otherwise they will believe a
+backfill completed while payments are still missing. Treat it as a warning state, not a detail.
 
 **Trap 3 — `fromDate`/`toDate` are naive IST wall-time, with no timezone suffix.**
 `"2026-08-10T14:40:00"` means 14:40 **India time**. Do **not** call
@@ -413,6 +430,77 @@ fails.
 
 On edit, build the PATCH body from changed fields only — and include `clientSecret` **only if the
 field is non-empty**.
+
+### The "Poll now" control
+
+Two actions that look similar and behave differently, so make them a **split button** — primary
+action plus a menu — rather than one button that sometimes opens a dialog:
+
+```
+[ Poll now  ▾ ]
+     └── Poll now                 → POST /poll  {}
+     └── Fetch a past range…      → opens the range sheet
+```
+
+| | Poll now | Fetch a past range |
+|---|---|---|
+| Body | `{}` | `{ from, to }` |
+| Window | since the stored watermark | exactly what you pick |
+| Advances the watermark | **yes** | **no** — safe, repeatable |
+| Use for | "did I miss something just now?" | recovering a known gap |
+
+Because a ranged fetch never advances the watermark, it cannot disturb the live schedule and is safe
+to re-run as often as needed. Say so in the sheet — admins are reasonably nervous about buttons that
+touch money.
+
+#### The range sheet
+
+```
+┌────────────────────────────────────────────┐
+│  Fetch a past range                        │
+│                                            │
+│  From   [ 09 Aug 2026 ]  [ 00:00 ]         │
+│  To     [ 09 Aug 2026 ]  [ 23:59 ]         │
+│                                            │
+│  All times are India Standard Time (IST)   │
+│                                            │
+│  Quick:  [Today] [Yesterday] [Last 6 h]    │
+│                                            │
+│  Existing payments are skipped — safe to   │
+│  re-run.                                   │
+│                     [ Cancel ]  [ Fetch ]  │
+└────────────────────────────────────────────┘
+```
+
+- **Date *and* time for both ends**, defaulting to today 00:00 → 23:59.
+- **Label the timezone as IST explicitly.** The server reads these as Indian wall-clock time
+  regardless of the device's zone, so an admin travelling abroad must not be shown their local time
+  without a label.
+- Serialise with the `istParam` helper in §3.7 — never `toIso8601String()` on a UTC `DateTime`.
+- Validate `from <= to` before sending (the server also returns `400`, but inline is nicer).
+- Warn above roughly a week: long windows are the main way to hit the 5,000-transaction cap.
+
+#### While it runs
+
+A ranged fetch can take tens of seconds and credits real money. Disable the button, show a spinner,
+and **do not set a short client timeout** — a timeout that fires while the server is still working
+leaves the admin unsure whether it ran, and the natural reaction is to press it again.
+
+#### Reporting the result
+
+Per account, in priority order:
+
+1. `error` present → red: *"{accountId}: failed — {error}"*
+2. `hitPageCap: true` → **amber, and do not call it success**:
+   *"{accountId}: fetched 5,000 transactions and stopped — the range was too large. Narrow it and
+   run again."*
+3. otherwise → green: *"{accountId}: {totalSaved} new of {totalSeen} seen"*
+
+`totalSeen` far exceeding `totalSaved` is normal and healthy — it means those payments were already
+credited. Word it as "already recorded", not as an error.
+
+Echo the resolved `window` from the response in the result panel so the admin can confirm the range
+they actually got.
 
 ### Confirmations
 
