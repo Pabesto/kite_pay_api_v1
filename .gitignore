@@ -1,2 +1,6 @@
 node_modules/
 .env
+
+# Live PineLabs gateway credentials, read by scripts/seed-pinelab-accounts.js.
+# Must never be committed — delete it once the accounts are seeded.
+pinelab-seed.json
