@@ -1,0 +1,19 @@
+first create a user in the target appwrite project with the following details:
+then copy the userId and put entry in users_meta_test table with the following details: 
+{
+  "userId": "fetch from appwrite auth admin userId",
+  "email": "admin@kitepay3.com",
+  "name": "Admin",
+  "role": "admin",
+  "parentId": null,
+  "status": true,
+  "labels": [
+    "admin"
+  ],
+  "commission": 2,
+  "assigned_to": null,
+  "$id": "same as userId"
+}
+
+
+

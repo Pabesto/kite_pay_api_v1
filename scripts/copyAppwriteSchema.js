@@ -4,18 +4,19 @@
 //     node scripts/copyAppwriteSchema.js
 
 // =====================  EDIT THESE  =====================
-const SOURCE = {
-  endpoint:   'https://fra.cloud.appwrite.io/v1',
-  projectId:  '688c98fd002bfe3cf596',
-  apiKey:     'standard_b2443fedac19c0903a7a280fbb0d121ea52353d7d81533f1b8a76dab54721871a595a87624511da1ad635336e50946caf684a8650bfe4fd4f5d9839cb916e595314f8b2921cc78dcd477e468393bcd4932616d3412da4e5cc5d6d79a4b31e391d2d5e1172eaa08a2fafc3b2b8615bc9ec57b17d70884c7b48957ccdc7d8d803a',
-  databaseId: '688ca9f3003e593a6227',
-};
 
-const TARGET = {
+const SOURCE = {
   endpoint:   'https://sgp.cloud.appwrite.io/v1',
   projectId:  '69fbf3d100025d91e8d5',
   apiKey:     'standard_cbe1d7b44195f9ddd89443d29adfdce5bce20bece882e0702037f71832c69915d5e6e89b1edfe1f944eac197b22289f7190895e2bd3dbca5fdf68d29123106ae70674ac2b0ba70b2b5bfa8eeeb504b39eca5054d81db7edcb27ca6ada6dc4ae93949d0fb1c623cc585090cfb21a3bb2c527ab6773037b837de2e33f11cdf3854',
   databaseId: '69fbf49100207103019a',
+};
+
+const TARGET = {
+  endpoint:   'https://sgp.cloud.appwrite.io/v1',
+  projectId:  '6a788fcd001d540868ef',
+  apiKey:     'standard_0e2204b5f230c3d9c08735b1afedb9a86aa64f90765f3b0dde25efd15c5cf504c522c7081e2974e829796c65f107dc3bb987ef798c00cdf4986fff2a2ed945f5636f4a051bfa4e28e49c353a4e4b9c2c664622f873429a46e83f851106c19d01e2c5d895f364ac63b1aa288726a5f8eeb6a7a3d99c84c8d74f860a3d9aaf9170',
+  databaseId: '6a789095000fcaf71dd7',
 };
 
 // Tables for which rows should be copied (in addition to schema).
