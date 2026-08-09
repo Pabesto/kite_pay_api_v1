@@ -1962,7 +1962,27 @@ reloadPinelabPoller().catch(e => console.error('[pinelabs] boot reload failed:',
 
 // Admin-only: trigger a manual PineLabs poll. Omit from/to to run with the
 // normal watermark window; pass both for an explicit backfill window.
-// Body: { from?: ISOString, to?: ISOString }
+// Body: { from?, to? } — either 'YYYY-MM-DD' or naive IST 'YYYY-MM-DDTHH:mm:ss'.
+// Both are IST wall-time, matching every other date filter in this API.
+
+const PINELAB_DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+// A date-only value covers that whole IST day. Without this, a plain 'YYYY-MM-DD'
+// from a date picker reaches the poller's toIstDate(), becomes an Invalid Date, and
+// fmtIst() throws inside runOnce's per-account try/catch — surfacing as
+// { error: 'Invalid time value' } inside an HTTP 200. That silent no-op is the
+// failure this normalisation exists to prevent.
+function pinelabExpandIstBound(value, endOfDay) {
+  const v = String(value).trim();
+  return PINELAB_DATE_ONLY.test(v) ? `${v}T${endOfDay ? '23:59:59' : '00:00:00'}` : v;
+}
+
+// Mirrors the poller's own naive-IST interpretation; used here only to validate
+// before we hand the strings over.
+function pinelabParseIst(v) {
+  return new Date(/[zZ]|[+\-]\d{2}:?\d{2}$/.test(v) ? v : v.replace(' ', 'T') + '+05:30');
+}
+
 app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
   try {
     const { from, to } = req.body || {};
@@ -1972,8 +1992,26 @@ app.post('/admin/pinelabs/poll', authenticateAdmin, async (req, res) => {
     if (!pinelabPoller) {
       return res.status(503).json({ error: 'PineLabs poller is disabled' });
     }
-    const result = await pinelabPoller.runOnce({ from, to });
-    res.json({ ok: true, ...result });
+
+    const window = {};
+    if (from && to) {
+      const fromStr = pinelabExpandIstBound(from, false);
+      const toStr   = pinelabExpandIstBound(to, true);
+
+      if (isNaN(pinelabParseIst(fromStr).getTime()) || isNaN(pinelabParseIst(toStr).getTime())) {
+        return res.status(400).json({
+          error: "from/to must be 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:mm:ss' (IST wall-time)",
+        });
+      }
+      if (pinelabParseIst(fromStr) > pinelabParseIst(toStr)) {
+        return res.status(400).json({ error: 'from must not be after to' });
+      }
+      window.from = fromStr;
+      window.to = toStr;
+    }
+
+    const result = await pinelabPoller.runOnce(window);
+    res.json({ ok: true, window: from && to ? window : 'watermark', ...result });
   } catch (e) {
     console.error('[admin/pinelabs/poll] error:', e);
     res.status(500).json({ error: e.message || 'poll failed' });
