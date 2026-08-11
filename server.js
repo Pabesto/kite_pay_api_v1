@@ -42,6 +42,7 @@ const reviewMode = require('./reviewMode'); // in-memory manual-review-mode regi
 const dashboardCounters = require('./dashboardCounters');
 const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
+const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
 
 const fs = require('fs');
 const path = require('path');
@@ -88,6 +89,9 @@ const APPWRITE_PARTNER_WEBHOOK_DELIVERIES_COLLECTION_ID = process.env.APPWRITE_P
 const APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID = process.env.APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID;
 const APPWRITE_CONFIG_COLLECTION_ID = process.env.APPWRITE_CONFIG_COLLECTION_ID;
 const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID;
+// Razorpay UAT notification captures (default matches setup-uat-webhook-schema.js).
+// Capture log only — never part of the money path.
+const APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID = process.env.APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID || 'uat_webhook_data';
 // PineLabs merchant credentials (default matches setup-pinelab-accounts-schema.js).
 // Secret-bearing collection — server API key only, never exposed to client SDKs.
 const APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID || 'pinelab_accounts';
@@ -909,6 +913,13 @@ app.use('/api/wallet', walletRoutes(databases, storage, users, ID, Query, APPWRI
 
 // Pinelabs QR routes
 app.use('/pinelabs', digiqrRoutes);
+
+// Razorpay UAT notification receiver (Notification API v4.0 — UPI §5.10, Bharat QR §5.11).
+// Capture + validate only: it is deliberately NOT given finalizeTransaction, any lock helper,
+// or any money-path collection id, so it cannot credit or corrupt anything. See uatWebhook.js.
+// rupeesToPaiseStrict is declared below (~line 913) but is a hoisted function declaration —
+// same as updateDailyQrTotal, which is passed to the mounts above from line 1782. Do not "fix".
+app.use('/uat', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');
