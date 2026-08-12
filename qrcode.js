@@ -257,6 +257,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 $id: doc.$id,
                 qrId: doc.qrId,
                 companyName: doc.companyName || null,
+                integrationName: doc.integrationName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
@@ -493,13 +494,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // This is an admin-only endpoint
     router.patch('/edit-qr/:qrId', authenticateAdmin, async (req, res) => {
         const { qrId } = req.params;
-        const { qrType, companyName, fileId, imageUrl } = req.body;
+        const { qrType, companyName, integrationName, fileId, imageUrl } = req.body;
 
-        console.log('Edit QR Entry request:', { qrId, qrType, companyName, fileId, imageUrl });
+        console.log('Edit QR Entry request:', { qrId, qrType, companyName, integrationName, fileId, imageUrl });
 
         // Validate at least one field is provided for update
-        if (!qrType && !companyName && !fileId && !imageUrl) {
-            return res.status(400).json({ message: "At least one field (qrType, companyName, fileId, or imageUrl) must be provided for update." });
+        if (!qrType && !companyName && !integrationName && !fileId && !imageUrl) {
+            return res.status(400).json({ message: "At least one field (qrType, companyName, integrationName, fileId, or imageUrl) must be provided for update." });
         }
 
         try {
@@ -522,6 +523,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const updatePayload = {};
             if (qrType !== undefined) updatePayload.qrType = qrType;
             if (companyName !== undefined) updatePayload.companyName = companyName;
+            // Free-text tag, same treatment as companyName. Admin-only via the route's
+            // authenticateAdmin middleware. Appwrite column: integrationName (text, optional).
+            if (integrationName !== undefined) updatePayload.integrationName = integrationName;
             if (fileId !== undefined) updatePayload.fileId = fileId;
             if (imageUrl !== undefined) updatePayload.imageUrl = imageUrl;
 
@@ -838,6 +842,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 $id: doc.$id,
                 qrId: doc.qrId,
                 companyName: doc.companyName || null,
+                integrationName: doc.integrationName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,
@@ -958,6 +963,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 $id: doc.$id,
                 qrId: doc.qrId,
                 companyName: doc.companyName || null,
+                integrationName: doc.integrationName || null,
                 fileId: doc.fileId,
                 imageUrl: doc.imageUrl,
                 assignedUserId: doc.assignedUserId || null,

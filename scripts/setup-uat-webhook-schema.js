@@ -36,7 +36,9 @@ for (const [name, val] of Object.entries({ APPWRITE_ENDPOINT: ENDPOINT, APPWRITE
 const COLUMNS = [
   { key: 'payload',           kind: 'string',  size: 1000000, required: false, note: 'full raw notification JSON — source of truth' },
   { key: 'txnId',             kind: 'string',  size: 64,  required: false, note: 'Razorpay unique txn id (§5.3) — dedup key' },
-  { key: 'qrCodeId',          kind: 'string',  size: 64,  required: false, note: 'tid, or username when tid is absent (UPI/BharatQR)' },
+  { key: 'qrCodeId',          kind: 'string',  size: 64,  required: false, note: 'derived id: tid, or username when tid is absent' },
+  { key: 'tid',               kind: 'string',  size: 32,  required: false, note: 'Terminal ID exactly as sent (Razorpay confirmed they send it)' },
+  { key: 'mid',               kind: 'string',  size: 32,  required: false, note: 'acquiring-bank Merchant ID (§5.3) — reconciliation key' },
   { key: 'rrnNumber',         kind: 'string',  size: 64,  required: false, note: 'rrNumber from the notification' },
   { key: 'paymentMode',       kind: 'string',  size: 16,  required: false, note: 'UPI | BHARATQR | CARD | …' },
   { key: 'providerStatus',    kind: 'string',  size: 24,  required: false, note: "Razorpay's status — NOT the money-status enum" },
@@ -58,6 +60,7 @@ const COLUMNS = [
 const INDEXES = [
   { key: 'idx_txnId',      type: 'key', columns: ['txnId'] },       // dedup lookup — key, never unique
   { key: 'idx_created_at', type: 'key', columns: ['created_at'] },  // list ordering
+  { key: 'idx_tid',        type: 'key', columns: ['tid'] },         // "show me everything for terminal X"
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

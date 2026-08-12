@@ -256,6 +256,60 @@ describe('POST /uat/razorpay-webhook — §5.11 Bharat QR sample', () => {
     });
 });
 
+describe('tid / mid — Razorpay confirmed both are sent for our account', () => {
+    const WITH_IDS = { ...UPI_SAMPLE, txnId: 'TIDMID_1', tid: '10000002', mid: '22100002' };
+
+    test('tid and mid are stored as their own columns, and tid drives qrCodeId', async () => {
+        const db = makeDb();
+        const res = await post(buildApp(db), WITH_IDS);
+
+        expect(res.status).toBe(200);
+        expect(res.body.parsed.tid).toBe('10000002');
+        expect(res.body.parsed.mid).toBe('22100002');
+        expect(res.body.parsed.qrCodeId).toBe('10000002');   // derived from tid, not username
+        expect(res.body.parsed.username).toBe('2222110001'); // username still recorded separately
+        expect(res.body.warnings).toEqual([]);               // nothing missing → clean capture
+
+        const data = db.createDocument.mock.calls[0][3];
+        expect(data.tid).toBe('10000002');
+        expect(data.mid).toBe('22100002');
+        expect(data.qrCodeId).toBe('10000002');
+    });
+
+    test('a missing mid is flagged now that Razorpay says it will be present', async () => {
+        const db = makeDb();
+        const { mid, ...noMid } = WITH_IDS;
+        const res = await post(buildApp(db), noMid);
+        expect(res.status).toBe(200);
+        expect(res.body.parsed.mid).toBeNull();
+        expect(res.body.warnings).toContain('no mid — Razorpay confirmed this should be present');
+    });
+
+    test('the username fallback still works if tid ever goes missing again', async () => {
+        const db = makeDb();
+        const res = await post(buildApp(db), { ...UPI_SAMPLE, txnId: 'NOTID_1', mid: '22100002' });
+        expect(res.status).toBe(200);
+        expect(res.body.parsed.tid).toBeNull();
+        expect(res.body.parsed.qrCodeId).toBe('2222110001');
+        expect(res.body.warnings).toContain('no tid — fell back to username');
+    });
+
+    test('the complete raw payload is stored verbatim, undocumented fields included', async () => {
+        // §5.3 warns that Razorpay may add/remove undocumented fields at any time. The raw
+        // payload is the source of truth precisely so a future field is never lost.
+        const db = makeDb();
+        const body = { ...WITH_IDS, someFieldRazorpayAddsLater: { nested: [1, 2, 3] } };
+        await post(buildApp(db), body);
+
+        const stored = JSON.parse(db.createDocument.mock.calls[0][3].payload);
+        expect(stored).toEqual(body);
+        expect(Object.keys(stored)).toHaveLength(Object.keys(body).length);
+        expect(stored.someFieldRazorpayAddsLater).toEqual({ nested: [1, 2, 3] });
+        expect(stored.setting).toEqual({});   // empty object preserved, not dropped
+        expect(stored.states).toEqual(['SETTLED']);
+    });
+});
+
 describe('POST /uat/razorpay-webhook — §4.4 retry/status handling', () => {
     test('non-AUTHORIZED statuses are recorded with a warning, never rejected', async () => {
         // §4.4: Razorpay also posts VOIDED / REFUNDED / PENDING. A 400 here would count

@@ -4,3 +4,7 @@ node_modules/
 # Live PineLabs gateway credentials, read by scripts/seed-pinelab-accounts.js.
 # Must never be committed — delete it once the accounts are seeded.
 pinelab-seed.json
+
+# Credential handover material for Razorpay's integration team — contains the live
+# UAT_WEBHOOK_TOKEN. Send it to Razorpay over a secure channel; never commit it.
+RAZORPAY_UAT_*.txt

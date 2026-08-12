@@ -49,6 +49,8 @@ const CAPS = {
     payload: 1000000,
     txnId: 64,
     qrCodeId: 64,
+    tid: 32,
+    mid: 32,
     rrnNumber: 64,
     paymentMode: 16,
     providerStatus: 24,
@@ -137,12 +139,19 @@ module.exports = (
         if (!txnId) warnings.push('no txnId/id — cannot dedup this notification');
         else if (!body.txnId) warnings.push('no txnId — fell back to the undocumented id field');
 
-        // `tid` is card-only per §5.3; UPI and Bharat QR identify the terminal by `username`.
-        let qrCodeId = body.tid || null;
+        // §5.3 marks `tid` card-only and the UPI/Bharat QR samples omit it, but Razorpay have
+        // since confirmed they will send `tid` and `mid` for our account. Both are kept as
+        // their own fields — `tid`/`mid` record what actually arrived, `qrCodeId` is the
+        // derived identifier the rest of the system would key on. The fallback stays so a
+        // notification that arrives without `tid` is still captured rather than dropped.
+        const tid = body.tid || null;
+        const mid = body.mid || null;
+        let qrCodeId = tid;
         if (!qrCodeId) {
             qrCodeId = body.username || null;
             warnings.push(qrCodeId ? 'no tid — fell back to username' : 'no tid and no username — QR unidentifiable');
         }
+        if (!mid) warnings.push('no mid — Razorpay confirmed this should be present');
 
         // §5.3: amount is Double(15,2) in RUPEES. Convert exactly once, string-based.
         let amountPaise = null;
@@ -188,6 +197,8 @@ module.exports = (
         return {
             txnId,
             qrCodeId,
+            tid,
+            mid,
             amountRupeesRaw: body.amount === undefined ? null : String(body.amount),
             amountPaise,
             providerStatus,
@@ -254,6 +265,8 @@ module.exports = (
                         payload: cap(JSON.stringify(body), CAPS.payload),
                         txnId: cap(parsed.txnId, CAPS.txnId),
                         qrCodeId: cap(parsed.qrCodeId, CAPS.qrCodeId),
+                        tid: cap(parsed.tid, CAPS.tid),
+                        mid: cap(parsed.mid, CAPS.mid),
                         rrnNumber: cap(parsed.rrnNumber, CAPS.rrnNumber),
                         paymentMode: cap(parsed.paymentMode, CAPS.paymentMode),
                         providerStatus: cap(parsed.providerStatus, CAPS.providerStatus),
@@ -312,6 +325,8 @@ module.exports = (
                 id: d.$id,
                 txnId: d.txnId,
                 qrCodeId: d.qrCodeId,
+                tid: d.tid,
+                mid: d.mid,
                 rrnNumber: d.rrnNumber,
                 paymentMode: d.paymentMode,
                 providerStatus: d.providerStatus,
