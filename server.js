@@ -914,12 +914,22 @@ app.use('/api/wallet', walletRoutes(databases, storage, users, ID, Query, APPWRI
 // Pinelabs QR routes
 app.use('/pinelabs', digiqrRoutes);
 
-// Razorpay UAT notification receiver (Notification API v4.0 — UPI §5.10, Bharat QR §5.11).
-// Capture + validate only: it is deliberately NOT given finalizeTransaction, any lock helper,
-// or any money-path collection id, so it cannot credit or corrupt anything. See uatWebhook.js.
-// rupeesToPaiseStrict is declared below (~line 913) but is a hoisted function declaration —
+// Razorpay notification receiver (Notification API v4.0 — UPI §5.10, Bharat QR §5.11).
+// CAPTURE + VALIDATE ONLY, on BOTH paths. Deliberately NOT given finalizeTransaction, any
+// lock helper, or any money-path collection id, so it cannot credit or corrupt anything.
+//
+// `/prod` is a naming convenience so Razorpay can register a production-looking URL now
+// (their setup TAT is slow). It does NOT credit money. The no-money guarantee is a property
+// of the dependencies injected below, NOT of the path — renaming or re-pointing a mount will
+// never make payments credit. Real crediting means routing into finalizeTransaction via the
+// 7-step ingest choreography in CLAUDE.md, as a separate change.
+// Until that lands, every notification is stored raw in uat_webhook_data and is replayable;
+// KitePay balances will NOT reflect Razorpay payments received in the meantime.
+//
+// rupeesToPaiseStrict is declared below (~line 930) but is a hoisted function declaration —
 // same as updateDailyQrTotal, which is passed to the mounts above from line 1782. Do not "fix".
-app.use('/uat', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
+app.use('/uat',  uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
+app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');

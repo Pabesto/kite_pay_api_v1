@@ -20,6 +20,10 @@
 //      ledgers, daily summaries, Redis counters, sockets, or partner webhooks.
 //   3. `finalizeTransaction` is not among its injected dependencies, so no code path here
 //      can credit money even by accident.
+//   4. This router is mounted at MORE THAN ONE PATH (`/uat` and `/prod` — see server.js).
+//      All of them are capture-only. The no-money guarantee comes from the dependencies the
+//      factory is given, NOT from the path, so `/prod` is not "the real one". Do not add
+//      crediting here for one path: real ingest belongs in the finalize pipeline.
 //
 // WHY IT RETURNS 200 FOR ALMOST EVERYTHING (deliberate divergence from the live webhooks)
 // The production webhooks in server.js return 400 on an unexpected payload. This one does not.
