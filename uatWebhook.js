@@ -231,7 +231,9 @@ module.exports = (
         uatLimiter,
         requireUatToken,
         async (req, res) => {
+            console.log('📩 Razorpay UAT webhook received from', req.ip, 'with headers', req.headers);
             const body = req.body;
+            console.log('📩 Razorpay UAT webhook body:', JSON.stringify(body));
             if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length === 0) {
                 return res.status(400).json({ error: 'Empty or unparseable body' });
             }
