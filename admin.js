@@ -5799,15 +5799,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     cron.schedule('*/5 * * * *', async () => {
         try {
             const jobQrIds = [];
-            let cursor = 0;
+            let cursor = '0'; // node-redis v5 SCAN takes/returns a STRING cursor — a number throws
             do {
                 const scan = await redisClient.scan(cursor, { MATCH: 'holdreset:txnjob:*', COUNT: 100 });
-                cursor = Number(scan.cursor);
+                cursor = String(scan.cursor);
                 for (const key of scan.keys) {
-                    if (key.includes(':lock:')) continue; // skip lock keys
+                    if (key.includes(':lock:') || key === TXN_JOB_INDEX_KEY) continue; // skip lock + index keys
                     jobQrIds.push(key.substring('holdreset:txnjob:'.length));
                 }
-            } while (cursor !== 0);
+            } while (cursor !== '0');
 
             for (const qid of jobQrIds) {
                 const state = await readTxnJob(qid);
