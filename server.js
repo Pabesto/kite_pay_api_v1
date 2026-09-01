@@ -43,6 +43,7 @@ const dashboardCounters = require('./dashboardCounters');
 const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
 const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
+const axisWorldlineUatRoutes = require('./axisWorldlineUat'); // Axis Worldline UAT capture endpoint — no money path
 
 const fs = require('fs');
 const path = require('path');
@@ -92,6 +93,9 @@ const APPWRITE_TEST_DAILY_QR_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_TEST
 // Razorpay UAT notification captures (default matches setup-uat-webhook-schema.js).
 // Capture log only — never part of the money path.
 const APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID = process.env.APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID || 'uat_webhook_data';
+// Axis Worldline UAT notification captures (default matches setup-axis-worldline-uat-schema.js).
+// webhook_data-shaped capture log only — never part of the money path.
+const APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID = process.env.APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID || 'axis_worldline_uat';
 // PineLabs merchant credentials (default matches setup-pinelab-accounts-schema.js).
 // Secret-bearing collection — server API key only, never exposed to client SDKs.
 const APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID || 'pinelab_accounts';
@@ -930,6 +934,10 @@ app.use('/pinelabs', digiqrRoutes);
 // same as updateDailyQrTotal, which is passed to the mounts above from line 1782. Do not "fix".
 app.use('/uat',  uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
+// Axis Worldline UAT capture — same no-money contract as the Razorpay UAT router above.
+// Mounted at /prod per the URL handed to Worldline; still capture-only (the no-money
+// guarantee comes from the injected deps, not the path — see axisWorldlineUat.js header).
+app.use('/prod', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');
