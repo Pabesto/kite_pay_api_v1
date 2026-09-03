@@ -44,7 +44,7 @@ const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
 const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
 const axisWorldlineUatRoutes = require('./axisWorldlineUat'); // Axis Worldline UAT capture endpoint — no money path
-const phonepeCaptureRoutes = require('./phonepeCapture'); // PhonePe rows from the browser extension — LIVE money path (full ingest choreography)
+const extensionCaptureRoutes = require('./extensionCapture'); // PhonePe/BharatPe rows from the browser extensions — LIVE money path (full ingest choreography)
 
 const fs = require('fs');
 const path = require('path');
@@ -939,9 +939,12 @@ app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, AP
 // Mounted at /prod per the URL handed to Worldline; still capture-only (the no-money
 // guarantee comes from the injected deps, not the path — see axisWorldlineUat.js header).
 app.use('/prod', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
-// PhonePe extension ingest — X-API-Key checked against PHONEPE_EXTENSION_API_KEY. Credits money:
-// runs the same lock → dedup → review gate → finalizeTransaction sequence as the webhooks above.
-app.use('/', phonepeCaptureRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview));
+// Browser-extension ingest (/phonepe-capture, /bharatpe-capture) — X-API-Key checked against
+// <PROVIDER>_EXTENSION_API_KEY. Credits money: runs the same lock → dedup → review gate →
+// finalizeTransaction sequence as the webhooks above.
+for (const provider of ['phonepe', 'bharatpe']) {
+  app.use('/', extensionCaptureRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview, provider));
+}
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');

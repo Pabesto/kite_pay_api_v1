@@ -1,5 +1,5 @@
 /**
- * phonepeCapture.test.js — POST /phonepe-capture (browser-extension ingest, LIVE money path)
+ * extensionCapture.test.js — POST /<provider>-capture (browser-extension ingest, LIVE money path)
  * Pins: static-key auth, exactly-once per paymentId, lock acquire/release incl. error path,
  * held-for-review never finalizes, non-SUCCESS rows skipped, per-row result reporting.
  */
@@ -16,7 +16,7 @@ function rupeesToPaiseStrict(rupees) {
     return parseInt(intPart, 10) * 100 + parseInt(frac, 10);
 }
 
-function build({ db = {}, manual = false, lockOk = true } = {}) {
+function build({ db = {}, manual = false, lockOk = true, provider } = {}) {
     const databases = {
         listDocuments: jest.fn().mockResolvedValue({ documents: [], total: 0 }),
         createDocument: jest.fn().mockImplementation((_d, _c, _id, data) => Promise.resolve({ $id: 'doc1', ...data })),
@@ -36,9 +36,9 @@ function build({ db = {}, manual = false, lockOk = true } = {}) {
     };
     let app;
     jest.isolateModules(() => {
-        const factory = require('../phonepeCapture.js');
+        const factory = require('../extensionCapture.js');
         const router = factory(databases, { unique: () => 'newId' }, Query, 'db1', WEBHOOK_COL, rupeesToPaiseStrict,
-            deps.acquireLock, deps.releaseLock, deps.resolveReviewOwners, deps.reviewMode, deps.ConfigManager, deps.finalizeTransaction, deps.emitPendingReview);
+            deps.acquireLock, deps.releaseLock, deps.resolveReviewOwners, deps.reviewMode, deps.ConfigManager, deps.finalizeTransaction, deps.emitPendingReview, provider);
         app = express();
         app.use(express.json());
         app.use('/', router);
@@ -143,5 +143,27 @@ describe('ingest', () => {
         const { app } = build();
         expect((await post(app, { transactions: [] })).status).toBe(400);
         expect((await post(app, { transactions: Array(101).fill(ROW) })).status).toBe(400);
+    });
+});
+
+describe('bharatpe (same factory, provider arg)', () => {
+    const BKEY = 'bharat-key';
+    beforeEach(() => { process.env.BHARATPE_EXTENSION_API_KEY = BKEY; });
+
+    test('own path, own env key, stamps provider bharatpe; phonepe key is rejected', async () => {
+        const { app, deps } = build({ provider: 'bharatpe' });
+        expect((await request(app).get('/bharatpe-capture/ping').set('X-API-Key', BKEY)).body).toEqual({ ok: true });
+        expect((await request(app).get('/bharatpe-capture/ping').set('X-API-Key', KEY)).status).toBe(401);
+        expect((await request(app).get('/phonepe-capture/ping').set('X-API-Key', BKEY)).status).toBe(404);
+        const res = await request(app).post('/bharatpe-capture').set('X-API-Key', BKEY).send({ transactions: [ROW] });
+        expect(res.body.results).toEqual([{ paymentId: 'T250903001', result: 'saved' }]);
+        expect(deps.databases.createDocument.mock.calls[0][3].provider).toBe('bharatpe');
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    test('503 when BHARATPE_EXTENSION_API_KEY unset even if the phonepe key is set', async () => {
+        delete process.env.BHARATPE_EXTENSION_API_KEY;
+        const { app } = build({ provider: 'bharatpe' });
+        expect((await request(app).get('/bharatpe-capture/ping').set('X-API-Key', KEY)).status).toBe(503);
     });
 });

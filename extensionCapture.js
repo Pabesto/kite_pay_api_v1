@@ -1,19 +1,20 @@
-// phonepeCapture.js — ingest for PhonePe transactions scraped by our browser extension.
+// extensionCapture.js — ingest for transactions scraped by our browser extensions.
+// One factory, mounted once per provider (`phonepe`, `bharatpe`, …) — the last positional arg.
 //
-// PhonePe gives us a dashboard only (no webhook), so the extension reads the dashboard and
+// These providers give us a dashboard only (no webhook), so the extension reads the dashboard and
 // POSTs rows here. This IS a money path: every row runs the full 7-step ingest choreography
 // from CLAUDE.md (validate → lock:qr → dedup under lock → review gate → create → finalize).
 //
-// AUTH: static key in `X-API-Key`, compared constant-time against PHONEPE_EXTENSION_API_KEY.
-// Fails closed (503) when the env var is unset. Rotate by changing the env var and the
-// extension setting together.
+// AUTH: static key in `X-API-Key`, compared constant-time against <PROVIDER>_EXTENSION_API_KEY
+// (PHONEPE_EXTENSION_API_KEY, BHARATPE_EXTENSION_API_KEY). Fails closed (503) when the env var
+// is unset. Rotate by changing the env var and the extension setting together.
 //
-// REQUEST  POST /phonepe-capture   { transactions: [ { paymentId, utr, amount, payerVpa, qrRef, txnTime, status, raw } ] }
+// REQUEST  POST /<provider>-capture   { transactions: [ { paymentId, utr, amount, payerVpa, qrRef, txnTime, status, raw } ] }
 //   amount   rupee string exactly as displayed ("1250.00") — converted here, exactly once
 //   qrRef    our qrId (the extension maps store/terminal → qrId; server does not guess)
 //   txnTime  ISO-8601 with offset ("2026-09-03T15:30:12+05:30") or epoch ms
 //   status   only "SUCCESS" is ingested; other rows are reported as `skipped`
-// GET /phonepe-capture/ping  → 200 { ok:true } with a valid key (401/503 otherwise). Extension "test key" button.
+// GET /<provider>-capture/ping  → 200 { ok:true } with a valid key (401/503 otherwise). Extension "test key" button.
 // RESPONSE 200 { results: [ { paymentId, result: saved|held|duplicate|skipped|busy|invalid|error, error? } ] }
 //   Per-row outcome instead of HTTP codes because one batch mixes outcomes. `busy` rows must be
 //   re-sent by the extension on its next scrape; `duplicate`/`saved`/`held` are terminal.
@@ -65,17 +66,20 @@ module.exports = (
     reviewMode,
     ConfigManager,
     finalizeTransaction,
-    emitPendingReview
+    emitPendingReview,
+    provider = 'phonepe'
 ) => {
     const router = express.Router();
+    const ENV_KEY = `${provider.toUpperCase()}_EXTENSION_API_KEY`;
+    const BASE = `/${provider}-capture`;
 
-    if (!process.env.PHONEPE_EXTENSION_API_KEY) {
-        console.warn('⚠️  PHONEPE_EXTENSION_API_KEY is not set — POST /phonepe-capture will refuse every request (503).');
+    if (!process.env[ENV_KEY]) {
+        console.warn(`⚠️  ${ENV_KEY} is not set — POST ${BASE} will refuse every request (503).`);
     }
 
     function requireExtensionKey(req, res, next) {
-        const expected = process.env.PHONEPE_EXTENSION_API_KEY;
-        if (!expected) return res.status(503).json({ error: 'PhonePe capture not configured' });
+        const expected = process.env[ENV_KEY];
+        if (!expected) return res.status(503).json({ error: `${provider} capture not configured` });
         if (!secretEquals(req.headers['x-api-key'], expected)) return res.status(401).json({ error: 'Unauthorized' });
         next();
     }
@@ -104,7 +108,7 @@ module.exports = (
                     rrnNumber: n.rrnNumber,
                     amount: n.amountPaise,
                     vpa: n.vpa,
-                    provider: 'phonepe',
+                    provider,
                     created_at: n.isoDate,
                     status: 'normal',
                     ownerSubadminId,
@@ -115,7 +119,7 @@ module.exports = (
             if (manual) {
                 emitPendingReview({
                     $id: created.$id, qrCodeId: n.qrCodeId, paymentId: n.paymentId, amount: n.amountPaise,
-                    provider: 'phonepe', vpa: n.vpa, rrnNumber: n.rrnNumber, created_at: n.isoDate,
+                    provider, vpa: n.vpa, rrnNumber: n.rrnNumber, created_at: n.isoDate,
                     reviewExpiresAt: reviewFields.reviewExpiresAt, ownerSubadminId,
                 });
                 return 'held';
@@ -127,9 +131,9 @@ module.exports = (
         }
     }
 
-    router.get('/phonepe-capture/ping', requireExtensionKey, (_req, res) => res.status(200).json({ ok: true }));
+    router.get(`${BASE}/ping`, requireExtensionKey, (_req, res) => res.status(200).json({ ok: true }));
 
-    router.post('/phonepe-capture', requireExtensionKey, async (req, res) => {
+    router.post(BASE, requireExtensionKey, async (req, res) => {
         const rows = req.body?.transactions;
         if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'transactions must be a non-empty array' });
         if (rows.length > MAX_BATCH) return res.status(400).json({ error: `transactions must have at most ${MAX_BATCH} items` });
@@ -143,7 +147,7 @@ module.exports = (
             try {
                 results.push({ paymentId, result: await ingest(n, row) });
             } catch (e) {
-                console.error('[phonepe-capture] ingest error', paymentId, e?.message || e);
+                console.error(`[${BASE.slice(1)}] ingest error`, paymentId, e?.message || e);
                 results.push({ paymentId, result: 'error', error: 'Failed to record transaction' });
             }
         }
