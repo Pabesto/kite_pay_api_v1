@@ -11,7 +11,8 @@
 //
 // REQUEST  POST /<provider>-capture   { transactions: [ { paymentId, utr, amount, payerVpa, qrRef, txnTime, status, raw } ] }
 //   amount   rupee string exactly as displayed ("1250.00") — converted here, exactly once
-//   qrRef    our qrId (the extension maps store/terminal → qrId; server does not guess)
+//   qrRef    our qrId (the extension maps store/terminal → qrId; server does not guess). Lowercased
+//            here, so QRs used by extensions MUST be registered with a lowercase qrId.
 //   txnTime  ISO-8601 with offset ("2026-09-03T15:30:12+05:30") or epoch ms
 //   status   only "SUCCESS" is ingested; other rows are reported as `skipped`
 // GET /<provider>-capture/ping  → 200 { ok:true } with a valid key (401/503 otherwise). Extension "test key" button.
@@ -37,7 +38,7 @@ function secretEquals(a, b) {
 function normalize(row, rupeesToPaiseStrict) {
     if (!row || typeof row !== 'object') return { ok: false, error: 'row must be an object' };
     const paymentId = String(row.paymentId || '').trim();
-    const qrCodeId = String(row.qrRef || '').trim();
+    const qrCodeId = String(row.qrRef || '').trim().toLowerCase(); // qrIds for extension QRs are registered lowercase
     if (!paymentId) return { ok: false, error: 'paymentId required' };
     if (!qrCodeId) return { ok: false, error: 'qrRef required' };
     if (String(row.status || '').toUpperCase() !== 'SUCCESS') return { ok: false, skipped: true, error: `status ${row.status || 'missing'}` };

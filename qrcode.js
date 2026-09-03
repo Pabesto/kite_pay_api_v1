@@ -381,7 +381,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // POST a new QR code entry
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
-        const { qrId, qrType, companyName, fileId, imageUrl , createdAt } = req.body;
+        const { qrType, companyName, fileId, imageUrl , createdAt } = req.body;
+        // qrIds are stored lowercase so every later compare (ingest, extension qrRef) is case-insensitive by construction.
+        const qrId = String(req.body.qrId || '').trim().toLowerCase();
 
         // console.log('Create QR Entry request body:', req.body);
 

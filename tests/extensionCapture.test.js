@@ -85,11 +85,11 @@ describe('ingest', () => {
         expect(res.status).toBe(200);
         expect(res.body.results).toEqual([{ paymentId: 'T250903001', result: 'saved' }]);
         const data = deps.databases.createDocument.mock.calls[0][3];
-        expect(data).toMatchObject({ qrCodeId: 'QR-01', paymentId: 'T250903001', rrnNumber: '525012345678', amount: 125050, vpa: 'ramesh@ybl', provider: 'phonepe', status: 'normal', ownerSubadminId: 'sub1', created_at: '2026-09-03T10:00:12.000Z' });
+        expect(data).toMatchObject({ qrCodeId: 'qr-01', paymentId: 'T250903001', rrnNumber: '525012345678', amount: 125050, vpa: 'ramesh@ybl', provider: 'phonepe', status: 'normal', ownerSubadminId: 'sub1', created_at: '2026-09-03T10:00:12.000Z' });
         expect(JSON.parse(data.payload)).toEqual(ROW);
-        expect(deps.acquireLock).toHaveBeenCalledWith('lock:qr:QR-01', 'T250903001', 15);
+        expect(deps.acquireLock).toHaveBeenCalledWith('lock:qr:qr-01', 'T250903001', 15);
         expect(deps.finalizeTransaction).toHaveBeenCalledTimes(1);
-        expect(deps.releaseLock).toHaveBeenCalledWith('lock:qr:QR-01', 'T250903001');
+        expect(deps.releaseLock).toHaveBeenCalledWith('lock:qr:qr-01', 'T250903001');
     });
 
     test('duplicate paymentId → duplicate, no create, no finalize', async () => {
