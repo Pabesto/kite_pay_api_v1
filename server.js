@@ -99,10 +99,10 @@ const APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID = process.env.APPWRITE_UAT_WEBHOOK
 // Axis Worldline UAT notification captures (default matches setup-axis-worldline-uat-schema.js).
 // webhook_data-shaped capture log only — never part of the money path.
 const APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID = process.env.APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID || 'axis_worldline_uat';
-// Browser-extension health channel (defaults match setup-extension-alerts-schema.js).
-// Device health only — never part of the money path.
+// Browser-extension alert log (default matches setup-extension-alerts-schema.js). Device health
+// only — never part of the money path. Live device state is Redis-only (`extdev:` / `exthist:`),
+// so there is no devices collection to configure.
 const APPWRITE_EXTENSION_ALERTS_COLLECTION_ID = process.env.APPWRITE_EXTENSION_ALERTS_COLLECTION_ID || 'extension_alerts';
-const APPWRITE_EXTENSION_DEVICES_COLLECTION_ID = process.env.APPWRITE_EXTENSION_DEVICES_COLLECTION_ID || 'extension_devices';
 // PineLabs merchant credentials (default matches setup-pinelab-accounts-schema.js).
 // Secret-bearing collection — server API key only, never exposed to client SDKs.
 const APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID || 'pinelab_accounts';
@@ -968,8 +968,9 @@ for (const provider of ['phonepe', 'bharatpe']) {
 }
 // Extension health channel (/phonepe-capture/alert, /bharatpe-capture/alert + the admin panel
 // reads). Same X-API-Key as the capture routes above; deliberately given no finalizeTransaction
-// and no money-path collection id, so it can only write its own two collections.
-app.use('/', extensionAlertsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_EXTENSION_ALERTS_COLLECTION_ID, APPWRITE_EXTENSION_DEVICES_COLLECTION_ID, acquireLock, releaseLock, authenticateAdmin));
+// and no money-path collection id, so it can only write its own alert log and its Redis keys.
+// Heartbeats never reach Appwrite — live device state lives in Redis and rebuilds itself.
+app.use('/', extensionAlertsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_EXTENSION_ALERTS_COLLECTION_ID, redisClient, withRedisTimeout, acquireLock, releaseLock, authenticateAdmin));
 
 function rupeesToPaiseStrict(rupees) {
   const [intPart = '0', fracPart = ''] = String(rupees).trim().split('.');

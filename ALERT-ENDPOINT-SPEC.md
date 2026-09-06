@@ -115,31 +115,84 @@ silently loses alerts. Keep it a thin insert + enqueue.
 
 ## 4. What this backend does with them
 
-Appwrite, not SQL — two collections created by `node scripts/setup-extension-alerts-schema.js --write`.
+State is split on purpose: **durable evidence in Appwrite, live device state in Redis.**
 
-### 4.1 `extension_alerts` — append-only log
+| | Store | Why |
+|---|---|---|
+| Alert rows (`event: "alert"`) | Appwrite `extension_alerts`, capped per device — **or Redis, see 4.1.1** | Evidence. `catchup_unverified` / `row_rejected` mean payments may be missing or uncredited, and the extension never retries — this is the only copy |
+| Heartbeats | Redis only | ~1440/device/day, 99% of traffic, zero value once the device row absorbs them |
+| Live device state | Redis `extdev:<provider>:<instanceId>` | Pure current-state, self-healing: lose it and the next heartbeat rebuilds it in ≤1 min |
+| Ping timeline | Redis list `exthist:<provider>:<instanceId>`, last N | Shows *when* a laptop was reporting; gaps are outages |
 
-Every request (alert *and* heartbeat) is stored: `provider` (from the route, never the body),
-`alertId`, `event`, `type`, `severity` (derived, section 2), `instanceId`, `deviceLabel`,
-`expectedMerchantId`, `loggedInMerchantId`, `merchantOk`, `state`, `message`, `detailJson`,
-`statsJson`, `deviceAt` (UTC ISO from `body.at`), `created_at` (UTC ISO, when we received it).
+Both caps are env-tunable and apply identically to either backend:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `EXTENSION_ALERT_LOG_PER_DEVICE` | 50 | alert rows kept per laptop per extension — raise to 100/200/500 for a longer incident history |
+| `EXTENSION_DEVICE_HISTORY` | 80 | ping-ring entries per laptop per extension; at 1 heartbeat/min ≈ that many minutes of timeline |
+
+Both are clamped to ≥ 1 and fall back to the default on garbage — a negative would make `LTRIM`
+cut from the wrong end of the list. The live values are echoed to clients as `keptPerDevice` and
+`historyKept`, so raising them needs no frontend change.
+
+Create the one collection with `node scripts/setup-extension-alerts-schema.js --write`.
+
+### 4.1 `extension_alerts` — the durable log
+
+Stores `provider` (from the route, never the body), `alertId`, `event`, `type`, `severity`
+(derived, section 2), `instanceId`, `deviceLabel`, `expectedMerchantId`, `loggedInMerchantId`,
+`merchantOk`, `state`, `message`, `detailJson`, `statsJson`, `deviceAt` (UTC ISO from `body.at`),
+`created_at` (UTC ISO, when we received it).
 
 - `idx_alertId` is **unique** → a re-delivery hits a 409, which the route answers
-  `200 {"ok":true,"duplicate":true}` and skips the device upsert. Idempotent by construction.
-- `detail` / `stats` are stored as JSON strings, capped (16 KB / 8 KB). Over-cap payloads are
-  replaced by `{"_truncated":true,"size":N}` — never a half-parsed object.
-- Timestamps are UTC ISO strings, per the repo-wide rule. `deviceAt` is the laptop clock and can
-  drift; `created_at` is authoritative for ordering.
+  `200 {"ok":true,"duplicate":true}` and applies nothing further. Idempotent by construction.
+- **Capped per laptop per extension.** After each insert the route deletes rows past
+  `EXTENSION_ALERT_LOG_PER_DEVICE` (default 50) for that `(provider, instanceId)`, ordered by
+  `created_at` desc. One trim per insert in the steady state, bounded at 25 deletes per call, and
+  a trim failure never fails the alert. `idx_device_time` backs it. Raising the cap mid-life is
+  safe and takes effect immediately; *lowering* it trims the excess gradually, one alert at a time
+  per device, since the trim only runs on insert.
+- **Heartbeats are never written here.** Every row is a real alert.
+- `detail` / `stats` are JSON strings, capped (16 KB / 8 KB). Over-cap payloads become
+  `{"_truncated":true,"size":N}` — never a half-parsed object.
 
-### 4.2 `extension_devices` — one row per (provider, instanceId)
+#### 4.1.1 `EXTENSION_ALERT_STORE` — moving the log off Appwrite entirely
 
-Upserted on every request under `lock:extdevice:<provider>:<instanceId>` (10 s) so two alerts
-arriving together cannot create two rows for one laptop. If the lock is busy the row is simply
-left for the next alert — the log row is already durable, and alerts repeat.
+`EXTENSION_ALERT_STORE=redis` makes the alert log Redis-native: **nothing is written to Appwrite at
+all**, and the collection (and the schema script) become unnecessary. `appwrite` is the default,
+and any unrecognised value falls back to it, so the durable mode is the one you get by accident.
 
-Fields: `deviceLabel` / `expectedMerchantId` / `merchantOk` (sticky — kept when a later alert
+| | `appwrite` (default) | `redis` |
+|---|---|---|
+| Storage | `extension_alerts` collection | `extlog:<provider>:<instanceId>` list |
+| Per-device cap | `EXTENSION_ALERT_LOG_PER_DEVICE`, by a trim query + deletes after each insert | same value, by `LTRIM` — free, no query, no deletes |
+| Idempotency | unique index on `alertId` → 409 | `SET extseen:<alertId> NX EX 7d` |
+| Pagination | Appwrite document cursor | numeric offset (still an opaque cursor string to clients) |
+| Survives a Redis wipe | **yes** | no — the whole log goes |
+| Appwrite writes per alert | 1 create + 1 list + 0–1 deletes | **zero** |
+| TTL | none (cap only) | 7 days idle, refreshed per alert |
+
+Both modes return the identical response shape from `GET /api/admin/extension-alerts`, plus a
+`store` field naming the active backend. The one visible difference: in `redis` mode a row's `id`
+is its `alertId` (there is no Appwrite document id).
+
+What you give up in `redis` mode is narrower than it first looks — the log is a rolling
+`EXTENSION_ALERT_LOG_PER_DEVICE` rows per device in both modes, so it was never a full audit
+history. What you actually lose is that
+`row_rejected` and `catchup_unverified` rows stop surviving a Redis restart. If Redis on this
+deployment is not persistent, treat those two alert types as ephemeral and act on them the day
+they arrive.
+
+### 4.2 Redis device state — `extdev:<provider>:<instanceId>`
+
+One JSON value per laptop, rewritten on every request under `lock:extdevice:<provider>:<instanceId>`
+(10 s) because the incident fields carry forward. TTL `EXTENSION_DEVICE_TTL_SECONDS` (default
+7 days) refreshed on every write, so a laptop in daily use never expires and a retired one drops
+out of the fleet by itself.
+
+Fields: `deviceLabel` / `expectedMerchantId` / `merchantOk` (sticky — kept when a later report
 omits them), `lastState`, `lastType`, `lastMessage`, `lastSeenAt` (**any** request),
-`lastHeartbeatAt`, `lastIncidentAt`, `lastAlertId`, `openIncident`, `openSince`, `statsJson`.
+`lastHeartbeatAt`, `lastIncidentAt`, `lastAlertId`, `openIncident`, `openSince`, `stats`.
 
 Incident rules, exactly as implemented:
 
@@ -149,36 +202,59 @@ Incident rules, exactly as implemented:
 - **Exception:** an open `wrong_merchant` clears *only* on `recovered` with
   `detail.what === "merchant"` — a `live` heartbeat from the wrong account must not clear it.
 
-### 4.3 Offline detection — derived on read, not a watchdog job
+If the lock is busy the state write is skipped entirely — the next report (≤1 min) refreshes it.
 
-If the laptop sleeps or Chrome closes, no alert ever arrives. Rather than a cron job, the devices
-endpoint computes it: a device is `offline` when `now - lastSeenAt >= EXTENSION_ALERT_OFFLINE_MS`
-(default 180000 ms, about 3x a 1-minute heartbeat). `lastSeenAt` counts any request, so a device
-stuck in a `stale` repeat loop is still *online*, just unhealthy.
+### 4.3 Redis ping ring — `exthist:<provider>:<instanceId>`
+
+`LPUSH` + `LTRIM 0 79` + `EXPIRE`, one round trip, **outside** the device lock so a busy lock never
+costs a ping. Holds the last `EXTENSION_DEVICE_HISTORY` (default 80) reports — heartbeats *and*
+alerts, each tagged with `event` — newest first:
+
+```json
+{ "at":"2026-09-07T09:14:02.113Z", "deviceAt":"2026-09-07T09:14:01.980Z",
+  "event":"heartbeat", "type":"heartbeat", "state":"live", "severity":"info" }
+```
+
+At one heartbeat a minute the entry count is roughly the minutes of timeline you keep (80 ≈ 80 min,
+1440 ≈ a day). Read it from the device detail endpoint, which echoes the live value as
+`historyKept`.
+
+### 4.4 Offline detection — derived on read, not a watchdog job
+
+A device is `offline` when `now - lastSeenAt >= EXTENSION_ALERT_OFFLINE_MS` (default 180000 ms,
+about 3x a 1-minute heartbeat). `lastSeenAt` counts any request, so a device stuck in a `stale`
+repeat loop is still *online*, just unhealthy.
 
 **Set `heartbeatMinutes = 1` in every extension** — the default 3-minute threshold assumes it.
 
-### 4.4 Deliberately NOT implemented
+### 4.5 When Redis is down
+
+The alert channel keeps working: rows still land in Appwrite and the POST still answers 200. Only
+the fleet view degrades — `GET /devices` returns `200 {"devices":[],"degraded":true,...}` rather
+than a false "everything offline" screen, and every device reappears within one heartbeat of Redis
+coming back. This is the deliberate trade for keeping heartbeats out of the database.
+
+### 4.6 Deliberately NOT implemented
 
 - **No push notifications** (WhatsApp / Telegram / Slack) and no de-dup throttle for them: this
   repo has no ops notification channel. The panel polls `/devices` and shows the fleet.
   Add a notifier only when someone must be woken without the panel open.
-- **No retention job.** `extension_alerts` grows forever (one heartbeat row per device per minute
-  is about 43k rows/device/month). Add a sweeper before the fleet grows.
 - **No money cross-checks.** `catchup_unverified` and `row_rejected` are recorded and surfaced;
   reconciling them against settlement reports is a human job today.
 - **No rejection of rows from the wrong merchant.** With `wrongMerchantMode = "continue"` the
   extension keeps pushing the other merchant's transactions and the capture route still accepts
   them. Guarding that is a change to the capture route, not to alerts — ask first.
+- **No retention job needed.** The Appwrite cap and the Redis TTLs bound everything already.
 
-### 4.5 Reading it back
+### 4.7 Reading it back
 
-Both admin-only (`authenticateAdmin`), both projected through explicit pick functions:
+All admin-only (`authenticateAdmin`), all projected through explicit pick functions:
 
-- `GET /api/admin/extension-alerts/devices` — the fleet, worst-first, with derived `online` /
-  `status` / `severity`.
-- `GET /api/admin/extension-alerts` — the log, cursor-paginated, filterable by `provider`,
-  `instanceId`, `type`, `event`, `severity`.
+- `GET /api/admin/extension-alerts/devices` — the fleet from Redis, worst-first, with derived
+  `online` / `status` / `severity` and a `degraded` flag.
+- `GET /api/admin/extension-alerts/devices/:provider/:instanceId` — one device plus its ping ring.
+- `GET /api/admin/extension-alerts` — the durable log, cursor-paginated, filterable by `provider`,
+  `instanceId`, `type`, `severity`.
 
 Full request/response shapes for panel builders: **`EXTENSION_ALERTS_FRONTEND.md`**.
 
@@ -223,20 +299,27 @@ curl -s -X POST https://<host>/phonepe-capture/alert \
 
 - [x] Route per provider: `/phonepe-capture/alert`, `/bharatpe-capture/alert`; same key as the push route
 - [x] `X-API-Key` → 401 / 503; minimal schema (`event`, `alertId`, `instanceId`, `type`, `at`) → 400 with the raw body logged
-- [x] Insert into `extension_alerts` (unique `alertId` → 200 duplicate); upsert `extension_devices` under a per-device lock
-- [x] `200 {"ok":true}` even when the device upsert fails — the log row is already durable
+- [x] Alerts → Appwrite (unique `alertId` → 200 duplicate), capped per laptop per extension (`EXTENSION_ALERT_LOG_PER_DEVICE`, default 50)
+- [x] Heartbeats → Redis device state + ping ring only; never written to Appwrite
+- [x] `200 {"ok":true}` even when Redis is down or the trim fails — the alert row is what matters
 - [x] Incident open/close rules (4.2), including the `wrong_merchant` exception
-- [x] Offline devices derived on read (4.3) — no cron
-- [x] Admin reads for the panel (4.5) + `EXTENSION_ALERTS_FRONTEND.md`
+- [x] Ping ring of the last `EXTENSION_DEVICE_HISTORY` (default 80) reports per device (4.3)
+- [x] Offline derived on read (4.4) — no cron; `degraded` instead of a false all-offline screen (4.5)
+- [x] Admin reads for the panel (4.7) + `EXTENSION_ALERTS_FRONTEND.md`
 - [x] Tests: `tests/extensionAlerts.test.js`
-- [ ] Ops push notifications with throttling (4.4) — not built
-- [ ] Retention sweeper for `extension_alerts` (4.4) — not built
+- [ ] Ops push notifications with throttling (4.6) — not built
 - [ ] Extension side: Alert URL + `heartbeatMinutes = 1` + a distinct `deviceLabel` per profile
 
 ### Deploy order
 
 1. `node scripts/setup-extension-alerts-schema.js` (dry run), then `--write`.
-2. Set `APPWRITE_EXTENSION_ALERTS_COLLECTION_ID` / `APPWRITE_EXTENSION_DEVICES_COLLECTION_ID`
-   (and optionally `EXTENSION_ALERT_OFFLINE_MS`) in `.env` and on Render. Defaults match the script.
+   Skip this entirely if you are running `EXTENSION_ALERT_STORE=redis` — no collection is used.
+2. Set `APPWRITE_EXTENSION_ALERTS_COLLECTION_ID` in `.env` and on Render. Optional tuning:
+   `EXTENSION_ALERT_STORE` (`appwrite`),
+   `EXTENSION_ALERT_LOG_PER_DEVICE` (50), `EXTENSION_DEVICE_HISTORY` (80),
+   `EXTENSION_ALERT_OFFLINE_MS` (180000), `EXTENSION_DEVICE_TTL_SECONDS` (604800).
 3. Deploy, then smoke-test with the curl in section 5.
 4. Point each extension at its Alert URL with the same key it already uses for pushes.
+
+Upgrading from the first cut of this feature: an `extension_devices` collection may exist from the
+earlier schema script. Nothing reads or writes it any more — drop it whenever convenient.
