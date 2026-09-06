@@ -13,6 +13,7 @@ const qrOwnerCache = require('./qrOwnerCache');
 const path = require('path');
 const moment = require('moment-timezone');
 
+const ConfigManager = require('./configManager'); // for the `integrations` allow-list
 const { updateDashboardCounter } = require('./dashboardCounters');
 const { type } = require('os');
 const { compare } = require('bcrypt');
@@ -22,6 +23,10 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+// Mirrors the Appwrite enum on the qr_codes `type` attribute. Keep in sync with the
+// collection — an unlisted value makes createDocument throw "invalid format".
+const QR_TYPES = ['paytm', 'pinelabs', 'cashfree', 'razorpay', 'other'];
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, roleAuth, requireRole) => {
@@ -328,6 +333,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         qrId,
         qrType,
         companyName,
+        integrationName = null,
         fileId,
         imageUrl,
         createdByUserId,
@@ -339,6 +345,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 qrId,
                 qrType,
                 companyName,
+                integrationName,
             });
 
         // After successful creation:
@@ -366,8 +373,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             ID.unique(),
             {
             qrId,
-            type: qrType,
+            // enum attribute — omit rather than write null/'' when the caller sent no type
+            ...(qrType ? { type: qrType } : {}),
             companyName,
+            ...(integrationName ? { integrationName } : {}),
             fileId,
             imageUrl,
             assignedUserId,
@@ -381,14 +390,33 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // POST a new QR code entry
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
-        const { qrType, companyName, fileId, imageUrl , createdAt } = req.body;
+        const { companyName, fileId, imageUrl , createdAt } = req.body;
+        // integrationName is free text in Appwrite, but must be one of the admin-managed
+        // `integrations` config values. Empty config = no list configured = skip the check.
+        const integrations = ConfigManager.get('integrations', []);
+        const rawIntegration = req.body.integrationName == null ? null : String(req.body.integrationName).trim();
+        // store the config's canonical casing so listings don't drift ("Paytm" vs "paytm")
+        const integrationName = rawIntegration
+            ? (integrations.find(i => i.toLowerCase() === rawIntegration.toLowerCase()) || rawIntegration)
+            : null;
         // qrIds are stored lowercase so every later compare (ingest, extension qrRef) is case-insensitive by construction.
         const qrId = String(req.body.qrId || '').trim().toLowerCase();
+        // `type` is an Appwrite enum: normalise casing, then reject anything unlisted with a 400
+        // instead of letting createDocument fail with a 500. Omitted stays omitted (legacy behaviour).
+        const qrType = req.body.qrType == null ? null : String(req.body.qrType).trim().toLowerCase();
 
         // console.log('Create QR Entry request body:', req.body);
 
         if (!qrId || !fileId || !imageUrl) {
             return res.status(400).json({ message: "Missing required fields: qrId, fileId, or imageUrl." });
+        }
+
+        if (qrType !== null && !QR_TYPES.includes(qrType)) {
+            return res.status(400).json({ message: `Invalid qrType ${JSON.stringify(req.body.qrType)}. Must be one of: ${QR_TYPES.join(', ')}.` });
+        }
+
+        if (integrationName && integrations.length && !integrations.includes(integrationName)) {
+            return res.status(400).json({ message: `Invalid integrationName ${JSON.stringify(req.body.integrationName)}. Must be one of: ${integrations.join(', ')}.` });
         }
 
         try {
@@ -408,6 +436,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 qrId,
                 qrType,
                 companyName,
+                integrationName,
                 fileId,
                 imageUrl,
                 createdByUserId: req.user.userId, // set by your JWT middleware
