@@ -20,7 +20,9 @@ const LOCK_TTL_APPROVE        = 30;  // Redis lock TTL (seconds) for approve/rej
 const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdrawal request
 // ─────────────────────────────────────────────────────────────────────────────
 
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient) => {
+// creditPayoutWallet(withdrawalDoc) — from payout.js; credits an approved mode:'wallet' withdrawal
+// into the user's payout wallet (idempotent). Appended last per the factory-signature rule.
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, creditPayoutWallet) => {
 
   // Atomic lock release via Lua script — only deletes if value still matches ours
   const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
@@ -256,8 +258,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdraw_new', authenticateToken, async (req, res) => {
       const { userId, qrId, companyName, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
+      // mode 'wallet' = internal transfer into the user's Payout Wallet — exempt from time windows
+      // and from the max-pending cap (and never counted against it).
+      const isWallet = mode === 'wallet';
+
       // If the requester is not an admin, check if withdrawal time windows are enabled and enforce them
-      if (req.user.role != 'admin'){
+      if (req.user.role != 'admin' && !isWallet){
          await ConfigManager.refresh(); // Ensure we have the latest config values
          let isWithdrawalTimeWindowsEnabled = ConfigManager.get('withdrawal_time_windows_enabled');
          if(isWithdrawalTimeWindowsEnabled){
@@ -273,8 +279,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // return res.status(503).json({ error: 'Withdrawals are temporarily disabled for maintenance' });
 
       // basic validations
-      if (!['upi', 'bank'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi or bank.' });
-      if (!userId || !holderName) return res.status(400).json({ error: 'userId and name are required' });
+      // mode 'wallet' = transfer QR balance into the user's Payout Wallet (payout.js): no bank/UPI
+      // details, and NO commission — amount must equal preAmount and commission must be 0.
+      if (!['upi', 'bank', 'wallet'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi, bank or wallet.' });
+      if (!userId || (!holderName && !isWallet)) return res.status(400).json({ error: 'userId and name are required' });
       if (!qrId) return res.status(400).json({ error: 'qrId is required' });  // ← add
       if (mode === 'upi') {
         if (!upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
@@ -316,17 +324,19 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // const istTime = moment().tz('Asia/Kolkata').toISOString();
 
         try {
-          // Enforce max 2 pending per user
+          // Enforce max 2 pending per user (direct upi/bank only; wallet transfers neither count nor are capped)
+          if (!isWallet) {
           const pendingRequests = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
             Withdrawal_request_collectionId,
-            [Query.equal('userId', userId), Query.equal('status', 'pending')]
+            [Query.equal('userId', userId), Query.equal('status', 'pending'), Query.notEqual('mode', 'wallet')]
         );
 
           let MAX_PENDING_WITHDRAWALS = ConfigManager.get('max_withdrawal_requests') || MAX_PENDING_WITHDRAWALS;
 
           if (pendingRequests.total >= MAX_PENDING_WITHDRAWALS) {
             return res.status(400).json({ error: 'You already have the maximum number of pending withdrawal requests (2).' });
+          }
           }
 
           const usrDet = await getUserMeta(userId);
@@ -336,8 +346,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const preAmountPaise = toPaise(preAmount);
           if (preAmountPaise == null) return res.status(400).json({ error: 'Invalid preAmount' });
 
-          const userCommissionRate = Number(usrDet.commission || 0);
-          const parentCommissionRate = usrDet.parentId ? Number((await getUserMeta(usrDet.parentId)).commission || 0) : 0;
+          const userCommissionRate = isWallet ? 0 : Number(usrDet.commission || 0);
+          const parentCommissionRate = (isWallet || !usrDet.parentId) ? 0 : Number((await getUserMeta(usrDet.parentId)).commission || 0);
           let totalCommissionRate = userCommissionRate + parentCommissionRate;
 
           // Guard against misconfigured commission rates — prevent absurd deductions
@@ -438,7 +448,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             userId,
             qrId: qrId,
             companyName: companyName || null,
-            holderName,
+            holderName: isWallet ? (holderName || 'Payout Wallet') : holderName,
             amount: amount, // Rs
             preAmount: preAmount, // Rs
             commission: recalculatedCommissionRs, // Rs
@@ -730,6 +740,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             processedAt: doc.processedAt || null,
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
+            walletCreditFailed: doc.walletCreditFailed === true, // mode:wallet only — payout wallet credit needs retry-credit
             // Include other metadata if needed
             // add any other fields you need
           };
@@ -845,6 +856,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             processedAt: doc.processedAt || null,
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
+            walletCreditFailed: doc.walletCreditFailed === true, // mode:wallet only — payout wallet credit needs retry-credit
             // Include other metadata if needed
             // add any other fields you need
           };
@@ -959,9 +971,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdrawals/approve_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, utrNumber } = req.body;
 
-      if (!id || !utrNumber || utrNumber.trim().length < 5) {
-        return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
-      }
+      // UTR is required for direct (upi/bank) payouts; a mode:'wallet' withdrawal is an internal
+      // transfer (checked after the doc is loaded) and gets the wallet ledger id instead.
+      if (!id) return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
+      const utrGiven = typeof utrNumber === 'string' && utrNumber.trim().length >= 5;
 
       // const istOffsetMs = 5.5 * 60 * 60 * 1000;
       // const approvedAtIST = new Date(Date.now() + istOffsetMs).toISOString();
@@ -988,6 +1001,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         if (w.status !== 'pending') {
           return res.status(400).json({ error: `Cannot approve a ${w.status} request` });
+        }
+
+        const isWalletWithdrawal = w.mode === 'wallet';
+        if (!isWalletWithdrawal && !utrGiven) {
+          return res.status(400).json({ error: 'Invalid ID or UTR number too short' });
+        }
+        if (isWalletWithdrawal && typeof creditPayoutWallet !== 'function') {
+          return res.status(500).json({ error: 'Payout wallet is not configured on this server' });
         }
 
         // normalize money to paise
@@ -1091,7 +1112,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           w.$id,
           {
             status: 'approved',
-            utrNumber: utrNumber.trim(),
+            utrNumber: isWalletWithdrawal ? 'PAYOUT_WALLET' : utrNumber.trim(),
             processedAt: approvedAtIST,
             rejectionReason: null,
           }
@@ -1101,6 +1122,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // update dashboard counters
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', preAmountPaise).catch(console.error);
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
+
+        // Payout-wallet withdrawal: credit the wallet (idempotent on w.id) and stop — no commission
+        // was charged (rate forced to 0 at request time). Lock order: lock:qr → lock:payoutwallet.
+        // If the credit fails the withdrawal stays approved (QR already debited) and is flagged so
+        // admin can re-run it via POST /api/payout/admin/wallet/retry-credit.
+        if (isWalletWithdrawal) {
+          try {
+            const credit = await creditPayoutWallet(w);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id,
+              { utrNumber: credit.txn?.id || 'PAYOUT_WALLET', walletCreditFailed: false }).catch(console.error);
+            return res.json({ success: true, message: 'Withdrawal approved and credited to payout wallet' });
+          } catch (creditErr) {
+            console.error(`CRITICAL: payout wallet credit failed for withdrawal ${w.id} (user ${w.userId}). Use retry-credit.`, creditErr);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id, { walletCreditFailed: true })
+              .catch(e => console.error(`CRITICAL: could not flag walletCreditFailed on ${w.id}`, e));
+            return res.status(500).json({ error: 'Withdrawal approved but payout wallet credit failed — retry via payout wallet retry-credit' });
+          }
+        }
 
         // After updating Withdrawal request doc and QR ledger:
         const user = await getUserMeta(w.userId);

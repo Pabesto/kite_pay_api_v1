@@ -10,6 +10,7 @@ Live code (all flat in this directory):
 - `admin.js` — admin panel router (users, transactions, edits/deletes/status flags, manual review control plane + sweeper, summaries, config CRUD, QR hold-and-reset).
 - `qrcode.js`, `qrOwnerCache.js`, `userMetaCache.js`, `dashboardCounters.js` — QR lifecycle + caches.
 - `withdraw.js`, `wallet.js`, `withdrawalAccounts.js` — payouts, wallet, saved accounts.
+- `payout.js` — Customer Payout: per-user **payout wallet** (funded by `mode:'wallet'` withdrawals — no commission, exempt from time windows and the max-pending cap), saved customer beneficiary accounts (optional `upiId`, required for UPI payouts), customer payout requests (admin marks paid/rejected; subadmins read their own users' rows), admin manual wallet adjustments, separate payout-commission ledger (daily/monthly/all-time rollups). Frontend contract: `CUSTOMER_PAYOUT_FRONTEND.md`. Schema: `scripts/setup-payout-schema.js`. (The older `wallet.js` rupee wallet is unrelated — do not mix them.)
 - `partnerApi.js`, `partnerWebhooks.js` — external partner API + outbound signed webhooks. Contract doc: `PARTNER_API.md` (must be kept in sync).
 - `pineLabMulti.js` + `pinelabMultiPoller.js` — the **live** Pine Labs ingestion path.
 - `reviewMode.js`, `reviewResolve.js`, `transactionFinalize.js` — manual-review gate, exactly-once resolver, centralized finalize pipeline. Frontend contract: `MANUAL_REVIEW_FRONTEND.md`.
@@ -42,6 +43,8 @@ Every amount field is either integer **paise** or float **rupees**. Identify the
 | `commission_transactions.amount`, rollup `totalCommissionPaise`, daily-summary `totalsJson` values, Redis `counter:totalAmountReceived`, dashboard counter amounts, `api_merchants_requests.amount` | paise |
 | Withdrawal-request docs: `amount`, `preAmount`, `commission` | **rupees** |
 | Wallet collection (`balance`, `holdBalance`) and wallet transactions | **rupees** |
+| Payout feature (payout.js): `payout_wallets.balancePaise/holdPaise`, `payout_wallet_transactions.*Paise`, `customer_payouts.amountPaise/commissionPaise/totalPaise`, `payout_commission_transactions.amount`, `daily_payout_commission_summaries.commissionsJson`, `monthly_/all_time_payout_commission_totals.totalCommissionPaise` | paise (`*Rs` keys in responses are derived) |
+| `users_meta.commission` / `users_meta.payoutCommission` | percent rates (0–100), not money |
 | Client/request inputs: admin edit amount, merchant `qr_generate`, partner `searchField=amount`, withdrawal request bodies | rupees — convert at the boundary |
 
 Conversion and arithmetic rules:
@@ -70,6 +73,8 @@ Appwrite has no transactions. All money read-modify-writes are serialized with R
 | `rrnProcessing:<rrn>` | 30s | manual-transaction duplicate guard |
 | `lock:verify:<rrn>` | 15s | merchant payment verification |
 | `lock:commission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | commission rollup upserts |
+| `lock:payoutwallet:<userId>` | 15s request/adjust/withdrawal-credit, 30s paid/reject | every payout-wallet `balancePaise`/`holdPaise` RMW (payout.js `moveWallet`); fails closed. Lock order when nested: `lock:qr` → `lock:payoutwallet` (approve of a `mode:'wallet'` withdrawal). Ledger rows are idempotent on `(type, refId)` (unique index) |
+| `lock:payoutcommission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | payout-commission rollup upserts (daily JSON map, monthly and all-time per-user totals) |
 | `holdreset:txnjob:lock:<qrId>` | 600s, refreshed per batch | migration single-runner |
 
 ## Ingest & the finalize pipeline (exactly-once crediting)
@@ -138,7 +143,7 @@ Auth — choose the injected middleware; never ship an unauthenticated endpoint 
 |---|---|
 | `authenticateToken` | any logged-in user; `req.user` = the **full cached users_meta doc** (key fields: `userId`, `role`, `name`, `labels`, plus `$id`, `parentId`, `assigned_to`, …). Employee scoping compares against `req.user.$id`, which can differ from `userId` on older docs |
 | `authenticateAdmin` / `…OrSubAdmin` / `…OrSubAdminOrEmployee` | role gates |
-| `authenticateAdminOrLabel(label, { isSubadminAllowed })` | admin always; employee needs label; subadmin if flag |
+| `authenticateAdminOrLabel(label, { isSubadminAllowed })` | admin always; employee needs label; subadmin if flag. Payout labels: `view_payouts`, `edit_payouts`, `view_payout_commissions` (subadmin allowed, scoped to own earnings) |
 | `authenticatePartner` (partnerApi.js) | `X-API-Key: <partnerId>.<secret>`, bcrypt-checked; `req.partner` |
 | `authenticateMerchant` (apiMerchants.js) | Bearer secret + `merchantId` in body; `req.merchant`, `req.vpa` |
 
@@ -175,14 +180,14 @@ Emit only through the helpers returned by `initSocket` (socketServer.js) — nev
 - Load env at the top, before any project requires: `const path = require('path'); require('dotenv').config({ path: path.join(__dirname, '..', '.env') });` so the project-root `.env` is used regardless of cwd. Assert required env vars and `process.exit(1)` with a clear message. (`copyAppwriteSchema.js` is the standalone exception — no dotenv, hardcoded blocks; see Secrets.)
 - Data-mutating scripts are **dry-run by default**, write only with `--write`, print a plan + scanned/changed/skipped/failed counts.
 - Idempotent by construction: schema creates treat Appwrite 409 as skip; backfills **recompute-and-overwrite** aggregates from the source transactions (never increment — re-runs would double-count). Live incremental writers, by contrast, **merge-add under the daily lock** — the two write styles are intentionally different.
-- Deploy ordering: `setup-review-schema.js` before enabling manual review; `setup-partner-schema.js` then `backfill-owner.js --write` before the partner API serves history.
+- Deploy ordering: `setup-review-schema.js` before enabling manual review; `setup-partner-schema.js` then `backfill-owner.js --write` before the partner API serves history; `setup-payout-schema.js` before deploying payout.js (it also extends the withdrawal `mode` enum with `wallet` and adds `users_meta.payoutCommission`).
 - `transactionStatusMailer.js` sends real email via Hostinger on direct invocation — treat as production side effect.
 
 ## Testing bar & ship checklist
 
 `npm test` runs Jest over `tests/` with fully stubbed Appwrite/Redis. All four suites green is the bar before any change ships; a change may never increase the failure count.
 
-> **Current baseline note (2026-07-14):** `robustness.test.js` fails 24 tests ("argument handler must be a function" at withdraw.js:550) because withdraw.js's factory gained `APPWRITE_CONFIG_COLLECTION_ID` at position 16 and the test's `buildWithdrawApp` call was never updated — every later positional arg is shifted by one. server.js:884 (production) IS correct. Fix the test call, then delete this note. Any "argument handler must be a function" failure from a router factory means positional-arg drift — diff the factory signature against the call site before debugging anything else.
+> Any "argument handler must be a function" / "X is not a function" failure from a router factory means positional-arg drift — diff the factory signature against the test's call site (and the server.js mount) before debugging anything else. Tests that build admin.js/withdraw.js must `jest.mock` `../scripts/transactionStatusMailer` (top-level `return`, real email), `../configManager` (uninitialised → the known `MAX_PENDING_WITHDRAWALS` TDZ), and `../userMetaCache` (see `robustness.test.js`).
 
 Test patterns that are mandatory to copy:
 
@@ -200,7 +205,7 @@ Before shipping any change, verify every line of this checklist:
 5. **Queries**: deleted-exclusion OR-clause, tri-state `normal`, `Query.limit`, cursor rules, pick-function projection.
 6. **Auth**: middleware + in-handler ownership scoping on every new/changed endpoint.
 7. **Response shape** copied from the nearest sibling endpoint; error text stable.
-8. **Docs**: partner-visible changes mirrored in `PARTNER_API.md` (`pickTxn` + `txnView` + field table move together); review-UI changes in `MANUAL_REVIEW_FRONTEND.md`.
+8. **Docs**: partner-visible changes mirrored in `PARTNER_API.md` (`pickTxn` + `txnView` + field table move together); review-UI changes in `MANUAL_REVIEW_FRONTEND.md`; payout API changes in `CUSTOMER_PAYOUT_FRONTEND.md`.
 9. **Lifecycle**: workers registered in `gracefulShutdown`; intervals self-catching; test-env guards.
 10. **Secrets**: nothing from the secrets list echoed, moved, or committed; no new hardcoded credentials.
 11. `npm test` green; new tests for money logic.

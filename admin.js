@@ -179,6 +179,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 status: doc.status,
                 labels: doc.labels,
                 commission : doc.commission || 0,
+                payoutCommission : doc.payoutCommission || 0,
             }));
 
             const docs = simplifiedUsers;
@@ -236,6 +237,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             status: doc.status,
             labels: doc.labels,
             commission : doc.commission || 0,
+            payoutCommission : doc.payoutCommission || 0,
             }));
 
             return res.json(simplifiedUsers);
@@ -284,6 +286,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         status: doc.status,
         labels: doc.labels,
         commission : doc.commission || 0,
+        payoutCommission : doc.payoutCommission || 0,
         }));
 
         return res.json(simplifiedUsers);
@@ -338,6 +341,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 parentId: creatorId,
                 status: true,
                 commission: 0,
+                payoutCommission: 0,
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
@@ -491,7 +495,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // ✏️ Edit user endpoint ( admin/sub-admin or employee with all_users allowed )
     router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
     const userIdtoEdit = req.params.id;
-    const { name, email, labels, commission } = req.body;
+    const { name, email, labels, commission, payoutCommission } = req.body;
     const userRequested = req.user;
 
     if (!userIdtoEdit) {
@@ -502,7 +506,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         name === undefined &&
         email === undefined &&
         labels === undefined &&
-        commission === undefined
+        commission === undefined &&
+        payoutCommission === undefined
     ) {
         return res.status(400).json({ error: 'At least one field must be provided to update' });
     }
@@ -537,6 +542,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             return res.status(400).json({ error: 'Commission must be a valid number' });
         }
         updatePayload.commission = commissionNum;
+        }
+        // Customer Payout commission rate (%), charged when a customer payout is marked PAID (payout.js)
+        if (payoutCommission !== undefined) {
+        const payoutNum = Number(payoutCommission);
+        if (isNaN(payoutNum) || payoutNum < 0 || payoutNum > 100) {
+            return res.status(400).json({ error: 'Payout commission must be a number between 0 and 100' });
+        }
+        updatePayload.payoutCommission = payoutNum;
         }
 
         // Update specialized user data (name/email) and metadata in parallel

@@ -45,6 +45,7 @@ const partnerWebhooks = require('./partnerWebhooks');
 const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
 const axisWorldlineUatRoutes = require('./axisWorldlineUat'); // Axis Worldline UAT capture endpoint — no money path
 const extensionCaptureRoutes = require('./extensionCapture'); // PhonePe/BharatPe rows from the browser extensions — LIVE money path (full ingest choreography)
+const payoutRoutes = require('./payout'); // Customer Payout: payout wallet + customer payouts + payout commission — LIVE money path
 
 const fs = require('fs');
 const path = require('path');
@@ -100,6 +101,15 @@ const APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID = process.env.APPWRITE_AXIS_WORL
 // PineLabs merchant credentials (default matches setup-pinelab-accounts-schema.js).
 // Secret-bearing collection — server API key only, never exposed to client SDKs.
 const APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PINELAB_ACCOUNTS_COLLECTION_ID || 'pinelab_accounts';
+// Customer Payout feature (payout.js) — all amounts integer paise. Created by scripts/setup-payout-schema.js.
+const APPWRITE_PAYOUT_WALLETS_COLLECTION_ID = process.env.APPWRITE_PAYOUT_WALLETS_COLLECTION_ID || 'payout_wallets';
+const APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID || 'payout_wallet_transactions';
+const APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID || 'customer_payout_accounts';
+const APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID = process.env.APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID || 'customer_payouts';
+const APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID || 'payout_commission_transactions';
+const APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID || 'daily_payout_commission_summaries';
+const APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID || 'monthly_payout_commission_totals';
+const APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID || 'all_time_payout_commission_totals';
 const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
 
 // Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -902,7 +912,12 @@ app.use('/api', qrCodeRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, 
 app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));
+// Customer Payout module — built before the withdraw mount because /withdrawals/approve_new
+// credits mode:'wallet' withdrawals through payout.creditWalletFromWithdrawal.
+const payout = payoutRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID, authenticateToken, authenticateAdminOrLabel, redisClient, APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID);
+app.use('/api/payout', payout.router);
+
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, payout.creditWalletFromWithdrawal));
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));

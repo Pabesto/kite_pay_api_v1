@@ -12,6 +12,28 @@ const request = require('supertest');
 const express = require('express');
 const { Query } = require('node-appwrite');
 
+// admin.js requires the standalone mailer script at module scope; it has top-level `return`
+// and real email side effects — never load it in tests.
+jest.mock('../scripts/transactionStatusMailer', () => ({ sendMerchantHoldEmail: jest.fn() }));
+// withdraw.js reads max_withdrawal_requests via ConfigManager (uninitialised here → known TDZ).
+jest.mock('../configManager', () => ({
+    get: jest.fn((key, def = null) => (key === 'max_withdrawal_requests' ? 2 : def)),
+    refresh: jest.fn().mockResolvedValue({}),
+    getConfig: jest.fn().mockResolvedValue({}),
+    set: jest.fn().mockResolvedValue(),
+}));
+// userMetaCache is uninitialised in tests — route getUserMeta straight to the test's db mock.
+let mockDb = null;
+jest.mock('../userMetaCache', () => ({
+    getUserMeta: jest.fn(async (userId) => {
+        if (!mockDb) return null;
+        const { Query: Q } = require('node-appwrite');
+        const r = await mockDb.listDocuments('db1', 'users_meta', [Q.equal('userId', userId), Q.limit(1)]);
+        return r.documents[0] || null;
+    }),
+    invalidate: jest.fn(),
+}));
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Minimal Appwrite databases mock */
@@ -59,7 +81,10 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
     let router;
     jest.isolateModules(() => {
         const adminFactory = require('../admin.js');
+        // Positional args mirror the app.use('/api/admin', adminRoutes(...)) mount in server.js (39 args).
         router = adminFactory(
+            'https://appwrite.test/v1',   // APPWRITE_ENDPOINT
+            'proj1',                      // APPWRITE_PROJECT_ID
             db,
             {},
             {},
@@ -71,21 +96,32 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
             'webhook_col',
             'bucket1',
             'daily_qr',
+            'daily_deleted',
+            'daily_flagged',
             'commission_txs',
             'daily_commission',
             'all_time_commission',
             'monthly_commission',
-            jest.fn().mockResolvedValue(),
-            jest.fn(),
-            authUser,
-            () => authUser,
-            authUser,
-            authUser,
-            authUser,
-            {},
-            authUser,
-            () => authUser,
-            redis
+            'dashboard_counters',
+            'manual_hold',
+            'config_col',
+            jest.fn().mockResolvedValue(),   // updateDailyQrTotal
+            jest.fn(),                       // emitTxnNew
+            authUser,                        // authenticateToken
+            () => authUser,                  // authenticateAdminOrLabel
+            authUser,                        // authenticateAdmin
+            authUser,                        // authenticateAdminOrSubAdmin
+            authUser,                        // authenticateAdminOrSubAdminOrEmployee
+            {},                              // InputFile
+            authUser,                        // roleAuth
+            () => authUser,                  // requireRole
+            redis,
+            jest.fn(),                       // emitTxnStatusNew
+            'withdrawal_col',
+            jest.fn().mockResolvedValue(),   // finalizeTransaction
+            'rejected_txns',
+            'daily_rejected',
+            jest.fn()                        // emitReviewResolved
         );
     });
     const app = express();
@@ -95,6 +131,7 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
 }
 
 function buildWithdrawApp(db, redis) {
+    mockDb = db;
     let router;
     jest.isolateModules(() => {
         const withdrawFactory = require('../withdraw.js');
@@ -114,6 +151,7 @@ function buildWithdrawApp(db, redis) {
             'daily_commission',
             'all_time_commission',
             'monthly_commission',
+            'config_col',
             jest.fn().mockResolvedValue(),
             jest.fn(),
             asAdmin,
@@ -124,7 +162,8 @@ function buildWithdrawApp(db, redis) {
             {},
             asAdmin,
             () => asAdmin,
-            redis
+            redis,
+            jest.fn().mockResolvedValue({ skipped: false, txn: { id: 'pwt_1' } }) // creditPayoutWallet
         );
     });
     const app = express();
@@ -414,7 +453,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('Invalid mode value returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'cash',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'cash',
             amount: 100, preAmount: 100, commission: 0,
         });
         expect(res.status).toBe(400);
@@ -423,7 +462,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('UPI mode without upiId returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'upi',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'upi',
             amount: 100, preAmount: 100, commission: 0,
         });
         expect(res.status).toBe(400);
@@ -432,7 +471,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('UPI mode with malformed UPI ID returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'upi',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'upi',
             upiId: 'not-a-valid-upi',
             amount: 100, preAmount: 100, commission: 0,
         });
@@ -442,7 +481,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('Bank mode with invalid IFSC returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'bank',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'bank',
             bankName: 'SBI', accountNumber: '12345678901', ifscCode: 'INVALID_CODE',
             amount: 100, preAmount: 100, commission: 0,
         });
@@ -452,7 +491,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('Bank mode with account number too short returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'bank',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'bank',
             bankName: 'SBI', accountNumber: '1234567', ifscCode: 'SBIN0001234',
             amount: 100, preAmount: 100, commission: 0,
         });
@@ -462,7 +501,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('Bank mode with account number containing letters returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'bank',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'bank',
             bankName: 'SBI', accountNumber: '1234abc67890', ifscCode: 'SBIN0001234',
             amount: 100, preAmount: 100, commission: 0,
         });
@@ -472,7 +511,7 @@ describe('POST /withdraw_new — input validation', () => {
 
     test('Negative or zero amount returns 400', async () => {
         const res = await request(app).post('/withdraw_new').send({
-            userId: 'user1', holderName: 'Alice', mode: 'upi',
+            userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'upi',
             upiId: 'alice@okaxis', amount: -50, preAmount: -50, commission: 0,
         });
         expect(res.status).toBe(400);
