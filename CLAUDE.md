@@ -13,6 +13,8 @@ Live code (all flat in this directory):
 - `payout.js` — Customer Payout: per-user **payout wallet** (funded by `mode:'wallet'` withdrawals — no commission, exempt from time windows and the max-pending cap), saved customer beneficiary accounts (optional `upiId`, required for UPI payouts), customer payout requests (admin marks paid/rejected; subadmins read their own users' rows), admin manual wallet adjustments, separate payout-commission ledger (daily/monthly/all-time rollups). Frontend contract: `CUSTOMER_PAYOUT_FRONTEND.md`. Schema: `scripts/setup-payout-schema.js`. (The older `wallet.js` rupee wallet is unrelated — do not mix them.)
 - `partnerApi.js`, `partnerWebhooks.js` — external partner API + outbound signed webhooks. Contract doc: `PARTNER_API.md` (must be kept in sync).
 - `pineLabMulti.js` + `pinelabMultiPoller.js` — the **live** Pine Labs ingestion path.
+- `extensionCapture.js` — PhonePe/BharatPe rows scraped by the browser extensions. **LIVE money path**: runs the full 7-step ingest choreography. Static `X-API-Key` per provider (`<PROVIDER>_EXTENSION_API_KEY`).
+- `extensionAlerts.js` — health/heartbeat channel for those same extensions (`POST /<provider>-capture/alert`) plus the admin fleet/log reads. Same key as the capture route; **not** a money path (no finalize, no QR lock, own two collections only). Spec: `ALERT-ENDPOINT-SPEC.md`. Panel contract: `EXTENSION_ALERTS_FRONTEND.md`. Schema: `scripts/setup-extension-alerts-schema.js`.
 - `reviewMode.js`, `reviewResolve.js`, `transactionFinalize.js` — manual-review gate, exactly-once resolver, centralized finalize pipeline. Frontend contract: `MANUAL_REVIEW_FRONTEND.md`.
 - `configManager.js`, `socketServer.js`, `apiMerchants.js` — runtime config, Socket.io, merchant API.
 - `scripts/` — idempotent one-off schema/backfill tools. `tests/` — Jest suite.
@@ -75,6 +77,7 @@ Appwrite has no transactions. All money read-modify-writes are serialized with R
 | `lock:commission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | commission rollup upserts |
 | `lock:payoutwallet:<userId>` | 15s request/adjust/withdrawal-credit, 30s paid/reject/revert | every payout-wallet `balancePaise`/`holdPaise` RMW (payout.js `moveWallet`); fails closed. Lock order when nested: `lock:qr` → `lock:payoutwallet` (approve of a `mode:'wallet'` withdrawal; admin revert-to-QR, which also takes `lock:qr` for 30s and writes the QR ledger `withdrawalApprovedAmount`/`amountAvailableForWithdrawal`). Ledger rows are idempotent on `(type, refId)` (unique index) |
 | `lock:payoutcommission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | payout-commission rollup upserts (daily JSON map, monthly and all-time per-user totals) |
+| `lock:extdevice:<provider>:<instanceId>` | 10s | `extension_devices` upsert (extensionAlerts.js). Not money — on contention the row is skipped and the next alert refreshes it |
 | `holdreset:txnjob:lock:<qrId>` | 600s, refreshed per batch | migration single-runner |
 
 ## Ingest & the finalize pipeline (exactly-once crediting)
@@ -205,7 +208,7 @@ Before shipping any change, verify every line of this checklist:
 5. **Queries**: deleted-exclusion OR-clause, tri-state `normal`, `Query.limit`, cursor rules, pick-function projection.
 6. **Auth**: middleware + in-handler ownership scoping on every new/changed endpoint.
 7. **Response shape** copied from the nearest sibling endpoint; error text stable.
-8. **Docs**: partner-visible changes mirrored in `PARTNER_API.md` (`pickTxn` + `txnView` + field table move together); review-UI changes in `MANUAL_REVIEW_FRONTEND.md`; payout API changes in `CUSTOMER_PAYOUT_FRONTEND.md`.
+8. **Docs**: partner-visible changes mirrored in `PARTNER_API.md` (`pickTxn` + `txnView` + field table move together); review-UI changes in `MANUAL_REVIEW_FRONTEND.md`; payout API changes in `CUSTOMER_PAYOUT_FRONTEND.md`; extension-alert changes in `ALERT-ENDPOINT-SPEC.md` + `EXTENSION_ALERTS_FRONTEND.md`.
 9. **Lifecycle**: workers registered in `gracefulShutdown`; intervals self-catching; test-env guards.
 10. **Secrets**: nothing from the secrets list echoed, moved, or committed; no new hardcoded credentials.
 11. `npm test` green; new tests for money logic.
