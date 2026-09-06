@@ -368,9 +368,12 @@ Response `201`:
     "rejectedAt": null,
     "addedInMinutes": null,        // whole minutes requestedAt → addedToBankingAt (null until stamped)
     "paidInMinutes": null,         // requestedAt → paidAt
-    "rejectedInMinutes": null      // requestedAt → rejectedAt
+    "rejectedInMinutes": null,     // requestedAt → rejectedAt
+    "cancelledInMinutes": null,    // requestedAt → cancelledAt
+    "waitingMinutes": 0            // PENDING ONLY: minutes waited so far, by the SERVER clock; null once resolved
 } }
 ```
+Every list response also carries `"serverTime": "<ISO>"` (the moment the page was produced).
 Effects: `holdPaise += totalPaise` immediately (refresh the wallet card). Errors:
 `400` validation · `404` accountId not yours · `409 Insufficient payout wallet balance` ·
 `409 Payout wallet is busy…` (retry once) · `422` rate misconfigured.
@@ -826,9 +829,11 @@ the effective rate — never blank. Setting it to `0` explicitly means 0.
 **Admin**
 1. *Withdrawals* — existing screen; wallet rows labelled "To Payout Wallet", approve without UTR.
 2. *Customer payout queue* — pending list with account chip, "Mark added", "Paid…" (reference dialog),
-   "Reject…" (reason dialog); Paid/Rejected tabs. Show "waiting N min" on pending rows (compute
-   from `requestedAt` to now — this is the only place the device does date math) so the oldest
-   requests stand out; paid/rejected rows show the server's `paidInMinutes` / `rejectedInMinutes`.
+   "Reject…" (reason dialog); Paid/Rejected tabs. Show "waiting N min" on pending rows so the oldest
+   stand out: render the server's `waitingMinutes` and tick it forward locally using the elapsed
+   time since the response's `serverTime` (never from the device's own idea of `requestedAt − now`,
+   which drifts on wrong clocks). Re-fetch to resync; paid/rejected rows show the server's
+   `paidInMinutes` / `rejectedInMinutes`. Only `requestedAt` is stored — waits are never persisted.
 3. *Wallets* — list, per-user drill-down with history, "Adjust…" dialog, "Revert to QR…" sheet
    (§6.4), "Export statement" (date range), and the integrity badge.
 3b. *Customer accounts* — all customers across users (§6.3) with the filter sheet (user, subadmin,

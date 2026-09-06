@@ -533,6 +533,8 @@ module.exports = (
     paidInMinutes: minutesBetween(d.createdAt, d.paidAt),
     rejectedInMinutes: minutesBetween(d.createdAt, d.rejectedAt),
     cancelledInMinutes: minutesBetween(d.createdAt, d.cancelledAt),
+    // pending only: server-clock wait so far (device clocks drift); null once resolved
+    waitingMinutes: d.status === 'pending' ? minutesBetween(d.createdAt, nowIso()) : null,
     customerName: d.customerName, bankName: d.bankName, ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null,
     mode: d.mode, amountPaise: d.amountPaise, commissionPaise: d.commissionPaise, totalPaise: d.totalPaise,
     amountRs: Number(d.amountPaise || 0) / 100, commissionRs: Number(d.commissionPaise || 0) / 100, totalRs: Number(d.totalPaise || 0) / 100,
@@ -1031,7 +1033,7 @@ module.exports = (
     queries.push(...dateQueries(q.from, q.to), orderQ, ...cursorQuery(q.cursor), Query.limit(limit));
     const r = await databases.listDocuments(DB, PAYOUTS, queries);
     const payouts = (await attachBankingStatus(r.documents)).map((d) => pickPayout(d, staff));
-    return { success: true, total: r.total, payouts, nextCursor: nextCursorOf(r.documents, limit) };
+    return { success: true, total: r.total, serverTime: nowIso(), payouts, nextCursor: nextCursorOf(r.documents, limit) };
   }
   // Admin / labelled employee (not subadmin) may see staff-only fields such as paidVia.
   const isStaff = (req) => req.user.role !== 'subadmin' && req.user.role !== 'user';

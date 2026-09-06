@@ -499,6 +499,10 @@ describe('service timeline', () => {
 
             jest.setSystemTime(new Date('2026-09-06T10:12:00.000Z'));
             const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+            // pending rows carry a server-clock wait; the list carries serverTime for drift-free ticking
+            const queue = await request(adminApp).get('/admin/requests?status=pending');
+            expect(queue.body.serverTime).toBe('2026-09-06T10:12:00.000Z');
+            expect(queue.body.payouts[0].waitingMinutes).toBe(12);
             const tag = await request(adminApp).patch(`/admin/accounts/${created.body.payout.accountId}/banking-status`).send({ bankingStatus: 'added' });
             expect(tag.status).toBe(200);
             expect(tag.body.stampedRequests).toBe(1);
@@ -508,6 +512,7 @@ describe('service timeline', () => {
             expect(paid.body.payout).toMatchObject({
                 addedToBankingAt: '2026-09-06T10:12:00.000Z', addedInMinutes: 12,
                 paidAt: '2026-09-06T10:30:30.000Z', paidInMinutes: 31, rejectedAt: null, rejectedInMinutes: null,
+                waitingMinutes: null, // resolved → no live wait
             });
             // tagging again must not re-stamp a resolved request
             expect((await request(adminApp).patch(`/admin/accounts/${created.body.payout.accountId}/banking-status`).send({ bankingStatus: 'added' })).body.stampedRequests).toBe(0);
