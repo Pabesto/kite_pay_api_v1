@@ -53,15 +53,28 @@ function makeDb(seed = {}) {
         listDocuments: jest.fn(async (_db, c, queries = []) => {
             let docs = col(c).slice();
             let limit = 25;
+            // Minimal evaluator for the Query methods the module uses (nested `or` included).
+            const matches = (d, q) => {
+                const v = d[q.attribute];
+                switch (q.method) {
+                    case 'equal': return q.values.includes(v);
+                    case 'notEqual': return v !== q.values[0];
+                    case 'startsWith': return String(v ?? '').startsWith(q.values[0]);
+                    case 'search': return String(v ?? '').toLowerCase().includes(String(q.values[0]).toLowerCase());
+                    case 'between': return v >= q.values[0] && v <= q.values[1];
+                    case 'greaterThanEqual': return v >= q.values[0];
+                    case 'lessThanEqual': return v <= q.values[0];
+                    case 'or': return q.values.some((inner) => matches(d, typeof inner === 'string' ? parse(inner) : inner)); // Query.or stores parsed objects
+                    default: return true;
+                }
+            };
             for (const raw of queries) {
                 const q = parse(raw);
                 if (!q) continue;
-                if (q.method === 'equal') {
-                    const vals = q.values;
-                    docs = docs.filter((d) => vals.includes(d[q.attribute]));
-                } else if (q.method === 'notEqual') {
-                    docs = docs.filter((d) => d[q.attribute] !== q.values[0]);
-                } else if (q.method === 'limit') limit = q.values[0];
+                if (q.method === 'limit') limit = q.values[0];
+                else if (q.method === 'orderDesc') docs.sort((a, b) => (a[q.attribute] < b[q.attribute] ? 1 : a[q.attribute] > b[q.attribute] ? -1 : 0));
+                else if (q.method === 'orderAsc') docs.sort((a, b) => (a[q.attribute] > b[q.attribute] ? 1 : a[q.attribute] < b[q.attribute] ? -1 : 0));
+                else if (!['cursorAfter', 'select'].includes(q.method)) docs = docs.filter((d) => matches(d, q));
             }
             return { documents: docs.slice(0, limit), total: docs.length };
         }),
@@ -94,7 +107,7 @@ function makeDb(seed = {}) {
 const COLS = {
     USERS: 'users_meta', WD: 'withdrawals', WALLETS: 'wallets', TXNS: 'wallet_txns',
     ACCOUNTS: 'accounts', PAYOUTS: 'payouts', COMM: 'payout_comm', DAILY: 'daily_payout_comm',
-    MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm',
+    MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm', QRS: 'qr_col',
 };
 
 // `label` = the authenticateAdminOrLabel factory; defaults to injecting admin1.
@@ -104,7 +117,7 @@ function buildPayout(db, redis, auth = asUser('user1'), label = adminOrLabel) {
         const factory = require('../payout.js');
         mod = factory(db, { unique: () => 'uid' }, Query, 'db1',
             COLS.USERS, COLS.WD, COLS.WALLETS, COLS.TXNS, COLS.ACCOUNTS, COLS.PAYOUTS, COLS.COMM, COLS.DAILY,
-            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME);
+            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS);
     });
     const app = express();
     app.use(express.json());
@@ -255,6 +268,35 @@ describe('POST /requests — hold + validation', () => {
         expect(res.status).toBe(201);
         expect(res.body.payout).toMatchObject({ accountId: 'acc1', customerName: 'Old Name', accountBankingStatus: 'added' });
         expect(db.store[COLS.ACCOUNTS]).toHaveLength(1);
+    });
+});
+
+describe('default payout commission', () => {
+    test('missing payoutCommission on user and parent → default 1.5% each (3% total); explicit 0 stays 0', async () => {
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }] });
+        const { app } = buildPayout(db, makeRedis());
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { userId: 'user1', role: 'user', parentId: 'sub1' },            // no payoutCommission field
+            sub1: { userId: 'sub1', role: 'subadmin', parentId: null },            // none either
+        })[id] || null);
+        const a = await request(app).get('/commission-preview?amount=100');
+        expect(a.body).toMatchObject({ commissionRate: 3, commissionPaise: 300 });
+
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { userId: 'user1', role: 'user', parentId: 'sub1', payoutCommission: 0 },
+            sub1: { userId: 'sub1', role: 'subadmin', parentId: null, payoutCommission: null },
+        })[id] || null);
+        const b = await request(app).get('/commission-preview?amount=100');
+        expect(b.body).toMatchObject({ commissionRate: 1.5, commissionPaise: 150 }); // 0 + default parent
+    });
+
+    test('config key default_payout_commission overrides the 1.5 fallback', async () => {
+        mockConfig.default_payout_commission = 2;
+        try {
+            const { app } = buildPayout(makeDb(), makeRedis());
+            userMetaCache.getUserMeta.mockResolvedValue({ userId: 'user1', role: 'user', parentId: null });
+            expect((await request(app).get('/commission-preview?amount=100')).body.commissionRate).toBe(2);
+        } finally { delete mockConfig.default_payout_commission; }
     });
 });
 
@@ -546,6 +588,60 @@ describe('dashboard counters', () => {
     });
 });
 
+describe('paidVia (staff-only) + lookup by unique id', () => {
+    const seed = () => ({
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', bankingStatus: 'added' }],
+        [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'Ravi', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: '2026-09-01T00:00:00.000Z' }],
+    });
+
+    test('paid stores paidVia; admin sees it everywhere, user and subadmin never do', async () => {
+        const db = makeDb(seed());
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidVia: 'HDFC current a/c ****4321' });
+        expect(paid.status).toBe(200);
+        expect(paid.body.payout.paidVia).toBe('HDFC current a/c ****4321');
+        expect(db.store[COLS.PAYOUTS][0].paidVia).toBe('HDFC current a/c ****4321');
+
+        expect((await request(adminApp).get('/admin/requests?status=paid')).body.payouts[0].paidVia).toBe('HDFC current a/c ****4321');
+        expect((await request(adminApp).get('/admin/requests/cpo_1')).body.payout.paidVia).toBe('HDFC current a/c ****4321');
+        expect((await request(adminApp).get('/admin/accounts/acc1/payouts')).body.payouts[0].paidVia).toBe('HDFC current a/c ****4321');
+        expect((await request(adminApp).get('/admin/requests?paidVia=HDFC current a/c ****4321')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        expect((await request(adminApp).get('/admin/requests?paidVia=other')).body.payouts).toEqual([]);
+
+        const { app: userApp } = buildPayout(db, makeRedis(), asUser('user1'));
+        const own = await request(userApp).get('/requests/cpo_1');
+        expect(own.status).toBe(200);
+        expect(own.body.payout.id).toBe('cpo_1');
+        expect(own.body.payout).not.toHaveProperty('paidVia');
+        expect((await request(userApp).get('/requests')).body.payouts[0]).not.toHaveProperty('paidVia');
+        expect((await request(userApp).get('/accounts/acc1/payouts')).body.payouts[0]).not.toHaveProperty('paidVia');
+
+        const sub = asUser('sub1', 'subadmin');
+        const { app: subApp } = buildPayout(db, makeRedis(), sub, () => sub);
+        const subRow = await request(subApp).get('/admin/requests/cpo_1');
+        expect(subRow.status).toBe(200);
+        expect(subRow.body.payout).not.toHaveProperty('paidVia');
+        expect((await request(subApp).get('/admin/requests?status=paid')).body.payouts[0]).not.toHaveProperty('paidVia');
+        // paidVia filter is ignored for a subadmin (they cannot see the field)
+        expect((await request(subApp).get('/admin/requests?paidVia=other')).body.payouts).toHaveLength(1);
+    });
+
+    test('paidVia is optional; lookups: unknown id → 404, foreign user → 404, subadmin foreign → 404, bad id → 400', async () => {
+        const db = makeDb(seed());
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        expect(paid.status).toBe(200);
+        expect(paid.body.payout.paidVia).toBeNull();
+        expect((await request(adminApp).get('/admin/requests/cpo_404')).status).toBe(404);
+        expect((await request(adminApp).get('/admin/requests/bad id!')).status).toBe(400);
+        expect((await request(buildPayout(db, makeRedis(), asUser('user2')).app).get('/requests/cpo_1')).status).toBe(404);
+        const other = asUser('subOther', 'subadmin');
+        expect((await request(buildPayout(db, makeRedis(), other, () => other).app).get('/admin/requests/cpo_1')).status).toBe(404);
+    });
+});
+
 describe('admin wallet adjust', () => {
     test('credit creates wallet if missing and writes ledger row', async () => {
         const db = makeDb();
@@ -757,6 +853,161 @@ describe('subadmin scoping on admin views', () => {
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
         expect((await request(app).get('/admin/requests')).body.payouts).toHaveLength(4);
         expect((await request(app).get('/admin/wallets')).body.wallets).toHaveLength(2);
+    });
+});
+
+describe('admin queue filters', () => {
+    const row = (o) => ({ status: 'pending', amountPaise: 1, commissionPaise: 0, totalPaise: 1, createdAt: '2026-09-01T00:00:00.000Z', ...o });
+    const seed = () => ({
+        [COLS.USERS]: [
+            { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' },
+            { $id: 'user2', userId: 'user2', role: 'user', parentId: 'sub1' },
+            { $id: 'userX', userId: 'userX', role: 'user', parentId: 'subOther' },
+        ],
+        [COLS.QRS]: [{ $id: 'q1', qrId: 'QR001', assignedUserId: 'user2' }],
+        [COLS.ACCOUNTS]: [
+            { $id: 'accA', userId: 'user1', accountNumber: '11110000', bankingStatus: 'added' },
+            { $id: 'accB', userId: 'user2', accountNumber: '22220000', bankingStatus: 'not_added' },
+        ],
+        [COLS.PAYOUTS]: [
+            row({ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'accA', customerName: 'Ravi Kumar', accountNumber: '11110000', mode: 'IMPS', amountPaise: 50000, createdAt: '2026-09-01T00:00:00.000Z' }),
+            row({ $id: 'p2', id: 'cpo_2', userId: 'user2', accountId: 'accB', customerName: 'Sita Devi', accountNumber: '22220000', upiId: 'sita@ybl', mode: 'UPI', amountPaise: 150000, status: 'paid', referenceNumber: 'UTR777', processedBy: 'admin1', processedAt: '2026-09-02T00:00:00.000Z', createdAt: '2026-09-02T00:00:00.000Z' }),
+            row({ $id: 'p3', id: 'cpo_3', userId: 'userX', accountId: 'accX', customerName: 'Ravi Shankar', accountNumber: '33330000', mode: 'NEFT', amountPaise: 99000, createdAt: '2026-09-03T00:00:00.000Z' }),
+        ],
+    });
+    const ids = (res) => res.body.payouts.map((p) => p.id).sort();
+    let app;
+    beforeEach(() => { app = buildPayout(makeDb(seed()), makeRedis(), asUser('admin1', 'admin')).app; });
+
+    test('subadminId → that subadmin\'s users; qrId → the QR\'s assigned user; both intersect', async () => {
+        expect(ids(await request(app).get('/admin/requests?subadminId=sub1'))).toEqual(['cpo_1', 'cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?qrId=QR001'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?qrId=QR001&subadminId=sub1'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?qrId=QR001&userId=user1'))).toEqual([]); // disjoint → empty
+        expect(ids(await request(app).get('/admin/requests?qrId=NOPE'))).toEqual([]);
+    });
+
+    test('mode, amount range (rupees), processedBy, accountId', async () => {
+        expect(ids(await request(app).get('/admin/requests?mode=upi'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?minAmount=600'))).toEqual(['cpo_2', 'cpo_3']);
+        expect(ids(await request(app).get('/admin/requests?minAmount=600&maxAmount=1000'))).toEqual(['cpo_3']);
+        expect(ids(await request(app).get('/admin/requests?maxAmount=500'))).toEqual(['cpo_1']);
+        expect(ids(await request(app).get('/admin/requests?processedBy=admin1'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?accountId=accA'))).toEqual(['cpo_1']);
+        expect((await request(app).get('/admin/requests?mode=CASH')).status).toBe(400);
+        expect((await request(app).get('/admin/requests?minAmount=10&maxAmount=5')).status).toBe(400);
+    });
+
+    test('search: name (default), digits → account number, upiId / referenceNumber / id explicit', async () => {
+        expect(ids(await request(app).get('/admin/requests?search=ravi'))).toEqual(['cpo_1', 'cpo_3']);
+        expect(ids(await request(app).get('/admin/requests?search=2222'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?search=sita@ybl&searchField=upiId'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?search=UTR777&searchField=referenceNumber'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?search=cpo_3&searchField=id'))).toEqual(['cpo_3']);
+        expect((await request(app).get('/admin/requests?search=x&searchField=notes')).status).toBe(400);
+    });
+
+    test('bankingStatus filters by the account\'s current tag; sort by amount asc', async () => {
+        expect(ids(await request(app).get('/admin/requests?bankingStatus=not_added'))).toEqual(['cpo_2']);
+        expect(ids(await request(app).get('/admin/requests?bankingStatus=added&subadminId=sub1'))).toEqual(['cpo_1']);
+        const sorted = await request(app).get('/admin/requests?sort=amount&order=asc');
+        expect(sorted.body.payouts.map((p) => p.id)).toEqual(['cpo_1', 'cpo_3', 'cpo_2']);
+        expect((await request(app).get('/admin/requests?sort=notes')).status).toBe(400);
+    });
+
+    test('subadmin: subadminId of someone else → 403; own users only even with qrId', async () => {
+        const sub = asUser('sub1', 'subadmin');
+        const { app: subApp } = buildPayout(makeDb(seed()), makeRedis(), sub, () => sub);
+        expect((await request(subApp).get('/admin/requests?subadminId=subOther')).status).toBe(403);
+        expect(ids(await request(subApp).get('/admin/requests?subadminId=sub1&mode=IMPS'))).toEqual(['cpo_1']);
+        expect(ids(await request(subApp).get('/admin/requests?search=ravi'))).toEqual(['cpo_1']); // cpo_3 belongs to another subadmin
+    });
+
+    test('user list accepts the row filters but stays scoped to self', async () => {
+        const { app: userApp } = buildPayout(makeDb(seed()), makeRedis(), asUser('user1'));
+        expect(ids(await request(userApp).get('/requests?search=ravi'))).toEqual(['cpo_1']);
+        expect(ids(await request(userApp).get('/requests?userId=user2&subadminId=sub1'))).toEqual(['cpo_1']); // scope params ignored
+    });
+});
+
+describe('customer account stats + detail', () => {
+    test('request → paid / reject bump the account stats; pickAccount exposes them', async () => {
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }], [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }] });
+        const { app } = buildPayout(db, makeRedis());
+        const r1 = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 }); // 10000 + 300
+        const r2 = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'IMPS', amount: 50 });  // 5000 + 150
+        const r3 = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'RTGS', amount: 20 });
+        expect([r1.status, r2.status, r3.status]).toEqual([201, 201, 201]);
+        const accId = r1.body.payout.accountId;
+        expect(db.store[COLS.ACCOUNTS][0]).toMatchObject({ requestCount: 3, lastRequestedAt: r3.body.payout.createdAt });
+
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        await request(adminApp).post(`/admin/requests/${r1.body.payout.id}/paid`).send({ referenceNumber: 'UTR00001' });
+        await request(adminApp).post(`/admin/requests/${r2.body.payout.id}/paid`).send({ referenceNumber: 'UTR00002' });
+        await request(adminApp).post(`/admin/requests/${r3.body.payout.id}/reject`).send({ reason: 'Wrong IFSC' });
+        expect(db.store[COLS.ACCOUNTS][0]).toMatchObject({ requestCount: 3, paidCount: 2, rejectedCount: 1, totalPaidPaise: 15000, totalCommissionPaise: 450 });
+        expect(db.store[COLS.ACCOUNTS][0].lastPaidAt).toBeTruthy();
+
+        const list = await request(adminApp).get('/admin/accounts');
+        expect(list.body.accounts[0]).toMatchObject({ $id: accId, requestCount: 3, paidCount: 2, rejectedCount: 1, pendingCount: 0, totalPaidPaise: 15000, totalPaidRs: 150, totalCommissionPaise: 450 });
+
+        // detail: account + its payouts (filters apply)
+        const detail = await request(adminApp).get(`/admin/accounts/${accId}/payouts?status=paid&sort=amount&order=asc`);
+        expect(detail.status).toBe(200);
+        expect(detail.body.account.$id).toBe(accId);
+        expect(detail.body.payouts.map((p) => [p.id, p.status])).toEqual([[r2.body.payout.id, 'paid'], [r1.body.payout.id, 'paid']]);
+        expect(detail.body.total).toBe(2);
+        // user sees their own account history; someone else's → 404
+        const own = await request(app).get(`/accounts/${accId}/payouts`);
+        expect(own.body.total).toBe(3);
+        expect((await request(buildPayout(db, makeRedis(), asUser('user2')).app).get(`/accounts/${accId}/payouts`)).status).toBe(404);
+    });
+
+    test('a failing stats bump never fails the money operation; recompute-stats repairs it', async () => {
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }], [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }] });
+        const origUpdate = db.updateDocument.getMockImplementation();
+        db.updateDocument.mockImplementation(async (d, c, id, data) => {
+            if (c === COLS.ACCOUNTS && 'requestCount' in data) throw new Error('stats down');
+            return origUpdate(d, c, id, data);
+        });
+        const { app } = buildPayout(db, makeRedis());
+        const r = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 });
+        expect(r.status).toBe(201);
+        expect(db.store[COLS.ACCOUNTS][0].requestCount).toBeUndefined();
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ referenceNumber: 'UTR00001' })).status).toBe(200);
+        db.updateDocument.mockImplementation(origUpdate);
+        const fixed = await request(adminApp).post(`/admin/accounts/${r.body.payout.accountId}/recompute-stats`);
+        expect(fixed.status).toBe(200);
+        expect(fixed.body.account).toMatchObject({ requestCount: 1, paidCount: 1, rejectedCount: 0, pendingCount: 0, totalPaidPaise: 10000, totalCommissionPaise: 300 });
+        expect(fixed.body.account.lastPaidAt).toBeTruthy();
+    });
+
+    test('accounts list: sort by totalPaid, minTotalPaid, subadminId scope, invalid sort → 400', async () => {
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'user1', userId: 'user1', parentId: 'sub1' }, { $id: 'userX', userId: 'userX', parentId: 'subOther' }],
+            [COLS.ACCOUNTS]: [
+                { $id: 'a1', userId: 'user1', customerName: 'A', accountNumber: '1', totalPaidPaise: 5000, paidCount: 1, createdAt: '2026-09-01T00:00:00.000Z' },
+                { $id: 'a2', userId: 'user1', customerName: 'B', accountNumber: '2', totalPaidPaise: 90000, paidCount: 4, createdAt: '2026-09-02T00:00:00.000Z' },
+                { $id: 'aX', userId: 'userX', customerName: 'X', accountNumber: '3', totalPaidPaise: 20000, paidCount: 2, createdAt: '2026-09-03T00:00:00.000Z' },
+            ],
+        });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).get('/admin/accounts?sort=totalPaid')).body.accounts.map((a) => a.$id)).toEqual(['a2', 'aX', 'a1']);
+        expect((await request(app).get('/admin/accounts?sort=paidCount&order=asc')).body.accounts.map((a) => a.$id)).toEqual(['a1', 'aX', 'a2']);
+        expect((await request(app).get('/admin/accounts?minTotalPaid=150')).body.accounts.map((a) => a.$id).sort()).toEqual(['a2', 'aX']);
+        expect((await request(app).get('/admin/accounts?subadminId=sub1&sort=totalPaid')).body.accounts.map((a) => a.$id)).toEqual(['a2', 'a1']);
+        expect((await request(app).get('/admin/accounts?sort=nope')).status).toBe(400);
+        const sub = asUser('sub1', 'subadmin');
+        const { app: subApp } = buildPayout(db, makeRedis(), sub, () => sub);
+        expect((await request(subApp).get('/admin/accounts/aX/payouts')).status).toBe(403);
+        expect((await request(subApp).get('/admin/accounts/a2/payouts')).status).toBe(200);
+    });
+
+    test('admin cannot create requests or accounts for themself', async () => {
+        const { app } = buildPayout(makeDb(), makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).post('/accounts').send(ACCOUNT)).status).toBe(403);
+        expect((await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 })).status).toBe(403);
     });
 });
 

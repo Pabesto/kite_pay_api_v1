@@ -179,7 +179,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 status: doc.status,
                 labels: doc.labels,
                 commission : doc.commission || 0,
-                payoutCommission : doc.payoutCommission || 0,
+                payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
             }));
 
             const docs = simplifiedUsers;
@@ -237,7 +237,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             status: doc.status,
             labels: doc.labels,
             commission : doc.commission || 0,
-            payoutCommission : doc.payoutCommission || 0,
+            payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
             }));
 
             return res.json(simplifiedUsers);
@@ -286,7 +286,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         status: doc.status,
         labels: doc.labels,
         commission : doc.commission || 0,
-        payoutCommission : doc.payoutCommission || 0,
+        payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
         }));
 
         return res.json(simplifiedUsers);
@@ -341,7 +341,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 parentId: creatorId,
                 status: true,
                 commission: 0,
-                payoutCommission: 0,
+                payoutCommission: Number(ConfigManager.get("default_payout_commission", 1.5)), // Customer Payout rate (%), see payout.js
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 

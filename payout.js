@@ -18,7 +18,16 @@
 const express = require('express');
 const moment = require('moment-timezone');
 const userMetaCache = require('./userMetaCache');
+const ConfigManager = require('./configManager');
 const { updateDashboardCounter } = require('./dashboardCounters');
+
+// Applied when a users_meta doc has no payoutCommission at all (null/undefined). An explicit 0 stays 0.
+// Admin-tunable via config key `default_payout_commission` (type double); fallback 1.5%.
+const DEFAULT_PAYOUT_COMMISSION = 1.5;
+const defaultPayoutCommission = () => {
+  const v = Number(ConfigManager.get('default_payout_commission', DEFAULT_PAYOUT_COMMISSION));
+  return isFinite(v) && v >= 0 && v <= 100 ? v : DEFAULT_PAYOUT_COMMISSION;
+};
 
 const CURSOR_RE = /^[a-zA-Z0-9_:-]{1,255}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
@@ -39,6 +48,7 @@ module.exports = (
   WALLETS, WALLET_TXNS, ACCOUNTS, PAYOUTS, COMMISSION_TXNS, DAILY_COMMISSION,
   authenticateToken, authenticateAdminOrLabel, redisClient,
   MONTHLY_COMMISSION, ALLTIME_COMMISSION, // appended: monthly / all-time payout-commission rollups
+  QRCODES, // appended: QR collection — lets the admin queue filter by qrId (→ the QR's assigned user)
 ) => {
   const router = express.Router();
 
@@ -121,14 +131,12 @@ module.exports = (
     return r.documents[0] || null;
   }
 
-  // Subadmin visibility = themselves + every user whose parentId is them (paged, not one page).
-  // Admin / labelled employee: unrestricted (returns null).
-  async function scopedUserIds(req) {
-    if (req.user.role !== 'subadmin') return null;
-    const ids = [req.user.userId];
+  // A subadmin's visible users = themselves + every user whose parentId is them (paged, not one page).
+  async function usersUnder(subadminId) {
+    const ids = [subadminId];
     let cursor = null;
     for (let page = 0; page < 10; page++) { // ponytail: 1,000-user ceiling per subadmin; raise the page cap if it matters
-      const q = [Query.equal('parentId', req.user.userId), Query.orderAsc('$id'), Query.limit(100)];
+      const q = [Query.equal('parentId', subadminId), Query.orderAsc('$id'), Query.limit(100)];
       if (cursor) q.push(Query.cursorAfter(cursor));
       const r = await databases.listDocuments(DB, USERS_META, q);
       for (const d of r.documents) if (d.userId) ids.push(d.userId);
@@ -137,19 +145,37 @@ module.exports = (
     }
     return ids;
   }
-  // userId scope queries for the admin/subadmin list routes. 403 when a subadmin asks for a foreign user.
   // Appwrite caps a single equal() at 100 values, so larger id sets are OR-ed in chunks.
-  async function userScope(req, requestedUserId) {
-    const allowed = await scopedUserIds(req);
-    if (requestedUserId) {
-      if (allowed && !allowed.includes(requestedUserId)) throw fail(403, 'Not authorized for this user');
-      return [Query.equal('userId', requestedUserId)];
-    }
-    if (!allowed) return [];
-    if (allowed.length <= 100) return [Query.equal('userId', allowed)];
+  function idsQuery(attr, ids) {
+    if (ids.length <= 100) return Query.equal(attr, ids);
     const chunks = [];
-    for (let i = 0; i < allowed.length; i += 100) chunks.push(Query.equal('userId', allowed.slice(i, i + 100)));
-    return [Query.or(chunks)];
+    for (let i = 0; i < ids.length; i += 100) chunks.push(Query.equal(attr, ids.slice(i, i + 100)));
+    return Query.or(chunks);
+  }
+  // Resolves the userId scope for admin/subadmin list routes from ?userId, ?subadminId (that
+  // subadmin's users), ?qrId (the QR's assigned user), intersected, then intersected again with a
+  // subadmin caller's own users. Returns [] (unrestricted), [query], or null (provably empty).
+  // 403 when a subadmin names a foreign user/subadmin.
+  async function userScope(req, q = {}) {
+    const allowed = req.user.role === 'subadmin' ? await usersUnder(req.user.userId) : null;
+    let target = null; // null = unrestricted
+    const narrow = (ids) => { target = target ? target.filter((x) => ids.includes(x)) : [...new Set(ids)]; };
+    if (q.userId) {
+      if (allowed && !allowed.includes(String(q.userId))) throw fail(403, 'Not authorized for this user');
+      narrow([String(q.userId)]);
+    }
+    if (q.subadminId) {
+      if (allowed && String(q.subadminId) !== req.user.userId) throw fail(403, 'Not authorized for this subadmin');
+      narrow(await usersUnder(String(q.subadminId)));
+    }
+    if (q.qrId) {
+      const qr = (await databases.listDocuments(DB, QRCODES, [Query.equal('qrId', String(q.qrId)), Query.limit(1)])).documents[0];
+      narrow(qr?.assignedUserId ? [qr.assignedUserId] : []);
+    }
+    if (allowed) narrow(allowed);
+    if (!target) return [];
+    if (!target.length) return null;
+    return [idsQuery('userId', target)];
   }
 
   // ─── wallet primitives (paise) ─────────────────────────────────────────────
@@ -265,12 +291,58 @@ module.exports = (
     refType: d.refType, refId: d.refId, referenceNumber: d.referenceNumber || null,
     notes: d.notes || null, createdBy: d.createdBy || null, createdAt: d.createdAt,
   });
-  const pickAccount = (d) => ({
-    $id: d.$id, userId: d.userId, customerName: d.customerName, bankName: d.bankName,
-    ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null, bankingStatus: d.bankingStatus || 'not_added',
-    notes: d.notes || null, createdAt: d.createdAt,
-    bankingStatusUpdatedAt: d.bankingStatusUpdatedAt || null, bankingStatusUpdatedBy: d.bankingStatusUpdatedBy || null,
-  });
+  // Per-account payout stats live on the account doc (paise / counts), bumped inside the same
+  // wallet-locked operations that create/pay/reject a request. Read with `|| 0`.
+  const pickAccount = (d) => {
+    const requestCount = Number(d.requestCount || 0), paidCount = Number(d.paidCount || 0), rejectedCount = Number(d.rejectedCount || 0);
+    const totalPaidPaise = Number(d.totalPaidPaise || 0), totalCommissionPaise = Number(d.totalCommissionPaise || 0);
+    return {
+      $id: d.$id, userId: d.userId, customerName: d.customerName, bankName: d.bankName,
+      ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null, bankingStatus: d.bankingStatus || 'not_added',
+      notes: d.notes || null, createdAt: d.createdAt,
+      bankingStatusUpdatedAt: d.bankingStatusUpdatedAt || null, bankingStatusUpdatedBy: d.bankingStatusUpdatedBy || null,
+      // stats
+      requestCount, paidCount, rejectedCount, pendingCount: Math.max(0, requestCount - paidCount - rejectedCount),
+      totalPaidPaise, totalPaidRs: totalPaidPaise / 100, totalCommissionPaise,
+      lastRequestedAt: d.lastRequestedAt || null, lastPaidAt: d.lastPaidAt || null,
+    };
+  };
+  const ACCOUNT_STAT_FIELDS = ['requestCount', 'paidCount', 'rejectedCount', 'totalPaidPaise', 'totalCommissionPaise'];
+  // Best-effort counter bump on the account doc; never fails the money operation (repair: recompute-stats).
+  async function bumpAccountStats(accountId, deltas, stamps = {}) {
+    try {
+      const a = await databases.getDocument(DB, ACCOUNTS, accountId);
+      const patch = { ...stamps };
+      for (const [k, d] of Object.entries(deltas)) patch[k] = Number(a[k] || 0) + d;
+      await databases.updateDocument(DB, ACCOUNTS, accountId, patch);
+    } catch (e) {
+      console.error(`payout: account stats bump failed for ${accountId} (run recompute-stats):`, e?.message);
+    }
+  }
+  // Recompute-and-overwrite from the account's payout rows (idempotent repair path).
+  async function recomputeAccountStats(accountId) {
+    const stats = { requestCount: 0, paidCount: 0, rejectedCount: 0, totalPaidPaise: 0, totalCommissionPaise: 0, lastRequestedAt: null, lastPaidAt: null };
+    let cursor = null;
+    for (let page = 0; page < 100; page++) { // ponytail: 10k rows per account; nobody has that many
+      const q = [Query.equal('accountId', accountId), Query.orderAsc('$id'), Query.limit(100)];
+      if (cursor) q.push(Query.cursorAfter(cursor));
+      const r = await databases.listDocuments(DB, PAYOUTS, q);
+      for (const p of r.documents) {
+        stats.requestCount++;
+        if (!stats.lastRequestedAt || p.createdAt > stats.lastRequestedAt) stats.lastRequestedAt = p.createdAt;
+        if (p.status === 'paid') {
+          stats.paidCount++;
+          stats.totalPaidPaise += Number(p.amountPaise || 0);
+          stats.totalCommissionPaise += Number(p.commissionPaise || 0);
+          const at = p.paidAt || p.processedAt || null;
+          if (at && (!stats.lastPaidAt || at > stats.lastPaidAt)) stats.lastPaidAt = at;
+        } else if (p.status === 'rejected') stats.rejectedCount++;
+      }
+      if (r.documents.length < 100) break;
+      cursor = r.documents[r.documents.length - 1].$id;
+    }
+    return databases.updateDocument(DB, ACCOUNTS, accountId, stats);
+  }
   // Whole minutes between two ISO stamps, clamped at 0; null when either is missing/invalid.
   function minutesBetween(startIso, endIso) {
     if (!startIso || !endIso) return null;
@@ -278,8 +350,11 @@ module.exports = (
     if (!isFinite(a) || !isFinite(b)) return null;
     return Math.max(0, Math.round((b - a) / 60000));
   }
-  const pickPayout = (d) => ({
+  // `staff` = admin / labelled employee view: adds paidVia (which of OUR accounts paid it) — never
+  // shown to users or subadmins.
+  const pickPayout = (d, staff = false) => ({
     $id: d.$id, id: d.id, userId: d.userId, accountId: d.accountId,
+    ...(staff ? { paidVia: d.paidVia || null } : {}),
     // Service timeline (UTC ISO) + derived durations for "added in X min / paid in Y min" badges
     requestedAt: d.createdAt,
     addedToBankingAt: d.addedToBankingAt || null,
@@ -315,9 +390,10 @@ module.exports = (
   async function payoutRatesFor(userId) {
     const user = await userMetaCache.getUserMeta(userId);
     if (!user) throw fail(404, 'User not found');
-    const userRate = Number(user.payoutCommission || 0);
+    const def = defaultPayoutCommission();
+    const userRate = Number(user.payoutCommission ?? def);
     const parent = user.parentId ? await userMetaCache.getUserMeta(user.parentId) : null;
-    const parentRate = parent ? Number(parent.payoutCommission || 0) : 0;
+    const parentRate = parent ? Number(parent.payoutCommission ?? def) : 0;
     const bad = (r) => !isFinite(r) || r < 0 || r > 100;
     if (bad(userRate)) throw fail(422, 'Your payout commission rate is invalid. Please contact support.');
     if (bad(parentRate)) throw fail(422, 'Parent payout commission rate is invalid. Please contact support.');
@@ -466,6 +542,12 @@ module.exports = (
     if (pending.documents[0]) throw fail(409, 'Account has a pending payout request');
     await databases.deleteDocument(DB, ACCOUNTS, account.$id); // paid/rejected rows keep their snapshot
   }
+  function rupeesFilter(v, label) {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    if (!isFinite(n) || n < 0) throw fail(400, `Invalid ${label}`);
+    return Math.round(n * 100);
+  }
   function accountSearchQueries(search) {
     const s = String(search || '').trim();
     if (!s) return [];
@@ -523,16 +605,34 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to preview payout commission'); }
   });
 
+  // Account lists: search, bankingStatus, from/to (createdAt, IST days), minTotalPaid (rupees),
+  // sort (createdAt | totalPaid | paidCount | requestCount | lastPaidAt), order (asc | desc)
+  const ACCOUNT_SORTS = { createdAt: '$createdAt', totalPaid: 'totalPaidPaise', paidCount: 'paidCount', requestCount: 'requestCount', lastPaidAt: 'lastPaidAt' };
   async function listAccounts(q, scopeQueries) {
     const limit = parseLimit(q.limit);
+    if (scopeQueries === null) return { success: true, total: 0, accounts: [], nextCursor: null };
     const queries = [...scopeQueries, ...accountSearchQueries(q.search)];
     if (q.bankingStatus) {
       if (!BANKING_STATUSES.includes(q.bankingStatus)) throw fail(400, 'Invalid bankingStatus');
       queries.push(Query.equal('bankingStatus', q.bankingStatus));
     }
-    queries.push(Query.orderDesc('$createdAt'), ...cursorQuery(q.cursor), Query.limit(limit));
+    const minPaid = rupeesFilter(q.minTotalPaid, 'minTotalPaid');
+    if (minPaid != null) queries.push(Query.greaterThanEqual('totalPaidPaise', minPaid));
+    const sortAttr = ACCOUNT_SORTS[q.sort || 'createdAt'];
+    if (!sortAttr) throw fail(400, 'Invalid sort');
+    if (q.order && !['asc', 'desc'].includes(q.order)) throw fail(400, 'Invalid order');
+    queries.push(...dateQueries(q.from, q.to), q.order === 'asc' ? Query.orderAsc(sortAttr) : Query.orderDesc(sortAttr), ...cursorQuery(q.cursor), Query.limit(limit));
     const r = await databases.listDocuments(DB, ACCOUNTS, queries);
     return { success: true, total: r.total, accounts: r.documents.map(pickAccount), nextCursor: nextCursorOf(r.documents, limit) };
+  }
+  // Account detail: the account (with stats) + its payout history (status/mode/sort/etc. filters apply)
+  async function accountWithPayouts(account, q, staff = false) {
+    const list = await listPayouts({ ...q, accountId: account.$id }, [Query.equal('userId', account.userId)], staff);
+    return { success: true, account: pickAccount(account), total: list.total, payouts: list.payouts, nextCursor: list.nextCursor };
+  }
+  // Single request by business id (cpo_…) with the live account tag attached
+  async function payoutView(doc, staff) {
+    return pickPayout((await attachBankingStatus([doc]))[0], staff);
   }
 
   router.get('/accounts', authenticateToken, async (req, res) => {
@@ -540,8 +640,17 @@ module.exports = (
     catch (e) { sendError(res, e, 'Failed to fetch customer payout accounts'); }
   });
 
+  // Customer payouts are a user/subadmin feature — admin manages them, never holds a wallet of their own.
+  const notForAdmin = (req) => { if (req.user.role === 'admin') throw fail(403, 'Customer payouts are for users and subadmins only'); };
+
+  router.get('/accounts/:accountId/payouts', authenticateToken, async (req, res) => {
+    try { res.json(await accountWithPayouts(await loadOwnAccount(req.user.userId, req.params.accountId), req.query)); }
+    catch (e) { sendError(res, e, 'Failed to fetch customer payout account history'); }
+  });
+
   router.post('/accounts', authenticateToken, async (req, res) => {
     try {
+      notForAdmin(req);
       const { account, created } = await findOrCreateAccount(req.user.userId, req.body, req.body.notes);
       res.status(created ? 201 : 200).json({ success: true, created, account: pickAccount(account) });
     } catch (e) { sendError(res, e, 'Failed to save customer payout account'); }
@@ -560,6 +669,7 @@ module.exports = (
   router.post('/requests', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
+      notForAdmin(req);
       const mode = String(req.body.mode || '').toUpperCase();
       if (!PAYOUT_MODES.includes(mode)) throw fail(400, 'Invalid mode. Must be NEFT, IMPS, RTGS or UPI.');
       const amountPaise = toPaise(req.body.amount);
@@ -591,7 +701,7 @@ module.exports = (
       const payout = await withWalletLock(userId, LOCK_TTL_REQUEST, async () => {
         await moveWallet(userId, { deltaHold: totalPaise }); // 409 if available < total
         try {
-          return await databases.createDocument(DB, PAYOUTS, ID.unique(), {
+          const doc = await databases.createDocument(DB, PAYOUTS, ID.unique(), {
             id, userId, accountId: account.$id,
             customerName: account.customerName, bankName: account.bankName, ifscCode: account.ifscCode, accountNumber: account.accountNumber,
             upiId: account.upiId || null,
@@ -603,6 +713,8 @@ module.exports = (
             addedToBankingAt: account.bankingStatus === 'added' ? (account.bankingStatusUpdatedAt || nowIso()) : null,
             paidAt: null, rejectedAt: null,
           });
+          await bumpAccountStats(account.$id, { requestCount: 1 }, { lastRequestedAt: doc.createdAt });
+          return doc;
         } catch (e) {
           await moveWallet(userId, { deltaHold: -totalPaise })
             .catch((e2) => console.error(`CRITICAL: payout doc create failed AND hold rollback failed. user=${userId} hold=${totalPaise}`, e2));
@@ -615,22 +727,86 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to create customer payout request'); }
   });
 
-  async function listPayouts(q, scopeQueries) {
+  // Filters shared by the user list and the admin queue. `scopeQueries` = userId scope
+  // ([] unrestricted, [query], or null = provably empty).
+  //   status, mode, accountId, processedBy, from/to (IST days), minAmount/maxAmount (rupees),
+  //   search + searchField (customerName | accountNumber | upiId | referenceNumber | id),
+  //   bankingStatus (current tag of the beneficiary account), sort (createdAt | processedAt | amount), order (asc | desc)
+  const PAYOUT_SORTS = { createdAt: 'createdAt', processedAt: 'processedAt', amount: 'amountPaise' };
+  const PAYOUT_SEARCH_FIELDS = ['customerName', 'accountNumber', 'upiId', 'referenceNumber', 'id'];
+  async function listPayouts(q, scopeQueries, staff = false) {
     const limit = parseLimit(q.limit);
+    const empty = { success: true, total: 0, payouts: [], nextCursor: null };
+    if (scopeQueries === null) return empty;
     const queries = [...scopeQueries];
+    if (staff && q.paidVia) queries.push(Query.equal('paidVia', String(q.paidVia).trim()));
     if (q.status) {
       if (!['pending', 'paid', 'rejected'].includes(q.status)) throw fail(400, 'Invalid status');
       queries.push(Query.equal('status', q.status));
     }
-    queries.push(...dateQueries(q.from, q.to), Query.orderDesc('createdAt'), ...cursorQuery(q.cursor), Query.limit(limit));
+    if (q.mode) {
+      const mode = String(q.mode).toUpperCase();
+      if (!PAYOUT_MODES.includes(mode)) throw fail(400, 'Invalid mode');
+      queries.push(Query.equal('mode', mode));
+    }
+    if (q.accountId) queries.push(Query.equal('accountId', String(q.accountId)));
+    if (q.processedBy) queries.push(Query.equal('processedBy', String(q.processedBy)));
+    const minP = rupeesFilter(q.minAmount, 'minAmount');
+    const maxP = rupeesFilter(q.maxAmount, 'maxAmount');
+    if (minP != null && maxP != null) {
+      if (maxP < minP) throw fail(400, 'maxAmount must be >= minAmount');
+      queries.push(Query.between('amountPaise', minP, maxP));
+    } else if (minP != null) queries.push(Query.greaterThanEqual('amountPaise', minP));
+    else if (maxP != null) queries.push(Query.lessThanEqual('amountPaise', maxP));
+    const search = String(q.search || '').trim();
+    if (search) {
+      const field = q.searchField || (/^\d+$/.test(search) ? 'accountNumber' : 'customerName');
+      if (!PAYOUT_SEARCH_FIELDS.includes(field)) throw fail(400, 'Invalid searchField');
+      if (field === 'customerName') queries.push(Query.search('customerName', search));       // fulltext index
+      else if (field === 'accountNumber') queries.push(Query.startsWith('accountNumber', search));
+      else queries.push(Query.equal(field, search));
+    }
+    if (q.bankingStatus) {
+      if (!BANKING_STATUSES.includes(q.bankingStatus)) throw fail(400, 'Invalid bankingStatus');
+      // Tag lives on the account: resolve matching accounts (same userId scope), then filter by accountId.
+      // ponytail: 500-account ceiling per filter call; add a status snapshot on the request if it matters
+      const ids = [];
+      let cursor = null;
+      for (let page = 0; page < 5; page++) {
+        const aq = [...scopeQueries, Query.equal('bankingStatus', q.bankingStatus), Query.orderAsc('$id'), Query.limit(100)];
+        if (cursor) aq.push(Query.cursorAfter(cursor));
+        const r = await databases.listDocuments(DB, ACCOUNTS, aq);
+        for (const a of r.documents) ids.push(a.$id);
+        if (r.documents.length < 100) break;
+        cursor = r.documents[r.documents.length - 1].$id;
+      }
+      if (!ids.length) return empty;
+      queries.push(idsQuery('accountId', ids));
+    }
+    const sortAttr = PAYOUT_SORTS[q.sort || 'createdAt'];
+    if (!sortAttr) throw fail(400, 'Invalid sort');
+    if (q.order && !['asc', 'desc'].includes(q.order)) throw fail(400, 'Invalid order');
+    const orderQ = q.order === 'asc' ? Query.orderAsc(sortAttr) : Query.orderDesc(sortAttr);
+    queries.push(...dateQueries(q.from, q.to), orderQ, ...cursorQuery(q.cursor), Query.limit(limit));
     const r = await databases.listDocuments(DB, PAYOUTS, queries);
-    const payouts = (await attachBankingStatus(r.documents)).map(pickPayout);
+    const payouts = (await attachBankingStatus(r.documents)).map((d) => pickPayout(d, staff));
     return { success: true, total: r.total, payouts, nextCursor: nextCursorOf(r.documents, limit) };
   }
+  // Admin / labelled employee (not subadmin) may see staff-only fields such as paidVia.
+  const isStaff = (req) => req.user.role !== 'subadmin' && req.user.role !== 'user';
 
   router.get('/requests', authenticateToken, async (req, res) => {
     try { res.json(await listPayouts(req.query, [Query.equal('userId', req.user.userId)])); }
     catch (e) { sendError(res, e, 'Failed to fetch customer payout requests'); }
+  });
+
+  // Deep link / search by unique id — own requests only
+  router.get('/requests/:id', authenticateToken, async (req, res) => {
+    try {
+      const p = await loadPayoutByBusinessId(req.params.id);
+      if (p.userId !== req.user.userId) throw fail(404, 'Customer payout request not found');
+      res.json({ success: true, payout: await payoutView(p, false) });
+    } catch (e) { sendError(res, e, 'Failed to fetch customer payout request'); }
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -642,11 +818,12 @@ module.exports = (
 
   router.get('/admin/wallets', adminView, async (req, res) => {
     try {
-      const scope = await userScope(req, req.query.userId);
+      const scope = await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId });
       if (req.query.userId) {
         return res.json({ success: true, wallet: walletView(req.query.userId, await getWallet(req.query.userId)) });
       }
       const limit = parseLimit(req.query.limit);
+      if (scope === null) return res.json({ success: true, total: 0, wallets: [], nextCursor: null });
       const r = await databases.listDocuments(DB, WALLETS, [...scope, Query.orderDesc('$createdAt'), ...cursorQuery(req.query.cursor), Query.limit(limit)]);
       res.json({ success: true, total: r.total, wallets: r.documents.map((w) => walletView(w.userId, w)), nextCursor: nextCursorOf(r.documents, limit) });
     } catch (e) { sendError(res, e, 'Failed to fetch payout wallets'); }
@@ -655,7 +832,7 @@ module.exports = (
   router.get('/admin/wallet/transactions', adminView, async (req, res) => {
     try {
       if (!req.query.userId) throw fail(400, 'userId is required');
-      await userScope(req, req.query.userId); // 403 for a subadmin asking about a foreign user
+      await userScope(req, { userId: req.query.userId }); // 403 for a subadmin asking about a foreign user
       res.json(await listWalletTxns(req.query.userId, req.query));
     } catch (e) { sendError(res, e, 'Failed to fetch payout wallet transactions'); }
   });
@@ -710,8 +887,27 @@ module.exports = (
   });
 
   router.get('/admin/accounts', adminView, async (req, res) => {
-    try { res.json(await listAccounts(req.query, await userScope(req, req.query.userId))); }
+    try { res.json(await listAccounts(req.query, await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId }))); }
     catch (e) { sendError(res, e, 'Failed to fetch customer payout accounts'); }
+  });
+
+  // Account detail for admin/subadmin: stats + every payout to this customer (filters as in listPayouts)
+  router.get('/admin/accounts/:accountId/payouts', adminView, async (req, res) => {
+    try {
+      const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
+      if (!account) throw fail(404, 'Customer payout account not found');
+      await userScope(req, { userId: account.userId }); // 403 for a subadmin on a foreign user's account
+      res.json(await accountWithPayouts(account, req.query, isStaff(req)));
+    } catch (e) { sendError(res, e, 'Failed to fetch customer payout account history'); }
+  });
+
+  // Repair path: rebuild one account's stats from its payout rows (idempotent overwrite)
+  router.post('/admin/accounts/:accountId/recompute-stats', adminEdit, async (req, res) => {
+    try {
+      const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
+      if (!account) throw fail(404, 'Customer payout account not found');
+      res.json({ success: true, account: pickAccount(await recomputeAccountStats(account.$id)) });
+    } catch (e) { sendError(res, e, 'Failed to recompute account stats'); }
   });
 
   router.delete('/admin/accounts/:accountId', adminEdit, async (req, res) => {
@@ -750,18 +946,32 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to update banking status'); }
   });
 
+  // Admin queue. Scope filters: userId, subadminId (their users + themselves), qrId (the QR's assigned
+  // user) — combinable, intersected. Row filters: see listPayouts.
   router.get('/admin/requests', adminView, async (req, res) => {
-    try { res.json(await listPayouts(req.query, await userScope(req, req.query.userId))); }
+    try { res.json(await listPayouts(req.query, await userScope(req, req.query), isStaff(req))); }
     catch (e) { sendError(res, e, 'Failed to fetch customer payout requests'); }
+  });
+
+  // Single request by unique id (cpo_…). Subadmins: only their users' requests (404 otherwise).
+  router.get('/admin/requests/:id', adminView, async (req, res) => {
+    try {
+      const p = await loadPayoutByBusinessId(req.params.id);
+      const scope = await userScope(req, { userId: p.userId }).catch(() => null);
+      if (scope === null) throw fail(404, 'Customer payout request not found');
+      res.json({ success: true, payout: await payoutView(p, isStaff(req)) });
+    } catch (e) { sendError(res, e, 'Failed to fetch customer payout request'); }
   });
 
   // Mark PAID: debits amount+commission from the wallet (releasing the hold), stamps the payout
   // reference number, then records payout commission. Exactly-once via wallet lock + re-read +
   // idempotent ledger row.
+  // Body: { referenceNumber (required), paidVia? (staff-only note: which of our accounts paid it, ≤100) }
   router.post('/admin/requests/:id/paid', adminEdit, async (req, res) => {
     try {
       const referenceNumber = String(req.body.referenceNumber || '').trim();
       if (referenceNumber.length < 5 || referenceNumber.length > 100) throw fail(400, 'Payout reference number is required (5–100 characters)');
+      const paidVia = String(req.body.paidVia || '').trim().slice(0, 100) || null;
       const found = await loadPayoutByBusinessId(req.params.id);
       if (found.status !== 'pending') throw fail(400, `Cannot mark a ${found.status} request as paid`);
 
@@ -781,9 +991,11 @@ module.exports = (
           });
         }
         const at = nowIso();
-        return databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'paid', referenceNumber, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
+        const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
+          status: 'paid', referenceNumber, paidVia, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
         });
+        await bumpAccountStats(p.accountId, { paidCount: 1, totalPaidPaise: Number(p.amountPaise || 0), totalCommissionPaise: Number(p.commissionPaise || 0) }, { lastPaidAt: at });
+        return doc;
       });
 
       const paidAmount = Number(updated.amountPaise || 0);
@@ -796,7 +1008,7 @@ module.exports = (
       try { await recordPayoutCommission(updated); }
       catch (e) { console.error(`CRITICAL: payout commission failed for ${updated.id}. Needs reconciliation.`, e); }
 
-      res.json({ success: true, message: 'Payout marked as paid', payout: pickPayout(updated) });
+      res.json({ success: true, message: 'Payout marked as paid', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to mark payout as paid'); }
   });
 
@@ -812,13 +1024,15 @@ module.exports = (
         if (p.status !== 'pending') throw fail(409, 'Request was already resolved');
         await moveWallet(p.userId, { deltaHold: -Number(p.totalPaise) }); // release the hold, balance untouched
         const at = nowIso();
-        return databases.updateDocument(DB, PAYOUTS, p.$id, {
+        const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
           status: 'rejected', rejectionReason: reason, referenceNumber: null, processedAt: at, rejectedAt: at, processedBy: req.user.userId,
         });
+        await bumpAccountStats(p.accountId, { rejectedCount: 1 });
+        return doc;
       });
       await inc('totalCustomerPayoutPendingAmount', -Number(updated.amountPaise || 0));
       await inc('totalCustomerPayoutPendingCount', -1);
-      res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated) });
+      res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to reject payout'); }
   });
 

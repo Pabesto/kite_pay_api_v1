@@ -44,7 +44,7 @@ Every amount field is either integer **paise** or float **rupees**. Identify the
 | Withdrawal-request docs: `amount`, `preAmount`, `commission` | **rupees** |
 | Wallet collection (`balance`, `holdBalance`) and wallet transactions | **rupees** |
 | Payout feature (payout.js): `payout_wallets.balancePaise/holdPaise`, `payout_wallet_transactions.*Paise`, `customer_payouts.amountPaise/commissionPaise/totalPaise`, `payout_commission_transactions.amount`, `daily_payout_commission_summaries.commissionsJson`, `monthly_/all_time_payout_commission_totals.totalCommissionPaise` | paise (`*Rs` keys in responses are derived) |
-| `users_meta.commission` / `users_meta.payoutCommission` | percent rates (0–100), not money |
+| `users_meta.commission` / `users_meta.payoutCommission` | percent rates (0–100), not money. A **missing** `payoutCommission` (null/undefined) means the config default `default_payout_commission` (fallback 1.5) — read it with `??`, never `\|\|`, because an explicit 0 is a real rate |
 | Client/request inputs: admin edit amount, merchant `qr_generate`, partner `searchField=amount`, withdrawal request bodies | rupees — convert at the boundary |
 
 Conversion and arithmetic rules:
@@ -180,7 +180,7 @@ Emit only through the helpers returned by `initSocket` (socketServer.js) — nev
 - Load env at the top, before any project requires: `const path = require('path'); require('dotenv').config({ path: path.join(__dirname, '..', '.env') });` so the project-root `.env` is used regardless of cwd. Assert required env vars and `process.exit(1)` with a clear message. (`copyAppwriteSchema.js` is the standalone exception — no dotenv, hardcoded blocks; see Secrets.)
 - Data-mutating scripts are **dry-run by default**, write only with `--write`, print a plan + scanned/changed/skipped/failed counts.
 - Idempotent by construction: schema creates treat Appwrite 409 as skip; backfills **recompute-and-overwrite** aggregates from the source transactions (never increment — re-runs would double-count). Live incremental writers, by contrast, **merge-add under the daily lock** — the two write styles are intentionally different.
-- Deploy ordering: `setup-review-schema.js` before enabling manual review; `setup-partner-schema.js` then `backfill-owner.js --write` before the partner API serves history; `setup-payout-schema.js` before deploying payout.js (it also extends the withdrawal `mode` enum with `wallet` and adds `users_meta.payoutCommission`).
+- Deploy ordering: `setup-review-schema.js` before enabling manual review; `setup-partner-schema.js` then `backfill-owner.js --write` before the partner API serves history; `setup-payout-schema.js` before deploying payout.js (it also extends the withdrawal `mode` enum with `wallet` and adds `users_meta.payoutCommission`), then optionally `backfill-payout-commission.js --write` to stamp the default rate on existing users (runtime falls back to the default anyway).
 - `transactionStatusMailer.js` sends real email via Hostinger on direct invocation — treat as production side effect.
 
 ## Testing bar & ship checklist

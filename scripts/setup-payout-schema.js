@@ -116,12 +116,25 @@ async function main() {
     await str(ACCOUNTS, 'createdAt', 40);
     await str(ACCOUNTS, 'bankingStatusUpdatedAt', 40);
     await str(ACCOUNTS, 'bankingStatusUpdatedBy', 64);
+    // per-customer payout stats (maintained by payout.js; repair: POST /admin/accounts/:id/recompute-stats)
+    await int(ACCOUNTS, 'requestCount');
+    await int(ACCOUNTS, 'paidCount');
+    await int(ACCOUNTS, 'rejectedCount');
+    await int(ACCOUNTS, 'totalPaidPaise');
+    await int(ACCOUNTS, 'totalCommissionPaise');
+    await str(ACCOUNTS, 'lastRequestedAt', 40);
+    await str(ACCOUNTS, 'lastPaidAt', 40);
     await sleep(4000);
     await idx(ACCOUNTS, 'idx_user_account', 'unique', ['userId', 'accountNumber']);
     await idx(ACCOUNTS, 'idx_userId', 'key', ['userId']);
     await idx(ACCOUNTS, 'idx_accountNumber', 'key', ['accountNumber']);
     await idx(ACCOUNTS, 'idx_bankingStatus', 'key', ['bankingStatus']);
     await idx(ACCOUNTS, 'idx_customerName_ft', 'fulltext', ['customerName']);
+    await idx(ACCOUNTS, 'idx_totalPaidPaise', 'key', ['totalPaidPaise']);   // sort/filter by amount paid
+    await idx(ACCOUNTS, 'idx_paidCount', 'key', ['paidCount']);
+    await idx(ACCOUNTS, 'idx_requestCount', 'key', ['requestCount']);
+    await idx(ACCOUNTS, 'idx_lastPaidAt', 'key', ['lastPaidAt']);
+    await idx(ACCOUNTS, 'idx_createdAt', 'key', ['createdAt']);
 
     // 4. customer_payouts
     const PAYOUTS = APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID;
@@ -145,6 +158,7 @@ async function main() {
     await str(PAYOUTS, 'notes', 500);
     await str(PAYOUTS, 'status', 16, true);        // pending | paid | rejected
     await str(PAYOUTS, 'referenceNumber', 100);
+    await str(PAYOUTS, 'paidVia', 100);            // staff-only: which of OUR accounts paid it
     await str(PAYOUTS, 'rejectionReason', 500);
     await str(PAYOUTS, 'createdAt', 40, true);
     await str(PAYOUTS, 'processedAt', 40);
@@ -160,6 +174,14 @@ async function main() {
     await idx(PAYOUTS, 'idx_status_createdAt', 'key', ['status', 'createdAt']);
     await idx(PAYOUTS, 'idx_user_status', 'key', ['userId', 'status']);
     await idx(PAYOUTS, 'idx_account_status', 'key', ['accountId', 'status']);   // delete-account pending guard
+    // admin queue filters / sorts
+    await idx(PAYOUTS, 'idx_customerName_ft', 'fulltext', ['customerName']);
+    await idx(PAYOUTS, 'idx_mode', 'key', ['mode']);
+    await idx(PAYOUTS, 'idx_amountPaise', 'key', ['amountPaise']);
+    await idx(PAYOUTS, 'idx_processedAt', 'key', ['processedAt']);
+    await idx(PAYOUTS, 'idx_processedBy', 'key', ['processedBy']);
+    await idx(PAYOUTS, 'idx_referenceNumber', 'key', ['referenceNumber']);
+    await idx(PAYOUTS, 'idx_paidVia', 'key', ['paidVia']);
 
     // 5. payout_commission_transactions (mirrors commission_transactions)
     const COMM = APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID;

@@ -52,6 +52,11 @@ carries `rejectionReason`; the user simply creates a new request.
 
 ## 2. Conventions (read first)
 
+- **Who has what:** the *user-side* feature (own payout wallet, own customer accounts, requesting
+  customer payouts, §3–§5) is for **users and subadmins only**. **Admins never have a wallet or
+  requests of their own** — do not show the wallet card, "New payout", "My customer accounts" or the
+  wallet-destination toggle to an admin; the server also refuses admin `POST /accounts` and
+  `POST /requests` with 403. Admin uses §6 exclusively.
 - **Auth:** same Bearer token as every other `/api/...` call. User endpoints are for any logged-in
   user and are always scoped to the caller. Admin **views** (`GET /api/payout/admin/...`) are open to
   role `admin`, an employee with the `view_payouts` label, and **subadmins — who only ever see their
@@ -71,7 +76,21 @@ carries `rejectionReason`; the user simply creates a new request.
 - **Times:** ISO-8601 UTC strings (`2026-09-06T10:00:30.000Z`). `DateTime.parse(s).toLocal()`.
   Date filters (`from`, `to`) are **IST calendar days** `YYYY-MM-DD`.
 - **Lists:** cursor pagination. Send `limit` (default 25, max 100) and `cursor` (the `nextCursor`
-  from the previous page). `nextCursor == null` ⇒ last page. Bad cursor ⇒ `400`.
+  from the previous page). `nextCursor == null` ⇒ last page. Bad cursor ⇒ `400`. Implement
+  infinite scroll (or "Load more") on **every** endpoint below — none of them returns everything:
+
+  | endpoint | list key |
+  |---|---|
+  | `GET /wallet/transactions`, `GET /admin/wallet/transactions` | `transactions` |
+  | `GET /accounts`, `GET /admin/accounts` | `accounts` |
+  | `GET /requests`, `GET /admin/requests` | `payouts` |
+  | `GET /accounts/:id/payouts`, `GET /admin/accounts/:id/payouts` | `payouts` (the `account` object is repeated on every page) |
+  | `GET /admin/wallets` (without `userId`) | `wallets` |
+  | `GET /admin/commissions` (max 50/page) | `commissions` |
+  | `GET /admin/commissions/monthly`, `…/all-time` | `totals` |
+
+  Changing any filter or sort resets the cursor — start again from page one. `total` is the count
+  matching the current filters (use it for "n results", not for paging).
 - **Errors:** `{ "error": "<message>" }`. Show `error` verbatim to the user for 400/409/422.
   - `400` validation · `403` not allowed · `404` not found · `409` busy lock / insufficient balance /
     already resolved · `422` commission rate misconfigured (tell user to contact support) · `500` server.
@@ -207,9 +226,18 @@ pending requests list and `holdPaise`.
     "customerName": "Ravi Kumar", "bankName": "SBI", "ifscCode": "SBIN0001234", "accountNumber": "12345678901",
     "upiId": "ravi@okaxis" | null,
     "bankingStatus": "not_added" | "added",
-    "notes": null, "createdAt": "…", "bankingStatusUpdatedAt": null, "bankingStatusUpdatedBy": null
+    "notes": null, "createdAt": "…", "bankingStatusUpdatedAt": null, "bankingStatusUpdatedBy": null,
+    // per-customer stats (paise / counts) — maintained by the server
+    "requestCount": 5, "paidCount": 4, "rejectedCount": 1, "pendingCount": 0,
+    "totalPaidPaise": 450000, "totalPaidRs": 4500, "totalCommissionPaise": 13500,
+    "lastRequestedAt": "…" | null, "lastPaidAt": "…" | null
   }] }
 ```
+Show the stats on the account card ("Paid 4 times · ₹4,500 total · last paid 2 Sep"). Tapping a card
+opens the history: `GET /api/payout/accounts/:accountId/payouts` → `{ success, account, total,
+payouts, nextCursor }` — the account (with stats) plus every request to that customer, newest first,
+paginated with `limit`/`cursor`; accepts the row filters of §5.4 (`status`, `mode`, `sort`,
+`from`/`to`, …). 404 if not yours.
 
 `POST /api/payout/accounts` — add a customer account without requesting a payout yet.
 ```jsonc
@@ -288,11 +316,25 @@ Effects: `holdPaise += totalPaise` immediately (refresh the wallet card). Errors
 `409 Payout wallet is busy…` (retry once) · `422` rate misconfigured.
 
 ### 5.4 `GET /api/payout/requests?status&from&to&limit&cursor` — own requests, newest first
-`status` optional: `pending | paid | rejected`. Rows have the shape above. Per status show:
+`status` optional: `pending | paid | rejected`. Also accepts `mode`, `search` (+`searchField`),
+`minAmount`/`maxAmount` (rupees), `bankingStatus`, `accountId`, `sort`/`order` — same semantics as
+the admin queue table in §6.1. Rows have the shape above. Per status show:
 - **pending** — "Awaiting admin", amount, total on hold, `accountBankingStatus` chip.
 - **paid** — green, `referenceNumber` (copyable), `processedAt`.
 - **rejected** — red, `rejectionReason` prominently, `processedAt`, a **"Request again"** button that
   opens the form pre-filled from this row (`accountId`, `mode`, `amountRs`, `notes`).
+
+### 5.4a Unique request id + lookup
+Every customer payout has a **unique, permanent id** `id` (format `cpo_<digits>`, e.g.
+`cpo_1725600000000456`) — distinct from the Appwrite `$id`. Show it on every row/detail with a copy
+button; it is what users quote to support and what admin types to find a request.
+
+- Search in any list: `?search=cpo_1725600000000456&searchField=id`.
+- Direct lookup (deep links, notifications, "open request"):
+  - user: `GET /api/payout/requests/:id` → `{ success, payout }` — own requests only, `404` otherwise.
+  - admin/subadmin: `GET /api/payout/admin/requests/:id` → `{ success, payout }` — subadmins get
+    `404` for requests of users that are not theirs. `400` if the id is malformed.
+  Both return the same row shape as the lists (with the live `accountBankingStatus`).
 
 ### 5.5 Service timeline on every request row
 Every payout row carries four timestamps and three server-computed durations so the user can see
@@ -327,9 +369,31 @@ users (+ themselves) and `?userId=` of anyone else returns `403`. Give subadmins
 of the queue/wallet screens (no action buttons) so they can see their users' payout requests, the
 commission each request paid (`commissionPaise`), and their own payout-commission earnings (§6.5).
 
-### 6.1 Customer payout queue — `GET /api/payout/admin/requests?status&userId&from&to&limit&cursor`
+### 6.1 Customer payout queue — `GET /api/payout/admin/requests?…`
 Same row shape as §5.3 plus every row carries `userId`. Default view: `status=pending`, oldest at the
-bottom (server returns newest first). Show the **`accountBankingStatus`** chip; when it is
+bottom (server returns newest first). All filters combine (AND). Build a filter sheet with these:
+
+| query param | values | notes |
+|---|---|---|
+| `status` | `pending` `paid` `rejected` | tabs |
+| `userId` | user id | one user |
+| `subadminId` | subadmin id | that subadmin's users **and** the subadmin themself. Subadmins may only pass their own id (else 403) |
+| `qrId` | QR code id | the user the QR is assigned to. Unknown QR → empty list. Combines with the two above by intersection |
+| `mode` | `NEFT` `IMPS` `RTGS` `UPI` | case-insensitive |
+| `bankingStatus` | `added` `not_added` | the beneficiary account's **current** tag — use `not_added` as the "to be added in banking" worklist |
+| `accountId` | account `$id` | all requests for one saved account |
+| `processedBy` | admin/employee user id | who marked it paid/rejected |
+| `search` (+ `searchField`) | text | `searchField` ∈ `customerName` (default; word search), `accountNumber` (prefix), `upiId`, `referenceNumber`, `id` (exact). Digits-only `search` without a field = account-number prefix |
+| `paidVia` | text (exact) | admin / labelled employee only — which of our accounts paid it; silently ignored for subadmins |
+| `minAmount` / `maxAmount` | **rupees** | on the payout amount (excl. commission) |
+| `from` / `to` | `YYYY-MM-DD` (IST) | on request time |
+| `sort` / `order` | `createdAt` (default) `processedAt` `amount` / `desc` (default) `asc` | `processedAt` sorts pending rows last |
+| `limit` / `cursor` | | pagination as in §2 |
+
+Bad values return `400 { error }` (e.g. `Invalid mode`, `Invalid searchField`, `maxAmount must be >=
+minAmount`). The same row filters (everything except `userId` / `subadminId` / `qrId`) also work on the
+user's own list `GET /api/payout/requests` (§5.4), so the user can search their history too.
+`GET /admin/accounts` and `GET /admin/wallets` accept `subadminId` as well. Show the **`accountBankingStatus`** chip; when it is
 `not_added` show an inline **"Mark added"** action (§6.3) — the admin adds the beneficiary in the bank
 portal first, tags it, then pays. For `mode: "UPI"` rows show `upiId` as the payee instead of the
 account number.
@@ -337,10 +401,18 @@ account number.
 ### 6.2 Resolve
 `POST /api/payout/admin/requests/:id/paid` — `:id` is the business id `cpo_…`.
 ```jsonc
-{ "referenceNumber": "UTR1234567890" }      // required, 5–100 chars — the bank/payout reference
+{ "referenceNumber": "UTR1234567890",        // required, 5–100 chars — the bank/payout reference (the user sees this)
+  "paidVia": "HDFC current a/c ****4321" }   // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
 ```
+`paidVia` is optional on the server, but **make it a required field in the Paid dialog** — it is the
+internal record of the source account. Offer the last few distinct values as quick-pick chips.
 `200 { success, message: "Payout marked as paid", payout }`. Effects: wallet `balance −= total`,
 `hold −= total`, ledger row `payout_paid`, payout commission recorded for admin/subadmin.
+
+**Visibility of `paidVia`:** it is returned only to role `admin` and labelled employees (on the queue,
+the single-request lookup, the account history, and the paid response). **Users and subadmins never
+receive the key at all** — do not render a "Paid via" row from a missing key, and never copy it into
+anything the user can see.
 Errors: `400` short reference / not pending (`Cannot mark a paid request as paid`) ·
 `409 Request was already resolved` (someone else won — refresh) · `409` wallet busy (retry).
 
@@ -352,8 +424,32 @@ Errors: `400` short reference / not pending (`Cannot mark a paid request as paid
 
 Both are exactly-once on the server; a double tap returns 400/409, never a double debit.
 
-### 6.3 Customer accounts — `GET /api/payout/admin/accounts?userId&bankingStatus&search&limit&cursor`
-Filter `bankingStatus=not_added` for the "to be added in banking" worklist.
+### 6.3 Customer accounts — all customers, how much we paid each
+`GET /api/payout/admin/accounts?…` lists **every** saved customer account (admin) or the caller's
+users' accounts (subadmin). Rows have the §5.1 shape including the stats block. Filters (AND):
+
+| query param | values | notes |
+|---|---|---|
+| `userId` / `subadminId` | ids | per user, or per subadmin (their users + themself) |
+| `search` | text | digits → account-number prefix, otherwise customer-name word search |
+| `bankingStatus` | `added` `not_added` | `not_added` = the "to be added in banking" worklist |
+| `minTotalPaid` | **rupees** | only customers we have paid at least this much |
+| `from` / `to` | `YYYY-MM-DD` (IST) | account creation date |
+| `sort` / `order` | `createdAt` (default) `totalPaid` `paidCount` `requestCount` `lastPaidAt` / `desc` (default) `asc` | e.g. `sort=totalPaid` = biggest payees first |
+| `limit` / `cursor` | | pagination |
+
+Suggested list row: name · bank/account (or UPI) · owner user · `bankingStatus` chip ·
+"Paid n × ₹total" · last paid. Tapping opens the detail:
+
+`GET /api/payout/admin/accounts/:accountId/payouts?status&mode&sort&order&from&to&limit&cursor`
+→ `{ success, account, total, payouts, nextCursor }`: the account with stats plus the full list of
+requests to that customer (each with its timeline, reference number and status). Default sort newest
+first; `status=paid` gives "everything we paid to this customer". Subadmins get 403 for accounts of
+users that are not theirs.
+
+`POST /api/payout/admin/accounts/:accountId/recompute-stats` (admin / `edit_payouts`) → rebuilds the
+stats block from the request rows and returns `{ success, account }`. Only needed if a stats figure
+ever looks wrong (the server logs when a stats update fails); safe to call any time.
 `PATCH /api/payout/admin/accounts/:accountId/banking-status`
 ```jsonc
 { "bankingStatus": "added" }        // or "not_added" to revert
@@ -434,13 +530,15 @@ wallet float", "Customer payouts pending (n / ₹)", "Customer payouts paid (n /
 { "payoutCommission": 2.5 }     // percent, 0–100; independent of "commission"
 ```
 `GET /api/admin/users` (and the subadmin/employee lists) now return `payoutCommission` next to
-`commission`. Add a second field in the Edit User form.
+`commission`. Add a second field in the Edit User form. **Default is 1.5 %**: a user with no value
+set is charged 1.5 (and their subadmin's missing value also counts as 1.5), so the lists always show
+the effective rate — never blank. Setting it to `0` explicitly means 0.
 
 ---
 
 ## 7. Suggested screens
 
-**User**
+**User and subadmin** (hide all of these for role `admin`)
 1. *Withdraw* — destination toggle **Direct / Payout Wallet**; wallet mode hides bank fields and the
    commission line ("No commission for wallet transfers").
 2. *Payout Wallet* — balance card (§4.1) + history list (§4.2) with type filter chips.
@@ -448,8 +546,9 @@ wallet float", "Customer payouts pending (n / ₹)", "Customer payouts paid (n /
 4. *New payout* — step 1 pick account (search list, §5.1) or "Add new" (five fields + confirm,
    optional UPI ID); step 2 mode segmented control (NEFT/IMPS/RTGS/UPI — selecting UPI reveals a
    required UPI ID field prefilled from the account), amount, notes, live preview (§5.2), submit.
-5. *Customer accounts* — list with `bankingStatus` chips, UPI ID if present, swipe-to-delete
-   (disabled/409-toast while a pending request exists).
+5. *Customer accounts* — list with `bankingStatus` chips, UPI ID if present, paid count / total paid,
+   tap → per-customer history (§5.1), swipe-to-delete (disabled/409-toast while a pending request
+   exists).
 
 **Admin**
 1. *Withdrawals* — existing screen; wallet rows labelled "To Payout Wallet", approve without UTR.
@@ -458,6 +557,9 @@ wallet float", "Customer payouts pending (n / ₹)", "Customer payouts paid (n /
    from `requestedAt` to now — this is the only place the device does date math) so the oldest
    requests stand out; paid/rejected rows show the server's `paidInMinutes` / `rejectedInMinutes`.
 3. *Wallets* — list, per-user drill-down with history and "Adjust…" dialog.
+3b. *Customer accounts* — all customers across users (§6.3) with the filter sheet (user, subadmin,
+   search, tag, min paid, sort by total paid / paid count / last paid), tap → detail with stats and
+   the list of payouts we made to that customer, "Mark added" and "Delete" actions.
 4. *Payout commission* — "This month" / "All time" tiles (§6.5 monthly/all-time), summary chart by
    day, transactions list.
 5. *Edit user* — add "Payout commission %".
