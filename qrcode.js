@@ -24,9 +24,21 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Mirrors the Appwrite enum on the qr_codes `type` attribute. Keep in sync with the
-// collection — an unlisted value makes createDocument throw "invalid format".
-const QR_TYPES = ['paytm', 'pinelabs', 'cashfree', 'razorpay', 'other'];
+// app_config.integrations is the ONLY source of truth for QR integrations — no hardcoded
+// list, no Appwrite enum. Admins add an integration by editing that config key alone.
+// Returns the configured names verbatim ("Razorpay"); matching is case-insensitive.
+function allowedIntegrations() {
+    return (ConfigManager.get('integrations', []) || [])
+        .map(v => String(v).trim())
+        .filter(Boolean);
+}
+
+// Resolve a client-supplied name to the config's canonical spelling, or null if unlisted.
+function canonicalIntegration(raw) {
+    const v = raw == null ? '' : String(raw).trim();
+    if (!v) return null;
+    return allowedIntegrations().find(i => i.toLowerCase() === v.toLowerCase()) || null;
+}
 
 // We will now pass the required dependencies and middleware from the main server file
 module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, bucketId,APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, roleAuth, requireRole) => {
@@ -331,7 +343,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
     async function saveQrEntry({
         qrId,
-        qrType,
         companyName,
         integrationName = null,
         fileId,
@@ -343,7 +354,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             console.log('Saving QR Entry:', {
                 qrId,
-                qrType,
                 companyName,
                 integrationName,
             });
@@ -351,10 +361,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         // After successful creation:
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsUploaded', 1).catch(console.error);
 
-        // Increment type-specific counter
-        if (qrType === 'pinelabs') {
+        // Increment integration-specific counter (names are config-cased; compare lowercase)
+        const counterKey = String(integrationName || '').toLowerCase();
+        if (counterKey === 'pinelabs') {
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', 1).catch(console.error);
-        } else if (qrType === 'paytm') {
+        } else if (counterKey === 'paytm') {
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', 1).catch(console.error);
         } else {
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', 1).catch(console.error);
@@ -373,8 +384,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             ID.unique(),
             {
             qrId,
-            // enum attribute — omit rather than write null/'' when the caller sent no type
-            ...(qrType ? { type: qrType } : {}),
             companyName,
             ...(integrationName ? { integrationName } : {}),
             fileId,
@@ -391,19 +400,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // This is an admin-only endpoint
     router.post('/create-qr-entry', authenticateAdmin, async (req, res) => {
         const { companyName, fileId, imageUrl , createdAt } = req.body;
-        // integrationName is free text in Appwrite, but must be one of the admin-managed
-        // `integrations` config values. Empty config = no list configured = skip the check.
-        const integrations = ConfigManager.get('integrations', []);
-        const rawIntegration = req.body.integrationName == null ? null : String(req.body.integrationName).trim();
-        // store the config's canonical casing so listings don't drift ("Paytm" vs "paytm")
-        const integrationName = rawIntegration
-            ? (integrations.find(i => i.toLowerCase() === rawIntegration.toLowerCase()) || rawIntegration)
-            : null;
         // qrIds are stored lowercase so every later compare (ingest, extension qrRef) is case-insensitive by construction.
         const qrId = String(req.body.qrId || '').trim().toLowerCase();
-        // `type` is an Appwrite enum: normalise casing, then reject anything unlisted with a 400
-        // instead of letting createDocument fail with a 500. Omitted stays omitted (legacy behaviour).
-        const qrType = req.body.qrType == null ? null : String(req.body.qrType).trim().toLowerCase();
+
+        // integrationName is the single integration field. `qrType` is still accepted as a
+        // legacy alias so older app builds keep working; both must name the same integration.
+        const rawIntegration = req.body.integrationName ?? req.body.qrType ?? null;
+        const integrationName = canonicalIntegration(rawIntegration);
 
         // console.log('Create QR Entry request body:', req.body);
 
@@ -411,12 +414,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             return res.status(400).json({ message: "Missing required fields: qrId, fileId, or imageUrl." });
         }
 
-        if (qrType !== null && !QR_TYPES.includes(qrType)) {
-            return res.status(400).json({ message: `Invalid qrType ${JSON.stringify(req.body.qrType)}. Must be one of: ${QR_TYPES.join(', ')}.` });
+        if (req.body.integrationName != null && req.body.qrType != null
+            && String(req.body.integrationName).trim().toLowerCase() !== String(req.body.qrType).trim().toLowerCase()) {
+            return res.status(400).json({ message: `integrationName ${JSON.stringify(req.body.integrationName)} and qrType ${JSON.stringify(req.body.qrType)} must be the same integration.` });
         }
 
-        if (integrationName && integrations.length && !integrations.includes(integrationName)) {
-            return res.status(400).json({ message: `Invalid integrationName ${JSON.stringify(req.body.integrationName)}. Must be one of: ${integrations.join(', ')}.` });
+        const integrations = allowedIntegrations();
+        if (rawIntegration != null && String(rawIntegration).trim() !== '' && !integrationName) {
+            return res.status(400).json({ message: `Invalid integrationName ${JSON.stringify(rawIntegration)}. Must be one of: ${integrations.join(', ')}.` });
         }
 
         try {
@@ -434,7 +439,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const newQrCode = await saveQrEntry({
                 qrId,
-                qrType,
                 companyName,
                 integrationName,
                 fileId,
@@ -493,10 +497,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // Decrement dashboard counters
             await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalQrsUploaded', -1).catch(console.error);
 
-            // Decrement type-specific counter
-            if (doc.type === 'pinelabs') {
+            // Decrement integration-specific counter. Falls back to the legacy `type` column so
+            // rows written before integrationName existed still decrement the counter they incremented.
+            const delCounterKey = String(doc.integrationName || doc.type || '').toLowerCase();
+            if (delCounterKey === 'pinelabs') {
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPinelabsQrs', -1).catch(console.error);
-            } else if (doc.type === 'paytm') {
+            } else if (delCounterKey === 'paytm') {
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPaytmQrs', -1).catch(console.error);
             } else {
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalOtherQrs', -1).catch(console.error);
@@ -552,11 +558,19 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // 2. Build update payload with only provided fields
             const updatePayload = {};
-            if (qrType !== undefined) updatePayload.qrType = qrType;
             if (companyName !== undefined) updatePayload.companyName = companyName;
-            // Free-text tag, same treatment as companyName. Admin-only via the route's
-            // authenticateAdmin middleware. Appwrite column: integrationName (text, optional).
-            if (integrationName !== undefined) updatePayload.integrationName = integrationName;
+            // integrationName is the single integration field; `qrType` stays accepted as a
+            // legacy alias. Both resolve through app_config.integrations, so an unlisted name
+            // is a 400 rather than a silent write. (The old code wrote a `qrType` key that no
+            // Appwrite attribute matched, so this edit path never actually took effect.)
+            const rawEditIntegration = integrationName !== undefined ? integrationName : qrType;
+            if (rawEditIntegration !== undefined) {
+                const canonical = canonicalIntegration(rawEditIntegration);
+                if (!canonical) {
+                    return res.status(400).json({ message: `Invalid integrationName ${JSON.stringify(rawEditIntegration)}. Must be one of: ${allowedIntegrations().join(', ')}.` });
+                }
+                updatePayload.integrationName = canonical;
+            }
             if (fileId !== undefined) updatePayload.fileId = fileId;
             if (imageUrl !== undefined) updatePayload.imageUrl = imageUrl;
 
