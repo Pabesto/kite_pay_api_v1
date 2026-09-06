@@ -66,6 +66,7 @@ describe('finalizeTransaction — happy path', () => {
             assignedUserId: 'user-42',
             qrCodeId: 'QR123',
             payload: {
+                status: 'normal',
                 $id: 'txn-doc-1',
                 qrCodeId: 'QR123',
                 paymentId: 'pay_abc',
@@ -96,7 +97,48 @@ describe('finalizeTransaction — happy path', () => {
         await finalizeTransaction(sampleCreated, { emitPayload: custom });
         await flush();
 
-        expect(deps.emitTxnNew.mock.calls[0][0].payload).toBe(custom);
+        // every key is passed through untouched; `status` is added on top
+        expect(deps.emitTxnNew.mock.calls[0][0].payload).toEqual({ ...custom, status: 'normal' });
+    });
+});
+
+// Clients render "Success" vs "HOLD" off payload.status. Reaching finalize means the txn is
+// live (held docs emit review:pending only), so the emit must always carry a status.
+describe('finalizeTransaction — emitted payload always carries status', () => {
+    test('adds status to a caller-supplied emitPayload that omits it', async () => {
+        const deps = makeDeps();
+        const finalizeTransaction = createFinalizeTransaction(deps);
+
+        // exactly what the 3 webhooks in server.js pass — note: no status key
+        await finalizeTransaction(sampleCreated, {
+            emitPayload: { $id: 'txn-doc-1', qrCodeId: 'QR123', paymentId: 'pay_abc', amount: 50000, provider: 'razorpay' },
+        });
+        await flush();
+
+        expect(deps.emitTxnNew.mock.calls[0][0].payload.status).toBe('normal');
+    });
+
+    test('carries the created docs own status through (review-approved txn)', async () => {
+        const deps = makeDeps();
+        const finalizeTransaction = createFinalizeTransaction(deps);
+
+        // resolveReview finalizes with the UPDATED doc after flipping reviewStatus
+        await finalizeTransaction({ ...sampleCreated, status: 'normal', reviewStatus: 'approved', deleted: false });
+        await flush();
+
+        expect(deps.emitTxnNew.mock.calls[0][0].payload.status).toBe('normal');
+    });
+
+    test('an explicit status in emitPayload still wins', async () => {
+        const deps = makeDeps();
+        const finalizeTransaction = createFinalizeTransaction(deps);
+
+        await finalizeTransaction({ ...sampleCreated, status: 'normal' }, {
+            emitPayload: { $id: 'x', qrCodeId: 'QR123', status: 'cyber' },
+        });
+        await flush();
+
+        expect(deps.emitTxnNew.mock.calls[0][0].payload.status).toBe('cyber');
     });
 });
 

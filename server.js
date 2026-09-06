@@ -1381,6 +1381,7 @@ app.get('/test_websocket', (req, res) => {
     vpa: vpAs[randInt(0, vpAs.length - 1)],
     provider: providers[randInt(0, providers.length - 1)],
     created_at: recentIso(240),               // anywhere in last 4 hours [15]
+    status: 'normal',                         // match the live finalize payload
   };
 
   emitTxnNew({

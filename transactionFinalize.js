@@ -47,15 +47,23 @@ module.exports = function createFinalizeTransaction(deps) {
         emitTxnNew({
             assignedUserId: qrDoc?.assignedUserId || '',
             qrCodeId,
-            payload: emitPayload || {
-                $id:        created.$id,
-                qrCodeId,
-                paymentId:  created.paymentId,
-                amount:     amountPaise,
-                rrnNumber:  created.rrnNumber || null,
-                vpa:        created.vpa || null,
-                provider:   created.provider,
-                created_at: isoDate,
+            payload: {
+                // Reaching finalize means the txn is live: either it was never held for review,
+                // or review approved it (held docs emit `review:pending` only and never get here).
+                // Injected for every caller so each ingest path doesn't have to remember it —
+                // clients key their "Success" vs "HOLD" label off this field. An explicit
+                // status in emitPayload still wins.
+                status: created.status || 'normal',
+                ...(emitPayload || {
+                    $id:        created.$id,
+                    qrCodeId,
+                    paymentId:  created.paymentId,
+                    amount:     amountPaise,
+                    rrnNumber:  created.rrnNumber || null,
+                    vpa:        created.vpa || null,
+                    provider:   created.provider,
+                    created_at: isoDate,
+                }),
             },
         });
 
