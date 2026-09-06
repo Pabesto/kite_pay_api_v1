@@ -40,7 +40,7 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -4215,6 +4215,16 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             totalAmountPaid: get('totalAmountPaid'),
             totalWithdrawalPendingAmount: get('totalWithdrawalPendingAmount'),
 
+            // Customer payouts / payout wallets (payout.js) — paise unless *Count
+            totalPayoutWalletFunded: get('totalPayoutWalletFunded'),               // QR balance moved into payout wallets (also inside totalAmountPaid)
+            totalPayoutWalletBalance: get('totalPayoutWalletBalance'),             // current float across all payout wallets
+            totalCustomerPayoutPendingAmount: get('totalCustomerPayoutPendingAmount'),
+            totalCustomerPayoutPendingCount: get('totalCustomerPayoutPendingCount'),
+            totalCustomerPayoutPaid: get('totalCustomerPayoutPaid'),
+            totalCustomerPayoutPaidCount: get('totalCustomerPayoutPaidCount'),
+            totalPayoutAdminProfit: get('totalPayoutAdminProfit'),
+            totalPayoutMerchantProfit: get('totalPayoutMerchantProfit'),
+
             // Users/Merchants
             activeUsers: get('activeUsers'),
             disabledUsers: get('disabledUsers'),
@@ -4512,6 +4522,19 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 totalMerchantProfit = Number(row.totalCommissionPaise || 0)
              }
 
+            // Payout commission earned by this subadmin (customer payouts, payout.js rollup)
+            let totalPayoutMerchantProfit = 0;
+            if (APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID) {
+                const payoutCommissionList = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID,
+                    [ Query.equal('userId', merchantId), Query.limit(1) ]
+                ).catch((e) => { console.error('payout commission total read failed:', e?.message); return { total: 0, documents: [] }; });
+                if (payoutCommissionList.total > 0) {
+                    totalPayoutMerchantProfit = Number(payoutCommissionList.documents[0].totalCommissionPaise || 0);
+                }
+            }
+
             const activeUsers = usersAll.filter(u => u.status === true && u.role === 'user').length;
             const disabledUsers = usersAll.filter(u => u.status !== true && u.role === 'user').length;
             const totalUsers = usersAll.filter(u => u.role === 'user').length;
@@ -4579,6 +4602,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 // --- Other ---
                 totalMerchantProfit,
+                totalPayoutMerchantProfit,   // paise, from customer payouts
 
                 // Users
                 activeUsers,
@@ -4766,6 +4790,39 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             withdrawableAmount = totalAvailableAmount - todayPayInAllQrs;
 
+            // 2c) Payout wallet + customer payouts (payout.js). All paise unless *Count. Lifetime totals
+            // live on the wallet doc; only the (small) pending set is summed live.
+            let payoutWalletBalance = 0, payoutWalletHold = 0, payoutWalletTotalCredited = 0, payoutWalletTotalAdminDebit = 0;
+            let customerPayoutPendingCount = 0, customerPayoutPendingAmount = 0;
+            let customerPayoutPaidCount = 0, customerPayoutPaidAmount = 0, customerPayoutCommissionPaid = 0;
+            let customerPayoutRejectedCount = 0;
+            if (APPWRITE_PAYOUT_WALLETS_COLLECTION_ID && APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID) {
+                try {
+                    const walletRes = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, [Query.equal('userId', userId), Query.limit(1)]);
+                    const w = walletRes.documents[0];
+                    if (w) {
+                        payoutWalletBalance = Number(w.balancePaise || 0);
+                        payoutWalletHold = Number(w.holdPaise || 0);
+                        payoutWalletTotalCredited = Number(w.totalCreditedPaise || 0);
+                        payoutWalletTotalAdminDebit = Number(w.totalAdminDebitPaise || 0);
+                        customerPayoutPaidCount = Number(w.paidCount || 0);
+                        customerPayoutPaidAmount = Number(w.totalPaidOutPaise || 0);
+                        customerPayoutCommissionPaid = Number(w.totalPayoutCommissionPaise || 0);
+                    }
+                    const pendingRows = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, [
+                        Query.equal('userId', userId), Query.equal('status', 'pending'), Query.limit(100), Query.orderAsc('$id'),
+                    ]);
+                    customerPayoutPendingCount = pendingRows.length;
+                    customerPayoutPendingAmount = pendingRows.reduce((s, p) => s + Number(p.amountPaise || 0), 0);
+                    const rejectedRes = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, [
+                        Query.equal('userId', userId), Query.equal('status', 'rejected'), Query.limit(1),
+                    ]);
+                    customerPayoutRejectedCount = Number(rejectedRes.total || 0);
+                } catch (e) {
+                    console.error('User dashboard: payout block failed (returning zeros):', e?.message);
+                }
+            }
+
             // 3) Respond
             return res.json({
                 userId,
@@ -4790,6 +4847,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // Commission
                 totalCommissionOnHold,
                 totalCommissionPaid,
+
+                // Payout wallet (payout.js) — paise
+                payoutWalletBalance,
+                payoutWalletHold,
+                payoutWalletAvailable: payoutWalletBalance - payoutWalletHold,
+                payoutWalletTotalCredited,
+                payoutWalletTotalAdminDebit,
+
+                // Customer payouts — paise unless *Count
+                customerPayoutPendingCount,
+                customerPayoutPendingAmount,
+                customerPayoutPaidCount,
+                customerPayoutPaidAmount,
+                customerPayoutCommissionPaid,
+                customerPayoutRejectedCount,
             });
 
         } catch (e) {

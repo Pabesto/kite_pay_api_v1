@@ -81,7 +81,7 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
     let router;
     jest.isolateModules(() => {
         const adminFactory = require('../admin.js');
-        // Positional args mirror the app.use('/api/admin', adminRoutes(...)) mount in server.js (39 args).
+        // Positional args mirror the app.use('/api/admin', adminRoutes(...)) mount in server.js (42 args).
         router = adminFactory(
             'https://appwrite.test/v1',   // APPWRITE_ENDPOINT
             'proj1',                      // APPWRITE_PROJECT_ID
@@ -121,7 +121,10 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
             jest.fn().mockResolvedValue(),   // finalizeTransaction
             'rejected_txns',
             'daily_rejected',
-            jest.fn()                        // emitReviewResolved
+            jest.fn(),                       // emitReviewResolved
+            'alltime_payout_comm',           // APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID
+            'payout_wallets',                // APPWRITE_PAYOUT_WALLETS_COLLECTION_ID
+            'customer_payouts'               // APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID
         );
     });
     const app = express();
@@ -586,5 +589,59 @@ describe('POST /withdraw_new — commission rate bounds', () => {
         });
         // Commission rate is valid (100) — should not return 422
         expect(res.status).not.toBe(422);
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// J. GET /dashboard/user/:userId — payout wallet + customer payout block
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('GET /dashboard/user/:userId — payout block', () => {
+    function dbWithPayouts() {
+        return makeDb({
+            listDocuments: jest.fn().mockImplementation((_dbId, colId, queries = []) => {
+                const q = queries.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+                const eq = (attr) => q.find((x) => x.method === 'equal' && x.attribute === attr)?.values?.[0];
+                if (colId === 'payout_wallets') {
+                    return Promise.resolve({ total: 1, documents: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300, totalCreditedPaise: 120000, totalPaidOutPaise: 60000, totalPayoutCommissionPaise: 1800, totalAdminDebitPaise: 0, paidCount: 3 }] });
+                }
+                if (colId === 'customer_payouts') {
+                    if (eq('status') === 'pending') return Promise.resolve({ total: 2, documents: [{ $id: 'p1', amountPaise: 10000 }, { $id: 'p2', amountPaise: 2500 }] });
+                    if (eq('status') === 'rejected') return Promise.resolve({ total: 4, documents: [{ $id: 'p9' }] });
+                }
+                return Promise.resolve({ documents: [], total: 0 }); // QRs, daily summaries
+            }),
+        });
+    }
+
+    test('self view returns wallet + payout figures (paise, counts)', async () => {
+        const app = buildAdminApp(dbWithPayouts(), makeRedis(), asUser('user1'));
+        const res = await request(app).get('/dashboard/user/user1');
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({
+            payoutWalletBalance: 50000, payoutWalletHold: 10300, payoutWalletAvailable: 39700,
+            payoutWalletTotalCredited: 120000, payoutWalletTotalAdminDebit: 0,
+            customerPayoutPendingCount: 2, customerPayoutPendingAmount: 12500,
+            customerPayoutPaidCount: 3, customerPayoutPaidAmount: 60000, customerPayoutCommissionPaid: 1800,
+            customerPayoutRejectedCount: 4,
+        });
+    });
+
+    test('user with no wallet gets zeros, and a payout read failure never breaks the dashboard', async () => {
+        const db = makeDb({
+            listDocuments: jest.fn().mockImplementation((_dbId, colId) => {
+                if (colId === 'customer_payouts') return Promise.reject(new Error('appwrite down'));
+                return Promise.resolve({ documents: [], total: 0 });
+            }),
+        });
+        const app = buildAdminApp(db, makeRedis(), asUser('user1'));
+        const res = await request(app).get('/dashboard/user/user1');
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ payoutWalletBalance: 0, payoutWalletAvailable: 0, customerPayoutPendingCount: 0, totalQrs: 0 });
+    });
+
+    test('another plain user is forbidden', async () => {
+        const app = buildAdminApp(dbWithPayouts(), makeRedis(), asUser('user2'));
+        expect((await request(app).get('/dashboard/user/user1')).status).toBe(403);
     });
 });

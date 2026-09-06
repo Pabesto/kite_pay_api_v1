@@ -18,6 +18,7 @@
 const express = require('express');
 const moment = require('moment-timezone');
 const userMetaCache = require('./userMetaCache');
+const { updateDashboardCounter } = require('./dashboardCounters');
 
 const CURSOR_RE = /^[a-zA-Z0-9_:-]{1,255}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
@@ -43,6 +44,13 @@ module.exports = (
 
   // ─── helpers ───────────────────────────────────────────────────────────────
   function fail(status, message) { const e = new Error(message); e.status = status; return e; }
+  // Admin dashboard counters (paise / counts). Fire-and-forget: never fails the money operation.
+  //   totalPayoutWalletBalance        — sum of all payout wallets' balancePaise (platform liability)
+  //   totalCustomerPayoutPendingAmount / Count — customer payouts awaiting admin (amount excl. commission)
+  //   totalCustomerPayoutPaid / Count — customer payouts marked PAID (amount excl. commission)
+  //   totalPayoutAdminProfit / totalPayoutMerchantProfit — payout commission earned (admin / subadmins)
+  //   totalPayoutWalletFunded         — written by withdraw.js when a mode:'wallet' withdrawal is approved
+  const inc = (key, delta) => updateDashboardCounter(databases, DB, key, delta).catch((e) => console.error(`Error updating ${key}:`, e));
   const nowIso = () => new Date().toISOString();
   const istDay = (ts = new Date()) => moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM-DD');
   const istMonth = (ts = new Date()) => moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM');
@@ -153,11 +161,26 @@ module.exports = (
     const w = await getWallet(userId);
     if (w) return w;
     try {
-      return await databases.createDocument(DB, WALLETS, ID.unique(), { userId, balancePaise: 0, holdPaise: 0, updatedAt: nowIso() });
+      return await databases.createDocument(DB, WALLETS, ID.unique(), { userId, balancePaise: 0, holdPaise: 0, ...ZERO_LIFETIME, updatedAt: nowIso() });
     } catch (e) {
       const again = await getWallet(userId); // unique-index race fallback
       if (again) return again;
       throw e;
+    }
+  }
+  // Lifetime totals kept on the wallet doc (paise / counts), maintained by moveWallet under the
+  // wallet lock so dashboards never scan the ledger. Read with `|| 0` — wallets created before
+  // the fields existed lack them.
+  const ZERO_LIFETIME = { totalCreditedPaise: 0, totalPaidOutPaise: 0, totalPayoutCommissionPaise: 0, totalAdminDebitPaise: 0, paidCount: 0 };
+  function lifetimeDelta(txn) {
+    if (!txn) return {};
+    const amount = Number(txn.amountPaise || 0);
+    switch (txn.type) {
+      case 'withdrawal_credit':
+      case 'admin_credit': return { totalCreditedPaise: amount };
+      case 'payout_paid': return { totalPaidOutPaise: amount, totalPayoutCommissionPaise: Number(txn.commissionPaise || 0), paidCount: 1 };
+      case 'admin_debit': return { totalAdminDebitPaise: amount };
+      default: return {};
     }
   }
   function walletView(userId, w) {
@@ -167,6 +190,11 @@ module.exports = (
     return {
       userId, balancePaise, holdPaise, availablePaise,
       balanceRs: balancePaise / 100, holdRs: holdPaise / 100, availableRs: availablePaise / 100,
+      totalCreditedPaise: Number(w?.totalCreditedPaise || 0),
+      totalPaidOutPaise: Number(w?.totalPaidOutPaise || 0),
+      totalPayoutCommissionPaise: Number(w?.totalPayoutCommissionPaise || 0),
+      totalAdminDebitPaise: Number(w?.totalAdminDebitPaise || 0),
+      paidCount: Number(w?.paidCount || 0),
       updatedAt: w?.updatedAt || null,
     };
   }
@@ -192,8 +220,10 @@ module.exports = (
         id: genId('pwt_'), ...txn, balanceAfterPaise: balancePaise, holdAfterPaise: holdPaise, createdAt: nowIso(),
       });
     }
+    const lifetime = {};
+    for (const [k, d] of Object.entries(lifetimeDelta(txn))) lifetime[k] = Number(w[k] || 0) + d;
     try {
-      await databases.updateDocument(DB, WALLETS, w.$id, { balancePaise, holdPaise, updatedAt: nowIso() });
+      await databases.updateDocument(DB, WALLETS, w.$id, { balancePaise, holdPaise, ...lifetime, updatedAt: nowIso() });
     } catch (e) {
       if (row) {
         await databases.deleteDocument(DB, WALLET_TXNS, row.$id)
@@ -201,7 +231,8 @@ module.exports = (
       }
       throw e;
     }
-    return { wallet: { ...w, balancePaise, holdPaise }, txn: row };
+    if (deltaBalance) await inc('totalPayoutWalletBalance', deltaBalance);
+    return { wallet: { ...w, balancePaise, holdPaise, ...lifetime }, txn: row };
   }
 
   // Credit an approved mode:'wallet' withdrawal into the user's payout wallet. Idempotent on
@@ -240,8 +271,23 @@ module.exports = (
     notes: d.notes || null, createdAt: d.createdAt,
     bankingStatusUpdatedAt: d.bankingStatusUpdatedAt || null, bankingStatusUpdatedBy: d.bankingStatusUpdatedBy || null,
   });
+  // Whole minutes between two ISO stamps, clamped at 0; null when either is missing/invalid.
+  function minutesBetween(startIso, endIso) {
+    if (!startIso || !endIso) return null;
+    const a = Date.parse(startIso), b = Date.parse(endIso);
+    if (!isFinite(a) || !isFinite(b)) return null;
+    return Math.max(0, Math.round((b - a) / 60000));
+  }
   const pickPayout = (d) => ({
     $id: d.$id, id: d.id, userId: d.userId, accountId: d.accountId,
+    // Service timeline (UTC ISO) + derived durations for "added in X min / paid in Y min" badges
+    requestedAt: d.createdAt,
+    addedToBankingAt: d.addedToBankingAt || null,
+    paidAt: d.paidAt || null,
+    rejectedAt: d.rejectedAt || null,
+    addedInMinutes: minutesBetween(d.createdAt, d.addedToBankingAt),
+    paidInMinutes: minutesBetween(d.createdAt, d.paidAt),
+    rejectedInMinutes: minutesBetween(d.createdAt, d.rejectedAt),
     customerName: d.customerName, bankName: d.bankName, ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null,
     mode: d.mode, amountPaise: d.amountPaise, commissionPaise: d.commissionPaise, totalPaise: d.totalPaise,
     amountRs: Number(d.amountPaise || 0) / 100, commissionRs: Number(d.commissionPaise || 0) / 100, totalRs: Number(d.totalPaise || 0) / 100,
@@ -296,7 +342,10 @@ module.exports = (
       // No (live) parent: the whole held commission goes to admin — never silently dropped.
       push(admin.userId, Number(p.userCommissionRate || 0) + Number(p.parentCommissionRate || 0));
     }
-    for (const tx of txs) await databases.createDocument(DB, COMMISSION_TXNS, ID.unique(), tx); // source of truth
+    for (const tx of txs) {
+      await databases.createDocument(DB, COMMISSION_TXNS, ID.unique(), tx); // source of truth
+      await inc(tx.earningType === 'admin' ? 'totalPayoutAdminProfit' : 'totalPayoutMerchantProfit', tx.amount);
+    }
     try {
       await upsertDailyPayoutCommission(txs);
       await upsertPeriodTotals(txs);
@@ -550,6 +599,9 @@ module.exports = (
             commissionRate: totalRate, userCommissionRate: userRate, parentCommissionRate: parentRate,
             notes, status: 'pending', referenceNumber: null, rejectionReason: null,
             createdAt: nowIso(), processedAt: null, processedBy: null,
+            // Beneficiary already in the banking portal → no wait; otherwise stamped when admin tags it `added`.
+            addedToBankingAt: account.bankingStatus === 'added' ? (account.bankingStatusUpdatedAt || nowIso()) : null,
+            paidAt: null, rejectedAt: null,
           });
         } catch (e) {
           await moveWallet(userId, { deltaHold: -totalPaise })
@@ -557,6 +609,8 @@ module.exports = (
           throw e;
         }
       });
+      await inc('totalCustomerPayoutPendingAmount', amountPaise);
+      await inc('totalCustomerPayoutPendingCount', 1);
       res.status(201).json({ success: true, payout: pickPayout({ ...payout, accountBankingStatus: account.bankingStatus || 'not_added' }) });
     } catch (e) { sendError(res, e, 'Failed to create customer payout request'); }
   });
@@ -675,10 +729,24 @@ module.exports = (
       if (!BANKING_STATUSES.includes(bankingStatus)) throw fail(400, 'bankingStatus must be added or not_added');
       const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
       if (!account) throw fail(404, 'Customer payout account not found');
+      const at = nowIso();
       const updated = await databases.updateDocument(DB, ACCOUNTS, account.$id, {
-        bankingStatus, bankingStatusUpdatedAt: nowIso(), bankingStatusUpdatedBy: req.user.userId,
+        bankingStatus, bankingStatusUpdatedAt: at, bankingStatusUpdatedBy: req.user.userId,
       });
-      res.json({ success: true, account: pickAccount(updated) });
+      // Timeline: stamp every pending request for this beneficiary that was waiting on the tag.
+      // Best-effort — the tag itself is already saved.
+      let stamped = 0;
+      if (bankingStatus === 'added') {
+        try {
+          const pending = await databases.listDocuments(DB, PAYOUTS, [Query.equal('accountId', account.$id), Query.equal('status', 'pending'), Query.limit(100)]);
+          for (const p of pending.documents) {
+            if (p.addedToBankingAt) continue;
+            await databases.updateDocument(DB, PAYOUTS, p.$id, { addedToBankingAt: at });
+            stamped++;
+          }
+        } catch (e) { console.error(`banking-status: could not stamp pending payouts for account ${account.$id}:`, e?.message); }
+      }
+      res.json({ success: true, account: pickAccount(updated), stampedRequests: stamped });
     } catch (e) { sendError(res, e, 'Failed to update banking status'); }
   });
 
@@ -712,10 +780,17 @@ module.exports = (
             },
           });
         }
+        const at = nowIso();
         return databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'paid', referenceNumber, rejectionReason: null, processedAt: nowIso(), processedBy: req.user.userId,
+          status: 'paid', referenceNumber, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
         });
       });
+
+      const paidAmount = Number(updated.amountPaise || 0);
+      await inc('totalCustomerPayoutPendingAmount', -paidAmount);
+      await inc('totalCustomerPayoutPendingCount', -1);
+      await inc('totalCustomerPayoutPaid', paidAmount);
+      await inc('totalCustomerPayoutPaidCount', 1);
 
       // Commission is derived from the paid payout — never blocks the response (mirrors withdraw approve).
       try { await recordPayoutCommission(updated); }
@@ -736,10 +811,13 @@ module.exports = (
         const p = await databases.getDocument(DB, PAYOUTS, found.$id);
         if (p.status !== 'pending') throw fail(409, 'Request was already resolved');
         await moveWallet(p.userId, { deltaHold: -Number(p.totalPaise) }); // release the hold, balance untouched
+        const at = nowIso();
         return databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'rejected', rejectionReason: reason, referenceNumber: null, processedAt: nowIso(), processedBy: req.user.userId,
+          status: 'rejected', rejectionReason: reason, referenceNumber: null, processedAt: at, rejectedAt: at, processedBy: req.user.userId,
         });
       });
+      await inc('totalCustomerPayoutPendingAmount', -Number(updated.amountPaise || 0));
+      await inc('totalCustomerPayoutPendingCount', -1);
       res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated) });
     } catch (e) { sendError(res, e, 'Failed to reject payout'); }
   });

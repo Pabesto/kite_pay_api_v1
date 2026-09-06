@@ -132,11 +132,35 @@ calls `POST /api/payout/admin/wallet/retry-credit` (§6.4). For `upi`/`bank` row
     "userId": "u1",
     "balancePaise": 500000, "holdPaise": 103000, "availablePaise": 397000,
     "balanceRs": 5000, "holdRs": 1030, "availableRs": 3970,
+    "totalCreditedPaise": 1200000,        // lifetime: wallet withdrawals + admin credits
+    "totalPaidOutPaise": 600000,          // lifetime: customer payouts paid (excl. commission)
+    "totalPayoutCommissionPaise": 18000,  // lifetime: payout commission charged
+    "totalAdminDebitPaise": 0,            // lifetime: admin debits
+    "paidCount": 3,                       // lifetime: customer payouts paid
     "updatedAt": "2026-09-06T10:00:30.000Z"      // null if the wallet has never been used
   }
 }
 ```
 Show **Available** big, with Balance and On hold underneath. A user with no wallet yet gets zeros.
+The lifetime fields also appear in the admin wallet views (§6.4).
+
+### 4.3 User dashboard — `GET /api/admin/dashboard/user/:userId` (existing endpoint, new keys)
+The user's existing dashboard call now also returns the payout block, so the home screen can show
+it without a second request. All values are **paise** unless the key ends in `Count`:
+
+| key | meaning |
+|---|---|
+| `payoutWalletBalance` / `payoutWalletHold` / `payoutWalletAvailable` | same as §4.1 (`available = balance − hold`) |
+| `payoutWalletTotalCredited` | lifetime money added to the wallet (wallet withdrawals + admin credits) |
+| `payoutWalletTotalAdminDebit` | lifetime admin debits |
+| `customerPayoutPendingCount` / `customerPayoutPendingAmount` | requests awaiting admin (amount excludes commission; the hold is amount + commission) |
+| `customerPayoutPaidCount` / `customerPayoutPaidAmount` | requests paid |
+| `customerPayoutCommissionPaid` | payout commission the user has paid so far |
+| `customerPayoutRejectedCount` | requests rejected (user can re-request) |
+
+Suggested tiles under the existing QR/withdrawal tiles: "Payout wallet available" (tap → §4 screen),
+"Customer payouts pending (n · ₹)", "Customer payouts paid (n · ₹)", "Payout commission paid".
+Same authorization as before: the user themself, their subadmin, admin, or employee.
 
 ### 4.2 `GET /api/payout/wallet/transactions?limit&cursor&type&from&to`
 `type` optional: `withdrawal_credit` | `payout_paid` | `admin_credit` | `admin_debit`.
@@ -247,7 +271,16 @@ Response `201`:
     "notes": "Order #4521", "status": "pending",
     "referenceNumber": null, "rejectionReason": null,
     "createdAt": "…", "processedAt": null, "processedBy": null,
-    "accountBankingStatus": "not_added"
+    "accountBankingStatus": "not_added",
+
+    // Service timeline (UTC ISO) — see §5.5
+    "requestedAt": "2026-09-06T10:00:00.000Z",
+    "addedToBankingAt": null,      // set when admin tags the account `added` (or inherited if already added)
+    "paidAt": null,
+    "rejectedAt": null,
+    "addedInMinutes": null,        // whole minutes requestedAt → addedToBankingAt (null until stamped)
+    "paidInMinutes": null,         // requestedAt → paidAt
+    "rejectedInMinutes": null      // requestedAt → rejectedAt
 } }
 ```
 Effects: `holdPaise += totalPaise` immediately (refresh the wallet card). Errors:
@@ -260,6 +293,28 @@ Effects: `holdPaise += totalPaise` immediately (refresh the wallet card). Errors
 - **paid** — green, `referenceNumber` (copyable), `processedAt`.
 - **rejected** — red, `rejectionReason` prominently, `processedAt`, a **"Request again"** button that
   opens the form pre-filled from this row (`accountId`, `mode`, `amountRs`, `notes`).
+
+### 5.5 Service timeline on every request row
+Every payout row carries four timestamps and three server-computed durations so the user can see
+how fast they were served. **Never compute the minutes on the device** — use the `*InMinutes`
+fields (whole minutes, clamped at 0, `null` when that step has not happened).
+
+| step | timestamp | duration (from `requestedAt`) | shown as |
+|---|---|---|---|
+| Requested | `requestedAt` | — | "Requested 10:00 AM" |
+| Account added in banking | `addedToBankingAt` | `addedInMinutes` | "Added to banking in 12 min" · while `null`: "Waiting for account to be added" (only if `accountBankingStatus == "not_added"`) |
+| Paid | `paidAt` | `paidInMinutes` | "Paid in 31 min" (green) |
+| Rejected | `rejectedAt` | `rejectedInMinutes` | "Rejected after 5 min" (red) |
+
+Notes:
+- If the customer account was **already** `added` when the request was made, `addedToBankingAt`
+  is the account's tag time (which may be earlier than the request) and `addedInMinutes` is `0` —
+  show "Account already added".
+- `processedAt` still exists and equals `paidAt` or `rejectedAt`; prefer the specific field.
+- A pending row gets `addedToBankingAt` filled in the moment admin taps "Mark added" (§6.3) —
+  refresh the list after that action. Render the timeline as a vertical stepper: Requested →
+  Added to banking → Paid/Rejected, each with its local time and the minutes badge.
+- For long waits show hours: `m >= 60 ? '${m ~/ 60} h ${m % 60} min' : '$m min'`.
 
 ---
 
@@ -303,7 +358,10 @@ Filter `bankingStatus=not_added` for the "to be added in banking" worklist.
 ```jsonc
 { "bankingStatus": "added" }        // or "not_added" to revert
 ```
-`200 { success, account }` (`bankingStatusUpdatedAt/By` filled). `:accountId` is the account's `$id`.
+`200 { success, account, stampedRequests }` (`bankingStatusUpdatedAt/By` filled). `:accountId` is
+the account's `$id`. `stampedRequests` = how many of this account's **pending** requests just got
+their `addedToBankingAt` set (their "Added to banking in X min" badge starts showing) — refresh the
+queue after tagging.
 
 `DELETE /api/payout/admin/accounts/:accountId` — delete any user's account. `409` while a pending
 request references it.
@@ -355,7 +413,23 @@ current IST month) and `GET /api/payout/admin/commissions/all-time?userId=&limit
 Rows are sorted highest earner first. Subadmins always get just their own row. Use these for the
 "This month" / "All time" tiles; use `summary` for the per-day chart.
 
-### 6.6 Set a user's payout commission — `PUT /api/admin/edit-user/:id` (existing)
+### 6.6 Dashboard tiles (existing endpoints, new keys)
+`GET /api/admin/dashboard/counters` (admin) now also returns, all **paise** unless the name ends in `Count`:
+
+| key | meaning |
+|---|---|
+| `totalPayoutWalletFunded` | QR balance moved into payout wallets via wallet withdrawals (this amount is also inside `totalAmountPaid`) |
+| `totalPayoutWalletBalance` | current float sitting in all payout wallets (platform liability) |
+| `totalCustomerPayoutPendingAmount` / `totalCustomerPayoutPendingCount` | customer payouts awaiting admin (amount excludes commission) |
+| `totalCustomerPayoutPaid` / `totalCustomerPayoutPaidCount` | customer payouts marked PAID (amount excludes commission) |
+| `totalPayoutAdminProfit` | payout commission earned by admin |
+| `totalPayoutMerchantProfit` | payout commission earned by subadmins |
+
+`GET /api/admin/dashboard/subadmin/:merchantId` now also returns `totalPayoutMerchantProfit` (paise) —
+show it beside the existing `totalMerchantProfit` (withdrawal commission). Suggested tiles: "Payout
+wallet float", "Customer payouts pending (n / ₹)", "Customer payouts paid (n / ₹)", "Payout commission".
+
+### 6.7 Set a user's payout commission — `PUT /api/admin/edit-user/:id` (existing)
 ```jsonc
 { "payoutCommission": 2.5 }     // percent, 0–100; independent of "commission"
 ```
@@ -380,7 +454,9 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 **Admin**
 1. *Withdrawals* — existing screen; wallet rows labelled "To Payout Wallet", approve without UTR.
 2. *Customer payout queue* — pending list with account chip, "Mark added", "Paid…" (reference dialog),
-   "Reject…" (reason dialog); Paid/Rejected tabs.
+   "Reject…" (reason dialog); Paid/Rejected tabs. Show "waiting N min" on pending rows (compute
+   from `requestedAt` to now — this is the only place the device does date math) so the oldest
+   requests stand out; paid/rejected rows show the server's `paidInMinutes` / `rejectedInMinutes`.
 3. *Wallets* — list, per-user drill-down with history and "Adjust…" dialog.
 4. *Payout commission* — "This month" / "All time" tiles (§6.5 monthly/all-time), summary chart by
    day, transactions list.

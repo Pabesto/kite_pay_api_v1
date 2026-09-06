@@ -1132,6 +1132,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             const credit = await creditPayoutWallet(w);
             await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id,
               { utrNumber: credit.txn?.id || 'PAYOUT_WALLET', walletCreditFailed: false }).catch(console.error);
+            if (!credit.skipped) await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPayoutWalletFunded', preAmountPaise).catch(console.error);
             return res.json({ success: true, message: 'Withdrawal approved and credited to payout wallet' });
           } catch (creditErr) {
             console.error(`CRITICAL: payout wallet credit failed for withdrawal ${w.id} (user ${w.userId}). Use retry-credit.`, creditErr);

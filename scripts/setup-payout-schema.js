@@ -66,6 +66,12 @@ async function main() {
     await str(WALLETS, 'userId', 64, true);
     await int(WALLETS, 'balancePaise');
     await int(WALLETS, 'holdPaise');
+    // lifetime totals for the user dashboard (maintained by payout.js moveWallet)
+    await int(WALLETS, 'totalCreditedPaise');
+    await int(WALLETS, 'totalPaidOutPaise');
+    await int(WALLETS, 'totalPayoutCommissionPaise');
+    await int(WALLETS, 'totalAdminDebitPaise');
+    await int(WALLETS, 'paidCount');
     await str(WALLETS, 'updatedAt', 40);
     await sleep(3000);
     await idx(WALLETS, 'idx_userId', 'unique', ['userId']);
@@ -143,6 +149,10 @@ async function main() {
     await str(PAYOUTS, 'createdAt', 40, true);
     await str(PAYOUTS, 'processedAt', 40);
     await str(PAYOUTS, 'processedBy', 64);
+    // service timeline (UTC ISO): requestedAt == createdAt; the rest are stamped by admin actions
+    await str(PAYOUTS, 'addedToBankingAt', 40);
+    await str(PAYOUTS, 'paidAt', 40);
+    await str(PAYOUTS, 'rejectedAt', 40);
     await bool(PAYOUTS, 'commissionRollupFailed');
     await sleep(4000);
     await idx(PAYOUTS, 'idx_id', 'unique', ['id']);

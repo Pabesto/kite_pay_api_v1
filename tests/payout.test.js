@@ -15,6 +15,11 @@ jest.mock('../userMetaCache', () => ({
     getUserMeta: jest.fn(),
     invalidate: jest.fn(),
 }));
+// Dashboard counters are a 2s in-memory batcher — mock so tests can assert deltas without timers.
+jest.mock('../dashboardCounters', () => ({ updateDashboardCounter: jest.fn().mockResolvedValue() }));
+const { updateDashboardCounter } = require('../dashboardCounters');
+const counterDeltas = () => updateDashboardCounter.mock.calls.map((c) => [c[2], c[3]]);
+
 // withdraw.js reads max_withdrawal_requests via ConfigManager (uninitialised here → known TDZ).
 const mockConfig = { max_withdrawal_requests: 2 };
 jest.mock('../configManager', () => ({
@@ -436,6 +441,111 @@ describe('admin paid / reject', () => {
     });
 });
 
+describe('service timeline', () => {
+    test('request on a not-added account: addedToBankingAt null → stamped when admin tags the account added', async () => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }).setSystemTime(new Date('2026-09-06T10:00:00.000Z'));
+        try {
+            const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }] });
+            const { app } = buildPayout(db, makeRedis());
+            const created = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 });
+            expect(created.body.payout).toMatchObject({ requestedAt: '2026-09-06T10:00:00.000Z', addedToBankingAt: null, addedInMinutes: null, paidAt: null, paidInMinutes: null });
+
+            jest.setSystemTime(new Date('2026-09-06T10:12:00.000Z'));
+            const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+            const tag = await request(adminApp).patch(`/admin/accounts/${created.body.payout.accountId}/banking-status`).send({ bankingStatus: 'added' });
+            expect(tag.status).toBe(200);
+            expect(tag.body.stampedRequests).toBe(1);
+
+            jest.setSystemTime(new Date('2026-09-06T10:30:30.000Z'));
+            const paid = await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' });
+            expect(paid.body.payout).toMatchObject({
+                addedToBankingAt: '2026-09-06T10:12:00.000Z', addedInMinutes: 12,
+                paidAt: '2026-09-06T10:30:30.000Z', paidInMinutes: 31, rejectedAt: null, rejectedInMinutes: null,
+            });
+            // tagging again must not re-stamp a resolved request
+            expect((await request(adminApp).patch(`/admin/accounts/${created.body.payout.accountId}/banking-status`).send({ bankingStatus: 'added' })).body.stampedRequests).toBe(0);
+        } finally { jest.useRealTimers(); }
+    });
+
+    test('request on an already-added account inherits the tag time; reject stamps rejectedAt', async () => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }).setSystemTime(new Date('2026-09-06T09:00:00.000Z'));
+        try {
+            const db = makeDb({
+                [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }],
+                [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', customerName: 'R', bankName: 'SBI', ifscCode: 'SBIN0001234', accountNumber: '12345678901', bankingStatus: 'added', bankingStatusUpdatedAt: '2026-09-01T00:00:00.000Z' }],
+            });
+            const { app } = buildPayout(db, makeRedis());
+            const created = await request(app).post('/requests').send({ accountId: 'acc1', mode: 'NEFT', amount: 10 });
+            expect(created.body.payout).toMatchObject({ addedToBankingAt: '2026-09-01T00:00:00.000Z', addedInMinutes: 0 }); // clamped, never negative
+            jest.setSystemTime(new Date('2026-09-06T09:05:00.000Z'));
+            const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+            const rej = await request(adminApp).post(`/admin/requests/${created.body.payout.id}/reject`).send({ reason: 'Wrong IFSC' });
+            expect(rej.body.payout).toMatchObject({ rejectedAt: '2026-09-06T09:05:00.000Z', rejectedInMinutes: 5, paidAt: null });
+        } finally { jest.useRealTimers(); }
+    });
+});
+
+describe('dashboard counters', () => {
+    test('request → paid: pending in/out, paid, wallet balance, commission profits', async () => {
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }], [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }] });
+        const { app } = buildPayout(db, makeRedis());
+        const created = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 }); // 10000 + 300 commission
+        expect(created.status).toBe(201);
+        expect(counterDeltas()).toEqual([['totalCustomerPayoutPendingAmount', 10000], ['totalCustomerPayoutPendingCount', 1]]);
+        updateDashboardCounter.mockClear();
+
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect(counterDeltas()).toEqual([
+            ['totalPayoutWalletBalance', -10300],
+            ['totalCustomerPayoutPendingAmount', -10000], ['totalCustomerPayoutPendingCount', -1],
+            ['totalCustomerPayoutPaid', 10000], ['totalCustomerPayoutPaidCount', 1],
+            ['totalPayoutMerchantProfit', 200], ['totalPayoutAdminProfit', 100],
+        ]);
+    });
+
+    test('reject reverses pending only; adjust and withdrawal credit move the wallet balance', async () => {
+        const db = makeDb({
+            [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }],
+            [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'a', status: 'pending', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300 }],
+        });
+        const { app, mod } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).post('/admin/requests/cpo_1/reject').send({ reason: 'Wrong IFSC' })).status).toBe(200);
+        expect(counterDeltas()).toEqual([['totalCustomerPayoutPendingAmount', -10000], ['totalCustomerPayoutPendingCount', -1]]);
+        updateDashboardCounter.mockClear();
+
+        await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 5, notes: 'manual' });
+        await mod.creditWalletFromWithdrawal({ $id: 'wd', id: 'wdh_9', userId: 'user1', qrId: 'qr1', preAmount: 20 });
+        expect(counterDeltas()).toEqual([['totalPayoutWalletBalance', -500], ['totalPayoutWalletBalance', 2000]]);
+    });
+
+    test('wallet doc keeps lifetime totals (credited / paid out / commission / admin debit / paidCount)', async () => {
+        const db = makeDb({ [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }] });
+        const { app, mod } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        await mod.creditWalletFromWithdrawal({ $id: 'wd', id: 'wdh_1', userId: 'user1', qrId: 'qr1', preAmount: 1000 }); // +100000
+        await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'credit', amount: 50, notes: 'bonus' });   // +5000
+        await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 10, notes: 'fix' });      // -1000
+        db.store[COLS.PAYOUTS] = [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'a', customerName: 'R', accountNumber: '1', mode: 'NEFT', amountPaise: 20000, commissionPaise: 600, totalPaise: 20600, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending' }];
+        db.store[COLS.WALLETS][0].holdPaise = 20600;
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({
+            balancePaise: 100000 + 5000 - 1000 - 20600, holdPaise: 0,
+            totalCreditedPaise: 105000, totalAdminDebitPaise: 1000, totalPaidOutPaise: 20000, totalPayoutCommissionPaise: 600, paidCount: 1,
+        });
+        const view = (await request(app).get('/admin/wallets?userId=user1')).body.wallet;
+        expect(view).toMatchObject({ totalCreditedPaise: 105000, totalPaidOutPaise: 20000, paidCount: 1 });
+    });
+
+    test('a failing counter never fails the money operation', async () => {
+        updateDashboardCounter.mockRejectedValueOnce(new Error('counters down'));
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }] });
+        const { app } = buildPayout(db, makeRedis());
+        const res = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 });
+        expect(res.status).toBe(201);
+        expect(db.store[COLS.WALLETS][0].holdPaise).toBe(10300);
+    });
+});
+
 describe('admin wallet adjust', () => {
     test('credit creates wallet if missing and writes ledger row', async () => {
         const db = makeDb();
@@ -750,6 +860,7 @@ describe('withdraw.js — mode:wallet', () => {
         expect(db.store['withdrawal_col'][0]).toMatchObject({ status: 'approved', utrNumber: 'pwt_9', walletCreditFailed: false });
         expect(db.store['qr_col'][0]).toMatchObject({ withdrawalRequestedAmount: 0, withdrawalApprovedAmount: 20000, commissionPaid: 0 });
         expect(db.store['commission_txs'] || []).toHaveLength(0);
+        expect(counterDeltas()).toEqual(expect.arrayContaining([['totalAmountPaid', 20000], ['totalWithdrawalPendingAmount', -20000], ['totalPayoutWalletFunded', 20000]]));
     });
 
     test('approve_new mode:wallet — credit failure flags the withdrawal and returns 500 (QR already debited)', async () => {
