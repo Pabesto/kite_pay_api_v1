@@ -228,7 +228,7 @@ supertest + the Appwrite/Redis stub helpers from `tests/robustness.test.js:17–
 5. **Confirm isolation:** after the curls, the production `webhook_data` collection row
    count and every QR doc's `totalPayInAmount` are unchanged, and
    `redis-cli get counter:totalTxCount` is unchanged.
-6. Hand Razorpay the deployed URL `https://kite-pay-api-v2.onrender.com/uat/razorpay-webhook`
+6. Hand Razorpay the deployed URL `https://kite-pay-api-v3.onrender.com/uat/razorpay-webhook`
    plus the header name and token value (out-of-band, never in git).
 
 ## Explicitly not doing

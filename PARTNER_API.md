@@ -18,7 +18,7 @@ response format, error handling, and complete code examples.
 **Base URL**
 
 ```
-https://kite-pay-api-v2.onrender.com/api/partner
+https://kite-pay-api-v3.onrender.com/api/partner
 ```
 
 Every path below is relative to this base.
@@ -317,26 +317,26 @@ Always check the HTTP status; error bodies are `{ "error": "..." }`.
 
 First page — transactions in July, 50 per page:
 ```bash
-curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50" \
+curl -s "https://kite-pay-api-v3.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50" \
   -H "X-API-Key: pk_AB12CD34.<secret>"
 ```
 
 Next page (using the returned `nextCursor`):
 ```bash
-curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50&cursor=6543ab..." \
+curl -s "https://kite-pay-api-v3.onrender.com/api/partner/transactions?from=2026-07-01&to=2026-07-31&limit=50&cursor=6543ab..." \
   -H "X-API-Key: pk_AB12CD34.<secret>"
 ```
 
 Find one transaction by RRN:
 ```bash
-curl -s "https://kite-pay-api-v2.onrender.com/api/partner/transactions?searchField=rrnNumber&searchValue=123456789012" \
+curl -s "https://kite-pay-api-v3.onrender.com/api/partner/transactions?searchField=rrnNumber&searchValue=123456789012" \
   -H "X-API-Key: pk_AB12CD34.<secret>"
 ```
 
 ### 6.2 Node.js — fetch every page
 
 ```js
-const BASE = 'https://kite-pay-api-v2.onrender.com/api/partner';
+const BASE = 'https://kite-pay-api-v3.onrender.com/api/partner';
 const API_KEY = process.env.PARTNER_API_KEY; // "pk_AB12CD34.<secret>"
 
 async function fetchAllTransactions(filters = {}) {
@@ -375,7 +375,7 @@ fetchAllTransactions({ from: '2026-07-01', to: '2026-07-31' })
 import os
 import requests
 
-BASE = "https://kite-pay-api-v2.onrender.com/api/partner"
+BASE = "https://kite-pay-api-v3.onrender.com/api/partner"
 API_KEY = os.environ["PARTNER_API_KEY"]  # "pk_AB12CD34.<secret>"
 
 def fetch_all_transactions(**filters):

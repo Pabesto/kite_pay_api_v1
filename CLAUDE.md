@@ -1,6 +1,6 @@
 # KitePay API — Engineering Standards
 
-This is a **production payments API** (India, UPI/QR pay-ins, withdrawals, partner API) handling real money for live merchants. It runs as a **single Node process** (Render, `kite-pay-api-v2.onrender.com`). There is no staging environment, no CI, and no linter — **the only gates are this document and `npm test`**. The bar for every change: *money totals must never be corrupted, credited twice, or silently lost.* When a rule below conflicts with "cleaner code", the rule wins.
+This is a **production payments API** (India, UPI/QR pay-ins, withdrawals, partner API) handling real money for live merchants. It runs as a **single Node process** (Render, `kite-pay-api-v3.onrender.com`). There is no staging environment, no CI, and no linter — **the only gates are this document and `npm test`**. The bar for every change: *money totals must never be corrupted, credited twice, or silently lost.* When a rule below conflicts with "cleaner code", the rule wins.
 
 ## Repo map — what is live and what is dead
 
