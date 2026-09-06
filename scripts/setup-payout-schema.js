@@ -30,6 +30,7 @@ const {
     APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID = 'daily_payout_commission_summaries',
     APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = 'monthly_payout_commission_totals',
     APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = 'all_time_payout_commission_totals',
+    APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID = 'payout_source_accounts',
 } = process.env;
 
 if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT_ID || !APPWRITE_API_KEY || !APPWRITE_DATABASE_ID || !APPWRITE_USERS_META_COLLECTION_ID || !APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID) {
@@ -121,6 +122,13 @@ async function main() {
     await int(ACCOUNTS, 'requestCount');
     await int(ACCOUNTS, 'paidCount');
     await int(ACCOUNTS, 'rejectedCount');
+    await int(ACCOUNTS, 'cancelledCount');
+    // beneficiary verification (staff): unverified | verified | name_mismatch | failed
+    await str(ACCOUNTS, 'verificationStatus', 16);
+    await str(ACCOUNTS, 'verifiedName', 100);
+    await str(ACCOUNTS, 'verifiedAt', 40);
+    await str(ACCOUNTS, 'verifiedBy', 64);
+    await str(ACCOUNTS, 'verificationNote', 300);
     await int(ACCOUNTS, 'totalPaidPaise');
     await int(ACCOUNTS, 'totalCommissionPaise');
     await str(ACCOUNTS, 'lastRequestedAt', 40);
@@ -136,6 +144,26 @@ async function main() {
     await idx(ACCOUNTS, 'idx_requestCount', 'key', ['requestCount']);
     await idx(ACCOUNTS, 'idx_lastPaidAt', 'key', ['lastPaidAt']);
     await idx(ACCOUNTS, 'idx_createdAt', 'key', ['createdAt']);
+    await idx(ACCOUNTS, 'idx_verificationStatus', 'key', ['verificationStatus']);
+
+    // 3b. payout_source_accounts — staff "paid via" quick-pick list
+    const SOURCES = APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID;
+    console.log(`\n${SOURCES}:`);
+    await collection(SOURCES, 'Payout Source Accounts');
+    await str(SOURCES, 'label', 100, true);
+    await str(SOURCES, 'labelKey', 100, true);      // lower-cased label, unique
+    await str(SOURCES, 'addedBy', 64);
+    await str(SOURCES, 'createdAt', 40);
+    await str(SOURCES, 'lastUsedAt', 40);
+    await int(SOURCES, 'useCount');
+    await int(SOURCES, 'totalPaidPaise');
+    await bool(SOURCES, 'active', true);
+    await sleep(4000);
+    await idx(SOURCES, 'idx_labelKey', 'unique', ['labelKey']);
+    await idx(SOURCES, 'idx_useCount', 'key', ['useCount']);
+    await idx(SOURCES, 'idx_lastUsedAt', 'key', ['lastUsedAt']);
+    await idx(SOURCES, 'idx_totalPaidPaise', 'key', ['totalPaidPaise']);
+    await idx(SOURCES, 'idx_active', 'key', ['active']);
 
     // 4. customer_payouts
     const PAYOUTS = APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID;
@@ -168,6 +196,7 @@ async function main() {
     await str(PAYOUTS, 'addedToBankingAt', 40);
     await str(PAYOUTS, 'paidAt', 40);
     await str(PAYOUTS, 'rejectedAt', 40);
+    await str(PAYOUTS, 'cancelledAt', 40);         // user self-cancel (status 'cancelled')
     await bool(PAYOUTS, 'commissionRollupFailed');
     await sleep(4000);
     await idx(PAYOUTS, 'idx_id', 'unique', ['id']);
@@ -233,6 +262,11 @@ async function main() {
     await dbl(APPWRITE_USERS_META_COLLECTION_ID, 'payoutCommission');
     await bool(APPWRITE_USERS_META_COLLECTION_ID, 'payoutDisabled');
     await str(APPWRITE_USERS_META_COLLECTION_ID, 'payoutDisabledReason', 200);
+    // per-user limits (paise / count; null = inherit platform config, 0 = unlimited) + realtime opt-out
+    await int(APPWRITE_USERS_META_COLLECTION_ID, 'payoutMaxPerRequestPaise');
+    await int(APPWRITE_USERS_META_COLLECTION_ID, 'payoutDailyLimitPaise');
+    await int(APPWRITE_USERS_META_COLLECTION_ID, 'payoutMaxPending');
+    await bool(APPWRITE_USERS_META_COLLECTION_ID, 'payoutRealtimeDisabled');
 
     // 8. withdrawal_requests: mode enum + walletCreditFailed
     const WD = APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID;

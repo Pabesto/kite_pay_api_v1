@@ -101,7 +101,19 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
     });
   });
 
-  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved };
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent };
+}
+
+// Customer-payout events (payout.js): to the affected user's room and/or admins.
+//   event: 'payout:update' (request/wallet changed) | 'payout:alert' (low balance, stale pending)
+function emitPayoutEvent({ userId, event = 'payout:update', payload, toAdmins = true }) {
+  try {
+    if (!io || !payload) return;
+    if (userId) io.to(`room:user:${userId}`).emit(event, payload);
+    if (toAdmins) io.to('room:admins').emit(event, payload);
+  } catch (e) {
+    console.error('emitPayoutEvent error:', e.message);
+  }
 }
 
 // Manual-review events — admins only (room:admins).

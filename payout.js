@@ -50,6 +50,8 @@ module.exports = (
   authenticateToken, authenticateAdminOrLabel, redisClient,
   MONTHLY_COMMISSION, ALLTIME_COMMISSION, // appended: monthly / all-time payout-commission rollups
   QRCODES, // appended: QR collection — lets the admin queue filter by qrId (→ the QR's assigned user)
+  emitPayoutEvent, // appended: socketServer helper ({ userId, event, payload, toAdmins }) — optional
+  SOURCE_ACCOUNTS, // appended: payout_source_accounts — "paid via" quick-pick list
 ) => {
   const router = express.Router();
 
@@ -132,6 +134,27 @@ module.exports = (
     return r.documents[0] || null;
   }
 
+  // Who can this caller see/act on?  admin → null (everyone); subadmin → self + their users;
+  // employee → the subadmins assigned to them (users_meta.assigned_to) + those subadmins' users;
+  // anyone else → nobody.
+  async function visibleUserIds(req) {
+    if (req.user.role === 'admin') return null;
+    if (req.user.role === 'subadmin') return usersUnder(req.user.userId);
+    if (req.user.role === 'employee') {
+      const keys = [...new Set([req.user.$id, req.user.userId].filter(Boolean))]; // older docs stamp either id
+      const r = await databases.listDocuments(DB, USERS_META, [Query.equal('assigned_to', keys), Query.equal('role', 'subadmin'), Query.limit(100)]);
+      const ids = [];
+      for (const s of r.documents) if (s.userId) ids.push(...(await usersUnder(s.userId)));
+      return [...new Set(ids)];
+    }
+    return [];
+  }
+  // 403 unless the caller may act on this user's data (admin always may).
+  async function assertCanAct(req, userId) {
+    const allowed = await visibleUserIds(req);
+    if (allowed && !allowed.includes(userId)) throw fail(403, 'Not authorized for this user');
+  }
+
   // A subadmin's visible users = themselves + every user whose parentId is them (paged, not one page).
   async function usersUnder(subadminId) {
     const ids = [subadminId];
@@ -158,7 +181,7 @@ module.exports = (
   // subadmin caller's own users. Returns [] (unrestricted), [query], or null (provably empty).
   // 403 when a subadmin names a foreign user/subadmin.
   async function userScope(req, q = {}) {
-    const allowed = req.user.role === 'subadmin' ? await usersUnder(req.user.userId) : null;
+    const allowed = await visibleUserIds(req);
     let target = null; // null = unrestricted
     const narrow = (ids) => { target = target ? target.filter((x) => ids.includes(x)) : [...new Set(ids)]; };
     if (q.userId) {
@@ -166,7 +189,7 @@ module.exports = (
       narrow([String(q.userId)]);
     }
     if (q.subadminId) {
-      if (allowed && String(q.subadminId) !== req.user.userId) throw fail(403, 'Not authorized for this subadmin');
+      if (allowed && !allowed.includes(String(q.subadminId))) throw fail(403, 'Not authorized for this subadmin');
       narrow(await usersUnder(String(q.subadminId)));
     }
     if (q.qrId) {
@@ -249,6 +272,105 @@ module.exports = (
       message: !platform.enabled ? platform.message : userDisabled ? `Customer payouts are disabled for your account${reason ? `: ${reason}` : ''}` : null,
     };
   }
+  // ─── admin-tunable settings (config keys) ───────────────────────────────────
+  const cfgRupeesPaise = (key) => { const v = Number(ConfigManager.get(key, 0)); return isFinite(v) && v > 0 ? Math.round(v * 100) : 0; }; // 0 = off
+  const cfgInt = (key) => { const v = parseInt(ConfigManager.get(key, 0), 10); return isFinite(v) && v > 0 ? v : 0; };
+  function settingsView() {
+    return {
+      customerPayouts: platformStatus(),
+      realtimeEnabled: parseBool(ConfigManager.get('payout_realtime_enabled', true), true),
+      requireVerifiedAccount: parseBool(ConfigManager.get('payout_require_verified_account', false), false),
+      alerts: {
+        enabled: parseBool(ConfigManager.get('payout_alerts_enabled', false), false),
+        lowBalanceThresholdPaise: cfgRupeesPaise('payout_low_balance_threshold'),
+        pendingAlertMinutes: cfgInt('payout_pending_alert_minutes'),
+      },
+      limits: { maxPerRequestPaise: cfgRupeesPaise('payout_max_per_request'), dailyLimitPaise: cfgRupeesPaise('payout_daily_limit'), maxPending: cfgInt('payout_max_pending') },
+    };
+  }
+
+  // ─── per-user limits: user value (null = inherit platform, 0 = unlimited) over platform config ──
+  function limitsFor(user) {
+    const s = settingsView().limits;
+    const pick = (userVal, cfgVal) => (userVal != null && isFinite(Number(userVal)) && Number(userVal) >= 0 ? Number(userVal) : cfgVal);
+    return {
+      maxPerRequestPaise: pick(user?.payoutMaxPerRequestPaise, s.maxPerRequestPaise),
+      dailyLimitPaise: pick(user?.payoutDailyLimitPaise, s.dailyLimitPaise),
+      maxPending: pick(user?.payoutMaxPending, s.maxPending),
+    };
+  }
+  // Today's (IST) requested amount excluding rejected/cancelled, plus the current pending count.
+  async function usageFor(userId) {
+    const day = istDay();
+    const q = [Query.equal('userId', userId), ...dateQueries(day, day), Query.orderAsc('$id'), Query.limit(100)];
+    let usedTodayPaise = 0, requestedTodayCount = 0, cursor = null;
+    for (let page = 0; page < 5; page++) { // ponytail: 500 requests/day/user ceiling for the daily-limit sum
+      const r = await databases.listDocuments(DB, PAYOUTS, cursor ? [...q, Query.cursorAfter(cursor)] : q);
+      for (const p of r.documents) if (p.status === 'pending' || p.status === 'paid') { usedTodayPaise += Number(p.amountPaise || 0); requestedTodayCount++; }
+      if (r.documents.length < 100) break;
+      cursor = r.documents[r.documents.length - 1].$id;
+    }
+    const pending = await databases.listDocuments(DB, PAYOUTS, [Query.equal('userId', userId), Query.equal('status', 'pending'), Query.limit(1)]);
+    return { usedTodayPaise, requestedTodayCount, pendingCount: Number(pending.total || 0) };
+  }
+  const rs = (paise) => `₹${(paise / 100).toFixed(2)}`;
+  function enforceLimits(limits, usage, amountPaise) {
+    if (limits.maxPerRequestPaise && amountPaise > limits.maxPerRequestPaise) throw fail(400, `Amount exceeds your per-payout limit of ${rs(limits.maxPerRequestPaise)}`);
+    if (limits.maxPending && usage.pendingCount >= limits.maxPending) throw fail(400, `You already have the maximum number of pending customer payouts (${limits.maxPending})`);
+    if (limits.dailyLimitPaise && usage.usedTodayPaise + amountPaise > limits.dailyLimitPaise) throw fail(400, `This payout would exceed your daily limit of ${rs(limits.dailyLimitPaise)} (used ${rs(usage.usedTodayPaise)} today)`);
+  }
+
+  // ─── realtime (socket) — platform toggle + per-user opt-out; never throws ──
+  async function notify(userId, payload, { toAdmins = true } = {}) {
+    try {
+      if (typeof emitPayoutEvent !== 'function' || !settingsView().realtimeEnabled) return;
+      const user = userId ? await userMetaCache.getUserMeta(userId) : null;
+      emitPayoutEvent({ userId: user && user.payoutRealtimeDisabled === true ? null : userId, event: 'payout:update', payload: { ...payload, at: nowIso() }, toAdmins });
+    } catch (e) { console.error('payout notify failed:', e?.message); }
+  }
+  // Low-balance alert when a wallet's available drops below the configured threshold (admin toggle).
+  function lowBalanceAlert(userId, availableBefore, availableAfter) {
+    try {
+      const s = settingsView().alerts;
+      if (!s.enabled || !s.lowBalanceThresholdPaise || typeof emitPayoutEvent !== 'function') return;
+      if (availableAfter < s.lowBalanceThresholdPaise && availableBefore >= s.lowBalanceThresholdPaise) {
+        emitPayoutEvent({ userId, event: 'payout:alert', toAdmins: true, payload: { type: 'low_balance', userId, availablePaise: availableAfter, thresholdPaise: s.lowBalanceThresholdPaise, at: nowIso() } });
+      }
+    } catch (e) { console.error('payout low-balance alert failed:', e?.message); }
+  }
+
+  // ─── "paid via" source accounts (quick-pick list) ───────────────────────────
+  const pickSource = (d) => ({ $id: d.$id, label: d.label, useCount: Number(d.useCount || 0), totalPaidPaise: Number(d.totalPaidPaise || 0), totalPaidRs: Number(d.totalPaidPaise || 0) / 100, lastUsedAt: d.lastUsedAt || null, addedBy: d.addedBy || null, createdAt: d.createdAt || null, active: d.active !== false });
+  async function findSource(label) {
+    const r = await databases.listDocuments(DB, SOURCE_ACCOUNTS, [Query.equal('labelKey', label.toLowerCase()), Query.limit(1)]);
+    return r.documents[0] || null;
+  }
+  async function upsertSource(label, by) {
+    const existing = await findSource(label);
+    if (existing) return existing;
+    try {
+      return await databases.createDocument(DB, SOURCE_ACCOUNTS, ID.unique(), { label, labelKey: label.toLowerCase(), addedBy: by || null, createdAt: nowIso(), lastUsedAt: null, useCount: 0, totalPaidPaise: 0, active: true });
+    } catch (e) {
+      const again = await findSource(label);
+      if (again) return again;
+      throw e;
+    }
+  }
+  // Best-effort usage bump at "paid" time — never fails the payout. Serialized per label so two
+  // admins paying from the same source at once cannot lose a count (read-modify-write).
+  async function touchSource(label, amountPaise, by) {
+    if (!SOURCE_ACCOUNTS || !label) return;
+    const key = `lock:payoutsource:${label.toLowerCase()}`;
+    let val = null;
+    try {
+      val = await acquireRetry(key, 5, 5);
+      if (!val) { console.error(`payout: source account bump skipped (lock busy) for "${label}"`); return; }
+      const s = await upsertSource(label, by);
+      await databases.updateDocument(DB, SOURCE_ACCOUNTS, s.$id, { useCount: Number(s.useCount || 0) + 1, totalPaidPaise: Number(s.totalPaidPaise || 0) + amountPaise, lastUsedAt: nowIso(), active: true });
+    } catch (e) { console.error(`payout: source account bump failed for "${label}":`, e?.message); }
+    finally { if (val) await releaseQuiet(key, val); }
+  }
+
   // users_meta doc by userId (docId === userId for new docs; older docs need the query fallback)
   async function findUserMetaDoc(userId) {
     const direct = await databases.getDocument(DB, USERS_META, userId).catch(() => null);
@@ -280,6 +402,7 @@ module.exports = (
     }
     const lifetime = {};
     for (const [k, d] of Object.entries(lifetimeDelta(txn))) lifetime[k] = Number(w[k] || 0) + d;
+    const availableBefore = Number(w.balancePaise || 0) - Number(w.holdPaise || 0);
     try {
       await databases.updateDocument(DB, WALLETS, w.$id, { balancePaise, holdPaise, ...lifetime, updatedAt: nowIso() });
     } catch (e) {
@@ -290,6 +413,7 @@ module.exports = (
       throw e;
     }
     if (deltaBalance) await inc('totalPayoutWalletBalance', deltaBalance);
+    lowBalanceAlert(userId, availableBefore, balancePaise - holdPaise);
     return { wallet: { ...w, balancePaise, holdPaise, ...lifetime }, txn: row };
   }
 
@@ -310,6 +434,7 @@ module.exports = (
           notes: `Withdrawal ${w.id} from QR ${w.qrId}`, createdBy: null,
         },
       });
+      await notify(w.userId, { type: 'wallet_changed', userId: w.userId, reason: 'withdrawal_credit', withdrawalId: w.id, amountPaise, wallet: walletView(w.userId, r.wallet) });
       return { skipped: false, txn: r.txn };
     });
   }
@@ -325,21 +450,24 @@ module.exports = (
   });
   // Per-account payout stats live on the account doc (paise / counts), bumped inside the same
   // wallet-locked operations that create/pay/reject a request. Read with `|| 0`.
+  const VERIFICATION_STATUSES = ['unverified', 'verified', 'name_mismatch', 'failed'];
   const pickAccount = (d) => {
-    const requestCount = Number(d.requestCount || 0), paidCount = Number(d.paidCount || 0), rejectedCount = Number(d.rejectedCount || 0);
+    const requestCount = Number(d.requestCount || 0), paidCount = Number(d.paidCount || 0), rejectedCount = Number(d.rejectedCount || 0), cancelledCount = Number(d.cancelledCount || 0);
     const totalPaidPaise = Number(d.totalPaidPaise || 0), totalCommissionPaise = Number(d.totalCommissionPaise || 0);
     return {
       $id: d.$id, userId: d.userId, customerName: d.customerName, bankName: d.bankName,
       ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null, bankingStatus: d.bankingStatus || 'not_added',
       notes: d.notes || null, createdAt: d.createdAt,
       bankingStatusUpdatedAt: d.bankingStatusUpdatedAt || null, bankingStatusUpdatedBy: d.bankingStatusUpdatedBy || null,
+      // beneficiary verification (set by staff)
+      verificationStatus: d.verificationStatus || 'unverified', verifiedName: d.verifiedName || null,
+      verifiedAt: d.verifiedAt || null, verifiedBy: d.verifiedBy || null, verificationNote: d.verificationNote || null,
       // stats
-      requestCount, paidCount, rejectedCount, pendingCount: Math.max(0, requestCount - paidCount - rejectedCount),
+      requestCount, paidCount, rejectedCount, cancelledCount, pendingCount: Math.max(0, requestCount - paidCount - rejectedCount - cancelledCount),
       totalPaidPaise, totalPaidRs: totalPaidPaise / 100, totalCommissionPaise,
       lastRequestedAt: d.lastRequestedAt || null, lastPaidAt: d.lastPaidAt || null,
     };
   };
-  const ACCOUNT_STAT_FIELDS = ['requestCount', 'paidCount', 'rejectedCount', 'totalPaidPaise', 'totalCommissionPaise'];
   // Best-effort counter bump on the account doc; never fails the money operation (repair: recompute-stats).
   async function bumpAccountStats(accountId, deltas, stamps = {}) {
     try {
@@ -353,7 +481,7 @@ module.exports = (
   }
   // Recompute-and-overwrite from the account's payout rows (idempotent repair path).
   async function recomputeAccountStats(accountId) {
-    const stats = { requestCount: 0, paidCount: 0, rejectedCount: 0, totalPaidPaise: 0, totalCommissionPaise: 0, lastRequestedAt: null, lastPaidAt: null };
+    const stats = { requestCount: 0, paidCount: 0, rejectedCount: 0, cancelledCount: 0, totalPaidPaise: 0, totalCommissionPaise: 0, lastRequestedAt: null, lastPaidAt: null };
     let cursor = null;
     for (let page = 0; page < 100; page++) { // ponytail: 10k rows per account; nobody has that many
       const q = [Query.equal('accountId', accountId), Query.orderAsc('$id'), Query.limit(100)];
@@ -369,6 +497,7 @@ module.exports = (
           const at = p.paidAt || p.processedAt || null;
           if (at && (!stats.lastPaidAt || at > stats.lastPaidAt)) stats.lastPaidAt = at;
         } else if (p.status === 'rejected') stats.rejectedCount++;
+        else if (p.status === 'cancelled') stats.cancelledCount++;
       }
       if (r.documents.length < 100) break;
       cursor = r.documents[r.documents.length - 1].$id;
@@ -392,9 +521,11 @@ module.exports = (
     addedToBankingAt: d.addedToBankingAt || null,
     paidAt: d.paidAt || null,
     rejectedAt: d.rejectedAt || null,
+    cancelledAt: d.cancelledAt || null,
     addedInMinutes: minutesBetween(d.createdAt, d.addedToBankingAt),
     paidInMinutes: minutesBetween(d.createdAt, d.paidAt),
     rejectedInMinutes: minutesBetween(d.createdAt, d.rejectedAt),
+    cancelledInMinutes: minutesBetween(d.createdAt, d.cancelledAt),
     customerName: d.customerName, bankName: d.bankName, ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null,
     mode: d.mode, amountPaise: d.amountPaise, commissionPaise: d.commissionPaise, totalPaise: d.totalPaise,
     amountRs: Number(d.amountPaise || 0) / 100, commissionRs: Number(d.commissionPaise || 0) / 100, totalRs: Number(d.totalPaise || 0) / 100,
@@ -402,6 +533,7 @@ module.exports = (
     referenceNumber: d.referenceNumber || null, rejectionReason: d.rejectionReason || null,
     createdAt: d.createdAt, processedAt: d.processedAt || null, processedBy: d.processedBy || null,
     accountBankingStatus: d.accountBankingStatus || null,
+    accountVerificationStatus: d.accountVerificationStatus || null,
   });
   const pickCommission = (d) => ({
     $id: d.$id, id: d.$id, userId: d.userId, sourcePayoutId: d.sourcePayoutId, amount: d.amount,
@@ -414,8 +546,11 @@ module.exports = (
     const ids = [...new Set(payouts.map((p) => p.accountId).filter(Boolean))];
     if (!ids.length) return payouts;
     const r = await databases.listDocuments(DB, ACCOUNTS, [Query.equal('$id', ids), Query.limit(ids.length)]);
-    const byId = Object.fromEntries(r.documents.map((a) => [a.$id, a.bankingStatus || 'not_added']));
-    return payouts.map((p) => ({ ...p, accountBankingStatus: byId[p.accountId] || null }));
+    const byId = Object.fromEntries(r.documents.map((a) => [a.$id, a]));
+    return payouts.map((p) => {
+      const a = byId[p.accountId];
+      return { ...p, accountBankingStatus: a ? (a.bankingStatus || 'not_added') : null, accountVerificationStatus: a ? (a.verificationStatus || 'unverified') : null };
+    });
   }
 
   // ─── commission (mirrors withdraw.js: user rate → parent earns, parent rate → admin earns) ──
@@ -604,10 +739,29 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to fetch payout wallet'); }
   });
 
-  // Can this user create a new customer payout right now? { enabled, platformEnabled, userEnabled, message }
+  // Can this user create a new customer payout right now, and within what limits?
+  // { enabled, platformEnabled, userEnabled, message, limits, usage, preferences, requireVerifiedAccount }
   router.get('/status', authenticateToken, async (req, res) => {
-    try { res.json({ success: true, ...(await payoutAccessFor(req.user.userId)) }); }
-    catch (e) { sendError(res, e, 'Failed to fetch payout status'); }
+    try {
+      const [access, user, usage] = await Promise.all([payoutAccessFor(req.user.userId), userMetaCache.getUserMeta(req.user.userId), usageFor(req.user.userId)]);
+      res.json({
+        success: true, ...access, limits: limitsFor(user), usage,
+        preferences: { realtime: !(user?.payoutRealtimeDisabled === true) }, realtimeEnabled: settingsView().realtimeEnabled,
+        requireVerifiedAccount: settingsView().requireVerifiedAccount,
+      });
+    } catch (e) { sendError(res, e, 'Failed to fetch payout status'); }
+  });
+
+  // Own UI preferences. Body: { realtime: boolean } — opt out of live socket updates for this user.
+  router.patch('/me/preferences', authenticateToken, async (req, res) => {
+    try {
+      if (typeof req.body.realtime !== 'boolean') throw fail(400, 'realtime must be true or false');
+      const doc = await findUserMetaDoc(req.user.userId);
+      if (!doc) throw fail(404, 'User not found');
+      await databases.updateDocument(DB, USERS_META, doc.$id, { payoutRealtimeDisabled: !req.body.realtime });
+      await userMetaCache.invalidate(req.user.userId);
+      res.json({ success: true, preferences: { realtime: req.body.realtime } });
+    } catch (e) { sendError(res, e, 'Failed to update preferences'); }
   });
 
   async function listWalletTxns(userId, q) {
@@ -654,6 +808,11 @@ module.exports = (
     if (q.bankingStatus) {
       if (!BANKING_STATUSES.includes(q.bankingStatus)) throw fail(400, 'Invalid bankingStatus');
       queries.push(Query.equal('bankingStatus', q.bankingStatus));
+    }
+    if (q.verificationStatus) {
+      if (!VERIFICATION_STATUSES.includes(q.verificationStatus)) throw fail(400, 'Invalid verificationStatus');
+      // legacy rows have no value → treat as unverified
+      queries.push(q.verificationStatus === 'unverified' ? Query.or([Query.equal('verificationStatus', 'unverified'), Query.isNull('verificationStatus')]) : Query.equal('verificationStatus', q.verificationStatus));
     }
     const minPaid = rupeesFilter(q.minTotalPaid, 'minTotalPaid');
     if (minPaid != null) queries.push(Query.greaterThanEqual('totalPaidPaise', minPaid));
@@ -730,13 +889,16 @@ module.exports = (
         if (mode === 'UPI' && !upiId) throw fail(400, 'UPI ID is required for a UPI payout');
       }
 
-      const { userRate, parentRate, totalRate } = await payoutRatesFor(userId);
+      const { user, userRate, parentRate, totalRate } = await payoutRatesFor(userId);
+      const limits = limitsFor(user);
+      if (limits.maxPerRequestPaise || limits.dailyLimitPaise || limits.maxPending) enforceLimits(limits, await usageFor(userId), amountPaise); // skip the usage scans when nothing is limited
       const commissionPaise = calculateCommissionPaise(amountPaise, totalRate);
       const totalPaise = amountPaise + commissionPaise;
       if (walletView(userId, await getWallet(userId)).availablePaise < totalPaise) throw fail(409, 'Insufficient payout wallet balance');
 
       account = account ? await fillUpiId(account, upiId) : (await findOrCreateAccount(userId, req.body, null)).account;
       if (mode === 'UPI' && !account.upiId) throw fail(400, 'UPI ID is required for a UPI payout'); // reused account without VPA
+      if (settingsView().requireVerifiedAccount && (account.verificationStatus || 'unverified') !== 'verified') throw fail(400, 'This customer account is not verified yet. Please wait for verification.');
       const id = genId('cpo_');
 
       const payout = await withWalletLock(userId, LOCK_TTL_REQUEST, async () => {
@@ -764,8 +926,33 @@ module.exports = (
       });
       await inc('totalCustomerPayoutPendingAmount', amountPaise);
       await inc('totalCustomerPayoutPendingCount', 1);
-      res.status(201).json({ success: true, payout: pickPayout({ ...payout, accountBankingStatus: account.bankingStatus || 'not_added' }) });
+      await notify(userId, { type: 'request_created', userId, payoutId: payout.id, status: 'pending', amountPaise });
+      res.status(201).json({ success: true, payout: pickPayout({ ...payout, accountBankingStatus: account.bankingStatus || 'not_added', accountVerificationStatus: account.verificationStatus || 'unverified' }) });
     } catch (e) { sendError(res, e, 'Failed to create customer payout request'); }
+  });
+
+  // User cancels their own PENDING request: releases the hold, no money moves, no commission.
+  router.post('/requests/:id/cancel', authenticateToken, async (req, res) => {
+    try {
+      const found = await loadPayoutByBusinessId(req.params.id);
+      if (found.userId !== req.user.userId) throw fail(404, 'Customer payout request not found');
+      if (found.status !== 'pending') throw fail(400, `Cannot cancel a ${found.status} request`);
+      const updated = await withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+        const p = await databases.getDocument(DB, PAYOUTS, found.$id);
+        if (p.status !== 'pending') throw fail(409, 'Request was already resolved');
+        await moveWallet(p.userId, { deltaHold: -Number(p.totalPaise) });
+        const at = nowIso();
+        const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
+          status: 'cancelled', rejectionReason: null, referenceNumber: null, processedAt: at, cancelledAt: at, processedBy: req.user.userId,
+        });
+        await bumpAccountStats(p.accountId, { cancelledCount: 1 });
+        return doc;
+      });
+      await inc('totalCustomerPayoutPendingAmount', -Number(updated.amountPaise || 0));
+      await inc('totalCustomerPayoutPendingCount', -1);
+      await notify(updated.userId, { type: 'request_cancelled', userId: updated.userId, payoutId: updated.id, status: 'cancelled' });
+      res.json({ success: true, message: 'Payout request cancelled', payout: await payoutView(updated, false) });
+    } catch (e) { sendError(res, e, 'Failed to cancel payout request'); }
   });
 
   // Filters shared by the user list and the admin queue. `scopeQueries` = userId scope
@@ -782,7 +969,7 @@ module.exports = (
     const queries = [...scopeQueries];
     if (staff && q.paidVia) queries.push(Query.equal('paidVia', String(q.paidVia).trim()));
     if (q.status) {
-      if (!['pending', 'paid', 'rejected'].includes(q.status)) throw fail(400, 'Invalid status');
+      if (!['pending', 'paid', 'rejected', 'cancelled'].includes(q.status)) throw fail(400, 'Invalid status');
       queries.push(Query.equal('status', q.status));
     }
     if (q.mode) {
@@ -807,14 +994,18 @@ module.exports = (
       else if (field === 'accountNumber') queries.push(Query.startsWith('accountNumber', search));
       else queries.push(Query.equal(field, search));
     }
-    if (q.bankingStatus) {
-      if (!BANKING_STATUSES.includes(q.bankingStatus)) throw fail(400, 'Invalid bankingStatus');
-      // Tag lives on the account: resolve matching accounts (same userId scope), then filter by accountId.
+    if (q.bankingStatus || q.verificationStatus) {
+      if (q.bankingStatus && !BANKING_STATUSES.includes(q.bankingStatus)) throw fail(400, 'Invalid bankingStatus');
+      if (q.verificationStatus && !VERIFICATION_STATUSES.includes(q.verificationStatus)) throw fail(400, 'Invalid verificationStatus');
+      // Tags live on the account: resolve matching accounts (same userId scope), then filter by accountId.
       // ponytail: 500-account ceiling per filter call; add a status snapshot on the request if it matters
+      const tagQ = [];
+      if (q.bankingStatus) tagQ.push(Query.equal('bankingStatus', q.bankingStatus));
+      if (q.verificationStatus) tagQ.push(q.verificationStatus === 'unverified' ? Query.or([Query.equal('verificationStatus', 'unverified'), Query.isNull('verificationStatus')]) : Query.equal('verificationStatus', q.verificationStatus));
       const ids = [];
       let cursor = null;
       for (let page = 0; page < 5; page++) {
-        const aq = [...scopeQueries, Query.equal('bankingStatus', q.bankingStatus), Query.orderAsc('$id'), Query.limit(100)];
+        const aq = [...scopeQueries, ...tagQ, Query.orderAsc('$id'), Query.limit(100)];
         if (cursor) aq.push(Query.cursorAfter(cursor));
         const r = await databases.listDocuments(DB, ACCOUNTS, aq);
         for (const a of r.documents) ids.push(a.$id);
@@ -878,10 +1069,11 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to fetch payout wallet transactions'); }
   });
 
-  // Manual credit/debit. Body: { userId, direction:'credit'|'debit', amount (rupees), notes (required),
-  // referenceNumber?, refId? (client idempotency key — resend the same refId to retry safely) }
+  // Manual credit/debit (admin role only). Body: { userId, direction:'credit'|'debit', amount (rupees),
+  // notes (required), referenceNumber?, refId? (client idempotency key — resend the same refId to retry safely) }
   router.post('/admin/wallet/adjust', adminEdit, async (req, res) => {
     try {
+      adminOnly(req);
       const { userId, direction, referenceNumber, refId } = req.body;
       if (!userId) throw fail(400, 'userId is required');
       if (!['credit', 'debit'].includes(direction)) throw fail(400, 'direction must be credit or debit');
@@ -906,6 +1098,7 @@ module.exports = (
           },
         });
       });
+      if (!result.duplicate) await notify(userId, { type: 'wallet_changed', userId, reason: type, wallet: walletView(userId, result.wallet) });
       res.json({ success: true, duplicate: !!result.duplicate, wallet: walletView(userId, result.wallet), transaction: pickWalletTxn(result.txn) });
     } catch (e) { sendError(res, e, 'Failed to adjust payout wallet'); }
   });
@@ -914,19 +1107,372 @@ module.exports = (
   const adminOnly = (req) => { if (req.user.role !== 'admin') throw fail(403, 'Admin only'); };
 
   router.get('/admin/settings', adminView, async (req, res) => {
-    try { res.json({ success: true, customerPayouts: platformStatus() }); }
+    try { adminOnly(req); res.json({ success: true, ...settingsView() }); }
     catch (e) { sendError(res, e, 'Failed to fetch payout settings'); }
   });
 
-  // Body: { enabled: boolean, message?: string ≤200 } — config keys customer_payouts_enabled / _disabled_message
+  // Every field optional; only the ones sent are written. Amount-type fields in RUPEES (0 = off/unlimited).
+  //   enabled, message                        → customer_payouts_enabled / customer_payouts_disabled_message
+  //   realtimeEnabled                          → payout_realtime_enabled
+  //   requireVerifiedAccount                   → payout_require_verified_account
+  //   alertsEnabled, lowBalanceThreshold, pendingAlertMinutes → payout_alerts_enabled / payout_low_balance_threshold / payout_pending_alert_minutes
+  //   maxPerRequest, dailyLimit, maxPending    → payout_max_per_request / payout_daily_limit / payout_max_pending
   router.patch('/admin/settings', adminEdit, async (req, res) => {
     try {
       adminOnly(req);
-      if (typeof req.body.enabled !== 'boolean') throw fail(400, 'enabled must be true or false');
-      await ConfigManager.set('customer_payouts_enabled', req.body.enabled ? 'true' : 'false');
-      if (req.body.message !== undefined) await ConfigManager.set('customer_payouts_disabled_message', String(req.body.message || '').trim().slice(0, 200));
-      res.json({ success: true, customerPayouts: platformStatus() });
+      const b = req.body || {};
+      const bool = (k) => { if (b[k] === undefined) return null; if (typeof b[k] !== 'boolean') throw fail(400, `${k} must be true or false`); return b[k] ? 'true' : 'false'; };
+      const nonNeg = (k) => { if (b[k] === undefined || b[k] === null) return null; const n = Number(b[k]); if (!isFinite(n) || n < 0) throw fail(400, `${k} must be a number >= 0`); return String(n); };
+      const writes = {
+        customer_payouts_enabled: bool('enabled'),
+        customer_payouts_disabled_message: b.message !== undefined ? String(b.message || '').trim().slice(0, 200) : null,
+        payout_realtime_enabled: bool('realtimeEnabled'),
+        payout_require_verified_account: bool('requireVerifiedAccount'),
+        payout_alerts_enabled: bool('alertsEnabled'),
+        payout_low_balance_threshold: nonNeg('lowBalanceThreshold'),
+        payout_pending_alert_minutes: nonNeg('pendingAlertMinutes'),
+        payout_max_per_request: nonNeg('maxPerRequest'),
+        payout_daily_limit: nonNeg('dailyLimit'),
+        payout_max_pending: nonNeg('maxPending'),
+      };
+      const entries = Object.entries(writes).filter(([, v]) => v !== null);
+      if (!entries.length) throw fail(400, 'No settings provided');
+      for (const [key, val] of entries) await ConfigManager.set(key, val);
+      res.json({ success: true, ...settingsView() });
     } catch (e) { sendError(res, e, 'Failed to update payout settings'); }
+  });
+
+  // Per-user limits (admin role only). Body: { maxPerRequest?, dailyLimit? (rupees), maxPending? }
+  // null = inherit platform default, 0 = unlimited for this user.
+  router.get('/admin/users/:userId/payout-limits', adminView, async (req, res) => {
+    try {
+      await assertCanAct(req, req.params.userId);
+      const user = await userMetaCache.getUserMeta(req.params.userId);
+      if (!user) throw fail(404, 'User not found');
+      res.json({
+        success: true, userId: req.params.userId,
+        userValues: { maxPerRequestPaise: user.payoutMaxPerRequestPaise ?? null, dailyLimitPaise: user.payoutDailyLimitPaise ?? null, maxPending: user.payoutMaxPending ?? null },
+        effective: limitsFor(user), platform: settingsView().limits, usage: await usageFor(req.params.userId),
+      });
+    } catch (e) { sendError(res, e, 'Failed to fetch payout limits'); }
+  });
+  router.patch('/admin/users/:userId/payout-limits', adminEdit, async (req, res) => {
+    try {
+      adminOnly(req);
+      const doc = await findUserMetaDoc(req.params.userId);
+      if (!doc) throw fail(404, 'User not found');
+      const b = req.body || {};
+      const patch = {};
+      const rupees = (k, field) => { if (b[k] === undefined) return; if (b[k] === null) { patch[field] = null; return; } const n = Number(b[k]); if (!isFinite(n) || n < 0) throw fail(400, `${k} must be a number >= 0 or null`); patch[field] = Math.round(n * 100); };
+      rupees('maxPerRequest', 'payoutMaxPerRequestPaise');
+      rupees('dailyLimit', 'payoutDailyLimitPaise');
+      if (b.maxPending !== undefined) { if (b.maxPending === null) patch.payoutMaxPending = null; else { const n = parseInt(b.maxPending, 10); if (!isFinite(n) || n < 0) throw fail(400, 'maxPending must be an integer >= 0 or null'); patch.payoutMaxPending = n; } }
+      if (!Object.keys(patch).length) throw fail(400, 'No limits provided');
+      await databases.updateDocument(DB, USERS_META, doc.$id, patch);
+      await userMetaCache.invalidate(req.params.userId);
+      const user = { ...doc, ...patch };
+      res.json({ success: true, userId: req.params.userId, userValues: { maxPerRequestPaise: user.payoutMaxPerRequestPaise ?? null, dailyLimitPaise: user.payoutDailyLimitPaise ?? null, maxPending: user.payoutMaxPending ?? null }, effective: limitsFor(user) });
+    } catch (e) { sendError(res, e, 'Failed to update payout limits'); }
+  });
+
+  // ─── "paid via" source accounts — staff quick-pick list (admin / labelled employee) ──
+  const staffOnly = (req) => { if (!isStaff(req)) throw fail(403, 'Not authorized'); };
+  router.get('/admin/source-accounts', adminView, async (req, res) => {
+    try {
+      staffOnly(req);
+      const limit = parseLimit(req.query.limit);
+      const queries = [];
+      const s = String(req.query.search || '').trim().toLowerCase();
+      if (s) queries.push(Query.startsWith('labelKey', s));
+      if (!parseBool(req.query.includeInactive, false)) queries.push(Query.equal('active', true));
+      const sort = { useCount: 'useCount', lastUsedAt: 'lastUsedAt', label: 'labelKey', totalPaid: 'totalPaidPaise' }[req.query.sort || 'useCount'];
+      if (!sort) throw fail(400, 'Invalid sort');
+      queries.push(sort === 'labelKey' ? Query.orderAsc(sort) : Query.orderDesc(sort), ...cursorQuery(req.query.cursor), Query.limit(limit));
+      const r = await databases.listDocuments(DB, SOURCE_ACCOUNTS, queries);
+      res.json({ success: true, total: r.total, sourceAccounts: r.documents.map(pickSource), nextCursor: nextCursorOf(r.documents, limit) });
+    } catch (e) { sendError(res, e, 'Failed to fetch source accounts'); }
+  });
+  router.post('/admin/source-accounts', adminEdit, async (req, res) => {
+    try {
+      const label = String(req.body.label || '').trim().slice(0, 100);
+      if (label.length < 2) throw fail(400, 'label is required (2–100 characters)');
+      const existing = await findSource(label);
+      const doc = existing ? (existing.active === false ? await databases.updateDocument(DB, SOURCE_ACCOUNTS, existing.$id, { active: true }) : existing) : await upsertSource(label, req.user.userId);
+      res.status(existing ? 200 : 201).json({ success: true, created: !existing, sourceAccount: pickSource(doc) });
+    } catch (e) { sendError(res, e, 'Failed to add source account'); }
+  });
+  router.delete('/admin/source-accounts/:id', adminEdit, async (req, res) => { // deactivate (history keeps the label text)
+    try {
+      adminOnly(req);
+      const doc = await databases.getDocument(DB, SOURCE_ACCOUNTS, req.params.id).catch(() => null);
+      if (!doc) throw fail(404, 'Source account not found');
+      await databases.updateDocument(DB, SOURCE_ACCOUNTS, doc.$id, { active: false });
+      res.json({ success: true, message: 'Source account deactivated' });
+    } catch (e) { sendError(res, e, 'Failed to deactivate source account'); }
+  });
+
+  // ─── wallet statement export (admin role only) — CSV, from/to IST days ──
+  router.get('/admin/wallet/export', adminView, async (req, res) => {
+    try {
+      adminOnly(req);
+      const { userId, from, to } = req.query;
+      if (!userId) throw fail(400, 'userId is required');
+      if (!from || !to) throw fail(400, 'from and to are required (YYYY-MM-DD)');
+      const base = [Query.equal('userId', String(userId)), ...dateQueries(from, to), Query.orderAsc('createdAt'), Query.limit(100)];
+      const rows = [];
+      let cursor = null, truncated = false;
+      for (let page = 0; page < 50; page++) { // ponytail: 5,000-row ceiling per export
+        const r = await databases.listDocuments(DB, WALLET_TXNS, cursor ? [...base, Query.cursorAfter(cursor)] : base);
+        rows.push(...r.documents);
+        if (r.documents.length < 100) break;
+        cursor = r.documents[r.documents.length - 1].$id;
+        if (page === 49) truncated = true;
+      }
+      const esc = (v) => { const s = v == null ? '' : String(v); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+      const header = ['createdAt', 'id', 'type', 'direction', 'amountRs', 'commissionRs', 'totalRs', 'balanceAfterRs', 'holdAfterRs', 'refType', 'refId', 'referenceNumber', 'notes', 'createdBy'];
+      const lines = [header.join(',')];
+      for (const d of rows) {
+        lines.push([d.createdAt, d.id, d.type, d.direction, Number(d.amountPaise || 0) / 100, Number(d.commissionPaise || 0) / 100, Number(d.totalPaise || 0) / 100,
+          d.balanceAfterPaise == null ? '' : Number(d.balanceAfterPaise) / 100, d.holdAfterPaise == null ? '' : Number(d.holdAfterPaise) / 100,
+          d.refType, d.refId, d.referenceNumber, d.notes, d.createdBy].map(esc).join(','));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="payout-wallet-${String(userId).replace(/[^a-zA-Z0-9_-]/g, '')}-${from}-${to}.csv"`);
+      res.setHeader('X-Row-Count', String(rows.length));
+      if (truncated) res.setHeader('X-Truncated', 'true');
+      res.send(`﻿${lines.join('\r\n')}\r\n`);
+    } catch (e) { sendError(res, e, 'Failed to export wallet statement'); }
+  });
+
+  // ─── daily time series for the admin dashboard (scoped like the queue) ──
+  // GET /admin/stats/daily?from&to&userId&subadminId  → per IST day: requested, paid, rejected, cancelled
+  router.get('/admin/stats/daily', adminView, async (req, res) => {
+    try {
+      const from = req.query.from || istDay(), to = req.query.to || from;
+      if (!DAY_RE.test(from) || !DAY_RE.test(to)) throw fail(400, 'Dates must be YYYY-MM-DD');
+      const start = moment.tz(from, 'Asia/Kolkata'), end = moment.tz(to, 'Asia/Kolkata');
+      if (!start.isValid() || !end.isValid() || end.isBefore(start)) throw fail(400, 'Invalid date range');
+      if (end.diff(start, 'days') > 366) throw fail(400, 'Range too large (max 366 days)');
+      const scope = await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId });
+      const days = [];
+      for (let d = start.clone(); !d.isAfter(end); d.add(1, 'day')) {
+        days.push({ date: d.format('YYYY-MM-DD'), requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, paidMinutesTotal: 0, rejectedCount: 0, cancelledCount: 0 });
+      }
+      const idx = new Map(days.map((x, i) => [x.date, i]));
+      let truncated = false;
+      const scan = async (attr, onDoc) => {
+        if (scope === null) return;
+        const bounds = dateQueries(from, to).map((q) => q.replace('"createdAt"', `"${attr}"`)); // same IST bounds on another attribute
+        const base = [...scope, ...bounds, Query.orderAsc('$id'), Query.limit(100)];
+        let cursor = null;
+        for (let page = 0; page < 100; page++) { // ponytail: 10k rows per scan per call
+          const r = await databases.listDocuments(DB, PAYOUTS, cursor ? [...base, Query.cursorAfter(cursor)] : base);
+          for (const p of r.documents) onDoc(p);
+          if (r.documents.length < 100) break;
+          cursor = r.documents[r.documents.length - 1].$id;
+          if (page === 99) truncated = true;
+        }
+      };
+      const bucket = (ts) => { const i = idx.get(istDay(ts)); return i === undefined ? null : days[i]; };
+      await scan('createdAt', (p) => { const b = bucket(p.createdAt); if (b) { b.requestedCount++; b.requestedAmountPaise += Number(p.amountPaise || 0); } });
+      await scan('processedAt', (p) => {
+        const b = bucket(p.processedAt); if (!b) return;
+        if (p.status === 'paid') { b.paidCount++; b.paidAmountPaise += Number(p.amountPaise || 0); b.paidCommissionPaise += Number(p.commissionPaise || 0); b.paidMinutesTotal += minutesBetween(p.createdAt, p.paidAt || p.processedAt) || 0; }
+        else if (p.status === 'rejected') b.rejectedCount++;
+        else if (p.status === 'cancelled') b.cancelledCount++;
+      });
+      const out = days.map(({ paidMinutesTotal, ...d }) => ({ ...d, avgPaidInMinutes: d.paidCount ? Math.round(paidMinutesTotal / d.paidCount) : null }));
+      const totals = out.reduce((t, d) => ({ requestedCount: t.requestedCount + d.requestedCount, requestedAmountPaise: t.requestedAmountPaise + d.requestedAmountPaise, paidCount: t.paidCount + d.paidCount, paidAmountPaise: t.paidAmountPaise + d.paidAmountPaise, paidCommissionPaise: t.paidCommissionPaise + d.paidCommissionPaise, rejectedCount: t.rejectedCount + d.rejectedCount, cancelledCount: t.cancelledCount + d.cancelledCount }), { requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, rejectedCount: 0, cancelledCount: 0 });
+      res.json({ success: true, range: { from, to }, days: out, totals, truncated });
+    } catch (e) { sendError(res, e, 'Failed to fetch payout daily stats'); }
+  });
+
+  // ─── alerts (on demand; admin toggles thresholds in settings) ──
+  // GET /admin/alerts → low-balance wallets + stale pending requests, scoped like the queue
+  router.get('/admin/alerts', adminView, async (req, res) => {
+    try {
+      const s = settingsView().alerts;
+      const scope = await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId });
+      const lowBalance = [], stalePending = [];
+      if (s.enabled && scope !== null) {
+        if (s.lowBalanceThresholdPaise) {
+          const base = [...scope, Query.orderAsc('$id'), Query.limit(100)];
+          let cursor = null;
+          for (let page = 0; page < 5; page++) { // ponytail: 500 wallets per call
+            const r = await databases.listDocuments(DB, WALLETS, cursor ? [...base, Query.cursorAfter(cursor)] : base);
+            for (const w of r.documents) { const v = walletView(w.userId, w); if (v.availablePaise < s.lowBalanceThresholdPaise) lowBalance.push({ userId: w.userId, availablePaise: v.availablePaise, balancePaise: v.balancePaise, holdPaise: v.holdPaise }); }
+            if (r.documents.length < 100) break;
+            cursor = r.documents[r.documents.length - 1].$id;
+          }
+        }
+        if (s.pendingAlertMinutes) {
+          const cutoff = new Date(Date.now() - s.pendingAlertMinutes * 60000).toISOString();
+          const r = await databases.listDocuments(DB, PAYOUTS, [...scope, Query.equal('status', 'pending'), Query.lessThanEqual('createdAt', cutoff), Query.orderAsc('createdAt'), Query.limit(100)]);
+          for (const p of r.documents) stalePending.push({ payoutId: p.id, userId: p.userId, amountPaise: Number(p.amountPaise || 0), customerName: p.customerName, requestedAt: p.createdAt, waitingMinutes: minutesBetween(p.createdAt, nowIso()) });
+        }
+      }
+      res.json({ success: true, enabled: s.enabled, thresholds: { lowBalancePaise: s.lowBalanceThresholdPaise, pendingMinutes: s.pendingAlertMinutes }, lowBalance, stalePending, counts: { lowBalance: lowBalance.length, stalePending: stalePending.length } });
+    } catch (e) { sendError(res, e, 'Failed to fetch payout alerts'); }
+  });
+
+  // ─── beneficiary verification (staff) ──
+  // Body: { status: unverified|verified|name_mismatch|failed, verifiedName?, note? }
+  router.patch('/admin/accounts/:accountId/verification', adminEdit, async (req, res) => {
+    try {
+      const { status } = req.body;
+      if (!VERIFICATION_STATUSES.includes(status)) throw fail(400, 'status must be unverified, verified, name_mismatch or failed');
+      const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
+      if (!account) throw fail(404, 'Customer payout account not found');
+      await assertCanAct(req, account.userId);
+      const updated = await databases.updateDocument(DB, ACCOUNTS, account.$id, {
+        verificationStatus: status,
+        verifiedName: req.body.verifiedName ? String(req.body.verifiedName).trim().slice(0, 100) : null,
+        verificationNote: req.body.note ? String(req.body.note).trim().slice(0, 300) : null,
+        verifiedAt: status === 'unverified' ? null : nowIso(), verifiedBy: status === 'unverified' ? null : req.user.userId,
+      });
+      await notify(account.userId, { type: 'account_verification', userId: account.userId, accountId: account.$id, verificationStatus: status }, { toAdmins: false });
+      res.json({ success: true, account: pickAccount(updated) });
+    } catch (e) { sendError(res, e, 'Failed to update verification'); }
+  });
+
+  // ─── ledger integrity check (admin role only) — READ-ONLY report, never modifies or restricts ──
+  async function pageAll(col, queries, cap = 5000) {
+    const docs = []; let cursor = null;
+    for (let page = 0; page < cap / 100; page++) {
+      const r = await databases.listDocuments(DB, col, cursor ? [...queries, Query.limit(100), Query.cursorAfter(cursor)] : [...queries, Query.limit(100)]);
+      docs.push(...r.documents);
+      if (r.documents.length < 100) return { docs, truncated: false };
+      cursor = r.documents[r.documents.length - 1].$id;
+    }
+    return { docs, truncated: true };
+  }
+  async function checkWallet(userId) {
+    const issues = [];
+    const add = (severity, code, message, data = {}) => issues.push({ severity, code, message, ...data });
+    const wallet = await getWallet(userId);
+    const [rowsR, payoutsR, wdR, accountsR] = await Promise.all([
+      pageAll(WALLET_TXNS, [Query.equal('userId', userId), Query.orderAsc('createdAt'), Query.orderAsc('$id')]), // $id tiebreak: two rows in one ms must not read as a chain break
+      pageAll(PAYOUTS, [Query.equal('userId', userId), Query.orderAsc('createdAt')]),
+      pageAll(WITHDRAWALS, [Query.equal('userId', userId), Query.equal('mode', 'wallet'), Query.orderAsc('$createdAt')]),
+      pageAll(ACCOUNTS, [Query.equal('userId', userId), Query.orderAsc('$id')]),
+    ]);
+    const rows = rowsR.docs, payouts = payoutsR.docs, withdrawals = wdR.docs, accounts = accountsR.docs;
+    const truncated = rowsR.truncated || payoutsR.truncated || wdR.truncated || accountsR.truncated;
+
+    // 1. ledger arithmetic: balance = credits − debits; running balanceAfter chain; duplicate (type, refId)
+    let credits = 0, debits = 0, running = 0, chainBreaks = 0;
+    const byType = {}, seen = new Set(), rowsByKey = new Map();
+    for (const r of rows) {
+      const total = Number(r.totalPaise || 0);
+      if (!['credit', 'debit'].includes(r.direction)) add('error', 'LEDGER_BAD_DIRECTION', `Ledger row ${r.id} has direction "${r.direction}"`, { rowId: r.id });
+      if (!(total >= 0)) add('error', 'LEDGER_BAD_AMOUNT', `Ledger row ${r.id} has invalid totalPaise ${r.totalPaise}`, { rowId: r.id });
+      if (r.direction === 'credit') credits += total; else debits += total;
+      byType[r.type] = (byType[r.type] || 0) + Number(r.amountPaise || 0);
+      const key = `${r.type}:${r.refId}`;
+      if (r.refId) { if (seen.has(key)) add('error', 'LEDGER_DUPLICATE_REF', `Duplicate ledger row for ${key} (double credit/debit?)`, { rowId: r.id, key }); seen.add(key); rowsByKey.set(key, r); }
+      running += r.direction === 'credit' ? total : -total;
+      if (r.balanceAfterPaise != null && Number(r.balanceAfterPaise) !== running) {
+        if (chainBreaks++ < 5) add('error', 'LEDGER_CHAIN_BREAK', `Row ${r.id}: balanceAfter ${r.balanceAfterPaise} but running sum is ${running}`, { rowId: r.id, expected: running, actual: Number(r.balanceAfterPaise) });
+        running = Number(r.balanceAfterPaise); // resync so one break is reported once, not for every later row
+      }
+    }
+    if (chainBreaks > 5) add('error', 'LEDGER_CHAIN_BREAK', `${chainBreaks - 5} more balanceAfter chain breaks not listed`);
+    const expectedBalance = credits - debits;
+    const balance = Number(wallet?.balancePaise || 0), hold = Number(wallet?.holdPaise || 0);
+    if (balance !== expectedBalance) add('error', 'BALANCE_MISMATCH', `Wallet balance ${balance} ≠ ledger credits − debits ${expectedBalance} (drift ${balance - expectedBalance})`, { walletPaise: balance, ledgerPaise: expectedBalance, driftPaise: balance - expectedBalance });
+
+    // 2. hold = Σ pending totalPaise; available ≥ 0
+    const pending = payouts.filter((p) => p.status === 'pending');
+    const expectedHold = pending.reduce((s, p) => s + Number(p.totalPaise || 0), 0);
+    if (hold !== expectedHold) add('error', 'HOLD_MISMATCH', `Wallet hold ${hold} ≠ Σ pending requests ${expectedHold} (${pending.length} pending)`, { walletPaise: hold, expectedPaise: expectedHold, driftPaise: hold - expectedHold });
+    if (balance - hold < 0) add('error', 'NEGATIVE_AVAILABLE', `Available is negative (${balance - hold})`, { availablePaise: balance - hold });
+
+    // 3. lifetime totals on the wallet doc vs ledger
+    const lt = { totalCreditedPaise: (byType.withdrawal_credit || 0) + (byType.admin_credit || 0), totalPaidOutPaise: byType.payout_paid || 0, totalAdminDebitPaise: byType.admin_debit || 0, totalRevertedToQrPaise: byType.revert_to_qr || 0,
+      totalPayoutCommissionPaise: rows.filter((r) => r.type === 'payout_paid').reduce((s, r) => s + Number(r.commissionPaise || 0), 0), paidCount: rows.filter((r) => r.type === 'payout_paid').length };
+    for (const [k, v] of Object.entries(lt)) if (wallet && Number(wallet[k] || 0) !== v) add('warning', 'LIFETIME_MISMATCH', `Wallet ${k} ${Number(wallet[k] || 0)} ≠ ledger ${v}`, { field: k, walletValue: Number(wallet[k] || 0), ledgerValue: v });
+
+    // 4. wallet withdrawals ↔ credit rows; reverts ↔ walletRevertedPaise
+    for (const w of withdrawals) {
+      if (w.status !== 'approved') continue;
+      const credited = Math.round(Number(w.preAmount) * 100);
+      const row = rowsByKey.get(`withdrawal_credit:${w.id}`);
+      if (!row) add(w.walletCreditFailed ? 'warning' : 'error', 'WITHDRAWAL_NOT_CREDITED', `Approved wallet withdrawal ${w.id} (${credited} paise) has no wallet credit row${w.walletCreditFailed ? ' (flagged walletCreditFailed — use retry-credit)' : ''}`, { withdrawalId: w.id, amountPaise: credited });
+      else if (Number(row.amountPaise) !== credited) add('error', 'WITHDRAWAL_CREDIT_AMOUNT', `Withdrawal ${w.id}: credited ${row.amountPaise} but preAmount is ${credited}`, { withdrawalId: w.id });
+      const reverted = rows.filter((r) => r.type === 'revert_to_qr' && r.referenceNumber === w.id).reduce((s, r) => s + Number(r.amountPaise || 0), 0);
+      if (Number(w.walletRevertedPaise || 0) !== reverted) add('warning', 'REVERT_TRACKING', `Withdrawal ${w.id}: walletRevertedPaise ${Number(w.walletRevertedPaise || 0)} ≠ Σ revert rows ${reverted}`, { withdrawalId: w.id });
+      if (reverted > credited) add('error', 'REVERT_EXCEEDS_CREDIT', `Withdrawal ${w.id}: reverted ${reverted} > credited ${credited}`, { withdrawalId: w.id });
+    }
+    for (const r of rows) if (r.type === 'withdrawal_credit' && !withdrawals.some((w) => w.id === r.refId)) add('error', 'ORPHAN_CREDIT', `Credit row ${r.id} references unknown wallet withdrawal ${r.refId}`, { rowId: r.id });
+
+    // 5. paid payouts ↔ payout_paid rows (exactly one each way, same total)
+    const paidById = new Map(payouts.filter((p) => p.status === 'paid').map((p) => [p.id, p]));
+    for (const p of paidById.values()) {
+      const row = rowsByKey.get(`payout_paid:${p.id}`);
+      if (!row) add('error', 'PAID_NOT_DEBITED', `Paid request ${p.id} (${p.totalPaise} paise) has no wallet debit row`, { payoutId: p.id });
+      else if (Number(row.totalPaise) !== Number(p.totalPaise)) add('error', 'PAID_AMOUNT_MISMATCH', `Request ${p.id}: debited ${row.totalPaise} but request total is ${p.totalPaise}`, { payoutId: p.id });
+    }
+    for (const r of rows) {
+      if (r.type !== 'payout_paid') continue;
+      const p = payouts.find((x) => x.id === r.refId);
+      if (!p) add('error', 'ORPHAN_DEBIT', `Debit row ${r.id} references unknown request ${r.refId}`, { rowId: r.id });
+      else if (p.status !== 'paid') add('error', 'DEBIT_ON_UNPAID', `Request ${p.id} is ${p.status} but has a payout_paid debit row`, { payoutId: p.id });
+    }
+
+    // 6. commission txns per paid request (ceil split may exceed the request's commission by ≤1 paise per share)
+    const paidIds = [...paidById.keys()];
+    if (paidIds.length) {
+      const sums = {};
+      for (let i = 0; i < paidIds.length; i += 100) {
+        const r = await pageAll(COMMISSION_TXNS, [Query.equal('sourcePayoutId', paidIds.slice(i, i + 100))], 2000);
+        for (const c of r.docs) sums[c.sourcePayoutId] = (sums[c.sourcePayoutId] || 0) + Number(c.amount || 0);
+      }
+      for (const p of paidById.values()) {
+        const expected = Number(p.commissionPaise || 0), got = sums[p.id] || 0;
+        if (expected > 0 && (got < expected || got > expected + 2)) add('warning', 'COMMISSION_MISMATCH', `Request ${p.id}: commission txns total ${got} vs request commission ${expected}`, { payoutId: p.id, expectedPaise: expected, recordedPaise: got });
+      }
+    }
+
+    // 7. account stats vs requests
+    const perAcc = {};
+    for (const p of payouts) {
+      const a = perAcc[p.accountId] = perAcc[p.accountId] || { requestCount: 0, paidCount: 0, rejectedCount: 0, cancelledCount: 0, totalPaidPaise: 0 };
+      a.requestCount++;
+      if (p.status === 'paid') { a.paidCount++; a.totalPaidPaise += Number(p.amountPaise || 0); }
+      else if (p.status === 'rejected') a.rejectedCount++;
+      else if (p.status === 'cancelled') a.cancelledCount++;
+    }
+    for (const acc of accounts) {
+      const exp = perAcc[acc.$id] || { requestCount: 0, paidCount: 0, rejectedCount: 0, cancelledCount: 0, totalPaidPaise: 0 };
+      for (const k of Object.keys(exp)) if (Number(acc[k] || 0) !== exp[k]) add('warning', 'ACCOUNT_STATS_MISMATCH', `Account ${acc.$id} (${acc.customerName}): ${k} ${Number(acc[k] || 0)} ≠ ${exp[k]} (fix: recompute-stats)`, { accountId: acc.$id, field: k });
+    }
+
+    const errors = issues.filter((i) => i.severity === 'error').length, warnings = issues.filter((i) => i.severity === 'warning').length;
+    return {
+      userId, checkedAt: nowIso(), ok: errors === 0, errors, warnings, truncated,
+      wallet: walletView(userId, wallet),
+      ledger: { rows: rows.length, creditsPaise: credits, debitsPaise: debits, expectedBalancePaise: expectedBalance, expectedHoldPaise: expectedHold, byTypePaise: byType },
+      counts: { payouts: payouts.length, pending: pending.length, paid: paidById.size, walletWithdrawals: withdrawals.length, accounts: accounts.length },
+      issues,
+    };
+  }
+  router.get('/admin/integrity/wallet/:userId', adminView, async (req, res) => {
+    try { adminOnly(req); res.json({ success: true, report: await checkWallet(req.params.userId) }); }
+    catch (e) { sendError(res, e, 'Failed to run integrity check'); }
+  });
+  // Page through wallets (≤ 25 per call — each is a full check) → summaries; drill into one with the route above.
+  router.get('/admin/integrity/wallets', adminView, async (req, res) => {
+    try {
+      adminOnly(req);
+      const limit = parseLimit(req.query.limit ?? 10, 25);
+      const r = await databases.listDocuments(DB, WALLETS, [Query.orderAsc('$id'), ...cursorQuery(req.query.cursor), Query.limit(limit)]);
+      const reports = [];
+      for (const w of r.documents) {
+        const rep = await checkWallet(w.userId);
+        reports.push({ userId: rep.userId, ok: rep.ok, errors: rep.errors, warnings: rep.warnings, truncated: rep.truncated, balancePaise: rep.wallet.balancePaise, holdPaise: rep.wallet.holdPaise, driftPaise: rep.wallet.balancePaise - rep.ledger.expectedBalancePaise, issueCodes: [...new Set(rep.issues.map((i) => i.code))] });
+      }
+      res.json({ success: true, checkedAt: nowIso(), reports, summary: { wallets: reports.length, withErrors: reports.filter((x) => !x.ok).length, withWarnings: reports.filter((x) => x.ok && x.warnings).length }, nextCursor: nextCursorOf(r.documents, limit) });
+    } catch (e) { sendError(res, e, 'Failed to run integrity check'); }
   });
 
   // Body: { enabled: boolean, reason?: string ≤200 } — sets users_meta.payoutDisabled (+reason), invalidates the meta cache
@@ -942,6 +1488,39 @@ module.exports = (
       await userMetaCache.invalidate(req.params.userId);
       res.json({ success: true, userId: req.params.userId, payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
     } catch (e) { sendError(res, e, 'Failed to update user payout access'); }
+  });
+
+  // What can be reverted from this wallet? The user's approved mode:'wallet' withdrawals with
+  // credited / reverted / revertable paise, plus the wallet (available caps any single revert).
+  // GET /admin/wallet/revertable?userId&onlyRevertable=true&limit&cursor   (admin role only)
+  router.get('/admin/wallet/revertable', adminView, async (req, res) => {
+    try {
+      adminOnly(req);
+      const userId = String(req.query.userId || '');
+      if (!userId) throw fail(400, 'userId is required');
+      const limit = parseLimit(req.query.limit);
+      const onlyRevertable = parseBool(req.query.onlyRevertable, true);
+      const queries = [Query.equal('userId', userId), Query.equal('mode', 'wallet'), Query.equal('status', 'approved'), Query.orderDesc('$createdAt'), ...cursorQuery(req.query.cursor), Query.limit(limit)];
+      const r = await databases.listDocuments(DB, WITHDRAWALS, queries);
+      const wallet = walletView(userId, await getWallet(userId));
+      const rows = r.documents.map((w) => {
+        const creditedPaise = Math.round(Number(w.preAmount || 0) * 100);
+        const revertedPaise = Number(w.walletRevertedPaise || 0);
+        const revertablePaise = Math.max(0, creditedPaise - revertedPaise);
+        return {
+          withdrawalId: w.id, qrId: w.qrId, approvedAt: w.processedAt || null, requestedAt: w.createdAt || null,
+          creditedPaise, revertedPaise, revertablePaise, creditedRs: creditedPaise / 100, revertablePaise_capped: Math.min(revertablePaise, Math.max(0, wallet.availablePaise)),
+          walletCreditFailed: w.walletCreditFailed === true,
+        };
+      }).filter((x) => !onlyRevertable || x.revertablePaise > 0);
+      res.json({
+        success: true, userId, wallet,
+        withdrawals: rows,
+        pageTotalRevertablePaise: rows.reduce((s, x) => s + x.revertablePaise, 0),
+        maxSingleRevertPaise: Math.max(0, wallet.availablePaise), // money held by pending payouts cannot be reverted
+        nextCursor: nextCursorOf(r.documents, limit),
+      });
+    } catch (e) { sendError(res, e, 'Failed to fetch revertable withdrawals'); }
   });
 
   // ─── revert payout-wallet money back to the QR it was withdrawn from (admin role only) ──
@@ -1028,6 +1607,7 @@ module.exports = (
         return { duplicate: false, txn: moved.txn, wallet: moved.wallet, amountPaise, remainingPaise: remaining - amountPaise, qrId: w.qrId, newQrAvailablePaise: newAvailable };
       }), 'QR is currently being processed. Please try again in a moment.');
 
+      if (!result.duplicate) await notify(found.userId, { type: 'wallet_changed', userId: found.userId, reason: 'revert_to_qr', qrId: found.qrId, amountPaise: result.amountPaise, wallet: walletView(found.userId, result.wallet) });
       res.json({
         success: true, duplicate: !!result.duplicate, withdrawalId: found.id, qrId: found.qrId, userId: found.userId,
         amountPaise: result.amountPaise ?? Number(result.txn.amountPaise), remainingPaise: result.remainingPaise ?? null,
@@ -1041,6 +1621,7 @@ module.exports = (
   // whose credit failed (withdrawal doc has walletCreditFailed:true).
   router.post('/admin/wallet/retry-credit', adminEdit, async (req, res) => {
     try {
+      adminOnly(req);
       const { withdrawalId } = req.body;
       if (!withdrawalId) throw fail(400, 'withdrawalId is required');
       const r = await databases.listDocuments(DB, WITHDRAWALS, [Query.equal('id', String(withdrawalId)), Query.limit(1)]);
@@ -1074,6 +1655,7 @@ module.exports = (
     try {
       const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
       if (!account) throw fail(404, 'Customer payout account not found');
+      await assertCanAct(req, account.userId);
       res.json({ success: true, account: pickAccount(await recomputeAccountStats(account.$id)) });
     } catch (e) { sendError(res, e, 'Failed to recompute account stats'); }
   });
@@ -1082,6 +1664,7 @@ module.exports = (
     try {
       const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
       if (!account) throw fail(404, 'Customer payout account not found');
+      await assertCanAct(req, account.userId);
       await deleteAccount(account);
       res.json({ success: true, message: 'Customer payout account deleted' });
     } catch (e) { sendError(res, e, 'Failed to delete customer payout account'); }
@@ -1093,6 +1676,7 @@ module.exports = (
       if (!BANKING_STATUSES.includes(bankingStatus)) throw fail(400, 'bankingStatus must be added or not_added');
       const account = await databases.getDocument(DB, ACCOUNTS, req.params.accountId).catch(() => null);
       if (!account) throw fail(404, 'Customer payout account not found');
+      await assertCanAct(req, account.userId);
       const at = nowIso();
       const updated = await databases.updateDocument(DB, ACCOUNTS, account.$id, {
         bankingStatus, bankingStatusUpdatedAt: at, bankingStatusUpdatedBy: req.user.userId,
@@ -1110,6 +1694,7 @@ module.exports = (
           }
         } catch (e) { console.error(`banking-status: could not stamp pending payouts for account ${account.$id}:`, e?.message); }
       }
+      await notify(account.userId, { type: 'account_banking_status', userId: account.userId, accountId: account.$id, bankingStatus, stampedRequests: stamped }, { toAdmins: false });
       res.json({ success: true, account: pickAccount(updated), stampedRequests: stamped });
     } catch (e) { sendError(res, e, 'Failed to update banking status'); }
   });
@@ -1141,6 +1726,7 @@ module.exports = (
       if (referenceNumber.length < 5 || referenceNumber.length > 100) throw fail(400, 'Payout reference number is required (5–100 characters)');
       const paidVia = String(req.body.paidVia || '').trim().slice(0, 100) || null;
       const found = await loadPayoutByBusinessId(req.params.id);
+      await assertCanAct(req, found.userId); // employees: only their assigned subadmins' users
       if (found.status !== 'pending') throw fail(400, `Cannot mark a ${found.status} request as paid`);
 
       const updated = await withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
@@ -1175,6 +1761,8 @@ module.exports = (
       // Commission is derived from the paid payout — never blocks the response (mirrors withdraw approve).
       try { await recordPayoutCommission(updated); }
       catch (e) { console.error(`CRITICAL: payout commission failed for ${updated.id}. Needs reconciliation.`, e); }
+      await touchSource(paidVia, paidAmount, req.user.userId);
+      await notify(updated.userId, { type: 'request_paid', userId: updated.userId, payoutId: updated.id, status: 'paid', amountPaise: paidAmount, referenceNumber });
 
       res.json({ success: true, message: 'Payout marked as paid', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to mark payout as paid'); }
@@ -1185,6 +1773,7 @@ module.exports = (
       const reason = String(req.body.reason || '').trim();
       if (reason.length < 4 || reason.length > 500) throw fail(400, 'Rejection reason is required (4–500 characters)');
       const found = await loadPayoutByBusinessId(req.params.id);
+      await assertCanAct(req, found.userId);
       if (found.status !== 'pending') throw fail(400, `Cannot reject a ${found.status} request`);
 
       const updated = await withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
@@ -1200,6 +1789,7 @@ module.exports = (
       });
       await inc('totalCustomerPayoutPendingAmount', -Number(updated.amountPaise || 0));
       await inc('totalCustomerPayoutPendingCount', -1);
+      await notify(updated.userId, { type: 'request_rejected', userId: updated.userId, payoutId: updated.id, status: 'rejected', reason });
       res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to reject payout'); }
   });

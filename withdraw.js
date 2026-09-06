@@ -258,6 +258,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     router.post('/withdraw_new', authenticateToken, async (req, res) => {
       const { userId, qrId, companyName, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
+      // Ownership: the body's userId must be the caller (user), the caller or one of their own users
+      // (subadmin), or anyone (admin / employee). Without this a logged-in user could raise a
+      // withdrawal against another user's QR balance.
+      // (A missing userId still gets the 400 from the validation below, not a misleading 403.)
+      if (userId && req.user.role === 'user' && userId !== req.user.userId) {
+        return res.status(403).json({ error: 'You can only request withdrawals for your own account' });
+      }
+      if (userId && req.user.role === 'subadmin' && userId !== req.user.userId) {
+        const target = userId ? await getUserMeta(userId).catch(() => null) : null;
+        if (!target || target.parentId !== req.user.userId) {
+          return res.status(403).json({ error: 'You can only request withdrawals for your own users' });
+        }
+      }
+
       // mode 'wallet' = internal transfer into the user's Payout Wallet — exempt from time windows
       // and from the max-pending cap (and never counted against it).
       const isWallet = mode === 'wallet';

@@ -45,8 +45,9 @@ Today a user withdraws QR balance with a **withdrawal request** that admin pays 
 6. Admin can **manually credit/debit** a wallet with mandatory notes and an optional reference number
    (e.g. "customer paid outside platform"). These appear in the user's wallet history.
 
-Statuses of a customer payout request: `pending` → `paid` | `rejected` (final). A rejected request
-carries `rejectionReason`; the user simply creates a new request.
+Statuses of a customer payout request: `pending` → `paid` | `rejected` | `cancelled` (all final).
+A rejected request carries `rejectionReason`; `cancelled` means the user withdrew it themself
+(§5.4); in both cases the user simply creates a new request.
 
 ---
 
@@ -58,11 +59,18 @@ carries `rejectionReason`; the user simply creates a new request.
   wallet-destination toggle to an admin; the server also refuses admin `POST /accounts` and
   `POST /requests` with 403. Admin uses §6 exclusively.
 - **Auth:** same Bearer token as every other `/api/...` call. User endpoints are for any logged-in
-  user and are always scoped to the caller. Admin **views** (`GET /api/payout/admin/...`) are open to
-  role `admin`, an employee with the `view_payouts` label, and **subadmins — who only ever see their
-  own users (users whose parent is them) plus themselves**. Admin **actions** (paid / reject /
-  banking-status / adjust / retry-credit / delete) need `admin` or the `edit_payouts` label;
-  subadmins get 403 — hide the buttons for them. Non-authorized → 401/403.
+  user and are always scoped to the caller. Who sees / does what on `/api/payout/admin/...`:
+
+  | role | sees | may do |
+  |---|---|---|
+  | `admin` | everything | everything |
+  | `employee` with `view_payouts` / `edit_payouts` | **only the subadmins assigned to them** (`assigned_to`) and those subadmins' users | queue actions on those users: mark paid, reject, tag banking status, verify accounts, delete accounts, recompute stats; `paidVia` visible |
+  | `subadmin` | their own users (parent = them) plus themself | read-only |
+  | anyone else | — | 401/403 |
+
+  **Admin-role only** (403 for everyone else, including labelled employees): wallet adjust, revert-to-QR,
+  retry-credit, statement export, pause switches, per-user limits, settings, integrity check,
+  deactivating a source account. Hide those controls unless the role is `admin`.
 - **Base paths:** payout endpoints are under **`/api/payout`**. Withdrawal endpoints stay under
   `/api/user`. Edit-user stays under `/api/admin`.
 - **Money:**
@@ -186,20 +194,32 @@ Same authorization as before: the user themself, their subadmin, admin, or emplo
 The wallet response also carries `access` (same object as §4.1a) so one call drives both the card
 and the "New payout" button.
 
-### 4.1a Is the feature switched on? — `GET /api/payout/status`
-Customer payouts can be paused **platform-wide** (admin) or **for one user** (admin). While paused
-the user can still see the wallet, history and accounts, but cannot create a new request.
+### 4.1a Status: switched on? limits? usage? — `GET /api/payout/status`
+Call it when the payout screens open and on app resume; admins change these without notice.
 ```jsonc
 { "success": true,
   "enabled": false,             // may this user create a request right now?
   "platformEnabled": false,     // false = paused for everyone
   "userEnabled": true,          // false = paused for this user only
-  "message": "Bank maintenance till 6 PM"   // null when enabled; show verbatim when disabled
+  "message": "Bank maintenance till 6 PM",  // null when enabled; show verbatim when disabled
+  "limits": {                   // effective for THIS user; 0 = no limit
+    "maxPerRequestPaise": 50000, "dailyLimitPaise": 500000, "maxPending": 2 },
+  "usage": {                    // today = IST calendar day; pending/paid requests count, rejected/cancelled do not
+    "usedTodayPaise": 120000, "requestedTodayCount": 3, "pendingCount": 1 },
+  "preferences": { "realtime": true },     // this user's own opt-in to live socket updates (§9)
+  "realtimeEnabled": true,                 // platform switch for live updates
+  "requireVerifiedAccount": false          // when true, only accounts with verificationStatus "verified" can receive payouts (§5.6)
 }
 ```
-UI: when `enabled == false` disable the "New payout" button and show `message` in a banner above the
-requests list. `POST /requests` while disabled returns `403 { error: <same message> }` — treat it as
-a refresh trigger, not a crash. Also call this on app resume; admins flip it without notice.
+UI rules:
+- `enabled == false` → disable "New payout", show `message` in a banner above the requests list.
+  `POST /requests` while disabled returns `403 { error: <same message> }` — treat as a refresh trigger.
+- **Limits — `0` means no limit, for every parameter.** Show the non-zero ones on the New Payout form
+  ("Max ₹500 per payout · ₹1,200 left today · 1 of 2 pending"). Pre-validate the amount against
+  `maxPerRequestPaise` and `dailyLimitPaise − usedTodayPaise`; the server re-checks and answers
+  `400` with a precise message (`Amount exceeds your per-payout limit of ₹500.00`, `You already have
+  the maximum number of pending customer payouts (2)`, `This payout would exceed your daily limit of
+  ₹1200.00 (used ₹1000.00 today)`) — show it verbatim.
 
 ### 4.2 `GET /api/payout/wallet/transactions?limit&cursor&type&from&to`
 `type` optional: `withdrawal_credit` | `payout_paid` | `admin_credit` | `admin_debit` | `revert_to_qr`.
@@ -345,6 +365,14 @@ the admin queue table in §6.1. Rows have the shape above. Per status show:
 - **rejected** — red, `rejectionReason` prominently, `processedAt`, a **"Request again"** button that
   opens the form pre-filled from this row (`accountId`, `mode`, `amountRs`, `notes`).
 
+### 5.4 (cont.) Cancel your own pending request — `POST /api/payout/requests/:id/cancel`
+No body. Only the owner, only while `status == "pending"`. The hold is released (balance untouched,
+no ledger row, no commission), the row becomes `status: "cancelled"` with `cancelledAt` /
+`cancelledInMinutes`, and it can never be paid afterwards. `400` if not pending, `404` if not yours,
+`409` if admin resolved it at the same moment (refresh). Show a "Cancel request" action on pending
+rows with a confirmation; add a **Cancelled** tab/filter (`?status=cancelled`) — grey, "Cancelled by
+you", with "Request again". Admin queue rows show cancelled requests the same way.
+
 ### 5.4a Unique request id + lookup
 Every customer payout has a **unique, permanent id** `id` (format `cpo_<digits>`, e.g.
 `cpo_1725600000000456`) — distinct from the Appwrite `$id`. Show it on every row/detail with a copy
@@ -368,6 +396,16 @@ fields (whole minutes, clamped at 0, `null` when that step has not happened).
 | Account added in banking | `addedToBankingAt` | `addedInMinutes` | "Added to banking in 12 min" · while `null`: "Waiting for account to be added" (only if `accountBankingStatus == "not_added"`) |
 | Paid | `paidAt` | `paidInMinutes` | "Paid in 31 min" (green) |
 | Rejected | `rejectedAt` | `rejectedInMinutes` | "Rejected after 5 min" (red) |
+| Cancelled (by the user) | `cancelledAt` | `cancelledInMinutes` | "Cancelled after 2 min" (grey) |
+
+### 5.6 Beneficiary verification (set by staff, shown to the user)
+Every saved account carries `verificationStatus`: `unverified` (default) · `verified` ·
+`name_mismatch` · `failed`, plus `verifiedName` (the name the bank returned), `verifiedAt`,
+`verifiedBy`, `verificationNote`. Show it as a chip on account cards and on each request row
+(`accountVerificationStatus`, live value). When `GET /status` says `requireVerifiedAccount == true`,
+only `verified` accounts can be paid to — grey out the others in the picker and explain
+("Waiting for verification"); the server answers `400 This customer account is not verified yet…`.
+Both account lists accept `?verificationStatus=…`; the request lists too.
 
 Notes:
 - If the customer account was **already** `added` when the request was made, `addedToBankingAt`
@@ -426,7 +464,22 @@ account number.
   "paidVia": "HDFC current a/c ****4321" }   // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
 ```
 `paidVia` is optional on the server, but **make it a required field in the Paid dialog** — it is the
-internal record of the source account. Offer the last few distinct values as quick-pick chips.
+internal record of the source account. Build the field as a **type-to-search dropdown backed by the
+source-account list (§6.2a)**: as the admin types, call `GET /admin/source-accounts?search=<text>`
+and offer matches; picking one fills the field; typing a new value is allowed and is saved to the
+list automatically the moment the payout is marked paid.
+
+#### 6.2a Source accounts (the "paid via" list) — staff
+`GET /api/payout/admin/source-accounts?search&sort&includeInactive&limit&cursor`
+→ `{ success, total, sourceAccounts: [{ $id, label, useCount, totalPaidPaise, totalPaidRs, lastUsedAt, addedBy, createdAt, active }], nextCursor }`
+- `search` = prefix match on the label (case-insensitive); `sort` ∈ `useCount` (default, most used
+  first) `lastUsedAt` `totalPaid` `label`; `includeInactive=true` shows deactivated ones.
+- `useCount` / `totalPaidPaise` are bumped every time a payout is marked paid with that label, so the
+  list doubles as "how much went out of each of our accounts".
+- `POST /api/payout/admin/source-accounts { "label": "HDFC current ****4321" }` → `201 { success, created: true, sourceAccount }`
+  (`200 created: false` if it already exists; re-adding a deactivated label reactivates it).
+- `DELETE /api/payout/admin/source-accounts/:id` (admin role only) → deactivates; history keeps the text.
+- Subadmins get 403 on all of these (the list is staff-only, like `paidVia`).
 `200 { success, message: "Payout marked as paid", payout }`. Effects: wallet `balance −= total`,
 `hold −= total`, ledger row `payout_paid`, payout commission recorded for admin/subadmin.
 
@@ -471,6 +524,15 @@ users that are not theirs.
 `POST /api/payout/admin/accounts/:accountId/recompute-stats` (admin / `edit_payouts`) → rebuilds the
 stats block from the request rows and returns `{ success, account }`. Only needed if a stats figure
 ever looks wrong (the server logs when a stats update fails); safe to call any time.
+
+`PATCH /api/payout/admin/accounts/:accountId/verification` (admin / `edit_payouts`, within scope)
+```jsonc
+{ "status": "verified",                 // unverified | verified | name_mismatch | failed
+  "verifiedName": "RAVI KUMAR",         // optional, what the bank returned
+  "note": "Penny drop OK 06-Sep" }      // optional ≤300
+```
+→ `{ success, account }`. Setting `unverified` clears `verifiedAt`/`verifiedBy`. Put a "Verify…" dialog
+on the account detail with the four statuses; the user sees the resulting chip (§5.6).
 `PATCH /api/payout/admin/accounts/:accountId/banking-status`
 ```jsonc
 { "bankingStatus": "added" }        // or "not_added" to revert
@@ -498,6 +560,29 @@ request references it.
 `200 { success, duplicate: false, wallet, transaction }`. `duplicate: true` means this `refId` was
 already applied (nothing changed). Debit below available → `409 Insufficient payout wallet balance`.
 Show a confirmation dialog with the resulting available balance before sending.
+
+**"Revert to QR" from the wallet screen** (admin role only). On the per-user wallet drill-down add a
+**Revert to QR…** button. It opens a sheet fed by:
+
+`GET /api/payout/admin/wallet/revertable?userId=u1&onlyRevertable=true&limit&cursor`
+```jsonc
+{ "success": true, "userId": "u1",
+  "wallet": { …walletView… },                 // availablePaise = the most that can leave the wallet right now
+  "withdrawals": [{
+      "withdrawalId": "wdh_…", "qrId": "QR123", "requestedAt": "…", "approvedAt": "…",
+      "creditedPaise": 50000, "revertedPaise": 20000, "revertablePaise": 30000, "creditedRs": 500,
+      "revertablePaise_capped": 20000,       // min(revertablePaise, wallet available) — the max for THIS row right now
+      "walletCreditFailed": false }],
+  "pageTotalRevertablePaise": 30000,
+  "maxSingleRevertPaise": 20000,             // = wallet available; money held by pending payouts cannot be reverted
+  "nextCursor": null }
+```
+Sheet layout: one row per wallet withdrawal ("QR123 · credited ₹500 · reverted ₹200 · revertable
+₹300"), a selected row, an amount field pre-filled with `revertablePaise_capped` and capped at it,
+a "Revert all" shortcut (sends no `amount`), the **required note**, then a confirmation showing
+amount → QR id. Submit with `POST …/revert-to-qr` below, then refresh the wallet card, history and
+this list. `onlyRevertable=false` also lists fully reverted withdrawals (greyed). If
+`maxSingleRevertPaise` is 0, explain "all wallet money is held by pending customer payouts".
 
 `POST /api/payout/admin/wallet/revert-to-qr` — **admin role only.** Moves payout-wallet money back to
 the QR it was withdrawn from, so the user can request a normal (direct) withdrawal instead.
@@ -532,6 +617,14 @@ Rules the UI must respect:
   withdrawal keeps status `approved` but `walletRevertedPaise` grows; dashboard "wallet funded" and
   "total paid" both decrease by the amount.
 
+`GET /api/payout/admin/wallet/export?userId=u1&from=2026-09-01&to=2026-09-30` — **admin role only.**
+Returns a CSV file (`Content-Type: text/csv`, `Content-Disposition: attachment; filename="payout-wallet-<userId>-<from>-<to>.csv"`)
+of that user's wallet ledger rows in the IST date range, oldest first. Columns:
+`createdAt,id,type,direction,amountRs,commissionRs,totalRs,balanceAfterRs,holdAfterRs,refType,refId,referenceNumber,notes,createdBy`
+(amounts in **rupees** here, since it is a human statement). Headers `X-Row-Count` and, if the range
+exceeded 5,000 rows, `X-Truncated: true` (narrow the dates). `400` if `userId`, `from` or `to` is
+missing. Use the platform share/save-file flow; the response is a plain download.
+
 `POST /api/payout/admin/wallet/retry-credit` — `{ "withdrawalId": "wdh_…" }` → re-runs the wallet
 credit for an approved `mode:'wallet'` withdrawal (safe to call repeatedly; `skipped: true` means it was
 already credited). Surface it on withdrawal rows with `walletCreditFailed == true`.
@@ -563,12 +656,37 @@ current IST month) and `GET /api/payout/admin/commissions/all-time?userId=&limit
 Rows are sorted highest earner first. Subadmins always get just their own row. Use these for the
 "This month" / "All time" tiles; use `summary` for the per-day chart.
 
-### 6.5a Pause customer payouts — platform-wide and per user (admin role only)
-`GET /api/payout/admin/settings` → `{ success, customerPayouts: { enabled, message } }`
-`PATCH /api/payout/admin/settings`
+### 6.5a Settings — pause switches, limits, alerts, realtime, verification (admin role only)
+`GET /api/payout/admin/settings`
 ```jsonc
-{ "enabled": false, "message": "Bank maintenance till 6 PM" }   // message optional (≤200), shown to users while paused
+{ "success": true,
+  "customerPayouts": { "enabled": true, "message": "Customer payouts are temporarily disabled…" },
+  "realtimeEnabled": true,
+  "requireVerifiedAccount": false,
+  "alerts": { "enabled": false, "lowBalanceThresholdPaise": 0, "pendingAlertMinutes": 0 },
+  "limits":  { "maxPerRequestPaise": 0, "dailyLimitPaise": 0, "maxPending": 0 } }   // platform defaults; 0 = no limit
 ```
+`PATCH /api/payout/admin/settings` — send only the fields you change; amounts in **rupees**:
+```jsonc
+{ "enabled": false, "message": "Bank maintenance till 6 PM",   // pause everyone (message ≤200 shown to users)
+  "realtimeEnabled": true,                                      // live socket updates on/off for the whole platform
+  "requireVerifiedAccount": false,                              // only verified beneficiaries may be paid
+  "alertsEnabled": true, "lowBalanceThreshold": 500, "pendingAlertMinutes": 60,   // §6.8; 0 = that alert off
+  "maxPerRequest": 1000, "dailyLimit": 0, "maxPending": 2 }     // platform limits; 0 = no limit
+```
+→ the same shape as GET. `400` on a wrong type or a negative number. Build a settings screen with
+toggles and number fields; label every numeric field "0 = no limit".
+
+**Per-user limits** (override the platform values):
+`GET /api/payout/admin/users/:userId/payout-limits` → `{ success, userId, userValues, effective, platform, usage }`
+`PATCH /api/payout/admin/users/:userId/payout-limits`
+```jsonc
+{ "maxPerRequest": 250.5, "dailyLimit": null, "maxPending": 0 }   // rupees / count. null = inherit platform, 0 = no limit for this user
+```
+→ `{ success, userId, userValues: { maxPerRequestPaise, dailyLimitPaise, maxPending }, effective }`.
+Show three fields on the user detail, each with an "inherit" state (null) and the note "0 = no limit".
+
+**Pause one user** (`PATCH …/payout-access`, below) and **per-user limits** are both admin-role only.
 `PATCH /api/payout/admin/users/:userId/payout-access`
 ```jsonc
 { "enabled": false, "reason": "KYC pending" }    // reason optional (≤200); { "enabled": true } re-enables
@@ -577,6 +695,67 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 etc.) now include `payoutDisabled` and `payoutDisabledReason` — show a "Payouts paused" chip and a
 toggle in the user detail. Both switches return `403` for labelled employees; only role `admin` may
 pause. Pausing never touches money or existing requests — admin can still pay/reject the queue.
+
+### 6.5b Daily time series — `GET /api/payout/admin/stats/daily?from&to&userId&subadminId`
+Scoped like the queue (subadmins/employees see their users). Defaults to today; max 366 days.
+```jsonc
+{ "success": true, "range": { "from": "2026-09-01", "to": "2026-09-07" },
+  "days": [{ "date": "2026-09-02",
+             "requestedCount": 3, "requestedAmountPaise": 129000,     // by request time
+             "paidCount": 2, "paidAmountPaise": 109000, "paidCommissionPaise": 301, "avgPaidInMinutes": 18,  // by paid time
+             "rejectedCount": 0, "cancelledCount": 0 }, …],           // by resolution time
+  "totals": { "requestedCount": …, "requestedAmountPaise": …, "paidCount": …, "paidAmountPaise": …, "paidCommissionPaise": …, "rejectedCount": …, "cancelledCount": … },
+  "truncated": false }   // true = more than 10,000 rows in range were skipped; narrow the range
+```
+Chart ideas: paid amount per day (bars), avg minutes to pay (line), requested vs paid counts.
+
+### 6.5c Alerts — `GET /api/payout/admin/alerts?userId&subadminId` (admin toggles in §6.5a)
+```jsonc
+{ "success": true, "enabled": true, "thresholds": { "lowBalancePaise": 50000, "pendingMinutes": 60 },
+  "lowBalance":   [{ "userId": "u1", "availablePaise": 500, "balancePaise": 500, "holdPaise": 0 }],
+  "stalePending": [{ "payoutId": "cpo_…", "userId": "u1", "amountPaise": 10000, "customerName": "Ravi", "requestedAt": "…", "waitingMinutes": 183 }],
+  "counts": { "lowBalance": 1, "stalePending": 1 } }
+```
+Computed on demand (no background job) — poll it for a badge on the admin home, and list both
+sections on an "Alerts" screen. When alerts are enabled and a low-balance threshold is set, the
+server also pushes a realtime `payout:alert` (§9) the moment a wallet's available balance crosses
+below the threshold (on a new request hold, an admin debit or a revert).
+
+### 6.5d Ledger integrity check — `GET /api/payout/admin/integrity/...` (admin role only)
+**Read-only.** It recomputes what every balance *should* be from the raw ledger and reports
+differences. It never modifies data and never restricts a user — it is a report for humans.
+
+`GET /api/payout/admin/integrity/wallets?limit=10&cursor=` — pages through wallets (≤ 25 per call,
+each is a full check) and returns one summary per wallet:
+```jsonc
+{ "success": true, "checkedAt": "…",
+  "reports": [{ "userId": "u1", "ok": true, "errors": 0, "warnings": 0, "truncated": false,
+                "balancePaise": 39700, "holdPaise": 10300, "driftPaise": 0, "issueCodes": [] }, …],
+  "summary": { "wallets": 10, "withErrors": 1, "withWarnings": 2 }, "nextCursor": "…" }
+```
+`GET /api/payout/admin/integrity/wallet/:userId` — the full report for one wallet:
+```jsonc
+{ "success": true, "report": {
+    "userId": "u1", "checkedAt": "…", "ok": false, "errors": 2, "warnings": 1, "truncated": false,
+    "wallet":  { …walletView… },
+    "ledger":  { "rows": 12, "creditsPaise": 500000, "debitsPaise": 460300, "expectedBalancePaise": 39700, "expectedHoldPaise": 10300, "byTypePaise": { "withdrawal_credit": 500000, "payout_paid": 450000, … } },
+    "counts":  { "payouts": 45, "pending": 1, "paid": 43, "walletWithdrawals": 5, "accounts": 6 },
+    "issues":  [ { "severity": "error", "code": "BALANCE_MISMATCH", "message": "Wallet balance 40000 ≠ ledger credits − debits 39700 (drift 300)", "walletPaise": 40000, "ledgerPaise": 39700, "driftPaise": 300 }, … ] } }
+```
+Issue codes (severity in brackets): `BALANCE_MISMATCH` (E) wallet balance ≠ Σ ledger ·
+`HOLD_MISMATCH` (E) hold ≠ Σ pending requests · `NEGATIVE_AVAILABLE` (E) ·
+`LEDGER_CHAIN_BREAK` (E) a row's `balanceAfter` does not follow the running sum ·
+`LEDGER_DUPLICATE_REF` (E) two rows for the same (type, refId) — a possible double credit/debit ·
+`LEDGER_BAD_DIRECTION` / `LEDGER_BAD_AMOUNT` (E) · `WITHDRAWAL_NOT_CREDITED` (E, or W if already
+flagged for retry) · `WITHDRAWAL_CREDIT_AMOUNT` (E) · `ORPHAN_CREDIT` / `ORPHAN_DEBIT` (E) ·
+`PAID_NOT_DEBITED` / `PAID_AMOUNT_MISMATCH` / `DEBIT_ON_UNPAID` (E) · `REVERT_EXCEEDS_CREDIT` (E) ·
+`REVERT_TRACKING` (W) · `LIFETIME_MISMATCH` (W) wallet lifetime totals ≠ ledger ·
+`COMMISSION_MISMATCH` (W) commission rows ≠ request commission · `ACCOUNT_STATS_MISMATCH` (W, fix
+with recompute-stats). Each issue carries the numbers it compared (`walletPaise`, `ledgerPaise`,
+`driftPaise`, `rowId`, `payoutId`, `withdrawalId`, `accountId`, …) so the screen can show them.
+UI: an "Integrity" screen listing wallets red/amber/green with drift, tap → the issue list grouped by
+severity, with a "Re-check" button. `truncated: true` means the wallet has more than 5,000 rows in one
+collection and the check stopped early — say so.
 
 ### 6.6 Dashboard tiles (existing endpoints, new keys)
 `GET /api/admin/dashboard/counters` (admin) now also returns, all **paise** unless the name ends in `Count`:
@@ -625,7 +804,8 @@ the effective rate — never blank. Setting it to `0` explicitly means 0.
    "Reject…" (reason dialog); Paid/Rejected tabs. Show "waiting N min" on pending rows (compute
    from `requestedAt` to now — this is the only place the device does date math) so the oldest
    requests stand out; paid/rejected rows show the server's `paidInMinutes` / `rejectedInMinutes`.
-3. *Wallets* — list, per-user drill-down with history and "Adjust…" dialog.
+3. *Wallets* — list, per-user drill-down with history, "Adjust…" dialog, "Revert to QR…" sheet
+   (§6.4), "Export statement" (date range), and the integrity badge.
 3b. *Customer accounts* — all customers across users (§6.3) with the filter sheet (user, subadmin,
    search, tag, min paid, sort by total paid / paid count / last paid), tap → detail with stats and
    the list of payouts we made to that customer, "Mark added" and "Delete" actions.
@@ -653,3 +833,37 @@ data; hide Paid/Reject/Adjust/Mark-added/Delete).
   request still references it.
 - Subadmin on an admin screen: a `403` on `?userId=` means that user is not theirs — don't retry.
 - Never show paise integers raw; never compute commission client-side.
+
+---
+
+## 9. Realtime updates (Socket.io, optional at both ends)
+
+The app already has a Socket.io connection that joins `room:user:<userId>` (and `room:admins` for
+admins). Two new events arrive there — **treat them as "refresh now" hints, never as the source of
+truth**; always re-fetch the affected list/wallet.
+
+| event | to whom | `payload.type` values |
+|---|---|---|
+| `payout:update` | the affected user's room **and** admins (admins always, even if the user opted out) | `request_created` `request_paid` `request_rejected` `request_cancelled` `wallet_changed` (`reason`: `withdrawal_credit` \| `admin_credit` \| `admin_debit` \| `revert_to_qr`, includes `wallet`) `account_banking_status` `account_verification` (user only) |
+| `payout:alert` | user room + admins | `low_balance` (`availablePaise`, `thresholdPaise`) |
+
+Every payload has `userId`, `at` (ISO) and, where relevant, `payoutId`, `status`, `amountPaise`.
+
+Toggles:
+- **Platform** (admin settings §6.5a, `realtimeEnabled`): off = the server emits nothing.
+- **Per user**: `PATCH /api/payout/me/preferences { "realtime": false }` → `{ success, preferences }`;
+  the user then receives no `payout:update` events (admins still do). Read it back from
+  `GET /status` (`preferences.realtime`). Put a "Live updates" switch in the user's settings; when
+  off, fall back to pull-to-refresh / polling.
+
+## 10. Withdrawal ownership (existing endpoint, tightened)
+`POST /api/user/withdraw_new` now rejects a `userId` that the caller is not allowed to act for:
+a **user** may only send their own `userId` (403 `You can only request withdrawals for your own
+account`); a **subadmin** may send their own or one of their own users' ids (403 otherwise); admin and
+employees are unrestricted. The app already sends the logged-in user's id, so nothing changes for a
+correct client — but do not reuse a cached id from another session.
+
+## 11. One-line summary of "0 means no limit"
+Every numeric limit in this feature — platform `maxPerRequest`, `dailyLimit`, `maxPending`, the
+per-user overrides, the alert thresholds — uses **`0` = off / no limit**. Per-user values additionally
+accept **`null` = inherit the platform value**. Never display `0` as "₹0 limit"; display "No limit".

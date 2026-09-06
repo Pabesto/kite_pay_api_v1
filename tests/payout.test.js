@@ -19,6 +19,9 @@ jest.mock('../userMetaCache', () => ({
 jest.mock('../dashboardCounters', () => ({ updateDashboardCounter: jest.fn().mockResolvedValue() }));
 const { updateDashboardCounter } = require('../dashboardCounters');
 const counterDeltas = () => updateDashboardCounter.mock.calls.map((c) => [c[2], c[3]]);
+// socket emitter stub (payout.js calls it fire-and-forget)
+const mockEmit = jest.fn();
+const emitted = () => mockEmit.mock.calls.map((c) => c[0]);
 
 // withdraw.js reads max_withdrawal_requests via ConfigManager (uninitialised here → known TDZ).
 const mockConfig = { max_withdrawal_requests: 2 };
@@ -64,6 +67,8 @@ function makeDb(seed = {}) {
                     case 'between': return v >= q.values[0] && v <= q.values[1];
                     case 'greaterThanEqual': return v >= q.values[0];
                     case 'lessThanEqual': return v <= q.values[0];
+                    case 'isNull': return v == null;
+                    case 'isNotNull': return v != null;
                     case 'or': return q.values.some((inner) => matches(d, typeof inner === 'string' ? parse(inner) : inner)); // Query.or stores parsed objects
                     default: return true;
                 }
@@ -107,7 +112,7 @@ function makeDb(seed = {}) {
 const COLS = {
     USERS: 'users_meta', WD: 'withdrawals', WALLETS: 'wallets', TXNS: 'wallet_txns',
     ACCOUNTS: 'accounts', PAYOUTS: 'payouts', COMM: 'payout_comm', DAILY: 'daily_payout_comm',
-    MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm', QRS: 'qr_col',
+    MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm', QRS: 'qr_col', SOURCES: 'source_accounts',
 };
 
 // `label` = the authenticateAdminOrLabel factory; defaults to injecting admin1.
@@ -117,7 +122,7 @@ function buildPayout(db, redis, auth = asUser('user1'), label = adminOrLabel) {
         const factory = require('../payout.js');
         mod = factory(db, { unique: () => 'uid' }, Query, 'db1',
             COLS.USERS, COLS.WD, COLS.WALLETS, COLS.TXNS, COLS.ACCOUNTS, COLS.PAYOUTS, COLS.COMM, COLS.DAILY,
-            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS);
+            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS, mockEmit, COLS.SOURCES);
     });
     const app = express();
     app.use(express.json());
@@ -715,7 +720,10 @@ describe('disable customer payouts (platform + per user)', () => {
         const emp = asUser('emp1', 'employee');
         const { app: empApp } = buildPayout(db, makeRedis(), emp, () => emp);
         expect((await request(empApp).patch('/admin/settings').send({ enabled: true })).status).toBe(403);
+        expect((await request(empApp).get('/admin/settings')).status).toBe(403);
         expect((await request(empApp).patch('/admin/users/user1/payout-access').send({ enabled: true })).status).toBe(403);
+        const sub = asUser('sub1', 'subadmin');
+        expect((await request(buildPayout(db, makeRedis(), sub, () => sub).app).get('/admin/settings')).status).toBe(403);
     });
 });
 
@@ -791,6 +799,27 @@ describe('revert payout wallet → QR', () => {
         expect(counterDeltas()).toEqual([['totalPayoutWalletBalance', -50000], ['totalPayoutWalletBalance', 50000]]);
     });
 
+    test('revertable list for the wallet screen: per-withdrawal numbers, capped by available, admin only', async () => {
+        const db = makeDb(seed({
+            [COLS.WD]: [WD(), { ...WD(), $id: 'wd2', id: 'wdh_2', preAmount: 100, walletRevertedPaise: 10000 }, { ...WD(), $id: 'wd3', id: 'wdh_3', mode: 'bank' }, { ...WD(), $id: 'wd4', id: 'wdh_4', status: 'pending' }],
+            [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 30000 }], // available 20000
+        }));
+        const { app } = buildPayout(db, makeRedis(), admin());
+        const res = await request(app).get('/admin/wallet/revertable?userId=user1');
+        expect(res.status).toBe(200);
+        expect(res.body.withdrawals).toEqual([expect.objectContaining({ withdrawalId: 'wdh_1', qrId: 'qr1', creditedPaise: 50000, revertedPaise: 0, revertablePaise: 50000, revertablePaise_capped: 20000, walletCreditFailed: false })]);
+        expect(res.body).toMatchObject({ pageTotalRevertablePaise: 50000, maxSingleRevertPaise: 20000, wallet: { availablePaise: 20000 } });
+        const all = await request(app).get('/admin/wallet/revertable?userId=user1&onlyRevertable=false');
+        expect(all.body.withdrawals.map((w) => [w.withdrawalId, w.revertablePaise])).toEqual([['wdh_1', 50000], ['wdh_2', 0]]); // bank + pending excluded
+        expect((await request(app).get('/admin/wallet/revertable')).status).toBe(400);
+        const emp = asUser('emp1', 'employee');
+        expect((await request(buildPayout(db, makeRedis(), emp, () => emp).app).get('/admin/wallet/revertable?userId=user1')).status).toBe(403);
+        // and the flow the screen drives: revert the capped amount from that row
+        const rv = await request(app).post('/admin/wallet/revert-to-qr').send({ withdrawalId: 'wdh_1', amount: 200, notes: 'from wallet screen' });
+        expect(rv.status).toBe(200);
+        expect((await request(app).get('/admin/wallet/revertable?userId=user1')).body.withdrawals[0]).toMatchObject({ revertedPaise: 20000, revertablePaise: 30000, revertablePaise_capped: 0 });
+    });
+
     test('same refId twice → duplicate no-op', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), admin());
@@ -819,6 +848,494 @@ describe('revert payout wallet → QR', () => {
         expect(busy.status).toBe(409);
         expect(busy.body.error).toMatch(/QR is currently being processed/i);
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(50000);
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Batch 3: employee scoping, limits, self-cancel, source accounts, export, stats,
+//          alerts, verification, realtime, integrity check, withdraw ownership
+// ═══════════════════════════════════════════════════════════════════════════
+const ISO = () => new Date().toISOString();
+const clearCfg = (...keys) => keys.forEach((k) => delete mockConfig[k]);
+
+describe('employee scoping (assigned subadmins → their users)', () => {
+    const seed = () => ({
+        [COLS.USERS]: [
+            { $id: 'emp1', userId: 'emp1', role: 'employee' },
+            { $id: 'sub1', userId: 'sub1', role: 'subadmin', assigned_to: 'emp1' },
+            { $id: 'subOther', userId: 'subOther', role: 'subadmin', assigned_to: 'empOther' },
+            { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' },
+            { $id: 'userX', userId: 'userX', role: 'user', parentId: 'subOther' },
+            { $id: 'admin1', userId: 'admin1', role: 'admin' },
+        ],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }, { $id: 'wX', userId: 'userX', balancePaise: 50000, holdPaise: 10300 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', bankingStatus: 'not_added' }, { $id: 'accX', userId: 'userX', bankingStatus: 'not_added' }],
+        [COLS.PAYOUTS]: [
+            { $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'R', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: ISO() },
+            { $id: 'pX', id: 'cpo_X', userId: 'userX', accountId: 'accX', customerName: 'X', accountNumber: '2', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: ISO() },
+        ],
+    });
+    const emp = () => { const e = asUser('emp1', 'employee'); return [e, () => e]; };
+
+    test('employee sees only assigned subadmins\' users and can pay/reject/tag those; foreign → 403', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), ...emp());
+        expect((await request(app).get('/admin/requests')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        expect((await request(app).get('/admin/requests?userId=userX')).status).toBe(403);
+        expect((await request(app).get('/admin/requests?subadminId=subOther')).status).toBe(403);
+        expect((await request(app).get('/admin/accounts')).body.accounts.map((a) => a.$id)).toEqual(['acc1']);
+        expect((await request(app).get('/admin/wallets')).body.wallets.map((w) => w.userId)).toEqual(['user1']);
+        expect((await request(app).patch('/admin/accounts/accX/banking-status').send({ bankingStatus: 'added' })).status).toBe(403);
+        expect((await request(app).patch('/admin/accounts/acc1/banking-status').send({ bankingStatus: 'added' })).status).toBe(200);
+        expect((await request(app).post('/admin/requests/cpo_X/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(403);
+        expect((await request(app).post('/admin/requests/cpo_X/reject').send({ reason: 'nope' })).status).toBe(403);
+        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidVia: 'HDFC ****1' });
+        expect(paid.status).toBe(200);
+        expect(paid.body.payout.paidVia).toBe('HDFC ****1'); // employees are staff: they see paidVia
+        expect(db.store[COLS.WALLETS][0].balancePaise).toBe(39700);
+        expect(db.store[COLS.WALLETS][1].balancePaise).toBe(50000);
+    });
+
+    test('employee cannot touch wallets or settings (admin role only) and an unassigned employee sees nothing', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), ...emp());
+        expect((await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'credit', amount: 1, notes: 'abc' })).status).toBe(403);
+        expect((await request(app).post('/admin/wallet/retry-credit').send({ withdrawalId: 'x' })).status).toBe(403);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ withdrawalId: 'x', notes: 'abc' })).status).toBe(403);
+        expect((await request(app).patch('/admin/settings').send({ enabled: true })).status).toBe(403);
+        expect((await request(app).get('/admin/wallet/export?userId=user1&from=2026-09-01&to=2026-09-02')).status).toBe(403);
+        expect((await request(app).get('/admin/integrity/wallet/user1')).status).toBe(403);
+        const lonely = asUser('emp9', 'employee');
+        const { app: lonelyApp } = buildPayout(db, makeRedis(), lonely, () => lonely);
+        expect((await request(lonelyApp).get('/admin/requests')).body.payouts).toEqual([]);
+        expect((await request(lonelyApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(403);
+    });
+});
+
+describe('per-user limits (0 = unlimited, null = inherit platform)', () => {
+    const rich = () => ({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000000, holdPaise: 0 }] });
+    const meta = (extra = {}) => userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, payoutCommission: 0, ...extra } : id === 'admin1' ? { userId: 'admin1', role: 'admin' } : null));
+    const req = (app, amount) => request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount });
+
+    test('platform limits: per request, max pending, daily total; 0 switches each off', async () => {
+        meta();
+        Object.assign(mockConfig, { payout_max_per_request: 500, payout_max_pending: 2, payout_daily_limit: 1200 });
+        try {
+            const { app } = buildPayout(makeDb(rich()), makeRedis());
+            const big = await req(app, 500.01);
+            expect(big.status).toBe(400); expect(big.body.error).toMatch(/per-payout limit of ₹500.00/);
+            expect((await req(app, 500)).status).toBe(201);
+            expect((await req(app, 500)).status).toBe(201);
+            const third = await req(app, 100);
+            expect(third.status).toBe(400); expect(third.body.error).toMatch(/maximum number of pending customer payouts \(2\)/);
+            mockConfig.payout_max_pending = 0; // unlimited pending → daily limit is next
+            const daily = await req(app, 200.01);
+            expect(daily.status).toBe(400); expect(daily.body.error).toMatch(/daily limit of ₹1200.00 \(used ₹1000.00 today\)/);
+            expect((await req(app, 200)).status).toBe(201);
+            mockConfig.payout_daily_limit = 0; mockConfig.payout_max_per_request = 0;
+            expect((await req(app, 5000)).status).toBe(201); // everything off
+            const st = await request(app).get('/status');
+            expect(st.body.limits).toEqual({ maxPerRequestPaise: 0, dailyLimitPaise: 0, maxPending: 0 });
+            expect(st.body.usage).toMatchObject({ pendingCount: 4, usedTodayPaise: 620000, requestedTodayCount: 4 });
+        } finally { clearCfg('payout_max_per_request', 'payout_max_pending', 'payout_daily_limit'); }
+    });
+
+    test('user values override platform: null inherits, 0 = unlimited for that user', async () => {
+        mockConfig.payout_max_per_request = 100;
+        try {
+            meta({ payoutMaxPerRequestPaise: null });
+            expect((await req(buildPayout(makeDb(rich()), makeRedis()).app, 150)).status).toBe(400);
+            meta({ payoutMaxPerRequestPaise: 0 });
+            expect((await req(buildPayout(makeDb(rich()), makeRedis()).app, 150)).status).toBe(201);
+            meta({ payoutMaxPerRequestPaise: 20000 }); // 200 rupees, above platform 100
+            const { app } = buildPayout(makeDb(rich()), makeRedis());
+            expect((await req(app, 150)).status).toBe(201);
+            expect((await req(app, 250)).status).toBe(400);
+        } finally { clearCfg('payout_max_per_request'); }
+    });
+
+    test('admin limits endpoints: rupees in, paise stored, null clears, admin role only, cache invalidated', async () => {
+        const db = makeDb({ [COLS.USERS]: [{ $id: 'user1', userId: 'user1', role: 'user' }] });
+        userMetaCache.getUserMeta.mockImplementation(async (id) => db.store[COLS.USERS].find((u) => u.userId === id) || null);
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const set = await request(app).patch('/admin/users/user1/payout-limits').send({ maxPerRequest: 250.5, dailyLimit: 0, maxPending: 3 });
+        expect(set.status).toBe(200);
+        expect(db.store[COLS.USERS][0]).toMatchObject({ payoutMaxPerRequestPaise: 25050, payoutDailyLimitPaise: 0, payoutMaxPending: 3 });
+        expect(set.body.effective).toEqual({ maxPerRequestPaise: 25050, dailyLimitPaise: 0, maxPending: 3 });
+        expect(userMetaCache.invalidate).toHaveBeenCalledWith('user1');
+        expect((await request(app).patch('/admin/users/user1/payout-limits').send({ maxPerRequest: null })).status).toBe(200);
+        expect(db.store[COLS.USERS][0].payoutMaxPerRequestPaise).toBeNull();
+        expect((await request(app).patch('/admin/users/user1/payout-limits').send({ maxPending: -1 })).status).toBe(400);
+        expect((await request(app).patch('/admin/users/user1/payout-limits').send({})).status).toBe(400);
+        const get = await request(app).get('/admin/users/user1/payout-limits');
+        expect(get.body).toMatchObject({ userValues: { maxPerRequestPaise: null, dailyLimitPaise: 0, maxPending: 3 }, effective: { maxPerRequestPaise: 0, dailyLimitPaise: 0, maxPending: 3 } });
+        const emp = asUser('emp1', 'employee');
+        expect((await request(buildPayout(db, makeRedis(), emp, () => emp).app).patch('/admin/users/user1/payout-limits').send({ maxPending: 1 })).status).toBe(403);
+    });
+});
+
+describe('user self-cancel', () => {
+    const seed = () => ({
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', requestCount: 1 }],
+        [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'R', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, status: 'pending', createdAt: ISO() }],
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+    });
+
+    test('cancel releases the hold only, stamps cancelledAt, bumps account stats and counters, emits; then paid → 400', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        const res = await request(app).post('/requests/cpo_1/cancel');
+        expect(res.status).toBe(200);
+        expect(res.body.payout).toMatchObject({ status: 'cancelled', processedBy: 'user1', rejectionReason: null });
+        expect(res.body.payout.cancelledAt).toBeTruthy();
+        expect(res.body.payout.cancelledInMinutes).toBe(0);
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 50000, holdPaise: 0 });
+        expect(db.store[COLS.TXNS] || []).toHaveLength(0);
+        expect(db.store[COLS.ACCOUNTS][0].cancelledCount).toBe(1);
+        expect(counterDeltas()).toEqual([['totalCustomerPayoutPendingAmount', -10000], ['totalCustomerPayoutPendingCount', -1]]);
+        expect(emitted().at(-1)).toMatchObject({ userId: 'user1', event: 'payout:update', payload: { type: 'request_cancelled', payoutId: 'cpo_1' } });
+        expect((await request(app).post('/requests/cpo_1/cancel')).status).toBe(400);
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        expect(paid.status).toBe(400); expect(paid.body.error).toMatch(/cancelled/);
+        expect((await request(app).get('/requests?status=cancelled')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        expect((await request(adminApp).get('/admin/accounts')).body.accounts[0]).toMatchObject({ cancelledCount: 1, pendingCount: 0 });
+    });
+
+    test('someone else\'s request → 404; racing resolve → 409', async () => {
+        const db = makeDb(seed());
+        expect((await request(buildPayout(db, makeRedis(), asUser('user2')).app).post('/requests/cpo_1/cancel')).status).toBe(404);
+        db.getDocument.mockImplementationOnce(async () => ({ ...db.store[COLS.PAYOUTS][0], status: 'paid' }));
+        expect((await request(buildPayout(db, makeRedis()).app).post('/requests/cpo_1/cancel')).status).toBe(409);
+        expect(db.store[COLS.WALLETS][0].holdPaise).toBe(10300);
+    });
+});
+
+describe('"paid via" source accounts', () => {
+    const seed = () => ({
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 90000, holdPaise: 30900 }],
+        [COLS.PAYOUTS]: ['1', '2', '3'].map((n) => ({ $id: `p${n}`, id: `cpo_${n}`, userId: 'user1', accountId: 'acc1', customerName: 'R', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: ISO() })),
+    });
+
+    test('paid with paidVia upserts the source (case-insensitive) and bumps use/total; list, search, sort, create, deactivate', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR00001', paidVia: 'HDFC Current ****4321' });
+        await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR00002', paidVia: 'hdfc current ****4321' });
+        await request(app).post('/admin/requests/cpo_3/paid').send({ referenceNumber: 'UTR00003', paidVia: 'ICICI ****9' });
+        expect(db.store[COLS.SOURCES]).toHaveLength(2);
+        const list = await request(app).get('/admin/source-accounts');
+        expect(list.body.sourceAccounts.map((s) => [s.label, s.useCount, s.totalPaidPaise])).toEqual([['HDFC Current ****4321', 2, 20000], ['ICICI ****9', 1, 10000]]);
+        expect(list.body.sourceAccounts[0].lastUsedAt).toBeTruthy();
+        expect((await request(app).get('/admin/source-accounts?search=ici')).body.sourceAccounts.map((s) => s.label)).toEqual(['ICICI ****9']);
+        expect((await request(app).get('/admin/source-accounts?sort=label')).body.sourceAccounts.map((s) => s.label)).toEqual(['HDFC Current ****4321', 'ICICI ****9']);
+        const add = await request(app).post('/admin/source-accounts').send({ label: 'SBI ****7' });
+        expect(add.status).toBe(201); expect(add.body.created).toBe(true);
+        expect((await request(app).post('/admin/source-accounts').send({ label: 'sbi ****7' })).body.created).toBe(false);
+        expect((await request(app).post('/admin/source-accounts').send({ label: 'x' })).status).toBe(400);
+        const del = await request(app).delete(`/admin/source-accounts/${add.body.sourceAccount.$id}`);
+        expect(del.status).toBe(200);
+        expect((await request(app).get('/admin/source-accounts')).body.sourceAccounts.map((s) => s.label)).not.toContain('SBI ****7');
+        expect((await request(app).get('/admin/source-accounts?includeInactive=true')).body.sourceAccounts.map((s) => s.label)).toContain('SBI ****7');
+        expect((await request(app).post('/admin/source-accounts').send({ label: 'SBI ****7' })).body.sourceAccount.active).toBe(true); // re-adding reactivates
+        const sub = asUser('sub1', 'subadmin');
+        expect((await request(buildPayout(db, makeRedis(), sub, () => sub).app).get('/admin/source-accounts')).status).toBe(403);
+    });
+
+    test('a failing source bump never fails the paid response', async () => {
+        const db = makeDb(seed());
+        const origCreate = db.createDocument.getMockImplementation();
+        db.createDocument.mockImplementation(async (d, c, id, data) => { if (c === COLS.SOURCES) throw new Error('down'); return origCreate(d, c, id, data); });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR00001', paidVia: 'HDFC' })).status).toBe(200);
+        expect(db.store[COLS.PAYOUTS][0].status).toBe('paid');
+    });
+});
+
+describe('wallet statement export (CSV, admin only)', () => {
+    test('rows in range, escaped, rupee columns, headers; validation', async () => {
+        const db = makeDb({ [COLS.TXNS]: [
+            { $id: 't1', id: 'pwt_1', userId: 'user1', type: 'withdrawal_credit', direction: 'credit', amountPaise: 50000, commissionPaise: 0, totalPaise: 50000, balanceAfterPaise: 50000, holdAfterPaise: 0, refType: 'withdrawal', refId: 'wdh_1', notes: 'Plain', createdAt: '2026-09-02T05:00:00.000Z' },
+            { $id: 't2', id: 'pwt_2', userId: 'user1', type: 'payout_paid', direction: 'debit', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, balanceAfterPaise: 39700, holdAfterPaise: 0, refType: 'customer_payout', refId: 'cpo_1', referenceNumber: 'UTR1', notes: 'IMPS payout to "Ravi, Kumar"', createdBy: 'admin1', createdAt: '2026-09-03T05:00:00.000Z' },
+            { $id: 't3', id: 'pwt_3', userId: 'user1', type: 'admin_credit', direction: 'credit', amountPaise: 1, totalPaise: 1, createdAt: '2026-10-01T05:00:00.000Z' },
+            { $id: 't4', id: 'pwt_4', userId: 'user2', type: 'admin_credit', direction: 'credit', amountPaise: 1, totalPaise: 1, createdAt: '2026-09-02T05:00:00.000Z' },
+        ] });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/wallet/export?userId=user1&from=2026-09-01&to=2026-09-30');
+        expect(res.status).toBe(200);
+        expect(res.headers['content-type']).toMatch(/text\/csv/);
+        expect(res.headers['content-disposition']).toBe('attachment; filename="payout-wallet-user1-2026-09-01-2026-09-30.csv"');
+        expect(res.headers['x-row-count']).toBe('2');
+        const lines = res.text.replace(/^﻿/, '').trim().split('\r\n');
+        expect(lines[0]).toBe('createdAt,id,type,direction,amountRs,commissionRs,totalRs,balanceAfterRs,holdAfterRs,refType,refId,referenceNumber,notes,createdBy');
+        expect(lines[1]).toBe('2026-09-02T05:00:00.000Z,pwt_1,withdrawal_credit,credit,500,0,500,500,0,withdrawal,wdh_1,,Plain,');
+        expect(lines[2]).toBe('2026-09-03T05:00:00.000Z,pwt_2,payout_paid,debit,100,3,103,397,0,customer_payout,cpo_1,UTR1,"IMPS payout to ""Ravi, Kumar""",admin1');
+        expect(lines).toHaveLength(3);
+        expect((await request(app).get('/admin/wallet/export?userId=user1')).status).toBe(400);
+        expect((await request(app).get('/admin/wallet/export?from=2026-09-01&to=2026-09-02')).status).toBe(400);
+    });
+});
+
+describe('daily stats time series', () => {
+    test('buckets requested by createdAt and paid/rejected/cancelled by processedAt (IST days), avg paid minutes, totals; subadmin scoped', async () => {
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'user1', userId: 'user1', parentId: 'sub1' }, { $id: 'userX', userId: 'userX', parentId: 'subOther' }],
+            [COLS.PAYOUTS]: [
+                { $id: 'a', id: 'cpo_a', userId: 'user1', amountPaise: 10000, commissionPaise: 300, status: 'paid', createdAt: '2026-09-02T04:00:00.000Z', processedAt: '2026-09-02T04:30:00.000Z', paidAt: '2026-09-02T04:30:00.000Z' },
+                { $id: 'b', id: 'cpo_b', userId: 'user1', amountPaise: 20000, commissionPaise: 600, status: 'paid', createdAt: '2026-09-02T05:00:00.000Z', processedAt: '2026-09-03T05:10:00.000Z', paidAt: '2026-09-03T05:10:00.000Z' }, // requested day 2, paid day 3
+                { $id: 'c', id: 'cpo_c', userId: 'user1', amountPaise: 5000, status: 'rejected', createdAt: '2026-09-03T05:00:00.000Z', processedAt: '2026-09-03T06:00:00.000Z' },
+                { $id: 'd', id: 'cpo_d', userId: 'user1', amountPaise: 7000, status: 'cancelled', createdAt: '2026-09-03T05:00:00.000Z', processedAt: '2026-09-03T06:00:00.000Z' },
+                { $id: 'e', id: 'cpo_e', userId: 'user1', amountPaise: 1000, status: 'pending', createdAt: '2026-09-03T07:00:00.000Z' },
+                { $id: 'x', id: 'cpo_x', userId: 'userX', amountPaise: 99000, commissionPaise: 1, status: 'paid', createdAt: '2026-09-02T04:00:00.000Z', processedAt: '2026-09-02T04:05:00.000Z', paidAt: '2026-09-02T04:05:00.000Z' },
+            ],
+        });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/stats/daily?from=2026-09-01&to=2026-09-03');
+        expect(res.status).toBe(200);
+        expect(res.body.days).toEqual([
+            { date: '2026-09-01', requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: null },
+            { date: '2026-09-02', requestedCount: 3, requestedAmountPaise: 129000, paidCount: 2, paidAmountPaise: 109000, paidCommissionPaise: 301, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: 18 },
+            { date: '2026-09-03', requestedCount: 3, requestedAmountPaise: 13000, paidCount: 1, paidAmountPaise: 20000, paidCommissionPaise: 600, rejectedCount: 1, cancelledCount: 1, avgPaidInMinutes: 1450 },
+        ]);
+        expect(res.body.totals).toEqual({ requestedCount: 6, requestedAmountPaise: 142000, paidCount: 3, paidAmountPaise: 129000, paidCommissionPaise: 901, rejectedCount: 1, cancelledCount: 1 });
+        const sub = asUser('sub1', 'subadmin');
+        const scoped = await request(buildPayout(db, makeRedis(), sub, () => sub).app).get('/admin/stats/daily?from=2026-09-02&to=2026-09-02');
+        expect(scoped.body.days[0]).toMatchObject({ requestedCount: 2, paidCount: 1, paidAmountPaise: 10000 });
+        expect((await request(app).get('/admin/stats/daily?from=2026-09-03&to=2026-09-01')).status).toBe(400);
+    });
+});
+
+describe('alerts (admin toggle)', () => {
+    test('low-balance emit when a debit crosses the threshold; alerts endpoint lists low wallets + stale pending; off → nothing', async () => {
+        const stale = new Date(Date.now() - 3 * 3600000).toISOString();
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+            [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 60000, holdPaise: 10300 }, { $id: 'w2', userId: 'user2', balancePaise: 500, holdPaise: 0 }],
+            [COLS.PAYOUTS]: [
+                { $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'a', customerName: 'R', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: stale },
+                { $id: 'p2', id: 'cpo_2', userId: 'user2', accountId: 'b', amountPaise: 1, totalPaise: 1, status: 'pending', createdAt: ISO() },
+            ],
+        });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).get('/admin/alerts')).body).toMatchObject({ enabled: false, lowBalance: [], stalePending: [] });
+        Object.assign(mockConfig, { payout_alerts_enabled: 'true', payout_low_balance_threshold: 450, payout_pending_alert_minutes: 60 }); // 45000 paise
+        try {
+            const al = await request(app).get('/admin/alerts');
+            expect(al.body.lowBalance).toEqual([{ userId: 'user2', availablePaise: 500, balancePaise: 500, holdPaise: 0 }]);
+            expect(al.body.stalePending.map((s) => s.payoutId)).toEqual(['cpo_1']);
+            expect(al.body.stalePending[0].waitingMinutes).toBeGreaterThanOrEqual(179);
+            mockEmit.mockClear();
+            // paid does NOT move available (hold was taken at request time): no alert
+            await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+            expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(0);
+            // user1 available 49700 → admin debit ₹50 → 44700: crosses 45000 → one alert to user + admins
+            await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 50, notes: 'crossing' });
+            const alerts = emitted().filter((e) => e.event === 'payout:alert');
+            expect(alerts).toHaveLength(1);
+            expect(alerts[0]).toMatchObject({ userId: 'user1', toAdmins: true, payload: { type: 'low_balance', availablePaise: 44700, thresholdPaise: 45000 } });
+            mockEmit.mockClear();
+            await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 10, notes: 'below already → no second alert' });
+            expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(0);
+            // a new request whose hold crosses the threshold alerts too (that is where available really drops)
+            await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'credit', amount: 100, notes: 'back above' }); // 53700
+            mockEmit.mockClear();
+            userMetaCache.getUserMeta.mockResolvedValue({ userId: 'user1', role: 'user', parentId: null, payoutCommission: 0 });
+            expect((await request(buildPayout(db, makeRedis()).app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 })).status).toBe(201); // hold 10000 → 43700
+            expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(1);
+        } finally { clearCfg('payout_alerts_enabled', 'payout_low_balance_threshold', 'payout_pending_alert_minutes'); }
+    });
+});
+
+describe('beneficiary verification', () => {
+    test('staff sets status/name/note; payouts carry accountVerificationStatus; require-verified blocks unverified; filters', async () => {
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+            [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }],
+            [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', customerName: 'Ravi', bankName: 'SBI', ifscCode: 'SBIN0001234', accountNumber: '12345678901' }, { $id: 'acc2', userId: 'user1', customerName: 'Sita', bankName: 'SBI', ifscCode: 'SBIN0001234', accountNumber: '22222222222' }],
+        });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const { app: userApp } = buildPayout(db, makeRedis());
+        const v = await request(app).patch('/admin/accounts/acc1/verification').send({ status: 'verified', verifiedName: 'RAVI KUMAR', note: 'penny drop ok' });
+        expect(v.status).toBe(200);
+        expect(v.body.account).toMatchObject({ verificationStatus: 'verified', verifiedName: 'RAVI KUMAR', verificationNote: 'penny drop ok', verifiedBy: 'admin1' });
+        expect(v.body.account.verifiedAt).toBeTruthy();
+        expect((await request(app).patch('/admin/accounts/acc1/verification').send({ status: 'weird' })).status).toBe(400);
+        expect((await request(app).get('/admin/accounts?verificationStatus=verified')).body.accounts.map((a) => a.$id)).toEqual(['acc1']);
+        expect((await request(app).get('/admin/accounts?verificationStatus=unverified')).body.accounts.map((a) => a.$id)).toEqual(['acc2']);
+        expect((await request(userApp).get('/accounts?verificationStatus=unverified')).body.accounts.map((a) => a.$id)).toEqual(['acc2']);
+
+        mockConfig.payout_require_verified_account = 'true';
+        try {
+            const blocked = await request(userApp).post('/requests').send({ accountId: 'acc2', mode: 'NEFT', amount: 10 });
+            expect(blocked.status).toBe(400); expect(blocked.body.error).toMatch(/not verified/i);
+            expect(db.store[COLS.WALLETS][0].holdPaise).toBe(0);
+            const ok = await request(userApp).post('/requests').send({ accountId: 'acc1', mode: 'NEFT', amount: 10 });
+            expect(ok.status).toBe(201);
+            expect(ok.body.payout.accountVerificationStatus).toBe('verified');
+            expect((await request(userApp).get('/status')).body.requireVerifiedAccount).toBe(true);
+        } finally { clearCfg('payout_require_verified_account'); }
+        expect((await request(userApp).post('/requests').send({ accountId: 'acc2', mode: 'NEFT', amount: 10 })).status).toBe(201); // off again
+        expect((await request(app).get('/admin/requests?verificationStatus=verified')).body.payouts.map((p) => p.accountId)).toEqual(['acc1']);
+        const back = await request(app).patch('/admin/accounts/acc1/verification').send({ status: 'unverified' });
+        expect(back.body.account).toMatchObject({ verificationStatus: 'unverified', verifiedAt: null, verifiedBy: null });
+    });
+});
+
+describe('realtime events (platform toggle + user opt-out)', () => {
+    const seed = () => ({
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user' }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }],
+    });
+
+    test('request → paid emits to the user room and admins with typed payloads', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        const r = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 });
+        expect(emitted().at(-1)).toMatchObject({ userId: 'user1', event: 'payout:update', toAdmins: true, payload: { type: 'request_created', payoutId: r.body.payout.id, status: 'pending', amountPaise: 10000 } });
+        mockEmit.mockClear();
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' });
+        expect(emitted().map((e) => e.payload.type)).toEqual(['request_paid']);
+        expect(emitted()[0].payload).toMatchObject({ userId: 'user1', status: 'paid', referenceNumber: 'UTR12345', amountPaise: 10000 });
+        expect(emitted()[0].payload.at).toBeTruthy();
+    });
+
+    test('platform toggle off → no emits; user opt-out → admins only; preferences endpoint', async () => {
+        const db = makeDb(seed());
+        userMetaCache.getUserMeta.mockImplementation(async (id) => db.store[COLS.USERS].find((u) => u.userId === id) ? { ...db.store[COLS.USERS].find((u) => u.userId === id), parentId: null, payoutCommission: 1 } : null);
+        const { app } = buildPayout(db, makeRedis());
+        mockConfig.payout_realtime_enabled = 'false';
+        try {
+            await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 1 });
+            expect(emitted()).toEqual([]);
+        } finally { clearCfg('payout_realtime_enabled'); }
+        const pref = await request(app).patch('/me/preferences').send({ realtime: false });
+        expect(pref.status).toBe(200);
+        expect(db.store[COLS.USERS][1].payoutRealtimeDisabled).toBe(true);
+        expect(userMetaCache.invalidate).toHaveBeenCalledWith('user1');
+        mockEmit.mockClear();
+        await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 1 });
+        expect(emitted().at(-1)).toMatchObject({ userId: null, toAdmins: true, payload: { type: 'request_created' } });
+        expect((await request(app).get('/status')).body.preferences).toEqual({ realtime: false });
+        expect((await request(app).patch('/me/preferences').send({ realtime: 'yes' })).status).toBe(400);
+    });
+
+    test('admin settings PATCH writes every toggle/limit key; GET reflects them', async () => {
+        const ConfigManager = require('../configManager');
+        const { app } = buildPayout(makeDb(), makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).patch('/admin/settings').send({ realtimeEnabled: false, requireVerifiedAccount: true, alertsEnabled: true, lowBalanceThreshold: 500, pendingAlertMinutes: 30, maxPerRequest: 1000, dailyLimit: 0, maxPending: 3 });
+        expect(res.status).toBe(200);
+        const written = Object.fromEntries(ConfigManager.set.mock.calls);
+        expect(written).toMatchObject({ payout_realtime_enabled: 'false', payout_require_verified_account: 'true', payout_alerts_enabled: 'true', payout_low_balance_threshold: '500', payout_pending_alert_minutes: '30', payout_max_per_request: '1000', payout_daily_limit: '0', payout_max_pending: '3' });
+        expect((await request(app).patch('/admin/settings').send({ lowBalanceThreshold: -1 })).status).toBe(400);
+        expect((await request(app).patch('/admin/settings').send({})).status).toBe(400);
+        Object.assign(mockConfig, { payout_alerts_enabled: 'true', payout_low_balance_threshold: 500, payout_max_pending: 3 });
+        try {
+            expect((await request(app).get('/admin/settings')).body).toMatchObject({ realtimeEnabled: true, alerts: { enabled: true, lowBalanceThresholdPaise: 50000, pendingAlertMinutes: 0 }, limits: { maxPerRequestPaise: 0, dailyLimitPaise: 0, maxPending: 3 } });
+        } finally { clearCfg('payout_alerts_enabled', 'payout_low_balance_threshold', 'payout_max_pending'); }
+    });
+});
+
+describe('ledger integrity check (read-only report)', () => {
+    const clean = () => ({
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 39700, holdPaise: 10300, totalCreditedPaise: 50000, totalPaidOutPaise: 10000, totalPayoutCommissionPaise: 300, totalAdminDebitPaise: 0, totalRevertedToQrPaise: 0, paidCount: 1 }],
+        [COLS.WD]: [{ $id: 'wd1', id: 'wdh_1', userId: 'user1', qrId: 'qr1', mode: 'wallet', status: 'approved', preAmount: 500, walletRevertedPaise: 0 }],
+        [COLS.TXNS]: [
+            { $id: 't1', id: 'pwt_1', userId: 'user1', type: 'withdrawal_credit', direction: 'credit', amountPaise: 50000, totalPaise: 50000, balanceAfterPaise: 50000, refType: 'withdrawal', refId: 'wdh_1', createdAt: '2026-09-01T00:00:00.000Z' },
+            { $id: 't2', id: 'pwt_2', userId: 'user1', type: 'payout_paid', direction: 'debit', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, balanceAfterPaise: 39700, refType: 'customer_payout', refId: 'cpo_1', createdAt: '2026-09-02T00:00:00.000Z' },
+        ],
+        [COLS.PAYOUTS]: [
+            { $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, status: 'paid', createdAt: '2026-09-02T00:00:00.000Z' },
+            { $id: 'p2', id: 'cpo_2', userId: 'user1', accountId: 'acc1', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, status: 'pending', createdAt: '2026-09-03T00:00:00.000Z' },
+        ],
+        [COLS.COMM]: [{ $id: 'c1', userId: 'admin1', sourcePayoutId: 'cpo_1', amount: 300 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', customerName: 'Ravi', requestCount: 2, paidCount: 1, rejectedCount: 0, cancelledCount: 0, totalPaidPaise: 10000 }],
+    });
+
+    test('a consistent wallet reports ok with detailed ledger sums and zero issues, and writes nothing', async () => {
+        const db = makeDb(clean());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/integrity/wallet/user1');
+        expect(res.status).toBe(200);
+        expect(res.body.report).toMatchObject({ userId: 'user1', ok: true, errors: 0, warnings: 0, truncated: false, issues: [],
+            ledger: { rows: 2, creditsPaise: 50000, debitsPaise: 10300, expectedBalancePaise: 39700, expectedHoldPaise: 10300, byTypePaise: { withdrawal_credit: 50000, payout_paid: 10000 } },
+            counts: { payouts: 2, pending: 1, paid: 1, walletWithdrawals: 1, accounts: 1 } });
+        expect(db.updateDocument).not.toHaveBeenCalled();
+        expect(db.createDocument).not.toHaveBeenCalled();
+        expect(db.deleteDocument).not.toHaveBeenCalled();
+    });
+
+    test('every drift type is reported with a code, severity and numbers; nothing is modified or restricted', async () => {
+        const s = clean();
+        s[COLS.WALLETS][0].balancePaise = 40000;                 // BALANCE_MISMATCH (+300 drift)
+        s[COLS.WALLETS][0].holdPaise = 0;                        // HOLD_MISMATCH
+        s[COLS.WALLETS][0].totalPaidOutPaise = 0;                // LIFETIME_MISMATCH
+        s[COLS.TXNS][1].balanceAfterPaise = 39000;               // LEDGER_CHAIN_BREAK
+        s[COLS.TXNS].push({ $id: 't3', id: 'pwt_3', userId: 'user1', type: 'payout_paid', direction: 'debit', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, refType: 'customer_payout', refId: 'cpo_1', createdAt: '2026-09-02T01:00:00.000Z' }); // LEDGER_DUPLICATE_REF
+        s[COLS.TXNS].push({ $id: 't4', id: 'pwt_4', userId: 'user1', type: 'payout_paid', direction: 'debit', amountPaise: 1, totalPaise: 1, refId: 'cpo_ghost', createdAt: '2026-09-02T02:00:00.000Z' }); // ORPHAN_DEBIT
+        s[COLS.WD].push({ $id: 'wd2', id: 'wdh_2', userId: 'user1', qrId: 'qr1', mode: 'wallet', status: 'approved', preAmount: 100, walletCreditFailed: true }); // WITHDRAWAL_NOT_CREDITED (warning, flagged)
+        s[COLS.WD].push({ $id: 'wd3', id: 'wdh_3', userId: 'user1', qrId: 'qr1', mode: 'wallet', status: 'approved', preAmount: 100 }); // WITHDRAWAL_NOT_CREDITED (error)
+        s[COLS.COMM][0].amount = 100;                            // COMMISSION_MISMATCH
+        s[COLS.ACCOUNTS][0].totalPaidPaise = 999;                // ACCOUNT_STATS_MISMATCH
+        const db = makeDb(s);
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const rep = (await request(app).get('/admin/integrity/wallet/user1')).body.report;
+        expect(rep.ok).toBe(false);
+        const codes = rep.issues.map((i) => `${i.severity}:${i.code}`);
+        for (const c of ['error:BALANCE_MISMATCH', 'error:HOLD_MISMATCH', 'warning:LIFETIME_MISMATCH', 'error:LEDGER_CHAIN_BREAK', 'error:LEDGER_DUPLICATE_REF', 'error:ORPHAN_DEBIT', 'warning:WITHDRAWAL_NOT_CREDITED', 'error:WITHDRAWAL_NOT_CREDITED', 'warning:COMMISSION_MISMATCH', 'warning:ACCOUNT_STATS_MISMATCH']) expect(codes).toContain(c);
+        const bal = rep.issues.find((i) => i.code === 'BALANCE_MISMATCH');
+        expect(bal).toMatchObject({ walletPaise: 40000, ledgerPaise: 50000 - 10300 - 10300 - 1, driftPaise: 40000 - (50000 - 10300 - 10300 - 1) });
+        expect(bal.message).toMatch(/drift/);
+        expect(rep.issues.find((i) => i.code === 'HOLD_MISMATCH')).toMatchObject({ walletPaise: 0, expectedPaise: 10300 });
+        expect(rep.issues.find((i) => i.code === 'ACCOUNT_STATS_MISMATCH').message).toMatch(/recompute-stats/);
+        expect(db.updateDocument).not.toHaveBeenCalled();
+        // and the user is NOT restricted: they can still create a request
+        expect((await request(buildPayout(db, makeRedis()).app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 1 })).status).toBe(201);
+    });
+
+    test('wallets pager summarises each wallet; admin role only', async () => {
+        const s = clean();
+        s[COLS.WALLETS].push({ $id: 'w2', userId: 'user2', balancePaise: 5, holdPaise: 0 }); // no ledger rows → drift 5
+        const db = makeDb(s);
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/integrity/wallets?limit=10');
+        expect(res.status).toBe(200);
+        expect(res.body.reports).toEqual([
+            { userId: 'user1', ok: true, errors: 0, warnings: 0, truncated: false, balancePaise: 39700, holdPaise: 10300, driftPaise: 0, issueCodes: [] },
+            { userId: 'user2', ok: false, errors: 1, warnings: 0, truncated: false, balancePaise: 5, holdPaise: 0, driftPaise: 5, issueCodes: ['BALANCE_MISMATCH'] },
+        ]);
+        expect(res.body.summary).toEqual({ wallets: 2, withErrors: 1, withWarnings: 0 });
+        const emp = asUser('emp1', 'employee');
+        expect((await request(buildPayout(db, makeRedis(), emp, () => emp).app).get('/admin/integrity/wallets')).status).toBe(403);
+    });
+});
+
+describe('withdraw_new ownership check', () => {
+    function buildWithdraw(db, auth) {
+        let router;
+        jest.isolateModules(() => {
+            router = require('../withdraw.js')(db, {}, {}, { unique: () => 'newId1' }, Query, 'db1', 'users_meta', 'qr_col', 'withdrawal_col', 'bucket1',
+                'daily_qr', 'commission_txs', 'daily_commission', 'all_time_commission', 'monthly_commission', 'config_col',
+                jest.fn().mockResolvedValue(), jest.fn(), auth, () => auth, auth, auth, auth, {}, auth, () => auth, makeRedis(), jest.fn());
+        });
+        const app = express(); app.use(express.json()); app.use('/', router);
+        return app;
+    }
+    const body = (userId) => ({ userId, qrId: 'qr1', mode: 'wallet', amount: 1, preAmount: 1, commission: 0 });
+    const db = () => makeDb({ 'qr_col': [{ $id: 'q1', qrId: 'qr1', totalPayInAmount: 100000 }] });
+
+    test('user: only self; subadmin: self or own users; admin: anyone', async () => {
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({ user1: { userId: 'user1', parentId: 'sub1', commission: 0 }, userX: { userId: 'userX', parentId: 'subOther', commission: 0 }, sub1: { userId: 'sub1', commission: 0 } })[id] || null);
+        const u = await request(buildWithdraw(db(), asUser('user1', 'user'))).post('/withdraw_new').send(body('userX'));
+        expect(u.status).toBe(403); expect(u.body.error).toMatch(/own account/);
+        expect((await request(buildWithdraw(db(), asUser('user1', 'user'))).post('/withdraw_new').send(body('user1'))).status).toBe(200);
+        expect((await request(buildWithdraw(db(), asUser('sub1', 'subadmin'))).post('/withdraw_new').send(body('user1'))).status).toBe(200);
+        const s = await request(buildWithdraw(db(), asUser('sub1', 'subadmin'))).post('/withdraw_new').send(body('userX'));
+        expect(s.status).toBe(403); expect(s.body.error).toMatch(/own users/);
+        expect((await request(buildWithdraw(db(), asUser('admin1', 'admin'))).post('/withdraw_new').send(body('userX'))).status).toBe(200);
     });
 });
 
