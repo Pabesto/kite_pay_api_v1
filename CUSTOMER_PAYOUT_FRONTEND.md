@@ -204,6 +204,7 @@ Call it when the payout screens open and on app resume; admins change these with
   "message": "Bank maintenance till 6 PM",  // null when enabled; show verbatim when disabled
   "limits": {                   // effective for THIS user; 0 = no limit
     "maxPerRequestPaise": 50000, "dailyLimitPaise": 500000, "maxPending": 2 },
+  "modes": { "NEFT": true, "IMPS": true, "RTGS": false, "UPI": true },   // false = admin switched it off (§6.5a)
   "usage": {                    // today = IST calendar day; pending/paid requests count, rejected/cancelled do not
     "usedTodayPaise": 120000, "requestedTodayCount": 3, "pendingCount": 1 },
   "preferences": { "realtime": true },     // this user's own opt-in to live socket updates (§9)
@@ -214,6 +215,12 @@ Call it when the payout screens open and on app resume; admins change these with
 UI rules:
 - `enabled == false` → disable "New payout", show `message` in a banner above the requests list.
   `POST /requests` while disabled returns `403 { error: <same message> }` — treat as a refresh trigger.
+- **Modes** — render the NEFT / IMPS / RTGS / UPI selector from `modes`: a `false` mode stays visible
+  but disabled with a "Not available right now" hint, and can never be pre-selected (if the account's
+  last-used mode is off, fall back to the first enabled one). Sending a disabled mode returns
+  `400 <MODE> payouts are not available right now. Please choose another mode.` — refresh `/status`.
+  Existing pending requests in a mode that was later switched off are unaffected (admin can still
+  pay them).
 - **Limits — `0` means no limit, for every parameter.** Show the non-zero ones on the New Payout form
   ("Max ₹500 per payout · ₹1,200 left today · 1 of 2 pending"). Pre-validate the amount against
   `maxPerRequestPaise` and `dailyLimitPaise − usedTodayPaise`; the server re-checks and answers
@@ -325,9 +332,21 @@ Either pick a saved account **or** enter a new one (it is saved automatically):
   "upiId": "ravi@okaxis",
   "mode": "UPI", "amount": 1000, "notes": "optional, ≤500 chars" }
 ```
-`mode` ∈ `NEFT | IMPS | RTGS | UPI` (case-insensitive; stored uppercase). Choosing **UPI** with an
-account that has no `upiId` (and none in the body) → `400 UPI ID is required for a UPI payout` —
-show the UPI ID field whenever mode is UPI and prefill it from the selected account.
+`mode` ∈ `NEFT | IMPS | RTGS | UPI` (case-insensitive; stored uppercase).
+
+**Mode selector rules (mandatory):** fetch `GET /status` when the New Payout form opens and build
+the selector from its `modes` map. A mode whose value is `false` must be rendered **greyed out and
+not selectable** (visible, disabled, with a "Not available right now" label or tooltip) — never
+hidden, so the user understands it exists but is off, and never submittable. Default the selection
+to the first `true` mode; if the account's last-used mode is `false`, do not pre-select it. Re-fetch
+`/status` on app resume; if the currently selected mode has become `false`, clear the selection and
+show the label. Should a stale form still submit a disabled mode, the server answers
+`400 <MODE> payouts are not available right now. Please choose another mode.` — show it and rebuild
+the selector from a fresh `/status`.
+
+Choosing **UPI** with an account that has no `upiId` (and none in the body) →
+`400 UPI ID is required for a UPI payout` — show the UPI ID field whenever mode is UPI and prefill it
+from the selected account.
 Response `201`:
 ```jsonc
 { "success": true, "payout": {
@@ -661,6 +680,7 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 ```jsonc
 { "success": true,
   "customerPayouts": { "enabled": true, "message": "Customer payouts are temporarily disabled…" },
+  "modes": { "NEFT": true, "IMPS": true, "RTGS": false, "UPI": true },   // per-mode availability
   "realtimeEnabled": true,
   "requireVerifiedAccount": false,
   "alerts": { "enabled": false, "lowBalanceThresholdPaise": 0, "pendingAlertMinutes": 0 },
@@ -669,13 +689,17 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 `PATCH /api/payout/admin/settings` — send only the fields you change; amounts in **rupees**:
 ```jsonc
 { "enabled": false, "message": "Bank maintenance till 6 PM",   // pause everyone (message ≤200 shown to users)
+  "modes": { "RTGS": false },                                   // partial: only the modes you send change; keys NEFT/IMPS/RTGS/UPI, boolean
   "realtimeEnabled": true,                                      // live socket updates on/off for the whole platform
   "requireVerifiedAccount": false,                              // only verified beneficiaries may be paid
   "alertsEnabled": true, "lowBalanceThreshold": 500, "pendingAlertMinutes": 60,   // §6.8; 0 = that alert off
   "maxPerRequest": 1000, "dailyLimit": 0, "maxPending": 2 }     // platform limits; 0 = no limit
 ```
 → the same shape as GET. `400` on a wrong type or a negative number. Build a settings screen with
-toggles and number fields; label every numeric field "0 = no limit".
+toggles and number fields; label every numeric field "0 = no limit". Add a "Payout modes" row with
+four switches (NEFT / IMPS / RTGS / UPI) bound to `modes`; switching one off hides nothing for admin
+but greys the mode out for users and subadmins (§4.1a). Switching all four off is allowed and
+behaves like a pause with a per-mode message.
 
 **Per-user limits** (override the platform values):
 `GET /api/payout/admin/users/:userId/payout-limits` → `{ success, userId, userValues, effective, platform, usage }`
@@ -792,7 +816,8 @@ the effective rate — never blank. Setting it to `0` explicitly means 0.
 2. *Payout Wallet* — balance card (§4.1) + history list (§4.2) with type filter chips.
 3. *Customer Payouts* — tabs Pending / Paid / Rejected (§5.4) + FAB "New payout".
 4. *New payout* — step 1 pick account (search list, §5.1) or "Add new" (five fields + confirm,
-   optional UPI ID); step 2 mode segmented control (NEFT/IMPS/RTGS/UPI — selecting UPI reveals a
+   optional UPI ID); step 2 mode segmented control (NEFT/IMPS/RTGS/UPI built from `/status.modes` —
+   **disabled modes greyed out and unselectable, never pre-selected**, see §5.3; selecting UPI reveals a
    required UPI ID field prefilled from the account), amount, notes, live preview (§5.2), submit.
 5. *Customer accounts* — list with `bankingStatus` chips, UPI ID if present, paid count / total paid,
    tap → per-customer history (§5.1), swipe-to-delete (disabled/409-toast while a pending request
@@ -832,6 +857,9 @@ data; hide Paid/Reject/Adjust/Mark-added/Delete).
 - Deleting a saved account never touches paid/rejected history; a `409` on delete means a pending
   request still references it.
 - Subadmin on an admin screen: a `403` on `?userId=` means that user is not theirs — don't retry.
+- A payout mode can be switched off by admin at any moment: build the mode selector from
+  `/status.modes` every time the form opens, grey out and disable `false` modes, and never keep a
+  disabled mode selected from a cached form state (§5.3).
 - Never show paise integers raw; never compute commission client-side.
 
 ---

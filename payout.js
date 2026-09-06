@@ -275,9 +275,16 @@ module.exports = (
   // ─── admin-tunable settings (config keys) ───────────────────────────────────
   const cfgRupeesPaise = (key) => { const v = Number(ConfigManager.get(key, 0)); return isFinite(v) && v > 0 ? Math.round(v * 100) : 0; }; // 0 = off
   const cfgInt = (key) => { const v = parseInt(ConfigManager.get(key, 0), 10); return isFinite(v) && v > 0 ? v : 0; };
+  // Payout modes switch (admin): config `payout_disabled_modes` = comma list of disabled modes, e.g. "RTGS,UPI".
+  // Empty/missing = all enabled. Users see { NEFT: true, … } and cannot request a disabled mode.
+  function modesView() {
+    const disabled = new Set(String(ConfigManager.get('payout_disabled_modes', '') || '').split(',').map((m) => m.trim().toUpperCase()).filter((m) => PAYOUT_MODES.includes(m)));
+    return Object.fromEntries(PAYOUT_MODES.map((m) => [m, !disabled.has(m)]));
+  }
   function settingsView() {
     return {
       customerPayouts: platformStatus(),
+      modes: modesView(),
       realtimeEnabled: parseBool(ConfigManager.get('payout_realtime_enabled', true), true),
       requireVerifiedAccount: parseBool(ConfigManager.get('payout_require_verified_account', false), false),
       alerts: {
@@ -746,6 +753,7 @@ module.exports = (
       const [access, user, usage] = await Promise.all([payoutAccessFor(req.user.userId), userMetaCache.getUserMeta(req.user.userId), usageFor(req.user.userId)]);
       res.json({
         success: true, ...access, limits: limitsFor(user), usage,
+        modes: modesView(), // { NEFT: true, IMPS: true, RTGS: false, UPI: true } — false = not available right now
         preferences: { realtime: !(user?.payoutRealtimeDisabled === true) }, realtimeEnabled: settingsView().realtimeEnabled,
         requireVerifiedAccount: settingsView().requireVerifiedAccount,
       });
@@ -872,6 +880,7 @@ module.exports = (
       if (!access.enabled) throw fail(403, access.message);
       const mode = String(req.body.mode || '').toUpperCase();
       if (!PAYOUT_MODES.includes(mode)) throw fail(400, 'Invalid mode. Must be NEFT, IMPS, RTGS or UPI.');
+      if (!modesView()[mode]) throw fail(400, `${mode} payouts are not available right now. Please choose another mode.`);
       const amountPaise = toPaise(req.body.amount);
       if (amountPaise == null) throw fail(400, 'Invalid amount');
       const notes = req.body.notes ? String(req.body.notes).trim().slice(0, 500) : null;
@@ -1135,6 +1144,18 @@ module.exports = (
         payout_daily_limit: nonNeg('dailyLimit'),
         payout_max_pending: nonNeg('maxPending'),
       };
+      // modes: { NEFT?: bool, IMPS?: bool, RTGS?: bool, UPI?: bool } — partial, merged with the current state
+      if (b.modes !== undefined) {
+        if (!b.modes || typeof b.modes !== 'object' || Array.isArray(b.modes)) throw fail(400, 'modes must be an object like { "RTGS": false }');
+        const current = modesView();
+        for (const [k, v] of Object.entries(b.modes)) {
+          const m = String(k).toUpperCase();
+          if (!PAYOUT_MODES.includes(m)) throw fail(400, `Unknown payout mode "${k}"`);
+          if (typeof v !== 'boolean') throw fail(400, `modes.${k} must be true or false`);
+          current[m] = v;
+        }
+        writes.payout_disabled_modes = PAYOUT_MODES.filter((m) => !current[m]).join(',');
+      }
       const entries = Object.entries(writes).filter(([, v]) => v !== null);
       if (!entries.length) throw fail(400, 'No settings provided');
       for (const [key, val] of entries) await ConfigManager.set(key, val);

@@ -1222,6 +1222,37 @@ describe('realtime events (platform toggle + user opt-out)', () => {
         expect((await request(app).patch('/me/preferences').send({ realtime: 'yes' })).status).toBe(400);
     });
 
+    test('payout modes: admin disables a mode → users see it off and cannot request it; partial merge; validation', async () => {
+        const ConfigManager = require('../configManager');
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }] });
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const { app } = buildPayout(db, makeRedis());
+        expect((await request(app).get('/status')).body.modes).toEqual({ NEFT: true, IMPS: true, RTGS: true, UPI: true });
+
+        const set = await request(adminApp).patch('/admin/settings').send({ modes: { rtgs: false, UPI: false } });
+        expect(set.status).toBe(200);
+        expect(ConfigManager.set).toHaveBeenCalledWith('payout_disabled_modes', 'RTGS,UPI');
+        mockConfig.payout_disabled_modes = 'RTGS,UPI';
+        try {
+            expect((await request(app).get('/status')).body.modes).toEqual({ NEFT: true, IMPS: true, RTGS: false, UPI: false });
+            expect((await request(adminApp).get('/admin/settings')).body.modes).toEqual({ NEFT: true, IMPS: true, RTGS: false, UPI: false });
+            const blocked = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'rtgs', amount: 10 });
+            expect(blocked.status).toBe(400);
+            expect(blocked.body.error).toBe('RTGS payouts are not available right now. Please choose another mode.');
+            expect(db.store[COLS.WALLETS][0].holdPaise).toBe(0);
+            expect((await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 })).status).toBe(201);
+            // partial update merges: re-enable UPI only → RTGS stays off
+            ConfigManager.set.mockClear();
+            await request(adminApp).patch('/admin/settings').send({ modes: { UPI: true } });
+            expect(ConfigManager.set).toHaveBeenCalledWith('payout_disabled_modes', 'RTGS');
+        } finally { clearCfg('payout_disabled_modes'); }
+        expect((await request(adminApp).patch('/admin/settings').send({ modes: { CASH: false } })).status).toBe(400);
+        expect((await request(adminApp).patch('/admin/settings').send({ modes: { NEFT: 'no' } })).status).toBe(400);
+        expect((await request(adminApp).patch('/admin/settings').send({ modes: ['NEFT'] })).status).toBe(400);
+        const sub = asUser('sub1', 'subadmin');
+        expect((await request(buildPayout(db, makeRedis(), sub, () => sub).app).patch('/admin/settings').send({ modes: { NEFT: false } })).status).toBe(403);
+    });
+
     test('admin settings PATCH writes every toggle/limit key; GET reflects them', async () => {
         const ConfigManager = require('../configManager');
         const { app } = buildPayout(makeDb(), makeRedis(), asUser('admin1', 'admin'));
