@@ -155,6 +155,7 @@ calls `POST /api/payout/admin/wallet/retry-credit` (§6.4). For `upi`/`bank` row
     "totalPaidOutPaise": 600000,          // lifetime: customer payouts paid (excl. commission)
     "totalPayoutCommissionPaise": 18000,  // lifetime: payout commission charged
     "totalAdminDebitPaise": 0,            // lifetime: admin debits
+    "totalRevertedToQrPaise": 0,          // lifetime: moved back to QR codes by admin
     "paidCount": 3,                       // lifetime: customer payouts paid
     "updatedAt": "2026-09-06T10:00:30.000Z"      // null if the wallet has never been used
   }
@@ -172,6 +173,7 @@ it without a second request. All values are **paise** unless the key ends in `Co
 | `payoutWalletBalance` / `payoutWalletHold` / `payoutWalletAvailable` | same as §4.1 (`available = balance − hold`) |
 | `payoutWalletTotalCredited` | lifetime money added to the wallet (wallet withdrawals + admin credits) |
 | `payoutWalletTotalAdminDebit` | lifetime admin debits |
+| `payoutWalletTotalReverted` | lifetime amount admin moved back to the user's QR codes |
 | `customerPayoutPendingCount` / `customerPayoutPendingAmount` | requests awaiting admin (amount excludes commission; the hold is amount + commission) |
 | `customerPayoutPaidCount` / `customerPayoutPaidAmount` | requests paid |
 | `customerPayoutCommissionPaid` | payout commission the user has paid so far |
@@ -181,8 +183,26 @@ Suggested tiles under the existing QR/withdrawal tiles: "Payout wallet available
 "Customer payouts pending (n · ₹)", "Customer payouts paid (n · ₹)", "Payout commission paid".
 Same authorization as before: the user themself, their subadmin, admin, or employee.
 
+The wallet response also carries `access` (same object as §4.1a) so one call drives both the card
+and the "New payout" button.
+
+### 4.1a Is the feature switched on? — `GET /api/payout/status`
+Customer payouts can be paused **platform-wide** (admin) or **for one user** (admin). While paused
+the user can still see the wallet, history and accounts, but cannot create a new request.
+```jsonc
+{ "success": true,
+  "enabled": false,             // may this user create a request right now?
+  "platformEnabled": false,     // false = paused for everyone
+  "userEnabled": true,          // false = paused for this user only
+  "message": "Bank maintenance till 6 PM"   // null when enabled; show verbatim when disabled
+}
+```
+UI: when `enabled == false` disable the "New payout" button and show `message` in a banner above the
+requests list. `POST /requests` while disabled returns `403 { error: <same message> }` — treat it as
+a refresh trigger, not a crash. Also call this on app resume; admins flip it without notice.
+
 ### 4.2 `GET /api/payout/wallet/transactions?limit&cursor&type&from&to`
-`type` optional: `withdrawal_credit` | `payout_paid` | `admin_credit` | `admin_debit`.
+`type` optional: `withdrawal_credit` | `payout_paid` | `admin_credit` | `admin_debit` | `revert_to_qr`.
 ```jsonc
 {
   "success": true, "total": 12, "nextCursor": "abc…" | null,
@@ -206,6 +226,7 @@ Rendering rules per `type`:
 | `payout_paid` | debit | "Customer payout paid" | show `amountRs` + `commissionPaise/100` as "incl. ₹x commission"; `referenceNumber` |
 | `admin_credit` | credit | "Adjustment by admin" | `notes`, `referenceNumber` |
 | `admin_debit` | debit | "Adjustment by admin" | `notes`, `referenceNumber` |
+| `revert_to_qr` | debit | "Returned to QR" | `referenceNumber` = the original withdrawal id, `notes` = "Reverted to QR … : <admin note>". Tell the user the money is back on that QR and can be withdrawn normally |
 
 `totalPaise` is what moved the balance; `balanceAfterPaise` is the running balance — use it for a
 statement-style list. Holds (pending requests) do **not** create rows; they are visible through the
@@ -478,6 +499,39 @@ request references it.
 already applied (nothing changed). Debit below available → `409 Insufficient payout wallet balance`.
 Show a confirmation dialog with the resulting available balance before sending.
 
+`POST /api/payout/admin/wallet/revert-to-qr` — **admin role only.** Moves payout-wallet money back to
+the QR it was withdrawn from, so the user can request a normal (direct) withdrawal instead.
+```jsonc
+{ "withdrawalId": "wdh_…",      // the approved mode:'wallet' withdrawal that funded the wallet
+  "amount": 250.50,              // rupees, OPTIONAL — omit to revert everything still revertable from it
+  "notes": "Payout service withdrawn, returning funds",   // REQUIRED, min 3 chars — shown in the user's wallet history
+  "refId": "uuid" }              // client idempotency key — send one
+```
+`200`:
+```jsonc
+{ "success": true, "duplicate": false, "withdrawalId": "wdh_…", "qrId": "QR123", "userId": "u1",
+  "amountPaise": 25050, "remainingPaise": 24950,     // still revertable from this withdrawal
+  "qrAvailablePaise": 188500,                        // the QR's available balance after the credit-back
+  "wallet": { …walletView… }, "transaction": { …type "revert_to_qr"… } }
+```
+Rules the UI must respect:
+- Pick the withdrawal from the user's wallet-mode withdrawals (`mode: "wallet"`, `status: "approved"`);
+  each row now carries `walletRevertedPaise` — show "revertable = preAmount − reverted".
+- **Partial reverts are supported**: send `amount` (rupees) for part of it, or omit it to revert the
+  rest. Offer a "Revert all (₹X)" button plus an amount field capped at the revertable balance. Every
+  partial revert is its own ledger row (`type: "revert_to_qr"`, `referenceNumber` = withdrawal id,
+  `notes` = your note, `createdBy` = you) and the withdrawal's `walletRevertedPaise` accumulates —
+  the user's wallet history and `GET /admin/wallet/transactions?userId=…&type=revert_to_qr` list
+  every revert with time, amount and note.
+- Money that is **held by pending customer payouts cannot be reverted** (`409 Insufficient payout
+  wallet balance`) — resolve or reject those requests first.
+- `409 Amount exceeds…` / `409 Nothing left to revert…` — refresh the row. `409 QR is currently being
+  processed…` — retry once. `403` for anyone who is not role admin.
+- Show a confirmation with: amount, the QR it goes back to, and the note. The user sees the note.
+- Effects: wallet balance −amount (ledger row `revert_to_qr`), QR available +amount, the wallet
+  withdrawal keeps status `approved` but `walletRevertedPaise` grows; dashboard "wallet funded" and
+  "total paid" both decrease by the amount.
+
 `POST /api/payout/admin/wallet/retry-credit` — `{ "withdrawalId": "wdh_…" }` → re-runs the wallet
 credit for an approved `mode:'wallet'` withdrawal (safe to call repeatedly; `skipped: true` means it was
 already credited). Surface it on withdrawal rows with `walletCreditFailed == true`.
@@ -508,6 +562,21 @@ current IST month) and `GET /api/payout/admin/commissions/all-time?userId=&limit
 ```
 Rows are sorted highest earner first. Subadmins always get just their own row. Use these for the
 "This month" / "All time" tiles; use `summary` for the per-day chart.
+
+### 6.5a Pause customer payouts — platform-wide and per user (admin role only)
+`GET /api/payout/admin/settings` → `{ success, customerPayouts: { enabled, message } }`
+`PATCH /api/payout/admin/settings`
+```jsonc
+{ "enabled": false, "message": "Bank maintenance till 6 PM" }   // message optional (≤200), shown to users while paused
+```
+`PATCH /api/payout/admin/users/:userId/payout-access`
+```jsonc
+{ "enabled": false, "reason": "KYC pending" }    // reason optional (≤200); { "enabled": true } re-enables
+```
+→ `{ success, userId, payoutDisabled, payoutDisabledReason }`. The user lists (`GET /api/admin/users`
+etc.) now include `payoutDisabled` and `payoutDisabledReason` — show a "Payouts paused" chip and a
+toggle in the user detail. Both switches return `403` for labelled employees; only role `admin` may
+pause. Pausing never touches money or existing requests — admin can still pay/reject the queue.
 
 ### 6.6 Dashboard tiles (existing endpoints, new keys)
 `GET /api/admin/dashboard/counters` (admin) now also returns, all **paise** unless the name ends in `Count`:

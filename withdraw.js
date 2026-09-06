@@ -741,6 +741,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
             walletCreditFailed: doc.walletCreditFailed === true, // mode:wallet only — payout wallet credit needs retry-credit
+            walletRevertedPaise: Number(doc.walletRevertedPaise || 0), // mode:wallet only — already reverted back to the QR (paise)
             // Include other metadata if needed
             // add any other fields you need
           };
@@ -857,6 +858,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
             walletCreditFailed: doc.walletCreditFailed === true, // mode:wallet only — payout wallet credit needs retry-credit
+            walletRevertedPaise: Number(doc.walletRevertedPaise || 0), // mode:wallet only — already reverted back to the QR (paise)
             // Include other metadata if needed
             // add any other fields you need
           };

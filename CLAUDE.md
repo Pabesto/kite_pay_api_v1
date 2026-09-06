@@ -73,7 +73,7 @@ Appwrite has no transactions. All money read-modify-writes are serialized with R
 | `rrnProcessing:<rrn>` | 30s | manual-transaction duplicate guard |
 | `lock:verify:<rrn>` | 15s | merchant payment verification |
 | `lock:commission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | commission rollup upserts |
-| `lock:payoutwallet:<userId>` | 15s request/adjust/withdrawal-credit, 30s paid/reject | every payout-wallet `balancePaise`/`holdPaise` RMW (payout.js `moveWallet`); fails closed. Lock order when nested: `lock:qr` → `lock:payoutwallet` (approve of a `mode:'wallet'` withdrawal). Ledger rows are idempotent on `(type, refId)` (unique index) |
+| `lock:payoutwallet:<userId>` | 15s request/adjust/withdrawal-credit, 30s paid/reject/revert | every payout-wallet `balancePaise`/`holdPaise` RMW (payout.js `moveWallet`); fails closed. Lock order when nested: `lock:qr` → `lock:payoutwallet` (approve of a `mode:'wallet'` withdrawal; admin revert-to-QR, which also takes `lock:qr` for 30s and writes the QR ledger `withdrawalApprovedAmount`/`amountAvailableForWithdrawal`). Ledger rows are idempotent on `(type, refId)` (unique index) |
 | `lock:payoutcommission:daily:<day>` / `monthly:<userId>:<YYYY-MM>` / `alltime:<userId>` | 10s | payout-commission rollup upserts (daily JSON map, monthly and all-time per-user totals) |
 | `holdreset:txnjob:lock:<qrId>` | 600s, refreshed per batch | migration single-runner |
 
@@ -165,7 +165,7 @@ Emit only through the helpers returned by `initSocket` (socketServer.js) — nev
 ## Config layers
 
 - Env vars = deploy-time: numbers as `Number(process.env.X) || default`, booleans default-on unless the literal string `'false'`.
-- `ConfigManager` (Appwrite-backed, in-memory cache) = admin-tunable at runtime: `ConfigManager.get(key, default)` sync-cached; `await ConfigManager.getConfig()` when you must guarantee load; writes only via `set()`. Config docs are `{ key, val, type }` — new keys need `type` set for parsing (integer/double/boolean/json/array). **`getConfig()` reads without `Query.limit` → only the first 25 docs are cached**; add pagination before growing the collection past ~25 keys. `get()` defaults are fail-safe values — choose defaults that fail closed.
+- `ConfigManager` (Appwrite-backed, in-memory cache) = admin-tunable at runtime: `ConfigManager.get(key, default)` sync-cached; `await ConfigManager.getConfig()` when you must guarantee load; writes only via `set()`. Config docs are `{ key, val, type }` — new keys need `type` set for parsing (integer/double/boolean/json/array). **`getConfig()` reads without `Query.limit` → only the first 25 docs are cached**; add pagination before growing the collection past ~25 keys. `get()` defaults are fail-safe values — choose defaults that fail closed. Payout keys: `default_payout_commission` (double, fallback 1.5), `customer_payouts_enabled` (written by `PATCH /api/payout/admin/settings` as the string `'true'`/`'false'` via `set()`, which writes no `type` — payout.js parses it with `parseBool`, so give the doc `type: boolean` in Appwrite only if you want other readers to see a real boolean), `customer_payouts_disabled_message`.
 
 ## Background jobs & shutdown
 

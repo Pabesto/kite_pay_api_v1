@@ -37,10 +37,11 @@ const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^\d{4}-\d{2}$/;
 const PAYOUT_MODES = ['NEFT', 'IMPS', 'RTGS', 'UPI'];
 const BANKING_STATUSES = ['not_added', 'added'];
-const WALLET_TXN_TYPES = ['withdrawal_credit', 'payout_paid', 'admin_credit', 'admin_debit'];
+const WALLET_TXN_TYPES = ['withdrawal_credit', 'payout_paid', 'admin_credit', 'admin_debit', 'revert_to_qr'];
 
 const LOCK_TTL_REQUEST = 15;
 const LOCK_TTL_RESOLVE = 30;
+const LOCK_TTL_QR = 30; // revert-to-QR holds lock:qr (same key as withdraw approve/reject and the webhooks)
 
 module.exports = (
   databases, ID, Query, DB,
@@ -197,7 +198,7 @@ module.exports = (
   // Lifetime totals kept on the wallet doc (paise / counts), maintained by moveWallet under the
   // wallet lock so dashboards never scan the ledger. Read with `|| 0` — wallets created before
   // the fields existed lack them.
-  const ZERO_LIFETIME = { totalCreditedPaise: 0, totalPaidOutPaise: 0, totalPayoutCommissionPaise: 0, totalAdminDebitPaise: 0, paidCount: 0 };
+  const ZERO_LIFETIME = { totalCreditedPaise: 0, totalPaidOutPaise: 0, totalPayoutCommissionPaise: 0, totalAdminDebitPaise: 0, totalRevertedToQrPaise: 0, paidCount: 0 };
   function lifetimeDelta(txn) {
     if (!txn) return {};
     const amount = Number(txn.amountPaise || 0);
@@ -206,6 +207,7 @@ module.exports = (
       case 'admin_credit': return { totalCreditedPaise: amount };
       case 'payout_paid': return { totalPaidOutPaise: amount, totalPayoutCommissionPaise: Number(txn.commissionPaise || 0), paidCount: 1 };
       case 'admin_debit': return { totalAdminDebitPaise: amount };
+      case 'revert_to_qr': return { totalRevertedToQrPaise: amount };
       default: return {};
     }
   }
@@ -220,9 +222,39 @@ module.exports = (
       totalPaidOutPaise: Number(w?.totalPaidOutPaise || 0),
       totalPayoutCommissionPaise: Number(w?.totalPayoutCommissionPaise || 0),
       totalAdminDebitPaise: Number(w?.totalAdminDebitPaise || 0),
+      totalRevertedToQrPaise: Number(w?.totalRevertedToQrPaise || 0),
       paidCount: Number(w?.paidCount || 0),
       updatedAt: w?.updatedAt || null,
     };
+  }
+
+  // ─── enable / disable customer payouts (platform-wide config + per-user flag) ──
+  // Only NEW requests are blocked; viewing history, wallet, accounts stays open.
+  const parseBool = (v, def) => (v == null ? def : !['false', '0', 'no', ''].includes(String(v).toLowerCase()));
+  const DEFAULT_DISABLED_MESSAGE = 'Customer payouts are temporarily disabled. Please try again later.';
+  function platformStatus() {
+    return {
+      enabled: parseBool(ConfigManager.get('customer_payouts_enabled', true), true),
+      message: String(ConfigManager.get('customer_payouts_disabled_message', '') || '').trim() || DEFAULT_DISABLED_MESSAGE,
+    };
+  }
+  async function payoutAccessFor(userId) {
+    const platform = platformStatus();
+    const user = await userMetaCache.getUserMeta(userId);
+    const userDisabled = !!user?.payoutDisabled;
+    const reason = user?.payoutDisabledReason || null;
+    const enabled = platform.enabled && !userDisabled;
+    return {
+      enabled, platformEnabled: platform.enabled, userEnabled: !userDisabled,
+      message: !platform.enabled ? platform.message : userDisabled ? `Customer payouts are disabled for your account${reason ? `: ${reason}` : ''}` : null,
+    };
+  }
+  // users_meta doc by userId (docId === userId for new docs; older docs need the query fallback)
+  async function findUserMetaDoc(userId) {
+    const direct = await databases.getDocument(DB, USERS_META, userId).catch(() => null);
+    if (direct && direct.userId === userId) return direct;
+    const r = await databases.listDocuments(DB, USERS_META, [Query.equal('userId', userId), Query.limit(1)]);
+    return r.documents[0] || null;
   }
   async function findWalletTxn(type, refId) {
     const r = await databases.listDocuments(DB, WALLET_TXNS, [Query.equal('type', type), Query.equal('refId', refId), Query.limit(1)]);
@@ -567,8 +599,15 @@ module.exports = (
 
   router.get('/wallet', authenticateToken, async (req, res) => {
     try {
-      res.json({ success: true, wallet: walletView(req.user.userId, await getWallet(req.user.userId)) });
+      const [wallet, access] = await Promise.all([getWallet(req.user.userId), payoutAccessFor(req.user.userId)]);
+      res.json({ success: true, wallet: walletView(req.user.userId, wallet), access });
     } catch (e) { sendError(res, e, 'Failed to fetch payout wallet'); }
+  });
+
+  // Can this user create a new customer payout right now? { enabled, platformEnabled, userEnabled, message }
+  router.get('/status', authenticateToken, async (req, res) => {
+    try { res.json({ success: true, ...(await payoutAccessFor(req.user.userId)) }); }
+    catch (e) { sendError(res, e, 'Failed to fetch payout status'); }
   });
 
   async function listWalletTxns(userId, q) {
@@ -670,6 +709,8 @@ module.exports = (
     const userId = req.user.userId;
     try {
       notForAdmin(req);
+      const access = await payoutAccessFor(userId);
+      if (!access.enabled) throw fail(403, access.message);
       const mode = String(req.body.mode || '').toUpperCase();
       if (!PAYOUT_MODES.includes(mode)) throw fail(400, 'Invalid mode. Must be NEFT, IMPS, RTGS or UPI.');
       const amountPaise = toPaise(req.body.amount);
@@ -867,6 +908,133 @@ module.exports = (
       });
       res.json({ success: true, duplicate: !!result.duplicate, wallet: walletView(userId, result.wallet), transaction: pickWalletTxn(result.txn) });
     } catch (e) { sendError(res, e, 'Failed to adjust payout wallet'); }
+  });
+
+  // ─── settings: platform switch + per-user access (admin role only, not labels) ──
+  const adminOnly = (req) => { if (req.user.role !== 'admin') throw fail(403, 'Admin only'); };
+
+  router.get('/admin/settings', adminView, async (req, res) => {
+    try { res.json({ success: true, customerPayouts: platformStatus() }); }
+    catch (e) { sendError(res, e, 'Failed to fetch payout settings'); }
+  });
+
+  // Body: { enabled: boolean, message?: string ≤200 } — config keys customer_payouts_enabled / _disabled_message
+  router.patch('/admin/settings', adminEdit, async (req, res) => {
+    try {
+      adminOnly(req);
+      if (typeof req.body.enabled !== 'boolean') throw fail(400, 'enabled must be true or false');
+      await ConfigManager.set('customer_payouts_enabled', req.body.enabled ? 'true' : 'false');
+      if (req.body.message !== undefined) await ConfigManager.set('customer_payouts_disabled_message', String(req.body.message || '').trim().slice(0, 200));
+      res.json({ success: true, customerPayouts: platformStatus() });
+    } catch (e) { sendError(res, e, 'Failed to update payout settings'); }
+  });
+
+  // Body: { enabled: boolean, reason?: string ≤200 } — sets users_meta.payoutDisabled (+reason), invalidates the meta cache
+  router.patch('/admin/users/:userId/payout-access', adminEdit, async (req, res) => {
+    try {
+      adminOnly(req);
+      if (typeof req.body.enabled !== 'boolean') throw fail(400, 'enabled must be true or false');
+      const doc = await findUserMetaDoc(req.params.userId);
+      if (!doc) throw fail(404, 'User not found');
+      if (doc.role === 'admin') throw fail(400, 'Admins have no customer payouts');
+      const reason = req.body.enabled ? null : (String(req.body.reason || '').trim().slice(0, 200) || null);
+      await databases.updateDocument(DB, USERS_META, doc.$id, { payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
+      await userMetaCache.invalidate(req.params.userId);
+      res.json({ success: true, userId: req.params.userId, payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
+    } catch (e) { sendError(res, e, 'Failed to update user payout access'); }
+  });
+
+  // ─── revert payout-wallet money back to the QR it was withdrawn from (admin role only) ──
+  // Body: { withdrawalId (mode:'wallet', approved), amount? (rupees; default = everything not yet
+  //         reverted from this withdrawal), notes (REQUIRED), refId? (client idempotency key) }
+  // Money path (all paise), lock order lock:qr → lock:payoutwallet (same as approve):
+  //   1. re-read withdrawal under lock; remaining = preAmount − walletRevertedPaise; amount ≤ remaining
+  //   2. wallet debit (moveWallet, 409 if available < amount) + ledger row type 'revert_to_qr'
+  //   3. QR: withdrawalApprovedAmount −= amount, available recomputed (guard ≥ 0) — on failure the
+  //      wallet debit is compensated (ledger row deleted, balance restored)
+  //   4. withdrawal.walletRevertedPaise += amount; counters totalPayoutWalletFunded / totalAmountPaid −= amount
+  router.post('/admin/wallet/revert-to-qr', adminEdit, async (req, res) => {
+    try {
+      adminOnly(req);
+      const { withdrawalId, refId } = req.body;
+      if (!withdrawalId) throw fail(400, 'withdrawalId is required');
+      const notes = String(req.body.notes || '').trim();
+      if (notes.length < 3) throw fail(400, 'notes are required (min 3 characters)');
+      if (refId && !/^[a-zA-Z0-9_-]{1,64}$/.test(refId)) throw fail(400, 'Invalid refId');
+      const requested = req.body.amount == null || req.body.amount === '' ? null : toPaise(req.body.amount);
+      if (req.body.amount != null && req.body.amount !== '' && requested == null) throw fail(400, 'Invalid amount');
+
+      const found = (await databases.listDocuments(DB, WITHDRAWALS, [Query.equal('id', String(withdrawalId)), Query.limit(1)])).documents[0];
+      if (!found) throw fail(404, 'Withdrawal request not found');
+      if (found.mode !== 'wallet') throw fail(400, 'Withdrawal is not a payout-wallet withdrawal');
+      if (found.status !== 'approved') throw fail(400, `Cannot revert a ${found.status} withdrawal`);
+      if (!found.qrId || !found.userId) throw fail(400, 'Invalid withdrawal document data');
+      const ref = refId || genId('rvt_');
+
+      const result = await withLock(`lock:qr:${found.qrId}`, LOCK_TTL_QR, async () => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+        const existing = refId ? await findWalletTxn('revert_to_qr', ref) : null;
+        if (existing) return { duplicate: true, txn: existing, wallet: await getWallet(found.userId) };
+
+        // 1. fresh withdrawal under lock — bound the revert by what this withdrawal actually credited
+        const w = await databases.getDocument(DB, WITHDRAWALS, found.$id);
+        if (w.status !== 'approved') throw fail(409, 'Withdrawal is no longer approved');
+        if (!(await findWalletTxn('withdrawal_credit', w.id))) throw fail(409, 'This withdrawal was never credited to the payout wallet');
+        const creditedPaise = Math.round(Number(w.preAmount) * 100);
+        const revertedSoFar = Number(w.walletRevertedPaise || 0);
+        const remaining = creditedPaise - revertedSoFar;
+        if (remaining <= 0) throw fail(409, 'Nothing left to revert on this withdrawal');
+        const amountPaise = requested ?? remaining;
+        if (amountPaise > remaining) throw fail(409, `Amount exceeds the revertable balance of this withdrawal (${remaining} paise)`);
+
+        // 2. QR fresh read + new ledger values (computed before any write so both guards run first)
+        const qr = (await databases.listDocuments(DB, QRCODES, [Query.equal('qrId', w.qrId), Query.limit(1)])).documents[0];
+        if (!qr) throw fail(404, 'QR not found for withdrawal');
+        const total = Number(qr.totalPayInAmount || 0), approved = Number(qr.withdrawalApprovedAmount || 0);
+        const requestedW = Number(qr.withdrawalRequestedAmount || 0), onHold = Number(qr.amountOnHold || 0);
+        const commissionOnHold = Number(qr.commissionOnHold || 0), commissionPaid = Number(qr.commissionPaid || 0);
+        const newApproved = approved - amountPaise;
+        const newAvailable = total - newApproved - requestedW - onHold - commissionOnHold - commissionPaid;
+        if (newApproved < 0) throw fail(409, 'Ledger computation error: QR approved-withdrawal total would go negative');
+
+        // 3. wallet debit (409 if available < amount; hold is respected)
+        const moved = await moveWallet(w.userId, {
+          deltaBalance: -amountPaise,
+          txn: {
+            userId: w.userId, type: 'revert_to_qr', direction: 'debit', amountPaise, commissionPaise: 0, totalPaise: amountPaise,
+            refType: 'withdrawal_revert', refId: ref, referenceNumber: w.id,
+            notes: `Reverted to QR ${w.qrId} (withdrawal ${w.id}): ${notes}`.slice(0, 500), createdBy: req.user.userId,
+          },
+        });
+
+        // 4. QR credit-back; compensate the wallet if it fails
+        try {
+          await databases.updateDocument(DB, QRCODES, qr.$id, { withdrawalApprovedAmount: newApproved, amountAvailableForWithdrawal: newAvailable });
+        } catch (qrErr) {
+          try {
+            await databases.deleteDocument(DB, WALLET_TXNS, moved.txn.$id);
+            await databases.updateDocument(DB, WALLETS, moved.wallet.$id, { balancePaise: Number(moved.wallet.balancePaise) + amountPaise, totalRevertedToQrPaise: Number(moved.wallet.totalRevertedToQrPaise || 0) - amountPaise, updatedAt: nowIso() });
+            await inc('totalPayoutWalletBalance', amountPaise);
+          } catch (compErr) {
+            console.error(`CRITICAL: revert-to-qr QR update failed AND wallet compensation failed. user=${w.userId} withdrawal=${w.id} amount=${amountPaise} txn=${moved.txn.$id}`, compErr);
+          }
+          throw qrErr;
+        }
+
+        // 5. bound tracking + counters (never fail the response; ledgers are already consistent)
+        await databases.updateDocument(DB, WITHDRAWALS, w.$id, { walletRevertedPaise: revertedSoFar + amountPaise })
+          .catch((e) => console.error(`CRITICAL: revert-to-qr could not record walletRevertedPaise on ${w.id} (+${amountPaise})`, e));
+        await inc('totalPayoutWalletFunded', -amountPaise);
+        await inc('totalAmountPaid', -amountPaise);
+        return { duplicate: false, txn: moved.txn, wallet: moved.wallet, amountPaise, remainingPaise: remaining - amountPaise, qrId: w.qrId, newQrAvailablePaise: newAvailable };
+      }), 'QR is currently being processed. Please try again in a moment.');
+
+      res.json({
+        success: true, duplicate: !!result.duplicate, withdrawalId: found.id, qrId: found.qrId, userId: found.userId,
+        amountPaise: result.amountPaise ?? Number(result.txn.amountPaise), remainingPaise: result.remainingPaise ?? null,
+        qrAvailablePaise: result.newQrAvailablePaise ?? null,
+        wallet: walletView(found.userId, result.wallet), transaction: pickWalletTxn(result.txn),
+      });
+    } catch (e) { sendError(res, e, 'Failed to revert payout wallet amount to QR'); }
   });
 
   // Recovery path: re-run the idempotent wallet credit for an approved mode:'wallet' withdrawal

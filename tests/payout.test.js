@@ -642,6 +642,186 @@ describe('paidVia (staff-only) + lookup by unique id', () => {
     });
 });
 
+describe('disable customer payouts (platform + per user)', () => {
+    const ConfigManager = require('../configManager');
+    const wallet = () => ({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }] });
+
+    test('platform switch blocks new requests with the configured message; viewing still works', async () => {
+        mockConfig.customer_payouts_enabled = 'false';
+        mockConfig.customer_payouts_disabled_message = 'Bank maintenance till 6 PM';
+        try {
+            const { app } = buildPayout(makeDb(wallet()), makeRedis());
+            const st = await request(app).get('/status');
+            expect(st.body).toMatchObject({ enabled: false, platformEnabled: false, userEnabled: true, message: 'Bank maintenance till 6 PM' });
+            const r = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 });
+            expect(r.status).toBe(403);
+            expect(r.body.error).toBe('Bank maintenance till 6 PM');
+            expect((await request(app).get('/requests')).status).toBe(200);
+            expect((await request(app).get('/wallet')).body.access.enabled).toBe(false);
+        } finally { delete mockConfig.customer_payouts_enabled; delete mockConfig.customer_payouts_disabled_message; }
+    });
+
+    test('boolean true/false and string "false" are both honoured; default message when none set', async () => {
+        mockConfig.customer_payouts_enabled = false;
+        try {
+            const { app } = buildPayout(makeDb(wallet()), makeRedis());
+            const st = await request(app).get('/status');
+            expect(st.body.enabled).toBe(false);
+            expect(st.body.message).toMatch(/temporarily disabled/i);
+        } finally { delete mockConfig.customer_payouts_enabled; }
+        mockConfig.customer_payouts_enabled = true;
+        try {
+            const { app } = buildPayout(makeDb(wallet()), makeRedis());
+            expect((await request(app).get('/status')).body.enabled).toBe(true);
+        } finally { delete mockConfig.customer_payouts_enabled; }
+    });
+
+    test('per-user flag blocks that user only, with the reason', async () => {
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { userId: 'user1', role: 'user', parentId: null, payoutCommission: 1, payoutDisabled: true, payoutDisabledReason: 'KYC pending' },
+            user2: { userId: 'user2', role: 'user', parentId: null, payoutCommission: 1 },
+        })[id] || null);
+        const db = makeDb({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }, { $id: 'w2', userId: 'user2', balancePaise: 100000, holdPaise: 0 }] });
+        const { app } = buildPayout(db, makeRedis());
+        const r = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 });
+        expect(r.status).toBe(403);
+        expect(r.body.error).toBe('Customer payouts are disabled for your account: KYC pending');
+        expect((await request(app).get('/status')).body).toMatchObject({ enabled: false, platformEnabled: true, userEnabled: false });
+        const { app: app2 } = buildPayout(db, makeRedis(), asUser('user2'));
+        expect((await request(app2).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 10 })).status).toBe(201);
+    });
+
+    test('admin endpoints: settings read/write, per-user access write + cache invalidate; admin role only', async () => {
+        const db = makeDb({ [COLS.USERS]: [{ $id: 'user1', userId: 'user1', role: 'user' }, { $id: 'admin1', userId: 'admin1', role: 'admin' }] });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).get('/admin/settings')).body.customerPayouts).toEqual({ enabled: true, message: expect.stringMatching(/temporarily disabled/i) });
+        const set = await request(app).patch('/admin/settings').send({ enabled: false, message: 'Back at 6 PM' });
+        expect(set.status).toBe(200);
+        expect(ConfigManager.set).toHaveBeenCalledWith('customer_payouts_enabled', 'false');
+        expect(ConfigManager.set).toHaveBeenCalledWith('customer_payouts_disabled_message', 'Back at 6 PM');
+        expect((await request(app).patch('/admin/settings').send({ enabled: 'no' })).status).toBe(400);
+
+        const off = await request(app).patch('/admin/users/user1/payout-access').send({ enabled: false, reason: 'KYC pending' });
+        expect(off.status).toBe(200);
+        expect(db.store[COLS.USERS][0]).toMatchObject({ payoutDisabled: true, payoutDisabledReason: 'KYC pending' });
+        expect(userMetaCache.invalidate).toHaveBeenCalledWith('user1');
+        const on = await request(app).patch('/admin/users/user1/payout-access').send({ enabled: true });
+        expect(db.store[COLS.USERS][0]).toMatchObject({ payoutDisabled: false, payoutDisabledReason: null });
+        expect(on.body.payoutDisabled).toBe(false);
+        expect((await request(app).patch('/admin/users/admin1/payout-access').send({ enabled: false })).status).toBe(400);
+        expect((await request(app).patch('/admin/users/nobody/payout-access').send({ enabled: false })).status).toBe(404);
+
+        // labelled employee passes adminEdit but is not admin → 403 on both switches
+        const emp = asUser('emp1', 'employee');
+        const { app: empApp } = buildPayout(db, makeRedis(), emp, () => emp);
+        expect((await request(empApp).patch('/admin/settings').send({ enabled: true })).status).toBe(403);
+        expect((await request(empApp).patch('/admin/users/user1/payout-access').send({ enabled: true })).status).toBe(403);
+    });
+});
+
+describe('revert payout wallet → QR', () => {
+    const WD = () => ({ $id: 'wd1', id: 'wdh_1', userId: 'user1', qrId: 'qr1', mode: 'wallet', status: 'approved', amount: 500, preAmount: 500, commission: 0 });
+    const seed = (over = {}) => ({
+        [COLS.WD]: [WD()],
+        [COLS.QRS]: [{ $id: 'q1', qrId: 'qr1', totalPayInAmount: 200000, withdrawalApprovedAmount: 50000, withdrawalRequestedAmount: 10000, amountOnHold: 0, commissionOnHold: 500, commissionPaid: 1000, amountAvailableForWithdrawal: 138500 }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 0, totalRevertedToQrPaise: 0 }],
+        [COLS.TXNS]: [{ $id: 't0', id: 'pwt_0', type: 'withdrawal_credit', refId: 'wdh_1', userId: 'user1', amountPaise: 50000 }],
+        ...over,
+    });
+    const admin = () => asUser('admin1', 'admin');
+    const body = { withdrawalId: 'wdh_1', notes: 'Payout service withdrawn, returning funds' };
+
+    test('full revert: wallet debited with ledger row, QR approved reduced + available recomputed, withdrawal tracks it, counters reversed', async () => {
+        const db = makeDb(seed());
+        const redis = makeRedis();
+        const { app } = buildPayout(db, redis, admin());
+        const res = await request(app).post('/admin/wallet/revert-to-qr').send(body);
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ duplicate: false, withdrawalId: 'wdh_1', qrId: 'qr1', userId: 'user1', amountPaise: 50000, remainingPaise: 0, qrAvailablePaise: 188500 });
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 0, holdPaise: 0, totalRevertedToQrPaise: 50000 });
+        expect(db.store[COLS.QRS][0]).toMatchObject({ withdrawalApprovedAmount: 0, amountAvailableForWithdrawal: 188500, withdrawalRequestedAmount: 10000, commissionPaid: 1000 });
+        expect(db.store[COLS.WD][0].walletRevertedPaise).toBe(50000);
+        const row = db.store[COLS.TXNS].find((t) => t.type === 'revert_to_qr');
+        expect(row).toMatchObject({ direction: 'debit', amountPaise: 50000, totalPaise: 50000, refType: 'withdrawal_revert', referenceNumber: 'wdh_1', createdBy: 'admin1', balanceAfterPaise: 0 });
+        expect(row.notes).toContain('Payout service withdrawn');
+        expect(res.body.transaction.type).toBe('revert_to_qr');
+        expect(counterDeltas()).toEqual([['totalPayoutWalletBalance', -50000], ['totalPayoutWalletFunded', -50000], ['totalAmountPaid', -50000]]);
+        // lock order qr → wallet, both released
+        expect(redis.set.mock.calls.map((c) => c[0])).toEqual(['lock:qr:qr1', 'lock:payoutwallet:user1']);
+        expect(redis.eval).toHaveBeenCalledTimes(2);
+    });
+
+    test('partial reverts are bounded by what the withdrawal credited', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), admin());
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, amount: 200 })).body).toMatchObject({ amountPaise: 20000, remainingPaise: 30000 });
+        const over = await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, amount: 300.01 });
+        expect(over.status).toBe(409);
+        expect(over.body.error).toMatch(/exceeds/i);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send(body)).body).toMatchObject({ amountPaise: 30000, remainingPaise: 0 }); // default = remaining
+        const none = await request(app).post('/admin/wallet/revert-to-qr').send(body);
+        expect(none.status).toBe(409);
+        expect(none.body.error).toMatch(/nothing left/i);
+        expect(db.store[COLS.WALLETS][0].balancePaise).toBe(0);
+        expect(db.store[COLS.QRS][0].withdrawalApprovedAmount).toBe(0);
+        expect(db.store[COLS.WD][0].walletRevertedPaise).toBe(50000);
+    });
+
+    test('wallet money already held by pending payouts cannot be reverted', async () => {
+        const db = makeDb(seed({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 30000 }] }));
+        const { app } = buildPayout(db, makeRedis(), admin());
+        const res = await request(app).post('/admin/wallet/revert-to-qr').send(body); // wants 50000, available 20000
+        expect(res.status).toBe(409);
+        expect(res.body.error).toMatch(/insufficient/i);
+        expect(db.store[COLS.QRS][0].withdrawalApprovedAmount).toBe(50000);
+        expect(db.store[COLS.TXNS]).toHaveLength(1);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, amount: 200 })).status).toBe(200);
+    });
+
+    test('QR update failure compensates the wallet (ledger row removed, balance restored) and returns 500', async () => {
+        const db = makeDb(seed());
+        const origUpdate = db.updateDocument.getMockImplementation();
+        db.updateDocument.mockImplementation(async (d, c, id, data) => { if (c === COLS.QRS) throw new Error('appwrite down'); return origUpdate(d, c, id, data); });
+        const { app } = buildPayout(db, makeRedis(), admin());
+        const res = await request(app).post('/admin/wallet/revert-to-qr').send(body);
+        expect(res.status).toBe(500);
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 50000, totalRevertedToQrPaise: 0 });
+        expect(db.store[COLS.TXNS].map((t) => t.type)).toEqual(['withdrawal_credit']);
+        expect(db.store[COLS.WD][0].walletRevertedPaise).toBeUndefined();
+        expect(counterDeltas()).toEqual([['totalPayoutWalletBalance', -50000], ['totalPayoutWalletBalance', 50000]]);
+    });
+
+    test('same refId twice → duplicate no-op', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), admin());
+        const b = { ...body, amount: 100, refId: 'client-uuid-9' };
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send(b)).body.duplicate).toBe(false);
+        const again = await request(app).post('/admin/wallet/revert-to-qr').send(b);
+        expect(again.body.duplicate).toBe(true);
+        expect(db.store[COLS.WALLETS][0].balancePaise).toBe(40000);
+        expect(db.store[COLS.QRS][0].withdrawalApprovedAmount).toBe(40000);
+    });
+
+    test('validation + guards: notes required, admin role only, not wallet / not approved / never credited / QR lock busy', async () => {
+        const db = makeDb(seed({ [COLS.WD]: [WD(), { ...WD(), $id: 'wd2', id: 'wdh_2', mode: 'bank' }, { ...WD(), $id: 'wd3', id: 'wdh_3', status: 'pending' }, { ...WD(), $id: 'wd4', id: 'wdh_4' }] }));
+        const { app } = buildPayout(db, makeRedis(), admin());
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ withdrawalId: 'wdh_1' })).status).toBe(400);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, amount: -5 })).status).toBe(400);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, withdrawalId: 'wdh_2' })).status).toBe(400);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, withdrawalId: 'wdh_3' })).status).toBe(400);
+        expect((await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, withdrawalId: 'nope' })).status).toBe(404);
+        const never = await request(app).post('/admin/wallet/revert-to-qr').send({ ...body, withdrawalId: 'wdh_4' }); // no withdrawal_credit row for wdh_4
+        expect(never.status).toBe(409);
+        expect(never.body.error).toMatch(/never credited/i);
+        const emp = asUser('emp1', 'employee');
+        expect((await request(buildPayout(db, makeRedis(), emp, () => emp).app).post('/admin/wallet/revert-to-qr').send(body)).status).toBe(403);
+        const busy = await request(buildPayout(makeDb(seed()), makeRedis({ set: jest.fn().mockResolvedValue(null) }), admin()).app).post('/admin/wallet/revert-to-qr').send(body);
+        expect(busy.status).toBe(409);
+        expect(busy.body.error).toMatch(/QR is currently being processed/i);
+        expect(db.store[COLS.WALLETS][0].balancePaise).toBe(50000);
+    });
+});
+
 describe('admin wallet adjust', () => {
     test('credit creates wallet if missing and writes ledger row', async () => {
         const db = makeDb();

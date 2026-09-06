@@ -71,6 +71,7 @@ async function main() {
     await int(WALLETS, 'totalPaidOutPaise');
     await int(WALLETS, 'totalPayoutCommissionPaise');
     await int(WALLETS, 'totalAdminDebitPaise');
+    await int(WALLETS, 'totalRevertedToQrPaise');   // admin revert-to-QR debits
     await int(WALLETS, 'paidCount');
     await str(WALLETS, 'updatedAt', 40);
     await sleep(3000);
@@ -227,9 +228,11 @@ async function main() {
     await idx(ALLTIME, 'idx_userId', 'unique', ['userId']);
     await idx(ALLTIME, 'idx_total', 'key', ['totalCommissionPaise']);
 
-    // 7. users_meta.payoutCommission
+    // 7. users_meta: payoutCommission (%), per-user payout kill switch
     console.log(`\n${APPWRITE_USERS_META_COLLECTION_ID}:`);
     await dbl(APPWRITE_USERS_META_COLLECTION_ID, 'payoutCommission');
+    await bool(APPWRITE_USERS_META_COLLECTION_ID, 'payoutDisabled');
+    await str(APPWRITE_USERS_META_COLLECTION_ID, 'payoutDisabledReason', 200);
 
     // 8. withdrawal_requests: mode enum + walletCreditFailed
     const WD = APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID;
@@ -242,6 +245,7 @@ async function main() {
         await db.updateEnumAttribute(DB, WD, 'mode', [...elements, 'wallet'], !!attr.required, attr.default ?? null);
     });
     await bool(WD, 'walletCreditFailed');
+    await int(WD, 'walletRevertedPaise');          // paise already reverted from the payout wallet back to the QR
 
     console.log('\n✅ Customer Payout schema setup complete.\n');
     console.log('Optional .env overrides (defaults shown are what server.js uses):');

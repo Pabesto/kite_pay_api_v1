@@ -180,6 +180,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 labels: doc.labels,
                 commission : doc.commission || 0,
                 payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+                payoutDisabled : doc.payoutDisabled === true,
+                payoutDisabledReason : doc.payoutDisabledReason || null,
             }));
 
             const docs = simplifiedUsers;
@@ -238,6 +240,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             labels: doc.labels,
             commission : doc.commission || 0,
             payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+            payoutDisabled : doc.payoutDisabled === true,
+            payoutDisabledReason : doc.payoutDisabledReason || null,
             }));
 
             return res.json(simplifiedUsers);
@@ -287,6 +291,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         labels: doc.labels,
         commission : doc.commission || 0,
         payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+        payoutDisabled : doc.payoutDisabled === true,
+        payoutDisabledReason : doc.payoutDisabledReason || null,
         }));
 
         return res.json(simplifiedUsers);
@@ -4792,7 +4798,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // 2c) Payout wallet + customer payouts (payout.js). All paise unless *Count. Lifetime totals
             // live on the wallet doc; only the (small) pending set is summed live.
-            let payoutWalletBalance = 0, payoutWalletHold = 0, payoutWalletTotalCredited = 0, payoutWalletTotalAdminDebit = 0;
+            let payoutWalletBalance = 0, payoutWalletHold = 0, payoutWalletTotalCredited = 0, payoutWalletTotalAdminDebit = 0, payoutWalletTotalReverted = 0;
             let customerPayoutPendingCount = 0, customerPayoutPendingAmount = 0;
             let customerPayoutPaidCount = 0, customerPayoutPaidAmount = 0, customerPayoutCommissionPaid = 0;
             let customerPayoutRejectedCount = 0;
@@ -4805,6 +4811,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         payoutWalletHold = Number(w.holdPaise || 0);
                         payoutWalletTotalCredited = Number(w.totalCreditedPaise || 0);
                         payoutWalletTotalAdminDebit = Number(w.totalAdminDebitPaise || 0);
+                        payoutWalletTotalReverted = Number(w.totalRevertedToQrPaise || 0);
                         customerPayoutPaidCount = Number(w.paidCount || 0);
                         customerPayoutPaidAmount = Number(w.totalPaidOutPaise || 0);
                         customerPayoutCommissionPaid = Number(w.totalPayoutCommissionPaise || 0);
@@ -4854,6 +4861,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 payoutWalletAvailable: payoutWalletBalance - payoutWalletHold,
                 payoutWalletTotalCredited,
                 payoutWalletTotalAdminDebit,
+                payoutWalletTotalReverted,   // moved back to QR codes by admin
 
                 // Customer payouts — paise unless *Count
                 customerPayoutPendingCount,
