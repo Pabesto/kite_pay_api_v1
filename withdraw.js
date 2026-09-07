@@ -7,6 +7,7 @@ const multer = require('multer');
 const moment = require('moment-timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
+const qrSettlement = require('./qrSettlement');
 const ConfigManager = require('./configManager');
 const userMetaCache = require('./userMetaCache');
 
@@ -440,12 +441,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // available = what the user can actually withdraw right now (paise)
         const available = total - approved - requested - onHold - commissionOnHold - commissionPaid;
 
-        const todayPayinsAll = await getTodayPayins();
-
-        const todayPayinsForThisQr = Number(todayPayinsAll[qr.qrId] || 0);
-
-        // canWithdrawToday = whether the user can withdraw today based on today's pay-ins for this QR (paise)
-        const todayWithdrawAmount = available - todayPayinsForThisQr;
+        // T+1 hold, minus anything an admin released early for this QR today. ONE definition, shared
+        // with the dashboards and the QR lists (qrSettlement.js). Fails closed: if the release lookup
+        // errors it behaves as full T+1, never as "everything is available".
+        const settlement = await qrSettlement.forQr(qr.qrId, available);
+        const todayWithdrawAmount = settlement.withdrawablePaise;
 
         // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
         // Commission already computed in paise — no conversion needed

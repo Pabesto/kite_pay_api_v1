@@ -40,6 +40,7 @@ const userMetaCache = require('./userMetaCache');
 const qrOwnerCache = require('./qrOwnerCache');
 const reviewMode = require('./reviewMode'); // in-memory manual-review-mode registry (single-process)
 const dashboardCounters = require('./dashboardCounters');
+const qrSettlement = require('./qrSettlement'); // T+1 hold + admin T+0 release — the single withdrawable-today rule
 const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
 const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
@@ -116,6 +117,8 @@ const APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APP
 const APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID || 'monthly_payout_commission_totals';
 const APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID || 'all_time_payout_commission_totals';
 const APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID || 'payout_source_accounts';
+// One row per (qrId, IST day): how much of that day's pay-in an admin released early (T+0).
+const APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID = process.env.APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID || 'qr_daily_releases';
 const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
 
 // Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -614,6 +617,9 @@ async function flushCountersToAppwrite() {
 // Init userMetaCache early so Appwrite fallback works even if Redis is down
 userMetaCache.init({ redisClient, databases, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Query });
 dashboardCounters.init({ APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID });
+// The one definition of "withdrawable today" (T+1 hold + admin T+0 releases). Required by
+// withdraw.js, qrcode.js and admin.js — never duplicate the formula in a route.
+qrSettlement.init({ databases, Query, APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID });
 
 // Init qrOwnerCache — maps each QR code to the single subadmin who owns it, so every
 // transaction can be stamped with `ownerSubadminId` at write time and partners can

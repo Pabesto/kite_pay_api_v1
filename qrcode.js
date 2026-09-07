@@ -15,6 +15,7 @@ const moment = require('moment-timezone');
 
 const ConfigManager = require('./configManager'); // for the `integrations` allow-list
 const { updateDashboardCounter } = require('./dashboardCounters');
+const qrSettlement = require('./qrSettlement');
 const { type } = require('os');
 const { compare } = require('bcrypt');
 
@@ -325,11 +326,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
 
             // Map today and yesterday totals to each QR code
-            const qrCodesWithTotals = qrCodes.map(qr => ({
-                ...qr,
-                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
-                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
-            }));
+            // T+1 hold minus any admin T+0 release for today. canWithdrawTodayPaise is computed
+            // HERE, server-side: clients must display it, never recompute it (qrSettlement.js).
+            const releasesToday = await qrSettlement.releasesFor(qrCodes.map(q => q.qrId));
+            const qrCodesWithTotals = qrCodes.map(qr => {
+                const todayPayIn = todayTotalsObj[qr.qrId] || 0;
+                const released = releasesToday[qr.qrId] || 0;
+                return {
+                    ...qr,
+                    todayTotalPayIn: todayPayIn,
+                    yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+                    releasedTodayPaise: released,
+                    heldTodayPaise: qrSettlement.heldPaise(todayPayIn, released),
+                    canWithdrawTodayPaise: qrSettlement.withdrawablePaise(qr.amountAvailableForWithdrawal, todayPayIn, released),
+                };
+            });
 
             const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
 
@@ -936,11 +947,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             }
 
-            const qrCodesWithTotals = userQrCodes.map(qr => ({
-                ...qr,
-                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
-                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
-            }));
+            // T+1 hold minus any admin T+0 release for today. canWithdrawTodayPaise is computed
+            // HERE, server-side: clients must display it, never recompute it (qrSettlement.js).
+            const releasesToday = await qrSettlement.releasesFor(userQrCodes.map(q => q.qrId));
+            const qrCodesWithTotals = userQrCodes.map(qr => {
+                const todayPayIn = todayTotalsObj[qr.qrId] || 0;
+                const released = releasesToday[qr.qrId] || 0;
+                return {
+                    ...qr,
+                    todayTotalPayIn: todayPayIn,
+                    yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+                    releasedTodayPaise: released,
+                    heldTodayPaise: qrSettlement.heldPaise(todayPayIn, released),
+                    canWithdrawTodayPaise: qrSettlement.withdrawablePaise(qr.amountAvailableForWithdrawal, todayPayIn, released),
+                };
+            });
 
             const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
 
@@ -1055,11 +1076,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             }
 
-            const qrCodesWithTotals = userQrCodes.map(qr => ({
-                ...qr,
-                todayTotalPayIn: todayTotalsObj[qr.qrId] || 0,
-                yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
-            }));
+            // T+1 hold minus any admin T+0 release for today. canWithdrawTodayPaise is computed
+            // HERE, server-side: clients must display it, never recompute it (qrSettlement.js).
+            const releasesToday = await qrSettlement.releasesFor(userQrCodes.map(q => q.qrId));
+            const qrCodesWithTotals = userQrCodes.map(qr => {
+                const todayPayIn = todayTotalsObj[qr.qrId] || 0;
+                const released = releasesToday[qr.qrId] || 0;
+                return {
+                    ...qr,
+                    todayTotalPayIn: todayPayIn,
+                    yesterdayTotalPayIn: yesterdayTotalsObj[qr.qrId] || 0,
+                    releasedTodayPaise: released,
+                    heldTodayPaise: qrSettlement.heldPaise(todayPayIn, released),
+                    canWithdrawTodayPaise: qrSettlement.withdrawablePaise(qr.amountAvailableForWithdrawal, todayPayIn, released),
+                };
+            });
 
             const nextCursor = qrCodesWithTotals.length === limitNum ? qrCodesWithTotals[qrCodesWithTotals.length - 1].$id : null;
 

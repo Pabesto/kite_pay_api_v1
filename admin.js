@@ -21,6 +21,7 @@ const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
+const qrSettlement = require('./qrSettlement');
 
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
 const userMetaCache = require('./userMetaCache');
@@ -4550,9 +4551,20 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const totalMembershipPurchased = 0;
             const pendingMembershipUsers = 0;
 
-            let withdrawableAmount = totalAvailableAmount - todayPayInAllQrs;
-            let selfWithdrawableAmount = selfTotalAvailableAmount - todayPayInSelfAssignedQrs;
-            let userWithdrawableAmount = userTotalAvailableAmount - todayPayInUserAssignedQrs;
+            // Withdrawable = available − held, where held is today's pay-in minus any admin T+0
+            // release. One shared rule (qrSettlement.js) so this matches what /withdraw_new accepts.
+            // Computed once over every managed QR, then split by grouping via byQrId.
+            const settle = await qrSettlement.forQrDocs(AllManagedQrs);
+            const sumFor = (list) => list.reduce((s, q) => s + (settle.byQrId[q.qrId]?.withdrawablePaise || 0), 0);
+            const heldFor = (list) => list.reduce((s, q) => s + (settle.byQrId[q.qrId]?.heldPaise || 0), 0);
+            const releasedFor = (list) => list.reduce((s, q) => s + (settle.byQrId[q.qrId]?.releasedPaise || 0), 0);
+            let withdrawableAmount = settle.totals.withdrawablePaise;
+            let selfWithdrawableAmount = sumFor(AllSelfAssignedQrs);
+            let userWithdrawableAmount = sumFor(AllUserAssignedQrs);
+            const totalReleasedToday = settle.totals.releasedPaise;
+            const totalHeldToday = settle.totals.heldPaise;
+            const selfReleasedToday = releasedFor(AllSelfAssignedQrs), selfHeldToday = heldFor(AllSelfAssignedQrs);
+            const userReleasedToday = releasedFor(AllUserAssignedQrs), userHeldToday = heldFor(AllUserAssignedQrs);
 
             // Response
             return res.json({
@@ -4573,6 +4585,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 totalAmountOnHold,
                 totalCommissionOnHold,
                 totalCommissionPaid,
+                // T+1 settlement (paise): what is still held back today, and what admin released early
+                totalHeldToday,
+                totalReleasedToday,
 
                 // --- AllSelfAssignedQrs metrics ---
                 totalSelfAssignedQrs: AllSelfAssignedQrs.length,
@@ -4589,6 +4604,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 selfTotalAmountOnHold,
                 selfTotalCommissionOnHold,
                 selfTotalCommissionPaid,
+                selfHeldToday,
+                selfReleasedToday,
 
                 // --- AllUserAssignedQrs metrics (managed by merchant, assigned to sub-users) ---
                 totalUserAssignedQrs: AllUserAssignedQrs.length,
@@ -4605,6 +4622,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 userTotalAmountOnHold,
                 userTotalCommissionOnHold,
                 userTotalCommissionPaid,
+                userHeldToday,
+                userReleasedToday,
 
                 // --- Other ---
                 totalMerchantProfit,
@@ -4794,7 +4813,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 totalCommissionPaid += commPaid;
             }
 
-            withdrawableAmount = totalAvailableAmount - todayPayInAllQrs;
+            // Withdrawable = available − held (today's pay-in minus any admin T+0 release).
+            // Shared rule (qrSettlement.js), identical to what /withdraw_new enforces.
+            const settleUser = await qrSettlement.forQrDocs(qrs);
+            withdrawableAmount = settleUser.totals.withdrawablePaise;
+            const heldTodayPaise = settleUser.totals.heldPaise;
+            const releasedTodayPaise = settleUser.totals.releasedPaise;
 
             // 2c) Payout wallet + customer payouts (payout.js). All paise unless *Count. Lifetime totals
             // live on the wallet doc; only the (small) pending set is summed live.
@@ -4855,6 +4879,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 totalCommissionOnHold,
                 totalCommissionPaid,
 
+                // T+1 settlement (paise): still held back today, and released early by admin
+                heldTodayPaise,
+                releasedTodayPaise,
+
                 // Payout wallet (payout.js) — paise
                 payoutWalletBalance,
                 payoutWalletHold,
@@ -4907,6 +4935,98 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     //   { days: [ { date, totalPaise, totalRs, qrs: { qrId: paise, ... } } ],
     //     grandTotalPaise, grandTotalRs, todayPaise, todayRs, yesterdayPaise, yesterdayRs }
     // ─────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // T+0 early release (ADMIN ROLE ONLY — a risk decision, not a permission)
+    //
+    // Settlement is T+1: today's pay-in is held until tomorrow. Admin can release part of ONE QR's
+    // pay-in for ONE IST day, capped by `qr_daily_release_max_percent` (default 50).
+    //
+    // A release is a GATE, never money: it changes what may be withdrawn, never a stored balance. It
+    // cannot raise amountAvailableForWithdrawal, so the most it can unlock is today's own pay-in, and
+    // it expires by itself at IST midnight. All arithmetic lives in qrSettlement.js — never inline it.
+    // ─────────────────────────────────────────────────────────────────────────
+    const settlementError = (res, e, fallback) => {
+        if (e?.status) return res.status(e.status).json({ error: e.message });
+        console.error(`❌ ${fallback}:`, e);
+        return res.status(500).json({ error: fallback });
+    };
+    async function qrByBusinessId(qrId) {
+        const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.equal('qrId', String(qrId)), Query.limit(1)]);
+        return r.documents[0] || null;
+    }
+
+    // Everything the release dialog needs for one QR: balances, today's pay-in, what is held, the cap.
+    router.get('/qr-settlement/:qrId', authenticateAdmin, async (req, res) => {
+        try {
+            const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : qrSettlement.istDay();
+            const qr = await qrByBusinessId(req.params.qrId);
+            if (!qr) return res.status(404).json({ error: 'QR not found' });
+            const settle = await qrSettlement.forQrDocs([qr], day);
+            const release = await qrSettlement.getRelease(qr.qrId, day);
+            return res.json({
+                success: true, ...settle.rows[0], maxPercent: settle.maxPercent,
+                assignedUserId: qr.assignedUserId || null,
+                release: qrSettlement.pickRelease(release),
+            });
+        } catch (e) { return settlementError(res, e, 'Failed to fetch QR settlement'); }
+    });
+
+    // SET today's release for one QR. Absolute, not additive: sending the same value twice is a no-op.
+    // Body: { amount (RUPEES, 0 revokes), reason (min 4 chars), date? (YYYY-MM-DD, defaults to today) }
+    router.put('/qr-settlement/:qrId/release', authenticateAdmin, async (req, res) => {
+        try {
+            const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.date || '')) ? String(req.body.date) : qrSettlement.istDay();
+            const qr = await qrByBusinessId(req.params.qrId);
+            if (!qr) return res.status(404).json({ error: 'QR not found' });
+            const amountNum = Number(req.body.amount);
+            if (!isFinite(amountNum) || amountNum < 0) return res.status(400).json({ error: 'Invalid amount' });
+            const releasedPaise = Math.round(amountNum * 100);   // rupees → paise, at the boundary
+
+            const saved = await qrSettlement.setRelease({
+                ID, qrId: qr.qrId, releasedPaise, reason: req.body.reason, byUserId: req.user.userId, day,
+            });
+            const settle = await qrSettlement.forQrDocs([qr], day);
+            return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved) });
+        } catch (e) { return settlementError(res, e, 'Failed to update QR release'); }
+    });
+
+    // Revoke: same as setting 0. Money already withdrawn is not clawed back; only what is still
+    // sitting in the QR goes back to being held.
+    router.delete('/qr-settlement/:qrId/release', authenticateAdmin, async (req, res) => {
+        try {
+            const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : qrSettlement.istDay();
+            const qr = await qrByBusinessId(req.params.qrId);
+            if (!qr) return res.status(404).json({ error: 'QR not found' });
+            const saved = await qrSettlement.setRelease({
+                ID, qrId: qr.qrId, releasedPaise: 0,
+                reason: String(req.body?.reason || 'Release revoked'), byUserId: req.user.userId, day,
+            });
+            const settle = await qrSettlement.forQrDocs([qr], day);
+            return res.json({ success: true, message: 'Release revoked', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved) });
+        } catch (e) { return settlementError(res, e, 'Failed to revoke QR release'); }
+    });
+
+    // Every release for a day (audit view). ?date=YYYY-MM-DD&qrId=&limit=&cursor=
+    router.get('/qr-releases', authenticateAdmin, async (req, res) => {
+        try {
+            const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : qrSettlement.istDay();
+            const limit = Math.min(Math.max(parseInt(req.query.limit ?? 25, 10) || 25, 1), 100);
+            const cursor = req.query.cursor;
+            if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) return res.status(400).json({ error: 'Invalid cursor format' });
+            const r = await qrSettlement.listReleases({ day, qrId: req.query.qrId || null, limit, cursor });
+            const docs = r.documents || [];
+            return res.json({
+                success: true, date: day, maxPercent: qrSettlement.maxPercent(), total: r.total,
+                releases: docs.map(qrSettlement.pickRelease),
+                totalReleasedPaise: docs.reduce((s, d) => s + Number(d.releasedPaise || 0), 0),
+                nextCursor: docs.length === limit ? docs[docs.length - 1].$id : null,
+            });
+        } catch (e) {
+            if (isCursorError(e)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
+            return settlementError(res, e, 'Failed to fetch QR releases');
+        }
+    });
+
     router.get('/payin-summary', authenticateToken, async (req, res) => {
         try {
             const actor = req.user;
