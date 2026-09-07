@@ -150,6 +150,7 @@ function totalsOf(rows) {
 
 function fail(status, message) { return Object.assign(new Error(message), { status }); }
 const rs = (paise) => `₹${(paise / 100).toFixed(2)}`;
+const HISTORY_LIMIT = 20;   // newest-first trail of changes kept on the single row for a (QR, day)
 
 /** The release row for one QR on one day, or null. */
 async function getRelease(qrId, day = istDay()) {
@@ -161,8 +162,15 @@ async function getRelease(qrId, day = istDay()) {
 /**
  * SET (not add) how much of today's pay-in is released for one QR.
  *
- * Absolute semantics: sending the same value twice changes nothing, so a double submit or a retry can
- * never double-release. Give EITHER `percent` (of that day's pay-in) OR `releasedPaise`.
+ * Give exactly ONE of:
+ *   percent        — a share of that day's pay-in. Absolute: 50% twice is still 50%.
+ *   releasedPaise  — the total the release should become. Absolute: ₹2,000 twice is still ₹2,000.
+ *   addPaise       — release this much MORE on top of what is already released. Additive, for an
+ *                    admin topping up several times a day. Requires `expectedReleasedPaise`, so a
+ *                    retried request adds once and the second attempt is rejected as stale.
+ *
+ * Whatever the mode, what is STORED is always the absolute total, and the cap is always checked
+ * against that total — so ten small top-ups can never add up past the ceiling.
  *
  * Optimistic concurrency — `expectedTodayPayInPaise` / `expectedReleasedPaise`:
  * the numbers the admin was looking at must still be true on the server, otherwise the write is
@@ -175,17 +183,20 @@ async function getRelease(qrId, day = istDay()) {
  * rather than clamping so an admin always knows exactly what was granted.
  * `ID` is passed in by the caller (node-appwrite's ID helper).
  */
-async function setRelease({ ID, qrId, releasedPaise = null, percent = null, expectedTodayPayInPaise = null, expectedReleasedPaise = null, reason, byUserId, day = istDay() }) {
+async function setRelease({ ID, qrId, releasedPaise = null, percent = null, addPaise = null, expectedTodayPayInPaise = null, expectedReleasedPaise = null, reason, byUserId, day = istDay() }) {
     if (!_db || !_releasesCol) throw fail(500, 'QR release storage is not configured on this server');
     if (!qrId) throw fail(400, 'qrId is required');
     const note = String(reason || '').trim();
     if (note.length < 4) throw fail(400, 'A reason is required (min 4 characters)');
 
     const has = (v) => v !== null && v !== undefined && v !== '';
-    const byPercent = has(percent), byAmount = has(releasedPaise);
-    if (byPercent === byAmount) throw fail(400, 'Send exactly one of percent or amount');
+    const byPercent = has(percent), byAmount = has(releasedPaise), byAdd = has(addPaise);
+    if ([byPercent, byAmount, byAdd].filter(Boolean).length !== 1) throw fail(400, 'Send exactly one of percent, amount or addAmount');
     if (byPercent && !has(expectedTodayPayInPaise)) {
         throw fail(400, 'expectedTodayPayInPaise is required when releasing by percent, so the percentage is applied to the figure you were shown');
+    }
+    if (byAdd && !has(expectedReleasedPaise)) {
+        throw fail(400, 'expectedReleasedPaise is required when adding to a release, so a retried request cannot add the same amount twice');
     }
 
     // Current server state — the basis for BOTH the percentage and the staleness check.
@@ -211,22 +222,39 @@ async function setRelease({ ID, qrId, releasedPaise = null, percent = null, expe
         }
         percentAtSet = p;
         amount = Math.floor(todayPayInPaise * p / 100);   // floor: the cap is never exceeded by rounding
+    } else if (byAdd) {
+        const add = Number(addPaise);
+        if (!Number.isInteger(add) || add <= 0) throw fail(400, 'The amount to add must be greater than zero');
+        amount = currentReleasedPaise + add;              // stored absolute; the cap below checks the TOTAL
     } else {
         amount = Number(releasedPaise);
         if (!Number.isInteger(amount) || amount < 0) throw fail(400, 'Invalid release amount');
     }
 
+    // The ceiling always applies to the resulting TOTAL, so repeated top-ups can never creep past it.
     const cap = maxReleasablePaise(todayPayInPaise);
     if (amount > cap) {
         throw fail(400, maxPercent() === 0
             ? 'Early release is switched off (qr_daily_release_max_percent is 0)'
-            : `Cannot release ${rs(amount)}. The limit is ${maxPercent()}% of this QR's pay-in for ${day} (${rs(todayPayInPaise)}), which is ${rs(cap)}.`);
+            : byAdd
+                ? `Cannot add ${rs(Number(addPaise))}. That would take the release to ${rs(amount)}, and the limit is ${maxPercent()}% of this QR's pay-in for ${day} (${rs(todayPayInPaise)}), which is ${rs(cap)}. ${rs(Math.max(0, cap - currentReleasedPaise))} is still available to release.`
+                : `Cannot release ${rs(amount)}. The limit is ${maxPercent()}% of this QR's pay-in for ${day} (${rs(todayPayInPaise)}), which is ${rs(cap)}.`);
     }
+
+    const at = new Date().toISOString();
+    // Each change overwrites the single row for this (QR, day), so keep a bounded trail of the steps
+    // that got here — an admin topping up through the day would otherwise leave no history.
+    let history = [];
+    try { history = JSON.parse(existing?.historyJson || '[]') || []; } catch { history = []; }
+    history.unshift({ at, by: byUserId || null, fromPaise: currentReleasedPaise, toPaise: amount, mode: byPercent ? 'percent' : byAdd ? 'add' : 'set', reason: note.slice(0, 200) });
+    history = history.slice(0, HISTORY_LIMIT);
 
     const payload = {
         qrId, date: day, releasedPaise: amount,
         todayPayInAtSetPaise: todayPayInPaise, maxPercentAtSet: maxPercent(), percentAtSet,
-        reason: note.slice(0, 300), releasedBy: byUserId || null, updatedAt: new Date().toISOString(),
+        changeCount: Number(existing?.changeCount || 0) + 1,
+        historyJson: JSON.stringify(history),
+        reason: note.slice(0, 300), releasedBy: byUserId || null, updatedAt: at,
     };
     if (existing) return _db.updateDocument(_dbId, _releasesCol, existing.$id, payload);   // read above, under the staleness check
     try {
@@ -255,6 +283,8 @@ const pickRelease = (d) => (!d ? null : {
     releasedPaise: Number(d.releasedPaise || 0), releasedRs: Number(d.releasedPaise || 0) / 100,
     todayPayInAtSetPaise: Number(d.todayPayInAtSetPaise || 0), maxPercentAtSet: Number(d.maxPercentAtSet || 0),
     percentAtSet: d.percentAtSet == null ? null : Number(d.percentAtSet),
+    changeCount: Number(d.changeCount || 0),
+    history: (() => { try { return JSON.parse(d.historyJson || '[]') || []; } catch { return []; } })(),
     reason: d.reason || null, releasedBy: d.releasedBy || null,
     createdAt: d.createdAt || d.$createdAt || null, updatedAt: d.updatedAt || null,
 });

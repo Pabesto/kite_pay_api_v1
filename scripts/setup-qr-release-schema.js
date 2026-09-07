@@ -55,6 +55,8 @@ async function main() {
     await safe('attr maxPercentAtSet (double)', () => db.createFloatAttribute(DB, COL, 'maxPercentAtSet', false));
     await safe('attr percentAtSet (double)', () => db.createFloatAttribute(DB, COL, 'percentAtSet', false));   // null when set by exact amount
     await safe('attr reason (string)', () => db.createStringAttribute(DB, COL, 'reason', 300, false));
+    await safe('attr changeCount (integer)', () => db.createIntegerAttribute(DB, COL, 'changeCount', false));
+    await safe('attr historyJson (string)', () => db.createStringAttribute(DB, COL, 'historyJson', 20000, false));   // last 20 changes, newest first
     await safe('attr releasedBy (string)', () => db.createStringAttribute(DB, COL, 'releasedBy', 64, false));
     await safe('attr createdAt (string)', () => db.createStringAttribute(DB, COL, 'createdAt', 40, false));
     await safe('attr updatedAt (string)', () => db.createStringAttribute(DB, COL, 'updatedAt', 40, false));

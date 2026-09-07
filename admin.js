@@ -4977,7 +4977,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // SET today's release for one QR. Absolute, not additive: sending the same value twice is a no-op.
     // Body: exactly one of
     //   percent: 50                       ← the slider. Requires expectedTodayPayInPaise.
-    //   amount: 2000                      ← RUPEES; 0 revokes.
+    //   amount: 2000                      ← RUPEES, the new TOTAL; 0 revokes.
+    //   addAmount: 1000                   ← RUPEES to release ON TOP of the current release.
+    //                                       Requires expectedReleasedPaise so a retry cannot add twice.
     // plus reason (min 4 chars), optional date (YYYY-MM-DD, defaults to today), and the optimistic
     // guards expectedTodayPayInPaise / expectedReleasedPaise — the figures the dialog displayed.
     // A mismatch returns 409 { code: 'STALE_SETTLEMENT', current: {...} } instead of releasing an
@@ -4987,16 +4989,17 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.date || '')) ? String(req.body.date) : qrSettlement.istDay();
             const qr = await qrByBusinessId(req.params.qrId);
             if (!qr) return res.status(404).json({ error: 'QR not found' });
-            const hasAmount = req.body.amount !== undefined && req.body.amount !== null && req.body.amount !== '';
-            let releasedPaise = null;
-            if (hasAmount) {
-                const amountNum = Number(req.body.amount);
-                if (!isFinite(amountNum) || amountNum < 0) return res.status(400).json({ error: 'Invalid amount' });
-                releasedPaise = Math.round(amountNum * 100);     // rupees → paise, at the boundary
-            }
+            const given = (v) => v !== undefined && v !== null && v !== '';
+            const toPaise = (v, label) => {
+                const n = Number(v);
+                if (!isFinite(n) || n < 0) throw Object.assign(new Error(`Invalid ${label}`), { status: 400 });
+                return Math.round(n * 100);                      // rupees → paise, at the boundary
+            };
+            const releasedPaise = given(req.body.amount) ? toPaise(req.body.amount, 'amount') : null;
+            const addPaise = given(req.body.addAmount) ? toPaise(req.body.addAmount, 'addAmount') : null;
 
             const saved = await qrSettlement.setRelease({
-                ID, qrId: qr.qrId, releasedPaise, percent: req.body.percent,
+                ID, qrId: qr.qrId, releasedPaise, addPaise, percent: req.body.percent,
                 expectedTodayPayInPaise: req.body.expectedTodayPayInPaise,
                 expectedReleasedPaise: req.body.expectedReleasedPaise,
                 reason: req.body.reason, byUserId: req.user.userId, day,

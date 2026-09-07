@@ -142,9 +142,15 @@ Optional `?date=YYYY-MM-DD` to inspect another IST day; defaults to today.
     "releasedPaise": 200000, "releasedRs": 2000,
     "todayPayInAtSetPaise": 400000,  // what the day's pay-in was when it was set (audit)
     "maxPercentAtSet": 50,
-    "percentAtSet": 50,              // the slider value used, or null when set by exact amount
+    "percentAtSet": 50,              // the slider value last used, or null when set by rupee amount
     "reason": "merchant needs same-day funds",
-    "releasedBy": "admin1", "createdAt": "…", "updatedAt": "…" } }
+    "releasedBy": "admin1", "createdAt": "…", "updatedAt": "…",
+    "changeCount": 3,                // how many times it was changed today
+    "history": [                     // newest first, last 20 changes — the audit trail for the day
+      { "at": "…", "by": "admin1", "fromPaise": 250000, "toPaise": 300000, "mode": "add", "reason": "second tranche" },
+      { "at": "…", "by": "admin2", "fromPaise": 100000, "toPaise": 250000, "mode": "percent", "reason": "…" },
+      { "at": "…", "by": "admin1", "fromPaise": 0, "toPaise": 100000, "mode": "set", "reason": "…" }
+    ] } }
 ```
 
 **Keep the whole response.** You will send three of its numbers back on submit (§6.2), so hold onto
@@ -152,7 +158,15 @@ Optional `?date=YYYY-MM-DD` to inspect another IST day; defaults to today.
 
 ### 6.2 Set the release — `PUT /api/admin/qr-settlement/:qrId/release`
 
-Send **exactly one** of `percent` or `amount`.
+Send **exactly one** of `percent`, `amount` or `addAmount`. Whatever you send, the server stores the
+**absolute total**, and the cap is always checked against that total, so any number of top-ups through
+the day can never add up past the ceiling.
+
+| Field | Meaning | Requires |
+|---|---|---|
+| `percent` | release this share of the day's pay-in | `expectedTodayPayInPaise` |
+| `amount` | make the total release this many **rupees** (`0` revokes) | nothing, guards recommended |
+| `addAmount` | release this many **rupees more** on top of the current release | `expectedReleasedPaise` |
 
 **The slider (recommended).** Range `0` to `maxPercent`, stepping in whole percent. Show the rupee
 value live as `todayPayInPaise × percent ÷ 100`, rounded **down**, which is exactly what the server
@@ -166,23 +180,38 @@ computes, so the preview and the result always agree.
   "date": "2026-09-07" }                       // optional, defaults to today
 ```
 
-**Exact amount** (for a specific figure, and for revoking with `0`):
+**Typed rupee amount**, when the admin wants a specific figure, and for revoking with `0`:
 
 ```jsonc
-{ "amount": 2000,                              // RUPEES. 0 revokes.
+{ "amount": 2000,                              // RUPEES — the new TOTAL, not an increase
   "expectedReleasedPaise": 0,                  // optional here, still recommended
   "reason": "merchant needs same-day funds" }
 ```
+
+**Top up**, when releasing again later the same day. This is the one to use for "release a bit more":
+
+```jsonc
+{ "addAmount": 1000,                           // RUPEES to release ON TOP of what is already released
+  "expectedReleasedPaise": 200000,             // REQUIRED — what §6.1 showed as already released
+  "reason": "second tranche, evening" }
+```
+
+> **Do not use `amount` to top up.** With ₹2,000 already released, sending `amount: 1000` **lowers**
+> the release to ₹1,000. Sending `addAmount: 1000` raises it to ₹3,000. Pick the field that matches
+> the button the admin pressed, and label the input accordingly: "Total to release" for `amount`,
+> "Release additional" for `addAmount`.
 
 Returns the same shape as §6.1, with the updated numbers and the saved `release` (which also records
 `percentAtSet`, null when set by exact amount).
 
 #### The two safety rules, and why they exist
 
-**1. It is absolute, never a top-up.** Sending `percent: 50` twice leaves the release at 50%, never
-100%. Sending `amount: 2000` twice leaves it at ₹2,000, never ₹4,000. A double tap, a retry after a
-timeout, or a resubmitted form can therefore never release twice. Always send the total you want the
-release to be, and prefill the control from the current `releasedPaise`.
+**1. Repeats never stack.** Sending `percent: 50` twice leaves the release at 50%, never 100%.
+Sending `amount: 2000` twice leaves it at ₹2,000, never ₹4,000. Those two are absolute, so a double
+tap or a resubmitted form is harmless. `addAmount` is the one mode that *is* additive, which is
+exactly why it requires `expectedReleasedPaise`: after the first one lands, the current release no
+longer matches what was sent, so a retry is rejected with 409 rather than adding a second time. Never
+send `addAmount` without that guard.
 
 **2. The figures you were shown must still be true.** `expectedTodayPayInPaise` and
 `expectedReleasedPaise` are checked against the server before anything is written. This matters most
@@ -210,9 +239,14 @@ stops one admin silently overwriting another's decision.
 
 `400` with the real numbers when the request is above the cap, for example `Cannot release ₹3,000.00.
 The limit is 50% of this QR's pay-in for 2026-09-07 (₹4,000.00), which is ₹2,000.00.` Show it
-verbatim. Also `400` for a percent above `maxPercent` or outside 0 to 100, a negative amount, a reason
-under 4 characters, sending both or neither of `percent` and `amount`, omitting
-`expectedTodayPayInPaise` alongside a percent, or the feature being switched off entirely.
+verbatim. A refused top-up also tells the admin the headroom left, for example `Cannot add ₹300.00.
+That would take the release to ₹800.00, and the limit is … ₹500.00. ₹200.00 is still available to
+release.`
+
+Also `400` for a percent above `maxPercent` or outside 0 to 100, a negative amount, a top-up of zero
+or less, a reason under 4 characters, sending more or fewer than one of the three mode fields,
+omitting `expectedTodayPayInPaise` with a percent, omitting `expectedReleasedPaise` with a top-up, or
+the feature being switched off entirely.
 
 ### 6.3 Revoke — `DELETE /api/admin/qr-settlement/:qrId/release`
 Optional `?date=`. Identical to setting the amount to zero, and returns the same shape.
@@ -263,8 +297,13 @@ the new, larger ceiling.
 3. *QR detail* — a "Release funds early" action opening the dialog in §6.1 and §6.2, visible only for
    role `admin`, and only when `maxPercent > 0`. The dialog is a **slider from 0 to `maxPercent`**
    with the rupee value shown live, the resulting withdrawable figure previewed, a required reason,
-   and a confirm button. Send the percent together with the figures the dialog was built from, and be
-   ready to re-render in place on a `STALE_SETTLEMENT` reply.
+   and a confirm button. Offer two alternatives to the slider: a **"Total to release"** rupee field
+   (sends `amount`) and a **"Release additional"** rupee field (sends `addAmount`), the latter being
+   the natural one when the admin is topping up later in the day. Show the current release and the
+   remaining headroom above the inputs. Send the figures the dialog was built from, and be ready to
+   re-render in place on a `STALE_SETTLEMENT` reply.
+   Below the controls, list `release.history` as a simple timeline of the day's changes, each line
+   reading like "10:12 admin1 set ₹1,000" or "16:40 admin2 added ₹500 → ₹1,500", with the reason.
 4. *Released today* — the §6.4 list with the day's total, each row showing the QR, the amount, who
    released it and why, with a revoke action.
 

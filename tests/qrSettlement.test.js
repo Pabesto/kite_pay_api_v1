@@ -57,6 +57,7 @@ function makeDb(seed = {}) {
         getDocument: jest.fn(async (_d, c, id) => col(c).find((x) => x.$id === id) || Promise.reject(Object.assign(new Error('nf'), { code: 404 }))),
     };
 }
+const qrSettlementPick = (d) => require('../qrSettlement').pickRelease(d);
 const daily = (totals) => [{ $id: 'd1', date: require('moment-timezone')().tz('Asia/Kolkata').format('YYYY-MM-DD'), totalsJson: JSON.stringify(totals) }];
 const istToday = () => require('moment-timezone')().tz('Asia/Kolkata').format('YYYY-MM-DD');
 
@@ -283,6 +284,49 @@ describe('setting a release', () => {
         expect(db.store[RELEASES][0]).toMatchObject({ releasedPaise: 25000, percentAtSet: null });
         await expect(s.setRelease({ ID, qrId: 'qr1', releasedPaise: 30000, expectedReleasedPaise: 0, reason: 'stale', byUserId: 'admin1' }))
             .rejects.toMatchObject({ status: 409, code: 'STALE_SETTLEMENT' });
+    });
+
+    test('ADD: topping up through the day accumulates, and the cap applies to the running total', async () => {
+        const { db, s } = setup(100000);                     // cap = 50% of ₹1,000 = ₹500
+        const top = (addPaise, expectedReleasedPaise) => s.setRelease({ ID, qrId: 'qr1', addPaise, expectedReleasedPaise, reason: 'topping up', byUserId: 'admin1' });
+        expect((await top(20000, 0)).releasedPaise).toBe(20000);
+        expect((await top(20000, 20000)).releasedPaise).toBe(40000);
+        expect((await top(10000, 40000)).releasedPaise).toBe(50000);   // exactly at the cap
+        expect((await s.forQr('qr1', 500000)).withdrawablePaise).toBe(450000);
+        // the next top-up would cross the ceiling and is refused, with the headroom spelled out
+        const err = await top(1, 50000).catch((e) => e);
+        expect(err.status).toBe(400);
+        expect(err.message).toMatch(/would take the release to ₹500\.01/);
+        expect(err.message).toMatch(/₹0\.00 is still available to release/);
+        expect(db.store[RELEASES][0].releasedPaise).toBe(50000);       // unchanged
+    });
+
+    test('ADD is retry-safe: the same request twice adds once, the second is rejected as stale', async () => {
+        const { db, s } = setup(100000);
+        const req = { ID, qrId: 'qr1', addPaise: 20000, expectedReleasedPaise: 0, reason: 'network retry', byUserId: 'admin1' };
+        expect((await s.setRelease(req)).releasedPaise).toBe(20000);
+        await expect(s.setRelease(req)).rejects.toMatchObject({ status: 409, code: 'STALE_SETTLEMENT' });
+        expect(db.store[RELEASES][0].releasedPaise).toBe(20000);       // NOT 40000
+        await expect(s.setRelease({ ID, qrId: 'qr1', addPaise: 10000, reason: 'no guard sent', byUserId: 'admin1' }))
+            .rejects.toMatchObject({ status: 400, message: expect.stringMatching(/expectedReleasedPaise is required/) });
+        await expect(s.setRelease({ ID, qrId: 'qr1', addPaise: 0, expectedReleasedPaise: 20000, reason: 'zero top-up', byUserId: 'admin1' }))
+            .rejects.toMatchObject({ status: 400, message: expect.stringMatching(/greater than zero/) });
+    });
+
+    test('every change is kept as a trail on the row, newest first, and each mode is labelled', async () => {
+        const { db, s } = setup(100000);
+        await s.setRelease({ ID, qrId: 'qr1', releasedPaise: 10000, reason: 'first, exact', byUserId: 'admin1' });
+        await s.setRelease({ ID, qrId: 'qr1', addPaise: 15000, expectedReleasedPaise: 10000, reason: 'second, top-up', byUserId: 'admin2' });
+        await s.setRelease({ ID, qrId: 'qr1', percent: 50, expectedTodayPayInPaise: 100000, reason: 'third, slider', byUserId: 'admin1' });
+        const row = qrSettlementPick(db.store[RELEASES][0]);
+        expect(row.releasedPaise).toBe(50000);
+        expect(row.changeCount).toBe(3);
+        expect(row.history.map((h) => [h.mode, h.fromPaise, h.toPaise, h.by])).toEqual([
+            ['percent', 25000, 50000, 'admin1'],
+            ['add', 10000, 25000, 'admin2'],
+            ['set', 0, 10000, 'admin1'],
+        ]);
+        expect(row.history[0].at).toBeTruthy();
     });
 
     test('a QR with no pay-in today has a cap of zero, so nothing can be released', async () => {
