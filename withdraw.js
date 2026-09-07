@@ -30,6 +30,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       try { await redisClient.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [val] }); } catch (e) { console.error(`releaseLock failed for ${key} — lock will expire after TTL:`, e.message); }
   }
 
+  // Payout config keys are written by PATCH /api/payout/admin/settings as plain strings with no
+  // `type`, so ConfigManager hands them back as strings — 'false' is truthy. Always parse.
+  function cfgBool(key, def) {
+    const v = ConfigManager.get(key, def);
+    return v == null ? def : !['false', '0', 'no', ''].includes(String(v).toLowerCase());
+  }
+
   function generateWithdrawalId() {
     const prefix = 'wdh_';
     const timestamp = Date.now(); // milliseconds since epoch
@@ -360,8 +367,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const preAmountPaise = toPaise(preAmount);
           if (preAmountPaise == null) return res.status(400).json({ error: 'Invalid preAmount' });
 
-          const userCommissionRate = isWallet ? 0 : Number(usrDet.commission || 0);
-          const parentCommissionRate = (isWallet || !usrDet.parentId) ? 0 : Number((await getUserMeta(usrDet.parentId)).commission || 0);
+          // mode 'wallet': the payin commission is charged exactly like a direct withdrawal when
+          // `payout_wallet_charge_payin_commission` is on, so money leaving a QR always costs the
+          // payin rate once, wherever it goes. Reverting wallet money back to the QR refunds it
+          // (payout.js revert-to-qr), so a round trip is free. Default OFF — flipping the key is the
+          // only behaviour change, and it also changes what the client must send (commission ≠ 0).
+          const zeroWalletRates = isWallet && !cfgBool('payout_wallet_charge_payin_commission', false);
+          const userCommissionRate = zeroWalletRates ? 0 : Number(usrDet.commission || 0);
+          const parentCommissionRate = (zeroWalletRates || !usrDet.parentId) ? 0 : Number((await getUserMeta(usrDet.parentId)).commission || 0);
           let totalCommissionRate = userCommissionRate + parentCommissionRate;
 
           // Guard against misconfigured commission rates — prevent absurd deductions
@@ -1139,24 +1152,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', preAmountPaise).catch(console.error);
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
-        // Payout-wallet withdrawal: credit the wallet (idempotent on w.id) and stop — no commission
-        // was charged (rate forced to 0 at request time). Lock order: lock:qr → lock:payoutwallet.
-        // If the credit fails the withdrawal stays approved (QR already debited) and is flagged so
-        // admin can re-run it via POST /api/payout/admin/wallet/retry-credit.
-        if (isWalletWithdrawal) {
-          try {
-            const credit = await creditPayoutWallet(w);
-            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id,
-              { utrNumber: credit.txn?.id || 'PAYOUT_WALLET', walletCreditFailed: false }).catch(console.error);
-            if (!credit.skipped) await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPayoutWalletFunded', preAmountPaise).catch(console.error);
-            return res.json({ success: true, message: 'Withdrawal approved and credited to payout wallet' });
-          } catch (creditErr) {
-            console.error(`CRITICAL: payout wallet credit failed for withdrawal ${w.id} (user ${w.userId}). Use retry-credit.`, creditErr);
-            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id, { walletCreditFailed: true })
-              .catch(e => console.error(`CRITICAL: could not flag walletCreditFailed on ${w.id}`, e));
-            return res.status(500).json({ error: 'Withdrawal approved but payout wallet credit failed — retry via payout wallet retry-credit' });
-          }
-        }
+        // NOTE: the payout-wallet credit runs AFTER the commission block below, not here. The QR has
+        // already been debited principal + commission at this point, so the commission ledger must be
+        // written even if the wallet credit later fails (that failure is retryable; the QR debit is not).
 
         // After updating Withdrawal request doc and QR ledger:
         const user = await getUserMeta(w.userId);
@@ -1263,6 +1261,26 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             ).catch(e => console.error(`CRITICAL: Could not mark commissionRollupFailed on withdrawal ${w.id}`, e));
           }
 
+        }
+
+        // Payout-wallet withdrawal: credit the wallet (idempotent on w.id). Runs last, after the QR
+        // ledger, the withdrawal doc and the commission ledger are all committed.
+        // Lock order: lock:qr → lock:payoutwallet. If the credit fails the withdrawal stays approved
+        // (QR already debited, commission already earned) and is flagged, so admin can re-run it via
+        // POST /api/payout/admin/wallet/retry-credit.
+        if (isWalletWithdrawal) {
+          try {
+            const credit = await creditPayoutWallet(w);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id,
+              { utrNumber: credit.txn?.id || 'PAYOUT_WALLET', walletCreditFailed: false }).catch(console.error);
+            if (!credit.skipped) await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalPayoutWalletFunded', preAmountPaise).catch(console.error);
+            return res.json({ success: true, message: 'Withdrawal approved and credited to payout wallet' });
+          } catch (creditErr) {
+            console.error(`CRITICAL: payout wallet credit failed for withdrawal ${w.id} (user ${w.userId}). Use retry-credit.`, creditErr);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id, { walletCreditFailed: true })
+              .catch(e => console.error(`CRITICAL: could not flag walletCreditFailed on ${w.id}`, e));
+            return res.status(500).json({ error: 'Withdrawal approved but payout wallet credit failed — retry via payout wallet retry-credit' });
+          }
         }
 
         return res.json({ success: true, message: 'Withdrawal approved' });

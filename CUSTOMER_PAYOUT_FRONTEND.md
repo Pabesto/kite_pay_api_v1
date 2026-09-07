@@ -26,9 +26,11 @@ Today a user withdraws QR balance with a **withdrawal request** that admin pays 
 ```
 
 1. **Withdrawal request now has two destinations.** `mode: 'upi' | 'bank'` = **Direct** (unchanged).
-   `mode: 'wallet'` = **Payout Wallet**: admin approves, the QR balance moves into the user's
-   payout wallet, **no commission is cut**, no bank details are needed, **no time-window restriction
-   and no max-pending cap** (wallet requests also never count toward the direct cap).
+   `mode: 'wallet'` = **Payout Wallet**: admin approves and the QR balance moves into the user's
+   payout wallet. No bank details are needed, and there is **no time-window restriction and no
+   max-pending cap** (wallet requests also never count toward the direct cap). Whether this transfer
+   costs the **payin commission** is a server switch, off by default. See the warning in §3.1, it
+   changes what the app must send.
 2. **Payout Wallet** — one per user. `balance` = money in the wallet, `hold` = money reserved by
    pending customer payout requests, `available = balance − hold`.
 3. **Customer Payout** — from the wallet, the user asks admin to pay one of *their customers*
@@ -114,21 +116,48 @@ A rejected request carries `rejectionReason`; `cancelled` means the user withdre
 ### 3.1 `POST /api/user/withdraw_new` — user, unchanged except `mode: 'wallet'`
 Add a destination selector **Direct / Payout Wallet** to the existing withdrawal form.
 
-For **Payout Wallet** send:
+> ### ⚠️ BREAKING: read this before touching the wallet transfer
+> Whether a transfer into the payout wallet costs the **payin commission** is controlled by a server
+> switch. **You must read it from `GET /api/payout/status` (`walletTransferChargesPayinCommission`)
+> and send the matching numbers.** Hardcoding `commission: 0`, which is what the app does today, will
+> start failing with `400 Commission mismatch…` the moment the switch is turned on.
+
+**When `walletTransferChargesPayinCommission` is `false`** (the default, and how it behaves today) the
+transfer is free:
 ```jsonc
-{
-  "userId": "u1",
-  "qrId": "QR123",
-  "mode": "wallet",
+{ "userId": "u1", "qrId": "QR123", "mode": "wallet",
   "preAmount": 5000,       // rupees
-  "amount": 5000,          // MUST equal preAmount (no commission)
-  "commission": 0          // MUST be 0
-}
+  "amount": 5000,          // MUST equal preAmount
+  "commission": 0 }        // MUST be 0
 ```
-No `holderName`, `upiId`, bank fields needed (they are ignored / defaulted). Wallet requests are
-**not** subject to withdrawal time windows or the max-pending-requests cap (so skip the
-`/withdrawal_time_check` gate for this mode). The QR balance check and the 400-on-mismatch rules
-still apply. Response: `{ success: true, data: <withdrawal doc> }` with `mode: "wallet"`.
+
+**When it is `true`** the transfer is charged exactly like a direct withdrawal, at the user's normal
+payin rate, and you must send the real figures:
+```jsonc
+{ "userId": "u1", "qrId": "QR123", "mode": "wallet",
+  "preAmount": 5000,       // rupees the user receives in the wallet
+  "commission": 110,       // rupees, from /withdraw_commission_preview
+  "amount": 5110 }         // preAmount + commission, deducted from the QR
+```
+Get the commission from the existing `POST /api/user/withdraw_commission_preview` (same endpoint the
+Direct mode already uses, same request body). Never compute it on the device. The server recomputes
+and rejects any mismatch with `400`, so a stale or guessed number fails the request.
+
+| Field | Free mode | Charged mode |
+|---|---|---|
+| `preAmount` | what lands in the wallet | what lands in the wallet |
+| `commission` | `0` | payin commission from the preview |
+| `amount` | `= preAmount` | `= preAmount + commission` |
+| Debited from the QR | `preAmount` | `preAmount + commission` |
+| Credited to the wallet | `preAmount` | `preAmount` |
+
+**The commission is refundable.** If admin later moves that money back to the QR, the proportional
+commission goes back with it (§6.4), so a round trip costs the user nothing. Say so in the UI, for
+example "Commission is refunded if this money is returned to your QR."
+
+No `holderName`, `upiId` or bank fields are needed in either mode. Wallet requests are **not** subject
+to withdrawal time windows or the max-pending-requests cap, so skip the `/withdrawal_time_check` gate
+for this mode. Response: `{ success: true, data: <withdrawal doc> }` with `mode: "wallet"`.
 
 Skip the `/withdraw_commission_preview` call for wallet mode — commission is always 0.
 
@@ -209,12 +238,16 @@ Call it when the payout screens open and on app resume; admins change these with
     "usedTodayPaise": 120000, "requestedTodayCount": 3, "pendingCount": 1 },
   "preferences": { "realtime": true },     // this user's own opt-in to live socket updates (§9)
   "realtimeEnabled": true,                 // platform switch for live updates
-  "requireVerifiedAccount": false          // when true, only accounts with verificationStatus "verified" can receive payouts (§5.6)
+  "requireVerifiedAccount": false,         // when true, only accounts with verificationStatus "verified" can receive payouts (§5.6)
+  "walletTransferChargesPayinCommission": false   // ⚠️ drives the wallet-transfer form, see §3.1
 }
 ```
 UI rules:
 - `enabled == false` → disable "New payout", show `message` in a banner above the requests list.
   `POST /requests` while disabled returns `403 { error: <same message> }` — treat as a refresh trigger.
+- **`walletTransferChargesPayinCommission`** — read it before building the wallet-transfer form on the
+  withdrawal screen. `true` means that form must show and send the payin commission (§3.1). Re-read on
+  app resume; admin can flip it at any moment.
 - **Modes** — render the NEFT / IMPS / RTGS / UPI selector from `modes`: a `false` mode stays visible
   but disabled with a "Not available right now" hint, and can never be pre-selected (if the account's
   last-used mode is off, fall back to the first enabled one). Sending a disabled mode returns
@@ -619,8 +652,26 @@ the QR it was withdrawn from, so the user can request a normal (direct) withdraw
 { "success": true, "duplicate": false, "withdrawalId": "wdh_…", "qrId": "QR123", "userId": "u1",
   "amountPaise": 25050, "remainingPaise": 24950,     // still revertable from this withdrawal
   "qrAvailablePaise": 188500,                        // the QR's available balance after the credit-back
+  "commissionRefundPaise": 551,                      // payin commission handed back with this revert
+  "commissionRefundRs": 5.51,
+  "commissionRefundFailed": false,                   // true = money moved, ledger reversal did not (see below)
   "wallet": { …walletView… }, "transaction": { …type "revert_to_qr"… } }
 ```
+
+**The payin commission comes back with the principal.** If the transfer that funded this money was
+charged the payin commission (§3.1), reverting it refunds the proportional share, so the QR's
+available balance rises by `amountPaise + commissionRefundPaise`. A full revert always refunds the
+exact remainder, so a QR to wallet and back round trip costs the user nothing, and the money is
+charged the payin rate once, on whichever route it finally leaves by. When the transfer was free, the
+refund is simply `0`.
+
+Show the refund in the confirmation and in the success toast, for example "₹250.50 returned to QR123,
+plus ₹5.51 commission refunded." The user sees only the principal leave their wallet; the commission
+goes straight back to the QR, which is where it was taken from.
+
+`commissionRefundFailed: true` is rare and means the money moved correctly but the commission ledger
+reversal did not. The revert still stands and the user is whole. Surface it to admin as a warning, and
+the integrity report will list it under `COMMISSION_REFUND_FAILED` until it is reconciled.
 Rules the UI must respect:
 - Pick the withdrawal from the user's wallet-mode withdrawals (`mode: "wallet"`, `status: "approved"`);
   each row now carries `walletRevertedPaise` — show "revertable = preAmount − reverted".
@@ -684,6 +735,7 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 { "success": true,
   "customerPayouts": { "enabled": true, "message": "Customer payouts are temporarily disabled…" },
   "modes": { "NEFT": true, "IMPS": true, "RTGS": false, "UPI": true },   // per-mode availability
+  "walletTransferChargesPayinCommission": false,   // see §3.1 and §12
   "realtimeEnabled": true,
   "requireVerifiedAccount": false,
   "alerts": { "enabled": false, "lowBalanceThresholdPaise": 0, "pendingAlertMinutes": 0 },
@@ -693,6 +745,7 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 ```jsonc
 { "enabled": false, "message": "Bank maintenance till 6 PM",   // pause everyone (message ≤200 shown to users)
   "modes": { "RTGS": false },                                   // partial: only the modes you send change; keys NEFT/IMPS/RTGS/UPI, boolean
+  "walletTransferChargesPayinCommission": true,                 // ⚠️ changes what the app must send on a wallet transfer (§3.1, §12)
   "realtimeEnabled": true,                                      // live socket updates on/off for the whole platform
   "requireVerifiedAccount": false,                              // only verified beneficiaries may be paid
   "alertsEnabled": true, "lowBalanceThreshold": 500, "pendingAlertMinutes": 60,   // §6.8; 0 = that alert off
@@ -776,7 +829,10 @@ Issue codes (severity in brackets): `BALANCE_MISMATCH` (E) wallet balance ≠ Σ
 `LEDGER_BAD_DIRECTION` / `LEDGER_BAD_AMOUNT` (E) · `WITHDRAWAL_NOT_CREDITED` (E, or W if already
 flagged for retry) · `WITHDRAWAL_CREDIT_AMOUNT` (E) · `ORPHAN_CREDIT` / `ORPHAN_DEBIT` (E) ·
 `PAID_NOT_DEBITED` / `PAID_AMOUNT_MISMATCH` / `DEBIT_ON_UNPAID` (E) · `REVERT_EXCEEDS_CREDIT` (E) ·
-`REVERT_TRACKING` (W) · `LIFETIME_MISMATCH` (W) wallet lifetime totals ≠ ledger ·
+`REVERT_TRACKING` (W) · `COMMISSION_REFUND_EXCEEDS_CHARGE` (E) more payin commission refunded than
+the transfer charged · `COMMISSION_REFUND_INCOMPLETE` (E) a fully reverted transfer whose commission
+was not fully returned · `COMMISSION_REFUND_FAILED` (E) the QR was credited but the commission ledger
+reversal failed · `LIFETIME_MISMATCH` (W) wallet lifetime totals ≠ ledger ·
 `COMMISSION_MISMATCH` (W) commission rows ≠ request commission · `ACCOUNT_STATS_MISMATCH` (W, fix
 with recompute-stats). Each issue carries the numbers it compared (`walletPaise`, `ledgerPaise`,
 `driftPaise`, `rowId`, `payoutId`, `withdrawalId`, `accountId`, …) so the screen can show them.
@@ -900,3 +956,60 @@ correct client — but do not reuse a cached id from another session.
 Every numeric limit in this feature — platform `maxPerRequest`, `dailyLimit`, `maxPending`, the
 per-user overrides, the alert thresholds — uses **`0` = off / no limit**. Per-user values additionally
 accept **`null` = inherit the platform value**. Never display `0` as "₹0 limit"; display "No limit".
+
+---
+
+## 12. Payin commission on payout-wallet money (the full economics)
+
+This section exists so nobody has to reverse-engineer the money math from the endpoints. It is the
+single source of truth for what a rupee costs.
+
+**Two separate rates.** Each user has a **payin rate** (`commission`, charged when money leaves a QR)
+and a **payout rate** (`payoutCommission`, charged when a customer payout is marked paid). They are
+independent, set separately in Edit User, and reported in separate ledgers.
+
+**The rule.** A rupee leaving a QR pays the payin rate **exactly once**, no matter how it leaves, and
+pays the payout rate **only if** the platform sends it to a customer.
+
+With `walletTransferChargesPayinCommission` on, and a user at 2.2% payin and 1.5% payout:
+
+| Movement | Payin cut | Payout cut | Net effect |
+|---|---|---|---|
+| QR to direct withdrawal | 2.2% | none | user is paid, platform earns 2.2% |
+| QR to payout wallet | 2.2% | none | wallet holds the principal, QR paid the cut |
+| Wallet to customer payout | none, already paid | 1.5% | customer is paid, platform earned 3.7% in total |
+| Wallet back to the QR | **refunded** | none | round trip costs nothing |
+| QR to direct withdrawal, after a revert | 2.2% | none | still exactly one payin cut overall |
+
+So paying a customer through the platform costs the user 3.7%, and doing it themselves after a direct
+withdrawal costs 2.2%. The extra 1.5% is the fee for the platform actually sending the money.
+
+**Why the refund matters.** Without it, money that went to the wallet and came back would be charged
+the payin rate twice, once on the transfer and once on the eventual withdrawal. The refund is what
+makes the two routes equivalent and lets admin move money back and forth freely.
+
+**How the refund is calculated.** Partial reverts refund the proportional share, rounded down so they
+can never over-refund. The revert that empties a transfer refunds the exact remainder, so all the
+refunds for one transfer always add up to precisely what was charged, never a paise more or less. If
+part of the wallet was already paid to a customer, only the share that comes back is refunded, because
+the part that left the platform legitimately consumed its cut.
+
+**Where it is recorded.** The payin cut and its refund both live in the **withdrawal** commission
+ledger under the transfer's withdrawal id, the refund as a negative row. A fully reverted transfer
+therefore nets to zero there while keeping both entries visible for audit. The payout cut lives in the
+**payout** commission ledger. Neither ledger is ever written by the other side's flow.
+
+**Reporting note.** The reversal is posted back to the **day and month the commission was originally
+earned**, not the day of the revert. A commission earned in September and refunded in October reduces
+September's figures. If you have already published or settled on a closed period's number, expect it
+to move when a revert lands.
+
+**Two gaps that are accepted by design.** Money an admin credits into a wallet by hand never came from
+a QR, so it pays no payin cut on the way out. Money an admin debits by hand leaves without any cut at
+all. Both are deliberate admin actions on reconciliation paths.
+
+**Turning it on.** The switch is off by default, so nothing changes until an admin flips it. Before
+flipping it, ship an app build that reads `walletTransferChargesPayinCommission` from the status
+endpoint and sends the commission on wallet transfers (§3.1). Flipping it back is instant and safe,
+and transfers made while it was on keep their commission and their refund behaviour, because the
+refund is computed from what each transfer actually recorded, not from the current setting.

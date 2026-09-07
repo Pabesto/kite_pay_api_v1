@@ -113,6 +113,7 @@ const COLS = {
     USERS: 'users_meta', WD: 'withdrawals', WALLETS: 'wallets', TXNS: 'wallet_txns',
     ACCOUNTS: 'accounts', PAYOUTS: 'payouts', COMM: 'payout_comm', DAILY: 'daily_payout_comm',
     MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm', QRS: 'qr_col', SOURCES: 'source_accounts',
+    WD_COMM: 'commission_txs', WD_DAILY: 'daily_commission', WD_MONTHLY: 'monthly_commission', WD_ALLTIME: 'all_time_commission',
 };
 
 // `label` = the authenticateAdminOrLabel factory; defaults to injecting admin1.
@@ -122,7 +123,7 @@ function buildPayout(db, redis, auth = asUser('user1'), label = adminOrLabel) {
         const factory = require('../payout.js');
         mod = factory(db, { unique: () => 'uid' }, Query, 'db1',
             COLS.USERS, COLS.WD, COLS.WALLETS, COLS.TXNS, COLS.ACCOUNTS, COLS.PAYOUTS, COLS.COMM, COLS.DAILY,
-            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS, mockEmit, COLS.SOURCES);
+            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS, mockEmit, COLS.SOURCES, COLS.WD_COMM, COLS.WD_DAILY, COLS.WD_MONTHLY, COLS.WD_ALLTIME);
     });
     const app = express();
     app.use(express.json());
@@ -1346,6 +1347,277 @@ describe('ledger integrity check (read-only report)', () => {
         expect(res.body.summary).toEqual({ wallets: 2, withErrors: 1, withWarnings: 0 });
         const emp = asUser('emp1', 'employee');
         expect((await request(buildPayout(db, makeRedis(), emp, () => emp).app).get('/admin/integrity/wallets')).status).toBe(403);
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Payin commission on payout-wallet transfers, and its refund on revert-to-QR.
+// The property under test: a rupee leaving a QR pays the payin rate EXACTLY ONCE,
+// no matter how many times it bounces between the QR and the payout wallet.
+// ═══════════════════════════════════════════════════════════════════════════
+describe('payin commission on wallet transfers + refund on revert', () => {
+    const QR_TOTAL = 500000;           // ₹5,000 in the QR
+    const TRANSFER_RS = 1000;          // ₹1,000 moved to the wallet
+    const TRANSFER_PAISE = 100000;
+    const RATE = 2.2;                  // → 2200 paise commission on ₹1,000
+    const COMMISSION_PAISE = 2200;
+
+    // Both routers share ONE store, so the full QR → wallet → QR → withdrawal path is exercised.
+    function buildBoth(over = {}) {
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user', parentId: null, commission: RATE }],
+            [COLS.QRS]: [{ $id: 'q1', qrId: 'qr1', totalPayInAmount: QR_TOTAL, withdrawalApprovedAmount: 0, withdrawalRequestedAmount: 0, amountOnHold: 0, commissionOnHold: 0, commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL }],
+            ...over,
+        });
+        userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, commission: RATE, payoutCommission: 0 } : id === 'admin1' ? { userId: 'admin1', role: 'admin' } : null));
+        let wdRouter;
+        const asAdmin = asUser('admin1', 'admin');
+        jest.isolateModules(() => {
+            // NOTE: withdrawal collection name matches COLS.WD so payout.js reads the same rows
+            wdRouter = require('../withdraw.js')(db, {}, {}, { unique: () => 'wid' }, Query, 'db1', COLS.USERS, COLS.QRS, COLS.WD, 'bucket1',
+                'daily_qr', COLS.WD_COMM, COLS.WD_DAILY, COLS.WD_ALLTIME, COLS.WD_MONTHLY, 'config_col',
+                jest.fn().mockResolvedValue(), jest.fn(), asAdmin, () => asAdmin, asAdmin, asAdmin, asAdmin, {}, asAdmin, () => asAdmin,
+                makeRedis(), (w) => payout.mod.creditWalletFromWithdrawal(w));
+        });
+        const wdApp = express(); wdApp.use(express.json()); wdApp.use('/', wdRouter);
+        const payout = buildPayout(db, makeRedis(), asAdmin);
+        return { db, wdApp, payoutApp: payout.app };
+    }
+    const qr = (db) => db.store[COLS.QRS][0];
+    const commissionNet = (db) => (db.store[COLS.WD_COMM] || []).reduce((s, c) => s + Number(c.amount || 0), 0);
+
+    beforeEach(() => { mockConfig.payout_wallet_charge_payin_commission = 'true'; });
+    afterEach(() => { clearCfg('payout_wallet_charge_payin_commission'); });
+
+    async function transferToWallet({ wdApp }, rs = TRANSFER_RS, commissionRs = COMMISSION_PAISE / 100) {
+        const create = await request(wdApp).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'wallet', preAmount: rs, amount: rs + commissionRs, commission: commissionRs });
+        if (create.status !== 200) return create;
+        return request(wdApp).post('/withdrawals/approve_new').send({ id: create.body.data.id });
+    }
+
+    test('switch ON: QR pays principal + commission, wallet receives principal only, ledger records the earn', async () => {
+        const ctx = buildBoth();
+        const res = await transferToWallet(ctx);
+        expect(res.status).toBe(200);
+        expect(res.body.message).toMatch(/credited to payout wallet/);
+        expect(qr(ctx.db)).toMatchObject({
+            withdrawalApprovedAmount: TRANSFER_PAISE, withdrawalRequestedAmount: 0,
+            commissionOnHold: 0, commissionPaid: COMMISSION_PAISE,
+            amountAvailableForWithdrawal: QR_TOTAL - TRANSFER_PAISE - COMMISSION_PAISE,
+        });
+        expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(TRANSFER_PAISE); // principal only
+        expect(ctx.db.store[COLS.WD_COMM].map((c) => [c.userId, c.amount, c.earningType])).toEqual([['admin1', COMMISSION_PAISE, 'admin']]);
+    });
+
+    test('switch OFF: transfer stays free and a later revert refunds nothing', async () => {
+        mockConfig.payout_wallet_charge_payin_commission = 'false';
+        const ctx = buildBoth();
+        const res = await transferToWallet(ctx, TRANSFER_RS, 0);
+        expect(res.status).toBe(200);
+        expect(qr(ctx.db)).toMatchObject({ commissionPaid: 0, withdrawalApprovedAmount: TRANSFER_PAISE });
+        expect(ctx.db.store[COLS.WD_COMM] || []).toHaveLength(0);
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, notes: 'take it back' });
+        expect(rv.status).toBe(200);
+        expect(rv.body.commissionRefundPaise).toBe(0);
+        expect(ctx.db.store[COLS.WD][0].walletRevertedCommissionPaise).toBe(0);
+        expect(ctx.db.store[COLS.WD_COMM] || []).toHaveLength(0);
+    });
+
+    test('MONEY CONSERVATION: QR → wallet → QR → direct withdrawal charges the payin rate exactly once', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE);
+
+        // full revert: principal AND commission come back to the QR
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, notes: 'not doing payouts for this user' });
+        expect(rv.status).toBe(200);
+        expect(rv.body).toMatchObject({ commissionRefundPaise: COMMISSION_PAISE, commissionRefundFailed: false, amountPaise: TRANSFER_PAISE });
+        expect(qr(ctx.db)).toMatchObject({ withdrawalApprovedAmount: 0, commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL });
+        expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(0);
+        expect(ctx.db.store[COLS.WD][0]).toMatchObject({ walletRevertedPaise: TRANSFER_PAISE, walletRevertedCommissionPaise: COMMISSION_PAISE });
+        expect(commissionNet(ctx.db)).toBe(0);                       // ledger nets to zero
+        expect(ctx.db.store[COLS.WD_COMM].map((c) => c.amount)).toEqual([COMMISSION_PAISE, -COMMISSION_PAISE]);
+
+        // now the same money leaves directly: charged the payin rate, once
+        const direct = await request(ctx.wdApp).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: TRANSFER_RS, amount: TRANSFER_RS + COMMISSION_PAISE / 100, commission: COMMISSION_PAISE / 100 });
+        expect(direct.status).toBe(200);
+        await request(ctx.wdApp).post('/withdrawals/approve_new').send({ id: direct.body.data.id, utrNumber: 'UTR12345' });
+        expect(qr(ctx.db)).toMatchObject({ withdrawalApprovedAmount: TRANSFER_PAISE, commissionPaid: COMMISSION_PAISE });
+        expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE);        // exactly one payin cut, total
+    });
+
+    test('repeated back-and-forth never drifts: three round trips leave the QR and ledger exactly as they started', async () => {
+        const ctx = buildBoth();
+        for (let i = 0; i < 3; i++) {
+            const res = await transferToWallet(ctx);
+            expect(res.status).toBe(200);
+            expect(qr(ctx.db).commissionPaid).toBe(COMMISSION_PAISE);
+            const wd = ctx.db.store[COLS.WD][i];
+            const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: wd.id, notes: `round trip ${i + 1}` });
+            expect(rv.status).toBe(200);
+            expect(rv.body.commissionRefundPaise).toBe(COMMISSION_PAISE);
+            expect(qr(ctx.db)).toMatchObject({ withdrawalApprovedAmount: 0, commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL });
+            expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(0);
+        }
+        expect(commissionNet(ctx.db)).toBe(0);
+        expect(ctx.db.store[COLS.WD_COMM]).toHaveLength(6);          // 3 charges + 3 reversals
+    });
+
+    test('partial reverts: proportional, never over-refund, final revert settles the exact remainder', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        const id = ctx.db.store[COLS.WD][0].id;
+        const revert = (rs) => request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: id, amount: rs, notes: 'partial' });
+
+        const a = await revert(300);   // 30% of 100000 → floor(2200 * 30000/100000) = 660
+        expect(a.body.commissionRefundPaise).toBe(660);
+        const b = await revert(333.33); // floor(2200 * 33333/100000) = 733
+        expect(b.body.commissionRefundPaise).toBe(733);
+        expect(ctx.db.store[COLS.WD][0].walletRevertedCommissionPaise).toBe(1393);
+
+        const c = await revert(366.67); // final: exact remainder 2200 − 1393 = 807
+        expect(c.body).toMatchObject({ commissionRefundPaise: 807, remainingPaise: 0 });
+        expect(ctx.db.store[COLS.WD][0].walletRevertedCommissionPaise).toBe(COMMISSION_PAISE);
+        expect(qr(ctx.db)).toMatchObject({ commissionPaid: 0, withdrawalApprovedAmount: 0, amountAvailableForWithdrawal: QR_TOTAL });
+        expect(commissionNet(ctx.db)).toBe(0);
+        expect((await revert(1)).status).toBe(409);                  // nothing left
+    });
+
+    test('a payout consumed part of the wallet: only the reverted share of commission comes back', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        // pay ₹400 to a customer (payout rate 0 here), leaving ₹600 of principal in the wallet
+        userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, commission: RATE, payoutCommission: 0 } : { userId: 'admin1', role: 'admin' }));
+        const { app: userApp } = buildPayout(ctx.db, makeRedis(), asUser('user1'));
+        const req1 = await userApp && await request(userApp).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 400 });
+        expect(req1.status).toBe(201);
+        expect((await request(ctx.payoutApp).post(`/admin/requests/${req1.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(60000);
+
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, amount: 600, notes: 'return the rest' });
+        expect(rv.status).toBe(200);
+        expect(rv.body.commissionRefundPaise).toBe(1320);            // floor(2200 * 60000/100000)
+        expect(qr(ctx.db).commissionPaid).toBe(COMMISSION_PAISE - 1320); // the ₹400 that left keeps its cut
+        expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE - 1320);
+    });
+
+    test('rollups reverse against the ORIGINAL day and month, never today', async () => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] }).setSystemTime(new Date('2026-09-02T06:00:00.000Z'));
+        try {
+            const ctx = buildBoth();
+            await transferToWallet(ctx);
+            const day = ctx.db.store[COLS.WD_DAILY][0];
+            expect(day.date).toBe('2026-09-02');
+            expect(JSON.parse(day.commissionsJson)).toEqual({ admin1: COMMISSION_PAISE });
+            expect(ctx.db.store[COLS.WD_MONTHLY][0]).toMatchObject({ month: '2026-09', totalCommissionPaise: COMMISSION_PAISE });
+
+            jest.setSystemTime(new Date('2026-10-05T06:00:00.000Z')); // revert a month later
+            const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, notes: 'later revert' });
+            expect(rv.status).toBe(200);
+            expect(ctx.db.store[COLS.WD_DAILY]).toHaveLength(1);      // no bucket created for October
+            expect(JSON.parse(ctx.db.store[COLS.WD_DAILY][0].commissionsJson)).toEqual({ admin1: 0 });
+            expect(ctx.db.store[COLS.WD_MONTHLY]).toHaveLength(1);
+            expect(ctx.db.store[COLS.WD_MONTHLY][0]).toMatchObject({ month: '2026-09', totalCommissionPaise: 0 });
+            expect(ctx.db.store[COLS.WD_ALLTIME][0].totalCommissionPaise).toBe(0);
+        } finally { jest.useRealTimers(); }
+    });
+
+    test('a failing ledger reversal flags the withdrawal but never fails the revert or strands the QR', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        const origCreate = ctx.db.createDocument.getMockImplementation();
+        ctx.db.createDocument.mockImplementation(async (d, c, id, data) => { if (c === COLS.WD_COMM) throw new Error('ledger down'); return origCreate(d, c, id, data); });
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, notes: 'ledger will fail' });
+        expect(rv.status).toBe(200);                                  // money moved, so the revert stands
+        expect(rv.body).toMatchObject({ commissionRefundPaise: COMMISSION_PAISE, commissionRefundFailed: true });
+        expect(qr(ctx.db)).toMatchObject({ commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL });
+        expect(ctx.db.store[COLS.WD][0].commissionRefundFailed).toBe(true);
+        // and the integrity report surfaces it
+        const rep = (await request(ctx.payoutApp).get('/admin/integrity/wallet/user1')).body.report;
+        expect(rep.issues.map((i) => i.code)).toContain('COMMISSION_REFUND_FAILED');
+    });
+
+    test('integrity flags an over-refund and a fully reverted withdrawal whose commission was not returned', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        const wd = ctx.db.store[COLS.WD][0];
+        wd.walletRevertedPaise = TRANSFER_PAISE;
+        wd.walletRevertedCommissionPaise = COMMISSION_PAISE + 500;    // impossible: more than was charged
+        ctx.db.store[COLS.TXNS].push({ $id: 'rv', id: 'pwt_r', userId: 'user1', type: 'revert_to_qr', direction: 'debit', amountPaise: TRANSFER_PAISE, totalPaise: TRANSFER_PAISE, referenceNumber: wd.id, createdAt: ISO() });
+        const codes = (await request(ctx.payoutApp).get('/admin/integrity/wallet/user1')).body.report.issues.map((i) => i.code);
+        expect(codes).toContain('COMMISSION_REFUND_EXCEEDS_CHARGE');
+        wd.walletRevertedCommissionPaise = 0;                         // fully reverted, nothing given back
+        const codes2 = (await request(ctx.payoutApp).get('/admin/integrity/wallet/user1')).body.report.issues.map((i) => i.code);
+        expect(codes2).toContain('COMMISSION_REFUND_INCOMPLETE');
+    });
+
+    test('user under a subadmin: both earners are charged and both are reversed exactly', async () => {
+        // user rate 2.2 → subadmin earns; parent rate 1.0 → admin earns; QR pays 3.2% total
+        const db = makeDb({
+            [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'sub1', userId: 'sub1', role: 'subadmin', commission: 1.0 }],
+            [COLS.QRS]: [{ $id: 'q1', qrId: 'qr1', totalPayInAmount: QR_TOTAL, withdrawalApprovedAmount: 0, withdrawalRequestedAmount: 0, amountOnHold: 0, commissionOnHold: 0, commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL }],
+        });
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { userId: 'user1', role: 'user', parentId: 'sub1', commission: RATE, payoutCommission: 0 },
+            sub1: { userId: 'sub1', role: 'subadmin', parentId: null, commission: 1.0, payoutCommission: 0 },
+            admin1: { userId: 'admin1', role: 'admin' },
+        })[id] || null);
+        let wdRouter;
+        const adm = asUser('admin1', 'admin');
+        const payout = buildPayout(db, makeRedis(), adm);
+        jest.isolateModules(() => {
+            wdRouter = require('../withdraw.js')(db, {}, {}, { unique: () => 'wid' }, Query, 'db1', COLS.USERS, COLS.QRS, COLS.WD, 'b',
+                'daily_qr', COLS.WD_COMM, COLS.WD_DAILY, COLS.WD_ALLTIME, COLS.WD_MONTHLY, 'config_col',
+                jest.fn().mockResolvedValue(), jest.fn(), adm, () => adm, adm, adm, adm, {}, adm, () => adm,
+                makeRedis(), (w) => payout.mod.creditWalletFromWithdrawal(w));
+        });
+        const wdApp = express(); wdApp.use(express.json()); wdApp.use('/', wdRouter);
+
+        const create = await request(wdApp).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'wallet', preAmount: 1000, amount: 1032, commission: 32 });
+        expect(create.status).toBe(200);
+        expect((await request(wdApp).post('/withdrawals/approve_new').send({ id: create.body.data.id })).status).toBe(200);
+        expect(db.store[COLS.QRS][0].commissionPaid).toBe(3200);
+        expect(db.store[COLS.WD_COMM].map((c) => [c.userId, c.amount])).toEqual([['sub1', 2200], ['admin1', 1000]]);
+
+        const rv = await request(payout.app).post('/admin/wallet/revert-to-qr').send({ withdrawalId: db.store[COLS.WD][0].id, notes: 'return everything' });
+        expect(rv.status).toBe(200);
+        expect(rv.body.commissionRefundPaise).toBe(3200);
+        expect(db.store[COLS.QRS][0]).toMatchObject({ commissionPaid: 0, withdrawalApprovedAmount: 0, amountAvailableForWithdrawal: QR_TOTAL });
+        // each earner reversed exactly what they held, and the ledger nets to zero
+        const per = {};
+        for (const c of db.store[COLS.WD_COMM]) per[c.userId] = (per[c.userId] || 0) + c.amount;
+        expect(per).toEqual({ sub1: 0, admin1: 0 });
+        expect(db.store[COLS.WD_COMM].map((c) => c.amount)).toEqual([2200, 1000, -2200, -1000]);
+    });
+
+    test('a reversal never creates a negative rollup row when the original rollup is missing', async () => {
+        const ctx = buildBoth();
+        await transferToWallet(ctx);
+        // simulate the original rollups never having landed (the known non-fatal failure mode)
+        ctx.db.store[COLS.WD_MONTHLY] = [];
+        ctx.db.store[COLS.WD_ALLTIME] = [];
+        ctx.db.store[COLS.WD_DAILY] = [];
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, notes: 'missing rollups' });
+        expect(rv.status).toBe(200);
+        expect(rv.body.commissionRefundFailed).toBe(false);
+        expect(ctx.db.store[COLS.WD_MONTHLY]).toHaveLength(0);        // no negative row invented
+        expect(ctx.db.store[COLS.WD_ALLTIME]).toHaveLength(0);
+        const daily = ctx.db.store[COLS.WD_DAILY];
+        if (daily.length) expect(JSON.parse(daily[0].commissionsJson).admin1).toBe(0); // clamped, never negative
+        expect(qr(ctx.db)).toMatchObject({ commissionPaid: 0, amountAvailableForWithdrawal: QR_TOTAL });
+    });
+
+    test('the switch is visible to the app on status and settings, and only admin may flip it', async () => {
+        const ctx = buildBoth();
+        const { app: userApp } = buildPayout(ctx.db, makeRedis(), asUser('user1'));
+        expect((await request(userApp).get('/status')).body.walletTransferChargesPayinCommission).toBe(true);
+        expect((await request(ctx.payoutApp).get('/admin/settings')).body.walletTransferChargesPayinCommission).toBe(true);
+        const ConfigManager = require('../configManager');
+        ConfigManager.set.mockClear();
+        expect((await request(ctx.payoutApp).patch('/admin/settings').send({ walletTransferChargesPayinCommission: false })).status).toBe(200);
+        expect(ConfigManager.set).toHaveBeenCalledWith('payout_wallet_charge_payin_commission', 'false');
+        const emp = asUser('emp1', 'employee');
+        expect((await request(buildPayout(ctx.db, makeRedis(), emp, () => emp).app).patch('/admin/settings').send({ walletTransferChargesPayinCommission: true })).status).toBe(403);
     });
 });
 

@@ -52,6 +52,10 @@ module.exports = (
   QRCODES, // appended: QR collection — lets the admin queue filter by qrId (→ the QR's assigned user)
   emitPayoutEvent, // appended: socketServer helper ({ userId, event, payload, toAdmins }) — optional
   SOURCE_ACCOUNTS, // appended: payout_source_accounts — "paid via" quick-pick list
+  // appended: the WITHDRAWAL commission collections (not the payout ones above). Written to only by
+  // revert-to-QR, to refund the payin commission a wallet transfer charged. Reversal rows are posted
+  // under withdraw.js's own lock keys so the two can never race.
+  WD_COMMISSION_TXNS, WD_DAILY_COMMISSION, WD_MONTHLY_COMMISSION, WD_ALLTIME_COMMISSION,
 ) => {
   const router = express.Router();
 
@@ -287,6 +291,9 @@ module.exports = (
       modes: modesView(),
       realtimeEnabled: parseBool(ConfigManager.get('payout_realtime_enabled', true), true),
       requireVerifiedAccount: parseBool(ConfigManager.get('payout_require_verified_account', false), false),
+      // ON = a QR → payout-wallet transfer is charged the payin commission like any withdrawal, and a
+      // revert back to the QR refunds it. OFF = transfers are free (original behaviour).
+      walletTransferChargesPayinCommission: parseBool(ConfigManager.get('payout_wallet_charge_payin_commission', false), false),
       alerts: {
         enabled: parseBool(ConfigManager.get('payout_alerts_enabled', false), false),
         lowBalanceThresholdPaise: cfgRupeesPaise('payout_low_balance_threshold'),
@@ -608,26 +615,37 @@ module.exports = (
     }
   }
 
+  // Merge per-user deltas into one day's { date, commissionsJson } map, under `lockKey`.
+  // Deltas may be negative (commission reversal); a per-user total is clamped at 0 rather than
+  // written negative, and the clamp is reported so the caller can flag it.
+  async function upsertDailyMap(collection, day, perUser, lockKey) {
+    if (!Object.keys(perUser).length) return { clamped: [] };
+    const val = await acquireRetry(lockKey);
+    if (!val) throw new Error(`Could not acquire ${lockKey}`);
+    const clamped = [];
+    try {
+      const existing = await databases.listDocuments(DB, collection, [Query.equal('date', day), Query.limit(1)]);
+      const doc = existing.documents[0] || null;
+      let obj = {};
+      try { obj = doc ? (JSON.parse(doc.commissionsJson || '{}') || {}) : {}; } catch { obj = {}; }
+      for (const [uid, amt] of Object.entries(perUser)) {
+        const next = (obj[uid] || 0) + amt;
+        if (next < 0) { clamped.push({ userId: uid, wouldBe: next }); obj[uid] = 0; } else obj[uid] = next;
+      }
+      const payload = { date: day, commissionsJson: JSON.stringify(obj) };
+      if (doc) await databases.updateDocument(DB, collection, doc.$id, payload);
+      else await databases.createDocument(DB, collection, ID.unique(), payload);
+      return { clamped };
+    } finally {
+      await releaseQuiet(lockKey, val);
+    }
+  }
   async function upsertDailyPayoutCommission(txs) {
     const perUser = {};
     for (const { userId, amount } of txs) perUser[userId] = (perUser[userId] || 0) + Number(amount || 0);
     if (!Object.keys(perUser).length) return;
     const day = istDay();
-    const key = `lock:payoutcommission:daily:${day}`;
-    const val = await acquireRetry(key);
-    if (!val) throw new Error(`Could not acquire daily payout commission lock for ${day}`);
-    try {
-      const existing = await databases.listDocuments(DB, DAILY_COMMISSION, [Query.equal('date', day), Query.limit(1)]);
-      const doc = existing.documents[0] || null;
-      let obj = {};
-      try { obj = doc ? (JSON.parse(doc.commissionsJson || '{}') || {}) : {}; } catch { obj = {}; }
-      for (const [uid, amt] of Object.entries(perUser)) obj[uid] = (obj[uid] || 0) + amt;
-      const payload = { date: day, commissionsJson: JSON.stringify(obj) };
-      if (doc) await databases.updateDocument(DB, DAILY_COMMISSION, doc.$id, payload);
-      else await databases.createDocument(DB, DAILY_COMMISSION, ID.unique(), payload);
-    } finally {
-      await releaseQuiet(key, val);
-    }
+    await upsertDailyMap(DAILY_COMMISSION, day, perUser, `lock:payoutcommission:daily:${day}`);
   }
 
   // One row per (userId, month) and one per userId; totalCommissionPaise merged under a lock,
@@ -644,6 +662,9 @@ module.exports = (
       };
       const row = (await find()).documents[0];
       if (row) return bump(row);
+      // A reversal with no row to reverse would otherwise create a negative total. Nothing was ever
+      // recorded here, so there is nothing to take back; log it for the integrity report instead.
+      if (delta < 0) { console.error(`payout: skipped a ${delta} reversal — no rollup row exists for ${lockKey}`); return; }
       try {
         await databases.createDocument(DB, collection, ID.unique(), { ...base, totalCommissionPaise: delta });
       } catch (e) {
@@ -663,6 +684,100 @@ module.exports = (
       if (!delta) continue;
       await upsertTotal({ collection: MONTHLY_COMMISSION, match: [Query.equal('userId', userId), Query.equal('month', month)], base: { userId, month }, lockKey: `lock:payoutcommission:monthly:${userId}:${month}`, delta });
       await upsertTotal({ collection: ALLTIME_COMMISSION, match: [Query.equal('userId', userId)], base: { userId }, lockKey: `lock:payoutcommission:alltime:${userId}`, delta });
+    }
+  }
+
+  // ─── payin-commission refund when payout-wallet money goes back to its QR ──────────────────
+  // A wallet transfer charges the payin commission on the QR exactly like a direct withdrawal
+  // (withdraw.js, gated by `payout_wallet_charge_payin_commission`). Reverting that money to the same
+  // QR gives the proportional commission back, so a QR → wallet → QR round trip costs nothing and
+  // every rupee pays the payin rate exactly once, on whichever route it finally leaves by.
+  //
+  //   • QR side: commissionPaid −= refund, so available rises by principal + refund.
+  //   • Ledger: NEGATIVE rows in the WITHDRAWAL commission ledger under the same sourceWithdrawalId,
+  //     so a fully reverted withdrawal nets to zero and both the charge and the reversal stay visible.
+  //   • Rollups: posted to the ORIGINAL day/month (from the withdrawal's processedAt), never today.
+  //     A reversal posted to today would drive a quiet day's bucket negative.
+  //   • Locks: withdraw.js's own keys (`lock:commission:*`), so the two writers cannot race.
+
+  // Pure. How much payin commission this revert gives back, in paise.
+  // Partial reverts floor, so they never over-refund. The revert that empties the withdrawal returns
+  // the exact remainder, so all refunds together equal the original commission and never exceed it.
+  function computeCommissionRefund(w, revertedPaise, creditedPaise, revertedSoFar) {
+    const originalPaise = Math.round(Number(w.commission || 0) * 100);
+    if (!(originalPaise > 0) || !(creditedPaise > 0) || !(revertedPaise > 0)) return 0;
+    const remaining = Math.max(0, originalPaise - Number(w.walletRevertedCommissionPaise || 0));
+    if (remaining <= 0) return 0;
+    if (revertedSoFar + revertedPaise >= creditedPaise) return remaining;   // final revert: exact remainder
+    return Math.min(Math.floor(originalPaise * revertedPaise / creditedPaise), remaining);
+  }
+
+  // Splits `refundPaise` across whoever actually earned it and writes the reversal.
+  // Never throws: the QR has already been credited back by the time this runs, so a failure here is
+  // flagged for reconciliation instead of failing the revert.
+  async function recordCommissionRefund(w, refundPaise) {
+    if (!(refundPaise > 0) || !WD_COMMISSION_TXNS) return { refundedPaise: 0, rows: 0 };
+    try {
+      // What each earner still holds for this withdrawal = original rows minus earlier reversals.
+      const { docs } = await pageAll(WD_COMMISSION_TXNS, [Query.equal('sourceWithdrawalId', w.id), Query.orderAsc('$id')], 2000);
+      const net = {}, meta = {};
+      for (const c of docs) {
+        const amt = Number(c.amount || 0);
+        net[c.userId] = (net[c.userId] || 0) + amt;
+        if (amt > 0) meta[c.userId] = { earningType: c.earningType || 'admin', commissionRate: Number(c.commissionRate || 0) };
+      }
+      const earners = Object.entries(net).filter(([, v]) => v > 0);
+      const totalNet = earners.reduce((s, [, v]) => s + v, 0);
+      if (!earners.length || totalNet <= 0) {
+        console.error(`payout: commission refund for ${w.id} found no reversible commission rows (QR refunded ${refundPaise} paise)`);
+        return { refundedPaise: 0, rows: 0 };
+      }
+      // The QR figure is authoritative (it is what the user actually paid). The ledger can only give
+      // back what it recorded, so cap there and log any gap for the integrity report to surface.
+      const cap = Math.min(refundPaise, totalNet);
+      if (cap < refundPaise) console.error(`payout: commission refund for ${w.id} capped at ledger total ${totalNet} < QR refund ${refundPaise}`);
+
+      // Allocate proportionally, floor first, then hand the rounding remainder to anyone with
+      // headroom. Guarantees the parts sum to exactly `cap` and no earner goes below zero.
+      const alloc = {};
+      let left = cap;
+      for (const [userId, netAmt] of earners) {
+        const share = Math.min(Math.floor(cap * netAmt / totalNet), netAmt, left);
+        if (share > 0) { alloc[userId] = share; left -= share; }
+      }
+      for (const [userId, netAmt] of earners) {
+        if (left <= 0) break;
+        const top = Math.min(netAmt - (alloc[userId] || 0), left);
+        if (top > 0) { alloc[userId] = (alloc[userId] || 0) + top; left -= top; }
+      }
+      const perUser = {};
+      for (const [userId, share] of Object.entries(alloc)) perUser[userId] = -share;
+      if (!Object.keys(perUser).length) return { refundedPaise: 0, rows: 0 };
+
+      const createdAt = nowIso();
+      for (const [userId, delta] of Object.entries(perUser)) {
+        await databases.createDocument(DB, WD_COMMISSION_TXNS, ID.unique(), {
+          userId, sourceWithdrawalId: w.id, amount: delta,
+          commissionRate: meta[userId]?.commissionRate ?? 0,
+          earningType: meta[userId]?.earningType || 'admin', createdAt,
+        });
+        await inc(meta[userId]?.earningType === 'admin' ? 'totalAdminProfit' : 'totalMerchantProfit', delta);
+      }
+      // Rollups against the ORIGINAL period, under withdraw.js's lock keys.
+      const at = w.processedAt || w.createdAt || createdAt;
+      const day = istDay(at), month = istMonth(at);
+      const { clamped } = await upsertDailyMap(WD_DAILY_COMMISSION, day, perUser, `lock:commission:daily:${day}`);
+      if (clamped?.length) console.error(`payout: commission refund clamped a negative daily bucket for ${w.id} on ${day}`, clamped);
+      for (const [userId, delta] of Object.entries(perUser)) {
+        await upsertTotal({ collection: WD_MONTHLY_COMMISSION, match: [Query.equal('userId', userId), Query.equal('month', month)], base: { userId, month }, lockKey: `lock:commission:monthly:${userId}:${month}`, delta });
+        await upsertTotal({ collection: WD_ALLTIME_COMMISSION, match: [Query.equal('userId', userId)], base: { userId }, lockKey: `lock:commission:alltime:${userId}`, delta });
+      }
+      return { refundedPaise: cap, rows: Object.keys(perUser).length };
+    } catch (e) {
+      console.error(`CRITICAL: payin commission refund failed for withdrawal ${w.id} (${refundPaise} paise). Needs reconciliation.`, e);
+      await databases.updateDocument(DB, WITHDRAWALS, w.$id, { commissionRefundFailed: true })
+        .catch((e2) => console.error(`CRITICAL: could not flag commissionRefundFailed on ${w.id}`, e2));
+      return { refundedPaise: 0, rows: 0, failed: true };
     }
   }
 
@@ -758,6 +873,8 @@ module.exports = (
         modes: modesView(), // { NEFT: true, IMPS: true, RTGS: false, UPI: true } — false = not available right now
         preferences: { realtime: !(user?.payoutRealtimeDisabled === true) }, realtimeEnabled: settingsView().realtimeEnabled,
         requireVerifiedAccount: settingsView().requireVerifiedAccount,
+        // true = a transfer into this wallet costs the payin commission (refunded if reverted)
+        walletTransferChargesPayinCommission: settingsView().walletTransferChargesPayinCommission,
       });
     } catch (e) { sendError(res, e, 'Failed to fetch payout status'); }
   });
@@ -1139,6 +1256,7 @@ module.exports = (
         customer_payouts_disabled_message: b.message !== undefined ? String(b.message || '').trim().slice(0, 200) : null,
         payout_realtime_enabled: bool('realtimeEnabled'),
         payout_require_verified_account: bool('requireVerifiedAccount'),
+        payout_wallet_charge_payin_commission: bool('walletTransferChargesPayinCommission'),
         payout_alerts_enabled: bool('alertsEnabled'),
         payout_low_balance_threshold: nonNeg('lowBalanceThreshold'),
         payout_pending_alert_minutes: nonNeg('pendingAlertMinutes'),
@@ -1425,6 +1543,12 @@ module.exports = (
       const reverted = rows.filter((r) => r.type === 'revert_to_qr' && r.referenceNumber === w.id).reduce((s, r) => s + Number(r.amountPaise || 0), 0);
       if (Number(w.walletRevertedPaise || 0) !== reverted) add('warning', 'REVERT_TRACKING', `Withdrawal ${w.id}: walletRevertedPaise ${Number(w.walletRevertedPaise || 0)} ≠ Σ revert rows ${reverted}`, { withdrawalId: w.id });
       if (reverted > credited) add('error', 'REVERT_EXCEEDS_CREDIT', `Withdrawal ${w.id}: reverted ${reverted} > credited ${credited}`, { withdrawalId: w.id });
+      // payin commission: never refund more than was charged, and a full revert must refund all of it
+      const chargedCommission = Math.round(Number(w.commission || 0) * 100);
+      const refundedCommission = Number(w.walletRevertedCommissionPaise || 0);
+      if (refundedCommission > chargedCommission) add('error', 'COMMISSION_REFUND_EXCEEDS_CHARGE', `Withdrawal ${w.id}: refunded commission ${refundedCommission} > charged ${chargedCommission}`, { withdrawalId: w.id, refundedPaise: refundedCommission, chargedPaise: chargedCommission });
+      if (reverted >= credited && credited > 0 && refundedCommission !== chargedCommission) add('error', 'COMMISSION_REFUND_INCOMPLETE', `Withdrawal ${w.id} is fully reverted but refunded commission ${refundedCommission} ≠ charged ${chargedCommission}`, { withdrawalId: w.id, refundedPaise: refundedCommission, chargedPaise: chargedCommission });
+      if (w.commissionRefundFailed) add('error', 'COMMISSION_REFUND_FAILED', `Withdrawal ${w.id} is flagged commissionRefundFailed — the QR was credited but the commission ledger was not reversed`, { withdrawalId: w.id });
     }
     for (const r of rows) if (r.type === 'withdrawal_credit' && !withdrawals.some((w) => w.id === r.refId)) add('error', 'ORPHAN_CREDIT', `Credit row ${r.id} references unknown wallet withdrawal ${r.refId}`, { rowId: r.id });
 
@@ -1594,9 +1718,13 @@ module.exports = (
         const total = Number(qr.totalPayInAmount || 0), approved = Number(qr.withdrawalApprovedAmount || 0);
         const requestedW = Number(qr.withdrawalRequestedAmount || 0), onHold = Number(qr.amountOnHold || 0);
         const commissionOnHold = Number(qr.commissionOnHold || 0), commissionPaid = Number(qr.commissionPaid || 0);
+        // Payin commission this revert gives back (0 for transfers made while the charge was off).
+        const commissionRefundPaise = computeCommissionRefund(w, amountPaise, creditedPaise, revertedSoFar);
         const newApproved = approved - amountPaise;
-        const newAvailable = total - newApproved - requestedW - onHold - commissionOnHold - commissionPaid;
+        const newCommissionPaid = commissionPaid - commissionRefundPaise;
+        const newAvailable = total - newApproved - requestedW - onHold - commissionOnHold - newCommissionPaid;
         if (newApproved < 0) throw fail(409, 'Ledger computation error: QR approved-withdrawal total would go negative');
+        if (newCommissionPaid < 0) throw fail(409, 'Ledger computation error: QR paid-commission total would go negative');
 
         // 3. wallet debit (409 if available < amount; hold is respected)
         const moved = await moveWallet(w.userId, {
@@ -1608,9 +1736,9 @@ module.exports = (
           },
         });
 
-        // 4. QR credit-back; compensate the wallet if it fails
+        // 4. QR credit-back: principal AND the payin commission refund, in one write
         try {
-          await databases.updateDocument(DB, QRCODES, qr.$id, { withdrawalApprovedAmount: newApproved, amountAvailableForWithdrawal: newAvailable });
+          await databases.updateDocument(DB, QRCODES, qr.$id, { withdrawalApprovedAmount: newApproved, commissionPaid: newCommissionPaid, amountAvailableForWithdrawal: newAvailable });
         } catch (qrErr) {
           try {
             await databases.deleteDocument(DB, WALLET_TXNS, moved.txn.$id);
@@ -1622,12 +1750,20 @@ module.exports = (
           throw qrErr;
         }
 
-        // 5. bound tracking + counters (never fail the response; ledgers are already consistent)
-        await databases.updateDocument(DB, WITHDRAWALS, w.$id, { walletRevertedPaise: revertedSoFar + amountPaise })
-          .catch((e) => console.error(`CRITICAL: revert-to-qr could not record walletRevertedPaise on ${w.id} (+${amountPaise})`, e));
+        // 5. bound tracking + counters (never fail the response; the QR and wallet are already consistent)
+        await databases.updateDocument(DB, WITHDRAWALS, w.$id, {
+          walletRevertedPaise: revertedSoFar + amountPaise,
+          walletRevertedCommissionPaise: Number(w.walletRevertedCommissionPaise || 0) + commissionRefundPaise,
+        }).catch((e) => console.error(`CRITICAL: revert-to-qr could not record walletRevertedPaise on ${w.id} (+${amountPaise}, commission +${commissionRefundPaise})`, e));
+        // 6. reverse the payin commission in the withdrawal ledger (self-flagging, never fatal)
+        const refund = await recordCommissionRefund(w, commissionRefundPaise);
         await inc('totalPayoutWalletFunded', -amountPaise);
         await inc('totalAmountPaid', -amountPaise);
-        return { duplicate: false, txn: moved.txn, wallet: moved.wallet, amountPaise, remainingPaise: remaining - amountPaise, qrId: w.qrId, newQrAvailablePaise: newAvailable };
+        return {
+          duplicate: false, txn: moved.txn, wallet: moved.wallet, amountPaise,
+          remainingPaise: remaining - amountPaise, qrId: w.qrId, newQrAvailablePaise: newAvailable,
+          commissionRefundPaise, commissionReversedPaise: refund.refundedPaise, commissionRefundFailed: !!refund.failed,
+        };
       }), 'QR is currently being processed. Please try again in a moment.');
 
       if (!result.duplicate) await notify(found.userId, { type: 'wallet_changed', userId: found.userId, reason: 'revert_to_qr', qrId: found.qrId, amountPaise: result.amountPaise, wallet: walletView(found.userId, result.wallet) });
@@ -1635,6 +1771,10 @@ module.exports = (
         success: true, duplicate: !!result.duplicate, withdrawalId: found.id, qrId: found.qrId, userId: found.userId,
         amountPaise: result.amountPaise ?? Number(result.txn.amountPaise), remainingPaise: result.remainingPaise ?? null,
         qrAvailablePaise: result.newQrAvailablePaise ?? null,
+        // payin commission handed back to the QR with this revert (0 when the transfer was free)
+        commissionRefundPaise: result.commissionRefundPaise ?? 0,
+        commissionRefundRs: (result.commissionRefundPaise ?? 0) / 100,
+        commissionRefundFailed: !!result.commissionRefundFailed,
         wallet: walletView(found.userId, result.wallet), transaction: pickWalletTxn(result.txn),
       });
     } catch (e) { sendError(res, e, 'Failed to revert payout wallet amount to QR'); }

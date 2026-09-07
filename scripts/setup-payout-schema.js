@@ -9,7 +9,8 @@
 //   6. daily_payout_commission_summaries   — per-IST-day rollup { date, commissionsJson }
 //      + monthly_payout_commission_totals / all_time_payout_commission_totals (per-user rollups)
 //   7. users_meta.payoutCommission (double) — per-user payout commission rate (%)
-//   8. withdrawal_requests: `mode` enum gains 'wallet'; `walletCreditFailed` (boolean) added
+//   8. withdrawal_requests: `mode` enum gains 'wallet'; `walletCreditFailed`,
+//      `walletRevertedPaise`, `walletRevertedCommissionPaise`, `commissionRefundFailed` added
 //
 // Safe to run multiple times — every create tolerates 409 (already exists).
 // Run BEFORE deploying the payout code:  node scripts/setup-payout-schema.js
@@ -280,6 +281,8 @@ async function main() {
     });
     await bool(WD, 'walletCreditFailed');
     await int(WD, 'walletRevertedPaise');          // paise already reverted from the payout wallet back to the QR
+    await int(WD, 'walletRevertedCommissionPaise'); // payin commission already refunded to the QR for those reverts
+    await bool(WD, 'commissionRefundFailed');      // QR was credited but the commission ledger reversal failed
 
     console.log('\n✅ Customer Payout schema setup complete.\n');
     console.log('Optional .env overrides (defaults shown are what server.js uses):');
