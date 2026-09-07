@@ -53,6 +53,7 @@ async function main() {
     await safe('attr releasedPaise (integer, required)', () => db.createIntegerAttribute(DB, COL, 'releasedPaise', true));
     await safe('attr todayPayInAtSetPaise (integer)', () => db.createIntegerAttribute(DB, COL, 'todayPayInAtSetPaise', false));
     await safe('attr maxPercentAtSet (double)', () => db.createFloatAttribute(DB, COL, 'maxPercentAtSet', false));
+    await safe('attr percentAtSet (double)', () => db.createFloatAttribute(DB, COL, 'percentAtSet', false));   // null when set by exact amount
     await safe('attr reason (string)', () => db.createStringAttribute(DB, COL, 'reason', 300, false));
     await safe('attr releasedBy (string)', () => db.createStringAttribute(DB, COL, 'releasedBy', 64, false));
     await safe('attr createdAt (string)', () => db.createStringAttribute(DB, COL, 'createdAt', 40, false));

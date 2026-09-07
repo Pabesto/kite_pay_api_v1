@@ -4946,7 +4946,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // it expires by itself at IST midnight. All arithmetic lives in qrSettlement.js — never inline it.
     // ─────────────────────────────────────────────────────────────────────────
     const settlementError = (res, e, fallback) => {
-        if (e?.status) return res.status(e.status).json({ error: e.message });
+        if (e?.status) {
+            // A stale-basis rejection carries the fresh figures so the dialog can re-render in place.
+            return res.status(e.status).json({ error: e.message, ...(e.code ? { code: e.code } : {}), ...(e.current ? { current: e.current } : {}) });
+        }
         console.error(`❌ ${fallback}:`, e);
         return res.status(500).json({ error: fallback });
     };
@@ -4972,18 +4975,31 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     });
 
     // SET today's release for one QR. Absolute, not additive: sending the same value twice is a no-op.
-    // Body: { amount (RUPEES, 0 revokes), reason (min 4 chars), date? (YYYY-MM-DD, defaults to today) }
+    // Body: exactly one of
+    //   percent: 50                       ← the slider. Requires expectedTodayPayInPaise.
+    //   amount: 2000                      ← RUPEES; 0 revokes.
+    // plus reason (min 4 chars), optional date (YYYY-MM-DD, defaults to today), and the optimistic
+    // guards expectedTodayPayInPaise / expectedReleasedPaise — the figures the dialog displayed.
+    // A mismatch returns 409 { code: 'STALE_SETTLEMENT', current: {...} } instead of releasing an
+    // amount the admin never actually approved.
     router.put('/qr-settlement/:qrId/release', authenticateAdmin, async (req, res) => {
         try {
             const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.date || '')) ? String(req.body.date) : qrSettlement.istDay();
             const qr = await qrByBusinessId(req.params.qrId);
             if (!qr) return res.status(404).json({ error: 'QR not found' });
-            const amountNum = Number(req.body.amount);
-            if (!isFinite(amountNum) || amountNum < 0) return res.status(400).json({ error: 'Invalid amount' });
-            const releasedPaise = Math.round(amountNum * 100);   // rupees → paise, at the boundary
+            const hasAmount = req.body.amount !== undefined && req.body.amount !== null && req.body.amount !== '';
+            let releasedPaise = null;
+            if (hasAmount) {
+                const amountNum = Number(req.body.amount);
+                if (!isFinite(amountNum) || amountNum < 0) return res.status(400).json({ error: 'Invalid amount' });
+                releasedPaise = Math.round(amountNum * 100);     // rupees → paise, at the boundary
+            }
 
             const saved = await qrSettlement.setRelease({
-                ID, qrId: qr.qrId, releasedPaise, reason: req.body.reason, byUserId: req.user.userId, day,
+                ID, qrId: qr.qrId, releasedPaise, percent: req.body.percent,
+                expectedTodayPayInPaise: req.body.expectedTodayPayInPaise,
+                expectedReleasedPaise: req.body.expectedReleasedPaise,
+                reason: req.body.reason, byUserId: req.user.userId, day,
             });
             const settle = await qrSettlement.forQrDocs([qr], day);
             return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved) });

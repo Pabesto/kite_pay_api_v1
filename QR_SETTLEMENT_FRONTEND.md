@@ -142,30 +142,77 @@ Optional `?date=YYYY-MM-DD` to inspect another IST day; defaults to today.
     "releasedPaise": 200000, "releasedRs": 2000,
     "todayPayInAtSetPaise": 400000,  // what the day's pay-in was when it was set (audit)
     "maxPercentAtSet": 50,
+    "percentAtSet": 50,              // the slider value used, or null when set by exact amount
     "reason": "merchant needs same-day funds",
     "releasedBy": "admin1", "createdAt": "…", "updatedAt": "…" } }
 ```
 
-Dialog layout: show today's pay-in, what is held, and what is already released. Then an amount field
-**capped at `maxReleasablePaise`** with a "Release maximum" shortcut, a required reason, and a preview
-line of what the merchant's withdrawable figure becomes.
+**Keep the whole response.** You will send three of its numbers back on submit (§6.2), so hold onto
+`todayPayInPaise`, `releasedPaise` and `maxPercent` exactly as received.
 
 ### 6.2 Set the release — `PUT /api/admin/qr-settlement/:qrId/release`
+
+Send **exactly one** of `percent` or `amount`.
+
+**The slider (recommended).** Range `0` to `maxPercent`, stepping in whole percent. Show the rupee
+value live as `todayPayInPaise × percent ÷ 100`, rounded **down**, which is exactly what the server
+computes, so the preview and the result always agree.
+
 ```jsonc
-{ "amount": 2000,                              // RUPEES. 0 revokes. Absolute, not additive.
+{ "percent": 50,                               // 0…maxPercent
+  "expectedTodayPayInPaise": 400000,           // REQUIRED with percent — the figure your slider used
+  "expectedReleasedPaise": 0,                  // recommended — what §6.1 showed as already released
   "reason": "merchant needs same-day funds",   // required, min 4 characters
   "date": "2026-09-07" }                       // optional, defaults to today
 ```
-Returns the same shape as §6.1, with the updated numbers and the saved `release`.
 
-**`amount` is absolute, not a top-up.** Sending 2000 twice leaves the release at ₹2,000, never
-₹4,000. This is deliberate, so a double tap or a retry can never double-release. Always send the total
-you want the release to be, and prefill the field with the current `releasedPaise`.
+**Exact amount** (for a specific figure, and for revoking with `0`):
 
-`400` when the amount is above the cap, and the message contains the real numbers, for example
-`Cannot release ₹3,000.00. The limit is 50% of this QR's pay-in for 2026-09-07 (₹4,000.00), which is
-₹2,000.00.` Show it verbatim. Other `400`s: a negative amount, a reason under 4 characters, or the
-feature being switched off entirely.
+```jsonc
+{ "amount": 2000,                              // RUPEES. 0 revokes.
+  "expectedReleasedPaise": 0,                  // optional here, still recommended
+  "reason": "merchant needs same-day funds" }
+```
+
+Returns the same shape as §6.1, with the updated numbers and the saved `release` (which also records
+`percentAtSet`, null when set by exact amount).
+
+#### The two safety rules, and why they exist
+
+**1. It is absolute, never a top-up.** Sending `percent: 50` twice leaves the release at 50%, never
+100%. Sending `amount: 2000` twice leaves it at ₹2,000, never ₹4,000. A double tap, a retry after a
+timeout, or a resubmitted form can therefore never release twice. Always send the total you want the
+release to be, and prefill the control from the current `releasedPaise`.
+
+**2. The figures you were shown must still be true.** `expectedTodayPayInPaise` and
+`expectedReleasedPaise` are checked against the server before anything is written. This matters most
+for the slider: if ₹1,00,000 was on screen and the admin picks 50%, they approved ₹50,000. If another
+₹1,00,000 arrived while the dialog was open, applying 50% blindly would release ₹1,00,000, double what
+was approved. The server refuses instead:
+
+```jsonc
+// 409
+{ "error": "This QR changed while the release dialog was open: today's pay-in is now ₹2,00,000.00, you were shown ₹1,00,000.00. Check the new figures and confirm again.",
+  "code": "STALE_SETTLEMENT",
+  "current": { "todayPayInPaise": 200000, "releasedPaise": 0, "maxPercent": 50, "maxReleasablePaise": 100000 } }
+```
+
+Handle `code: "STALE_SETTLEMENT"` by re-rendering the dialog **in place** from `current`, without a
+second network call, keeping the admin's chosen percent and showing the new rupee value. Then require
+one more tap to confirm. Do not retry automatically, the whole point is that a human re-approves the
+new number.
+
+The same 409 fires when another admin released first and `expectedReleasedPaise` no longer matches.
+That one is not a correctness problem, because the absolute semantics already prevent stacking, but it
+stops one admin silently overwriting another's decision.
+
+#### Other rejections
+
+`400` with the real numbers when the request is above the cap, for example `Cannot release ₹3,000.00.
+The limit is 50% of this QR's pay-in for 2026-09-07 (₹4,000.00), which is ₹2,000.00.` Show it
+verbatim. Also `400` for a percent above `maxPercent` or outside 0 to 100, a negative amount, a reason
+under 4 characters, sending both or neither of `percent` and `amount`, omitting
+`expectedTodayPayInPaise` alongside a percent, or the feature being switched off entirely.
 
 ### 6.3 Revoke — `DELETE /api/admin/qr-settlement/:qrId/release`
 Optional `?date=`. Identical to setting the amount to zero, and returns the same shape.
@@ -214,7 +261,10 @@ the new, larger ceiling.
 
 **Admin side**
 3. *QR detail* — a "Release funds early" action opening the dialog in §6.1 and §6.2, visible only for
-   role `admin`, and only when `maxPercent > 0`.
+   role `admin`, and only when `maxPercent > 0`. The dialog is a **slider from 0 to `maxPercent`**
+   with the rupee value shown live, the resulting withdrawable figure previewed, a required reason,
+   and a confirm button. Send the percent together with the figures the dialog was built from, and be
+   ready to re-render in place on a `STALE_SETTLEMENT` reply.
 4. *Released today* — the §6.4 list with the day's total, each row showing the QR, the amount, who
    released it and why, with a revoke action.
 
@@ -236,5 +286,9 @@ the new, larger ceiling.
 - **The release lookup failing on the server** falls back to full T+1 holding, never to releasing
   everything. If a merchant reports that released money vanished briefly, this is why, and a refresh
   will bring it back.
+- **A busy QR can reject the slider repeatedly.** Every payment that lands changes the basis, so on a
+  high-volume QR the confirm may come back `STALE_SETTLEMENT` more than once. That is the guard doing
+  its job. Re-render from `current` and let the admin confirm the new figure; do not weaken the check
+  or drop the expected fields to make it go away.
 - **There is no realtime event for a release yet.** After an admin sets one, the merchant's screen
   updates on its next fetch, so make sure the QR screen re-fetches on resume and on pull-to-refresh.

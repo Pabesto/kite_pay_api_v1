@@ -159,23 +159,63 @@ async function getRelease(qrId, day = istDay()) {
 }
 
 /**
- * SET (not add) how much of today's pay-in is released for one QR. Absolute semantics: sending the
- * same value twice changes nothing, so a double submit can never double-release.
+ * SET (not add) how much of today's pay-in is released for one QR.
  *
- * Enforces, in order: a non-negative integer amount, and the `qr_daily_release_max_percent` ceiling
- * against the QR's pay-in for that day. Rejects rather than clamping, so an admin always knows
- * exactly what was granted. `ID` is passed in by the caller (node-appwrite's ID helper).
+ * Absolute semantics: sending the same value twice changes nothing, so a double submit or a retry can
+ * never double-release. Give EITHER `percent` (of that day's pay-in) OR `releasedPaise`.
+ *
+ * Optimistic concurrency — `expectedTodayPayInPaise` / `expectedReleasedPaise`:
+ * the numbers the admin was looking at must still be true on the server, otherwise the write is
+ * rejected with 409 and the fresh figures. This is REQUIRED for a percentage, because "50%" is
+ * meaningless without knowing 50% of what: if more money arrived while the dialog was open, 50% now
+ * means a bigger amount than the admin approved. It is optional but recommended for an absolute
+ * amount, where it serves as an "someone else changed this" warning rather than a correctness fix.
+ *
+ * Then enforces the `qr_daily_release_max_percent` ceiling against that day's pay-in, rejecting
+ * rather than clamping so an admin always knows exactly what was granted.
+ * `ID` is passed in by the caller (node-appwrite's ID helper).
  */
-async function setRelease({ ID, qrId, releasedPaise, reason, byUserId, day = istDay() }) {
+async function setRelease({ ID, qrId, releasedPaise = null, percent = null, expectedTodayPayInPaise = null, expectedReleasedPaise = null, reason, byUserId, day = istDay() }) {
     if (!_db || !_releasesCol) throw fail(500, 'QR release storage is not configured on this server');
     if (!qrId) throw fail(400, 'qrId is required');
-    const amount = Number(releasedPaise);
-    if (!Number.isInteger(amount) || amount < 0) throw fail(400, 'Invalid release amount');
     const note = String(reason || '').trim();
     if (note.length < 4) throw fail(400, 'A reason is required (min 4 characters)');
 
+    const has = (v) => v !== null && v !== undefined && v !== '';
+    const byPercent = has(percent), byAmount = has(releasedPaise);
+    if (byPercent === byAmount) throw fail(400, 'Send exactly one of percent or amount');
+    if (byPercent && !has(expectedTodayPayInPaise)) {
+        throw fail(400, 'expectedTodayPayInPaise is required when releasing by percent, so the percentage is applied to the figure you were shown');
+    }
+
+    // Current server state — the basis for BOTH the percentage and the staleness check.
     const payins = await todayPayIns(day);
     const todayPayInPaise = Number(payins[qrId] || 0);
+    const existing = await getRelease(qrId, day);
+    const currentReleasedPaise = Number(existing?.releasedPaise || 0);
+    const current = { todayPayInPaise, releasedPaise: currentReleasedPaise, maxPercent: maxPercent(), maxReleasablePaise: maxReleasablePaise(todayPayInPaise) };
+    const stale = (label, shown, actual) => Object.assign(
+        fail(409, `This QR changed while the release dialog was open: ${label} is now ${rs(actual)}, you were shown ${rs(shown)}. Check the new figures and confirm again.`),
+        { code: 'STALE_SETTLEMENT', current });
+    if (has(expectedTodayPayInPaise) && Number(expectedTodayPayInPaise) !== todayPayInPaise) throw stale("today's pay-in", Number(expectedTodayPayInPaise), todayPayInPaise);
+    if (has(expectedReleasedPaise) && Number(expectedReleasedPaise) !== currentReleasedPaise) throw stale('the already released amount', Number(expectedReleasedPaise), currentReleasedPaise);
+
+    let amount, percentAtSet = null;
+    if (byPercent) {
+        const p = Number(percent);
+        if (!isFinite(p) || p < 0 || p > 100) throw fail(400, 'percent must be between 0 and 100');
+        if (p > maxPercent()) {
+            throw fail(400, maxPercent() === 0
+                ? 'Early release is switched off (qr_daily_release_max_percent is 0)'
+                : `Cannot release ${p}% — the limit is ${maxPercent()}% of this QR's pay-in for ${day}.`);
+        }
+        percentAtSet = p;
+        amount = Math.floor(todayPayInPaise * p / 100);   // floor: the cap is never exceeded by rounding
+    } else {
+        amount = Number(releasedPaise);
+        if (!Number.isInteger(amount) || amount < 0) throw fail(400, 'Invalid release amount');
+    }
+
     const cap = maxReleasablePaise(todayPayInPaise);
     if (amount > cap) {
         throw fail(400, maxPercent() === 0
@@ -185,11 +225,10 @@ async function setRelease({ ID, qrId, releasedPaise, reason, byUserId, day = ist
 
     const payload = {
         qrId, date: day, releasedPaise: amount,
-        todayPayInAtSetPaise: todayPayInPaise, maxPercentAtSet: maxPercent(),
+        todayPayInAtSetPaise: todayPayInPaise, maxPercentAtSet: maxPercent(), percentAtSet,
         reason: note.slice(0, 300), releasedBy: byUserId || null, updatedAt: new Date().toISOString(),
     };
-    const existing = await getRelease(qrId, day);
-    if (existing) return _db.updateDocument(_dbId, _releasesCol, existing.$id, payload);
+    if (existing) return _db.updateDocument(_dbId, _releasesCol, existing.$id, payload);   // read above, under the staleness check
     try {
         return await _db.createDocument(_dbId, _releasesCol, ID.unique(), { ...payload, createdAt: payload.updatedAt });
     } catch (e) {
@@ -215,6 +254,7 @@ const pickRelease = (d) => (!d ? null : {
     $id: d.$id, qrId: d.qrId, date: d.date,
     releasedPaise: Number(d.releasedPaise || 0), releasedRs: Number(d.releasedPaise || 0) / 100,
     todayPayInAtSetPaise: Number(d.todayPayInAtSetPaise || 0), maxPercentAtSet: Number(d.maxPercentAtSet || 0),
+    percentAtSet: d.percentAtSet == null ? null : Number(d.percentAtSet),
     reason: d.reason || null, releasedBy: d.releasedBy || null,
     createdAt: d.createdAt || d.$createdAt || null, updatedAt: d.updatedAt || null,
 });

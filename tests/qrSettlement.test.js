@@ -230,6 +230,61 @@ describe('setting a release', () => {
         await expect(s.setRelease({ ...base, releasedPaise: 1 })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/switched off/i) });
     });
 
+    test('by percent: the slider releases exactly that share of the day\'s pay-in', async () => {
+        const { db, s } = setup(100000);
+        const doc = await s.setRelease({ ID, qrId: 'qr1', percent: 30, expectedTodayPayInPaise: 100000, reason: 'partial early release', byUserId: 'admin1' });
+        expect(doc).toMatchObject({ releasedPaise: 30000, percentAtSet: 30 });
+        expect((await s.forQr('qr1', 500000)).withdrawablePaise).toBe(430000);
+        // fractions floor, so the cap can never be exceeded by rounding
+        await s.setRelease({ ID, qrId: 'qr1', percent: 33.333, expectedTodayPayInPaise: 100000, reason: 'odd percent', byUserId: 'admin1' });
+        expect(db.store[RELEASES][0].releasedPaise).toBe(33333);
+    });
+
+    test('STALE BASIS: more money arrived since the dialog opened → 409 with the fresh figures, nothing written', async () => {
+        const { db, s } = setup(100000);
+        // admin was shown ₹1,000 of pay-in, but ₹2,000 is there now
+        db.store[DAILY][0].totalsJson = JSON.stringify({ qr1: 200000 });
+        const err = await s.setRelease({ ID, qrId: 'qr1', percent: 50, expectedTodayPayInPaise: 100000, reason: 'stale basis', byUserId: 'admin1' }).catch((e) => e);
+        expect(err).toMatchObject({ status: 409, code: 'STALE_SETTLEMENT' });
+        expect(err.message).toMatch(/changed while the release dialog was open/);
+        expect(err.current).toMatchObject({ todayPayInPaise: 200000, releasedPaise: 0, maxReleasablePaise: 100000, maxPercent: 50 });
+        expect(db.store[RELEASES] || []).toHaveLength(0);
+        // confirming against the new figure works, and 50% now means the larger amount deliberately
+        const ok = await s.setRelease({ ID, qrId: 'qr1', percent: 50, expectedTodayPayInPaise: 200000, reason: 'confirmed', byUserId: 'admin1' });
+        expect(ok.releasedPaise).toBe(100000);
+    });
+
+    test('STALE RELEASE: another admin released first → 409, so nobody overwrites a decision unknowingly', async () => {
+        const { db, s } = setup(100000);
+        await s.setRelease({ ID, qrId: 'qr1', releasedPaise: 20000, reason: 'first admin', byUserId: 'admin1' });
+        const err = await s.setRelease({ ID, qrId: 'qr1', percent: 50, expectedTodayPayInPaise: 100000, expectedReleasedPaise: 0, reason: 'second admin', byUserId: 'admin2' }).catch((e) => e);
+        expect(err).toMatchObject({ status: 409, code: 'STALE_SETTLEMENT' });
+        expect(err.current).toMatchObject({ releasedPaise: 20000 });
+        expect(db.store[RELEASES][0].releasedPaise).toBe(20000);   // untouched
+        // acknowledging the current value lets it through, and it REPLACES rather than adds
+        const ok = await s.setRelease({ ID, qrId: 'qr1', percent: 50, expectedTodayPayInPaise: 100000, expectedReleasedPaise: 20000, reason: 'confirmed overwrite', byUserId: 'admin2' });
+        expect(ok.releasedPaise).toBe(50000);                      // NOT 70000
+    });
+
+    test('percent guards: above the cap, out of range, missing basis, and both/neither of percent and amount', async () => {
+        const { s } = setup(100000);
+        const base = { ID, qrId: 'qr1', reason: 'a valid reason', byUserId: 'admin1' };
+        await expect(s.setRelease({ ...base, percent: 60, expectedTodayPayInPaise: 100000 })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/limit is 50%/) });
+        await expect(s.setRelease({ ...base, percent: 101, expectedTodayPayInPaise: 100000 })).rejects.toMatchObject({ status: 400 });
+        await expect(s.setRelease({ ...base, percent: -1, expectedTodayPayInPaise: 100000 })).rejects.toMatchObject({ status: 400 });
+        await expect(s.setRelease({ ...base, percent: 50 })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/expectedTodayPayInPaise is required/) });
+        await expect(s.setRelease({ ...base, percent: 50, releasedPaise: 100, expectedTodayPayInPaise: 100000 })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/exactly one/) });
+        await expect(s.setRelease({ ...base })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/exactly one/) });
+    });
+
+    test('an exact amount does not require the basis, but honours the guards when they are sent', async () => {
+        const { db, s } = setup(100000);
+        await s.setRelease({ ID, qrId: 'qr1', releasedPaise: 25000, reason: 'exact figure', byUserId: 'admin1' });
+        expect(db.store[RELEASES][0]).toMatchObject({ releasedPaise: 25000, percentAtSet: null });
+        await expect(s.setRelease({ ID, qrId: 'qr1', releasedPaise: 30000, expectedReleasedPaise: 0, reason: 'stale', byUserId: 'admin1' }))
+            .rejects.toMatchObject({ status: 409, code: 'STALE_SETTLEMENT' });
+    });
+
     test('a QR with no pay-in today has a cap of zero, so nothing can be released', async () => {
         const { s } = setup(0);
         await expect(s.setRelease({ ID, qrId: 'qr1', releasedPaise: 1, reason: 'nothing came in', byUserId: 'admin1' }))
