@@ -1,4 +1,6 @@
 // configManager.js
+const { Query } = require('node-appwrite');
+
 let configCache = null;
 let rawDocsCache = null; // Store raw docs for update operations
 let databasesInstance = null; // Store reference
@@ -22,13 +24,36 @@ class ConfigManager {
         }
 
         try {
-            const docs = await databasesInstance.listDocuments(
-                CONFIG_DB_ID,
-                CONFIG_COLLECTION_ID
-            );
+            // Page the whole collection. A bare listDocuments() returns only Appwrite's
+            // default 25 docs, which truncated both caches: getRawDoc() then returned null
+            // for every key past #25, so set() and admin POST /config CREATED a second row
+            // instead of updating the existing one (the payout_max_pending 100/200 dupes).
+            const all = [];
+            let cursor = null;
+            for (let page = 0; page < 50; page++) {
+                const q = [Query.limit(100), Query.orderAsc('$id')];
+                if (cursor) q.push(Query.cursorAfter(cursor));
+                const res = await databasesInstance.listDocuments(CONFIG_DB_ID, CONFIG_COLLECTION_ID, q);
+                all.push(...res.documents);
+                if (res.documents.length < 100) break;
+                cursor = res.documents[res.documents.length - 1].$id;
+            }
+
+            // Collapse any duplicate keys already in the collection: newest $updatedAt wins.
+            // Both caches must resolve to the SAME doc, otherwise get() reads one row while
+            // set() writes to another — that is what made a saved value appear to not stick.
+            const byKey = new Map();
+            for (const doc of all) {
+                const prev = byKey.get(doc.key);
+                if (!prev || String(doc.$updatedAt || '') > String(prev.$updatedAt || '')) byKey.set(doc.key, doc);
+            }
+            if (byKey.size !== all.length) {
+                const dupes = [...byKey.keys()].filter(k => all.filter(d => d.key === k).length > 1);
+                console.warn(`[config] duplicate keys in config collection: ${dupes.join(', ')} — newest value used; run "node scripts/dedupe-config.js --write" to clean up`);
+            }
 
             const config = {};
-            for (let doc of docs.documents) {
+            for (let doc of byKey.values()) {
                 const rawValue = doc.val ?? String(doc.value ?? '');
                 let parsedValue = rawValue;
                 if (doc.type === "integer") {
@@ -67,7 +92,7 @@ class ConfigManager {
             }
 
             configCache = config;
-            rawDocsCache = docs.documents;
+            rawDocsCache = [...byKey.values()];
 
             return config;
 
@@ -94,7 +119,15 @@ class ConfigManager {
         if (!databasesInstance) {
             throw new Error('ConfigManager not initialized.');
         }
-        const doc = this.getRawDoc(key);
+        // Never trust the cache alone to decide create-vs-update: a miss here writes a
+        // duplicate row that then shadows the real one. Confirm against the collection.
+        let doc = this.getRawDoc(key);
+        if (!doc) {
+            const found = await databasesInstance.listDocuments(CONFIG_DB_ID, CONFIG_COLLECTION_ID, [
+                Query.equal('key', key), Query.orderDesc('$updatedAt'), Query.limit(1),
+            ]);
+            doc = found.documents[0] || null;
+        }
 
         const serialized =Array.isArray(value) || typeof value === "object"
         ? JSON.stringify(value)
