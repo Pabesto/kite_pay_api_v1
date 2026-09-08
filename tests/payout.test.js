@@ -1207,6 +1207,25 @@ describe('realtime staff routing + new event types', () => {
         expect(e.platform).toBeFalsy();
     });
 
+    test('request_created carries the whole queue row so the popup needs no follow-up fetch', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        const r = await request(app).post('/requests').send({ ...ACCOUNT, mode: 'IMPS', amount: 100, notes: 'urgent' });
+        expect(r.status).toBe(201);
+        const e = emitted().at(-1);
+        expect(e.payload.type).toBe('request_created');
+        // identical to what GET /admin/requests would hand the list behind the dialog
+        expect(e.payload.payout).toEqual(r.body.payout);
+        expect(e.payload.payout).toMatchObject({
+            id: r.body.payout.id, customerName: 'Ravi Kumar', bankName: 'SBI', ifscCode: 'SBIN0001234',
+            mode: 'IMPS', amountPaise: 10000, status: 'pending', notes: 'urgent',
+            accountBankingStatus: expect.any(String), accountVerificationStatus: expect.any(String),
+        });
+        expect(e.payload.payout.waitingMinutes).not.toBeNull();
+        // flat keys older builds read stay put
+        expect(e.payload).toMatchObject({ payoutId: r.body.payout.id, amountPaise: 10000, status: 'pending', mode: 'IMPS', customerName: 'Ravi Kumar' });
+    });
+
     test('a user opting out still routes to their staff rooms', async () => {
         const db = makeDb(seed());
         userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1'

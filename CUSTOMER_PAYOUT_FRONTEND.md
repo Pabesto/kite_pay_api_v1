@@ -856,6 +856,42 @@ collection and the check stopped early — say so.
 show it beside the existing `totalMerchantProfit` (withdrawal commission). Suggested tiles: "Payout
 wallet float", "Customer payouts pending (n / ₹)", "Customer payouts paid (n / ₹)", "Payout commission".
 
+#### 6.6a Derived roll-ups (server-computed — the app must not recompute these)
+
+The same endpoint also returns these, all **paise** except `adminMarginPercent`. They are pure
+arithmetic over the counters above; the server owns the formulas so the tiles can never drift
+from the accounting.
+
+| key | formula | where it belongs |
+|---|---|---|
+| `withdrawalsToBank` | `totalAmountPaid − totalPayoutWalletFunded` | Merchant Withdrawals |
+| `totalPaidOut` | `withdrawalsToBank + totalCustomerPayoutPaid` | Overview |
+| `netFlow` | `totalAmountReceived − totalPaidOut` — **may be negative** | Overview |
+| `avgTxAmount` | `totalAmountReceived / totalTxCount`, rounded; `0` when there are no transactions | Overview (transaction-count footnote) |
+| `totalAdminProfitAll` | `totalAdminProfit + totalPayoutAdminProfit` | Profit |
+| `totalMerchantProfitAll` | `totalMerchantProfit + totalPayoutMerchantProfit` | Profit |
+| `totalPlatformProfit` | `totalAdminProfitAll + totalMerchantProfitAll` | Profit |
+| `totalCustomerPayoutAll` | `totalCustomerPayoutPaid + totalCustomerPayoutPendingAmount` | Customer Payouts |
+| `adminMarginPercent` | `totalAdminProfitAll / totalAmountReceived x 100`, plain number rounded to 2 dp (e.g. `2.14`); `0` when nothing was received | Profit |
+
+**Why `totalPaidOut` is not `totalAmountPaid + totalCustomerPayoutPaid`.** `totalPayoutWalletFunded`
+is a *subset* of `totalAmountPaid`: approving a withdrawal bumps `totalAmountPaid`, and a
+`mode:'wallet'` one then bumps `totalPayoutWalletFunded` as well (revert-to-QR backs both out
+together). Adding customer payouts on top of the untouched `totalAmountPaid` would count every
+rupee that travelled QR -> payout wallet -> customer **twice**. Hence the subtraction.
+
+**The two commission pots are disjoint.** `totalAdminProfit` / `totalMerchantProfit` are
+**withdrawal** commission only; customer-payout commission is only ever in
+`totalPayoutAdminProfit` / `totalPayoutMerchantProfit`. The `*All` keys therefore add, never
+double count. (payout.js does post to the withdrawal counters, but only as negative deltas when
+revert-to-QR refunds a payin commission — still withdrawal commission.)
+
+> Known drift: if a wallet withdrawal is approved but the wallet credit then fails,
+> `totalAmountPaid` has already moved while `totalPayoutWalletFunded` has not, and
+> `POST /admin/wallet/retry-credit` does not bump it either — so `withdrawalsToBank` reads high
+> until that is reconciled. Rare (it needs a mid-approval failure) and it never affects a
+> balance, only this tile.
+
 ### 6.7 Set a user's payout commission — `PUT /api/admin/edit-user/:id` (existing)
 ```jsonc
 { "payoutCommission": 2.5 }     // percent, 0–100; independent of "commission"
@@ -955,7 +991,7 @@ most also carry `payoutId`, `status`, `amountPaise`.
 
 | `payload.type` | Fired when | Extra payload | Suggested treatment |
 |---|---|---|---|
-| `request_created` | user submits a customer payout | `payoutId`, `status:'pending'`, `amountPaise` | **dialog + sound** |
+| `request_created` | user submits a customer payout | **full row in `payout` (see 9.1a)** plus `payoutId`, `status:'pending'`, `amountPaise`, `mode`, `totalPaise`, `commissionPaise`, `customerName`, `requestedByName`, `requestedByUserId` | **dialog + sound** |
 | `request_paid` | admin marks paid | `payoutId`, `referenceNumber`, `amountPaise` | toast |
 | `request_rejected` | admin rejects | `payoutId`, `reason` | toast |
 | `request_cancelled` | user cancels their own pending request | `payoutId` | silent list refresh |
@@ -968,6 +1004,46 @@ most also carry `payoutId`, `status`, `amountPaise`.
 | `access_changed` | admin enabled/disabled payouts for that user | `payoutDisabled`, `payoutDisabledReason` | toast; re-read `GET /status` |
 | `settings_changed` | admin saved §6.5a settings | `changed` (config keys), `settings` (full §6.5a GET shape) | **platform-wide**; refresh the settings screen and any pause banner |
 | `source_accounts_changed` | "paid via" list added/reactivated/deactivated | `action`, `label` | **platform-wide**; refresh the picker |
+
+#### 9.1a `request_created` — render the popup straight from the event
+
+This one event carries the **entire queue row** under `payload.payout`, byte-identical to what
+`GET /api/payout/admin/requests` returns for that row. Build the dialog from it directly — no
+follow-up fetch, no spinner in the popup.
+
+```jsonc
+{ "type": "request_created", "at": "2026-09-09T07:14:22.114Z",
+  "userId": "user1", "payoutId": "cpo_8f3a1c",
+  "requestedByUserId": "user1", "requestedByName": "Sharma Traders",  // WHO wants the payout
+  "customerName": "Ravi Kumar", "mode": "IMPS",                       // headline for the dialog
+  "status": "pending", "amountPaise": 250000,
+  "commissionPaise": 5000, "totalPaise": 255000,
+  "payout": {                        // === one row of the admin queue, same shape as §6.1 ===
+    "id": "cpo_8f3a1c", "userId": "user1", "accountId": "…",
+    "customerName": "Ravi Kumar", "bankName": "SBI",
+    "ifscCode": "SBIN0001234", "accountNumber": "12345678901", "upiId": null,
+    "mode": "IMPS", "amountPaise": 250000, "amountRs": 2500,
+    "commissionPaise": 5000, "totalPaise": 255000, "totalRs": 2550,
+    "status": "pending", "notes": "urgent",
+    "requestedAt": "2026-09-09T07:14:22.100Z", "waitingMinutes": 0,
+    "accountBankingStatus": "not_added", "accountVerificationStatus": "unverified"
+  } }
+```
+
+Suggested dialog: **₹2,500 → Ravi Kumar (IMPS)** as the title, "requested by Sharma Traders" as the
+subtitle, bank/IFSC/account (or UPI ID) as the body, and two chips for
+`accountBankingStatus` / `accountVerificationStatus` so whoever is on the queue knows straight away
+whether the beneficiary still needs adding or verifying. Actions: **Open in queue** (deep-link on
+`payoutId`) and **Dismiss** — resolve from the queue screen, never from the popup, so two admins
+can't act on one request from a toast.
+
+The flat keys sitting beside `payout` (`payoutId`, `amountPaise`, `mode`, `customerName`, …) are
+kept for older builds that read them directly — new code should prefer `payload.payout`.
+
+> `accountNumber` is unmasked here, exactly as in the queue: staff need it to make the transfer.
+> It only ever reaches the requester's own device and the payout staff rooms scoped in §9 — never
+> another tenant. Don't log the payload, and don't render the full number in a notification
+> shade preview.
 
 **`payout:alert`**
 

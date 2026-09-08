@@ -1076,8 +1076,18 @@ module.exports = (
       });
       await inc('totalCustomerPayoutPendingAmount', amountPaise);
       await inc('totalCustomerPayoutPendingCount', 1);
-      await notify(userId, { type: 'request_created', userId, payoutId: payout.id, status: 'pending', amountPaise });
-      res.status(201).json({ success: true, payout: pickPayout({ ...payout, accountBankingStatus: account.bankingStatus || 'not_added', accountVerificationStatus: account.verificationStatus || 'unverified' }) });
+      // The staff popup renders straight from this payload — it carries the same projection the
+      // admin queue row uses, so the dialog can never drift from the list behind it, and nobody
+      // has to round-trip GET /admin/requests/:id just to show who wants how much paid to whom.
+      // The flat keys above `payout` stay for older app builds that read them directly.
+      const view = pickPayout({ ...payout, accountBankingStatus: account.bankingStatus || 'not_added', accountVerificationStatus: account.verificationStatus || 'unverified' });
+      await notify(userId, {
+        type: 'request_created', userId, payoutId: payout.id, status: 'pending', amountPaise,
+        requestedByName: user?.name || null, requestedByUserId: userId,
+        customerName: account.customerName, mode, totalPaise, commissionPaise,
+        payout: view,
+      });
+      res.status(201).json({ success: true, payout: view });
     } catch (e) { sendError(res, e, 'Failed to create customer payout request'); }
   });
 

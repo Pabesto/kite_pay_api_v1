@@ -41,6 +41,40 @@ dayjs.extend(tz);
 dayjs.tz.setDefault('Asia/Kolkata');
 
 // We will now pass the required dependencies and middleware from the main server file
+// ─── derived dashboard figures (GET /dashboard/counters) ────────────────────────
+// Pure arithmetic over the counter map — no new counters, nothing persisted. Split out of
+// the route so the double-count rule is testable on its own.
+//
+// totalPayoutWalletFunded is a SUBSET of totalAmountPaid: withdraw.js bumps totalAmountPaid
+// on EVERY approval, then bumps totalPayoutWalletFunded again for the mode:'wallet' ones
+// (payout.js revert-to-QR backs both out together). So money that actually left the platform
+// has to subtract it before adding the customer payouts that money funded — otherwise every
+// rupee going QR → payout wallet → customer is counted twice.
+//
+// totalAdminProfit / totalMerchantProfit are WITHDRAWAL commission only (withdraw.js on
+// approve; payout.js only ever posts negative deltas there to refund a payin commission).
+// Customer-payout commission lives in totalPayoutAdminProfit / totalPayoutMerchantProfit
+// (payout.js on paid), so the *All roll-ups below add two disjoint pots.
+function deriveDashboardTotals(get) {
+    const received = get('totalAmountReceived');
+    const txCount = get('totalTxCount');
+    const withdrawalsToBank = get('totalAmountPaid') - get('totalPayoutWalletFunded');
+    const totalPaidOut = withdrawalsToBank + get('totalCustomerPayoutPaid');
+    const totalAdminProfitAll = get('totalAdminProfit') + get('totalPayoutAdminProfit');
+    const totalMerchantProfitAll = get('totalMerchantProfit') + get('totalPayoutMerchantProfit');
+    return {
+        totalPaidOut,
+        withdrawalsToBank,
+        netFlow: received - totalPaidOut,                                   // may be negative
+        avgTxAmount: txCount > 0 ? Math.round(received / txCount) : 0,      // never divide by zero
+        totalAdminProfitAll,
+        totalMerchantProfitAll,
+        totalPlatformProfit: totalAdminProfitAll + totalMerchantProfitAll,
+        totalCustomerPayoutAll: get('totalCustomerPayoutPaid') + get('totalCustomerPayoutPendingAmount'),
+        adminMarginPercent: received > 0 ? Math.round((totalAdminProfitAll / received) * 10000) / 100 : 0,
+    };
+}
+
 module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
@@ -4243,6 +4277,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // Memberships
             totalMembershipPurchased: get('totalMembershipPurchased'),
             pendingMembershipUsers: get('pendingMembershipUsers'),
+
+            // Derived roll-ups (see deriveDashboardTotals at the top of this file)
+            ...deriveDashboardTotals(get),
             };
 
             return res.status(200).json(payload);
@@ -6247,3 +6284,5 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     return router;
 
 };
+
+module.exports.deriveDashboardTotals = deriveDashboardTotals;
