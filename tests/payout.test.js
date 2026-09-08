@@ -1189,6 +1189,92 @@ describe('beneficiary verification', () => {
     });
 });
 
+describe('realtime staff routing + new event types', () => {
+    const seed = () => ({
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' }],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000, holdPaise: 0 }],
+    });
+
+    // The tenancy boundary: an event about user1 may only reach user1's own subadmin (sub1)
+    // and the employees under sub1 — never another subadmin's staff room.
+    test('events carry the subject subadmin + own id as staffRooms', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 });
+        const e = emitted().at(-1);
+        expect(e.payload.type).toBe('request_created');
+        expect(e.staffRooms).toEqual(['sub1', 'user1']);
+        expect(e.platform).toBeFalsy();
+    });
+
+    test('a user opting out still routes to their staff rooms', async () => {
+        const db = makeDb(seed());
+        userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1'
+            ? { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', payoutCommission: 2, payoutRealtimeDisabled: true }
+            : { $id: id, userId: id, role: 'admin', parentId: null }));
+        const { app } = buildPayout(db, makeRedis());
+        await request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 });
+        const e = emitted().at(-1);
+        expect(e.userId).toBeNull();               // the user's own device stays silent
+        expect(e.staffRooms).toEqual(['sub1', 'user1']); // staff are not blinded by that choice
+    });
+
+    test('settings change broadcasts platform-wide, not to one tenant', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).patch('/admin/settings').send({ realtimeEnabled: true, maxPending: 3 });
+        expect(res.status).toBe(200);
+        const e = emitted().find((x) => x.payload?.type === 'settings_changed');
+        expect(e).toBeTruthy();
+        expect(e.platform).toBe(true);
+        expect(e.userId).toBeNull();
+        expect(e.payload.changed).toEqual(expect.arrayContaining(['payout_max_pending']));
+    });
+
+    test('adding a beneficiary emits account_created; deleting emits account_deleted', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        const add = await request(app).post('/accounts').send(ACCOUNT);
+        expect(add.status).toBe(201);
+        expect(emitted().at(-1).payload).toMatchObject({ type: 'account_created', userId: 'user1' });
+        mockEmit.mockClear();
+        const del = await request(app).delete(`/accounts/${add.body.account.$id}`);
+        expect(del.status).toBe(200);
+        expect(emitted().at(-1).payload).toMatchObject({ type: 'account_deleted', userId: 'user1' });
+    });
+
+    test('stale-pending sweep alerts each request once, then stops re-ringing', async () => {
+        Object.assign(mockConfig, { payout_alerts_enabled: 'true', payout_pending_alert_minutes: 30 });
+        try {
+            const old = new Date(Date.now() - 60 * 60000).toISOString(); // 60 min > 30 min threshold
+            const db = makeDb({
+                ...seed(),
+                [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', status: 'pending', amountPaise: 10000, customerName: 'Ravi Kumar', createdAt: old }],
+            });
+            const { mod } = buildPayout(db, makeRedis());
+            await mod.sweepStalePending();
+            const alerts = emitted().filter((e) => e.event === 'payout:alert');
+            expect(alerts).toHaveLength(1);
+            expect(alerts[0].payload).toMatchObject({ type: 'stale_pending', payoutId: 'cpo_1', thresholdMinutes: 30 });
+            expect(alerts[0].staffRooms).toEqual(['sub1', 'user1']);
+
+            mockEmit.mockClear();
+            await mod.sweepStalePending();          // same row, second tick — must stay quiet
+            expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(0);
+        } finally {
+            delete mockConfig.payout_alerts_enabled; delete mockConfig.payout_pending_alert_minutes;
+        }
+    });
+
+    test('sweep emits nothing while the alert toggle is off', async () => {
+        const old = new Date(Date.now() - 60 * 60000).toISOString();
+        const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', status: 'pending', amountPaise: 10000, createdAt: old }] });
+        const { mod } = buildPayout(db, makeRedis());
+        await mod.sweepStalePending();
+        expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(0);
+    });
+});
+
 describe('realtime events (platform toggle + user opt-out)', () => {
     const seed = () => ({
         [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user' }],

@@ -925,25 +925,92 @@ data; hide Paid/Reject/Adjust/Mark-added/Delete).
 
 ---
 
-## 9. Realtime updates (Socket.io, optional at both ends)
+## 9. Realtime updates (Socket.io) + the staff notification centre
 
-The app already has a Socket.io connection that joins `room:user:<userId>` (and `room:admins` for
-admins). Two new events arrive there — **treat them as "refresh now" hints, never as the source of
-truth**; always re-fetch the affected list/wallet.
+Connect with the Appwrite JWT (`auth: { token }`, websocket transport). On connect the server
+puts you in your rooms automatically — **there is nothing to subscribe to for payouts**:
 
-| event | to whom | `payload.type` values |
+| Who you are | Rooms joined | What you receive |
 |---|---|---|
-| `payout:update` | the affected user's room **and** admins (admins always, even if the user opted out) | `request_created` `request_paid` `request_rejected` `request_cancelled` `wallet_changed` (`reason`: `withdrawal_credit` \| `admin_credit` \| `admin_debit` \| `revert_to_qr`, includes `wallet`) `account_banking_status` `account_verification` (user only) |
-| `payout:alert` | user room + admins | `low_balance` (`availablePaise`, `thresholdPaise`) |
+| any user | `room:user:<userId>` | payout events about **you** |
+| `role: 'admin'` | `room:admins` | **every** payout event, all tenants |
+| `role: 'subadmin'` | `room:payout_staff`, `room:payout_sub:<own userId>` | events about you and your own users |
+| `role: 'employee'` with `view_payouts` / `edit_payouts` / `view_payout_commissions` | `room:payout_staff`, one `room:payout_sub:<subadminId>` per assigned subadmin | events about those subadmins' users |
 
-Every payload has `userId`, `at` (ISO) and, where relevant, `payoutId`, `status`, `amountPaise`.
+The `room:payout_sub:*` split is the same tenancy boundary the REST routes enforce — a subadmin
+never receives another subadmin's customer names or amounts. Platform-wide notices
+(`settings_changed`, `source_accounts_changed`) go to `room:payout_staff` instead, since they
+carry no customer data.
 
-Toggles:
-- **Platform** (admin settings §6.5a, `realtimeEnabled`): off = the server emits nothing.
+> Room joins for staff complete a tick after `connect`. Always load the list once on screen mount
+> and treat every event as a **"refresh now" hint, never the source of truth** — re-fetch the
+> affected list/wallet rather than mutating local state from the payload.
+
+### 9.1 Event catalogue
+
+Two socket events, discriminated by `payload.type`. Every payload carries `userId` and `at` (ISO);
+most also carry `payoutId`, `status`, `amountPaise`.
+
+**`payout:update`**
+
+| `payload.type` | Fired when | Extra payload | Suggested treatment |
+|---|---|---|---|
+| `request_created` | user submits a customer payout | `payoutId`, `status:'pending'`, `amountPaise` | **dialog + sound** |
+| `request_paid` | admin marks paid | `payoutId`, `referenceNumber`, `amountPaise` | toast |
+| `request_rejected` | admin rejects | `payoutId`, `reason` | toast |
+| `request_cancelled` | user cancels their own pending request | `payoutId` | silent list refresh |
+| `wallet_changed` | wallet balance moved | `reason`: `withdrawal_credit` \| `admin_credit` \| `admin_debit` \| `revert_to_qr`, plus `wallet` | silent refresh (sound on admin adjust) |
+| `account_created` | user saves a **new** beneficiary | `accountId`, `customerName`, `bankingStatus`, `verificationStatus` | toast — it needs staff verification |
+| `account_deleted` | beneficiary removed (user or admin) | `accountId`, `customerName` | silent list refresh |
+| `account_verification` | staff set a verification status | `accountId`, `verificationStatus` | user only (`toAdmins:false`) |
+| `account_banking_status` | staff set banking status | `accountId`, `bankingStatus`, `stampedRequests` | user only (`toAdmins:false`) |
+| `limits_changed` | admin changed that user's payout limits | `effective` (same shape as §6.5a limits) | refresh limits, toast |
+| `access_changed` | admin enabled/disabled payouts for that user | `payoutDisabled`, `payoutDisabledReason` | toast; re-read `GET /status` |
+| `settings_changed` | admin saved §6.5a settings | `changed` (config keys), `settings` (full §6.5a GET shape) | **platform-wide**; refresh the settings screen and any pause banner |
+| `source_accounts_changed` | "paid via" list added/reactivated/deactivated | `action`, `label` | **platform-wide**; refresh the picker |
+
+**`payout:alert`**
+
+| `payload.type` | Fired when | Extra payload | Suggested treatment |
+|---|---|---|---|
+| `low_balance` | a wallet's available crosses below the threshold | `availablePaise`, `thresholdPaise` | **dialog + sound** |
+| `stale_pending` | a request has sat `pending` past `pendingAlertMinutes` | `payoutId`, `waitingMinutes`, `thresholdMinutes`, `amountPaise`, `customerName`, `requestedAt` | **dialog + sound** |
+
+`stale_pending` is pushed by a server sweep (~every 60s) and fires **once per request** — it does
+not repeat every tick. A process restart may re-announce rows that are still stale. Both alert
+types require `alertsEnabled` and their threshold to be non-zero in §6.5a. `GET /admin/alerts`
+(§6.5c) still returns the same two lists on demand — use it to populate the badge on load, and the
+socket to keep it live.
+
+### 9.2 Notification settings screen (per-event sound + popup)
+
+Build this **client-side** — store the toggles in `shared_preferences`, keyed by `payload.type`.
+There is deliberately no endpoint for it: these are per-device UI preferences, not platform
+config, so they must not go in `app_config`.
+
+```dart
+// one row per type from the tables above
+class NotifPref { bool popup; bool sound; }
+Map<String, NotifPref> prefs;   // 'request_created' -> {popup: true, sound: true}
+```
+
+Suggested defaults: popup+sound on for `request_created`, `low_balance`, `stale_pending`; toast
+only for the `request_*`/`account_*`/`limits_changed`/`access_changed` group; silent refresh for
+`request_cancelled`, `wallet_changed` and both platform notices. Group the settings page under
+**Requests / Wallet / Beneficiaries / Alerts / Platform** with a master "Mute all" at the top.
+
+Unknown `payload.type` values must be ignored silently — new types get added server-side and an
+older build must not crash or show a blank dialog.
+
+### 9.3 Kill switches (server-side, above all client toggles)
+
+- **Platform** (admin settings §6.5a, `realtimeEnabled` → `payout_realtime_enabled`): off = the
+  server emits **nothing** at all, for everyone. The app must still work fully on pull-to-refresh.
 - **Per user**: `PATCH /api/payout/me/preferences { "realtime": false }` → `{ success, preferences }`;
-  the user then receives no `payout:update` events (admins still do). Read it back from
-  `GET /status` (`preferences.realtime`). Put a "Live updates" switch in the user's settings; when
-  off, fall back to pull-to-refresh / polling.
+  that user's own device stops receiving `payout:update`. Staff rooms are unaffected — a subadmin
+  silencing their own device does not blind their employees. Read it back from `GET /status`
+  (`preferences.realtime`). Show a "Live updates" switch in the user's settings; when off, fall
+  back to pull-to-refresh / polling.
 
 ## 10. Withdrawal ownership (existing endpoint, tightened)
 `POST /api/user/withdraw_new` now rejects a `userId` that the caller is not allowed to act for:

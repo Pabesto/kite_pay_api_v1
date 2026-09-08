@@ -335,20 +335,40 @@ module.exports = (
   }
 
   // ─── realtime (socket) — platform toggle + per-user opt-out; never throws ──
-  async function notify(userId, payload, { toAdmins = true } = {}) {
+  // The subject's staff audience: their subadmin, plus their own id because usersUnder()
+  // counts a subadmin as one of their own visible users. Kept independent of the per-user
+  // opt-out below — a subadmin silencing their own device must not blind their employees.
+  async function staffRoomsFor(userId) {
+    if (!userId) return [];
+    const u = await userMetaCache.getUserMeta(userId).catch(() => null);
+    return [u?.parentId || null, userId];
+  }
+  async function notify(userId, payload, { toAdmins = true, event = 'payout:update' } = {}) {
     try {
       if (typeof emitPayoutEvent !== 'function' || !settingsView().realtimeEnabled) return;
       const user = userId ? await userMetaCache.getUserMeta(userId) : null;
-      emitPayoutEvent({ userId: user && user.payoutRealtimeDisabled === true ? null : userId, event: 'payout:update', payload: { ...payload, at: nowIso() }, toAdmins });
+      emitPayoutEvent({
+        userId: user && user.payoutRealtimeDisabled === true ? null : userId,
+        staffRooms: [user?.parentId || null, userId],
+        event, payload: { ...payload, at: nowIso() }, toAdmins,
+      });
     } catch (e) { console.error('payout notify failed:', e?.message); }
   }
+  // Platform-wide change (settings, limits, access, source accounts) — every payout staffer,
+  // no tenant scoping, and never pushed to the affected user's own device.
+  async function notifyPlatform(payload) {
+    try {
+      if (typeof emitPayoutEvent !== 'function' || !settingsView().realtimeEnabled) return;
+      emitPayoutEvent({ userId: null, platform: true, event: 'payout:update', payload: { ...payload, at: nowIso() }, toAdmins: true });
+    } catch (e) { console.error('payout platform notify failed:', e?.message); }
+  }
   // Low-balance alert when a wallet's available drops below the configured threshold (admin toggle).
-  function lowBalanceAlert(userId, availableBefore, availableAfter) {
+  async function lowBalanceAlert(userId, availableBefore, availableAfter) {
     try {
       const s = settingsView().alerts;
       if (!s.enabled || !s.lowBalanceThresholdPaise || typeof emitPayoutEvent !== 'function') return;
       if (availableAfter < s.lowBalanceThresholdPaise && availableBefore >= s.lowBalanceThresholdPaise) {
-        emitPayoutEvent({ userId, event: 'payout:alert', toAdmins: true, payload: { type: 'low_balance', userId, availablePaise: availableAfter, thresholdPaise: s.lowBalanceThresholdPaise, at: nowIso() } });
+        emitPayoutEvent({ userId, staffRooms: await staffRoomsFor(userId), event: 'payout:alert', toAdmins: true, payload: { type: 'low_balance', userId, availablePaise: availableAfter, thresholdPaise: s.lowBalanceThresholdPaise, at: nowIso() } });
       }
     } catch (e) { console.error('payout low-balance alert failed:', e?.message); }
   }
@@ -427,7 +447,7 @@ module.exports = (
       throw e;
     }
     if (deltaBalance) await inc('totalPayoutWalletBalance', deltaBalance);
-    lowBalanceAlert(userId, availableBefore, balancePaise - holdPaise);
+    lowBalanceAlert(userId, availableBefore, balancePaise - holdPaise).catch((e) => console.error('payout low-balance alert failed:', e?.message));
     return { wallet: { ...w, balancePaise, holdPaise, ...lifetime }, txn: row };
   }
 
@@ -832,6 +852,7 @@ module.exports = (
     const pending = await databases.listDocuments(DB, PAYOUTS, [Query.equal('accountId', account.$id), Query.equal('status', 'pending'), Query.limit(1)]);
     if (pending.documents[0]) throw fail(409, 'Account has a pending payout request');
     await databases.deleteDocument(DB, ACCOUNTS, account.$id); // paid/rejected rows keep their snapshot
+    await notify(account.userId, { type: 'account_deleted', userId: account.userId, accountId: account.$id, customerName: account.customerName || null });
   }
   function rupeesFilter(v, label) {
     if (v == null || v === '') return null;
@@ -977,6 +998,7 @@ module.exports = (
     try {
       notForAdmin(req);
       const { account, created } = await findOrCreateAccount(req.user.userId, req.body, req.body.notes);
+      if (created) await notify(req.user.userId, { type: 'account_created', userId: req.user.userId, accountId: account.$id, customerName: account.customerName || null, bankingStatus: account.bankingStatus || 'not_added', verificationStatus: account.verificationStatus || 'unverified' });
       res.status(created ? 201 : 200).json({ success: true, created, account: pickAccount(account) });
     } catch (e) { sendError(res, e, 'Failed to save customer payout account'); }
   });
@@ -1279,6 +1301,7 @@ module.exports = (
       const entries = Object.entries(writes).filter(([, v]) => v !== null);
       if (!entries.length) throw fail(400, 'No settings provided');
       for (const [key, val] of entries) await ConfigManager.set(key, val);
+      await notifyPlatform({ type: 'settings_changed', changed: entries.map(([k]) => k), settings: settingsView() });
       res.json({ success: true, ...settingsView() });
     } catch (e) { sendError(res, e, 'Failed to update payout settings'); }
   });
@@ -1312,6 +1335,7 @@ module.exports = (
       await databases.updateDocument(DB, USERS_META, doc.$id, patch);
       await userMetaCache.invalidate(req.params.userId);
       const user = { ...doc, ...patch };
+      await notify(req.params.userId, { type: 'limits_changed', userId: req.params.userId, effective: limitsFor(user) });
       res.json({ success: true, userId: req.params.userId, userValues: { maxPerRequestPaise: user.payoutMaxPerRequestPaise ?? null, dailyLimitPaise: user.payoutDailyLimitPaise ?? null, maxPending: user.payoutMaxPending ?? null }, effective: limitsFor(user) });
     } catch (e) { sendError(res, e, 'Failed to update payout limits'); }
   });
@@ -1339,6 +1363,7 @@ module.exports = (
       if (label.length < 2) throw fail(400, 'label is required (2–100 characters)');
       const existing = await findSource(label);
       const doc = existing ? (existing.active === false ? await databases.updateDocument(DB, SOURCE_ACCOUNTS, existing.$id, { active: true }) : existing) : await upsertSource(label, req.user.userId);
+      await notifyPlatform({ type: 'source_accounts_changed', action: existing ? 'reactivated' : 'created', label: doc.label });
       res.status(existing ? 200 : 201).json({ success: true, created: !existing, sourceAccount: pickSource(doc) });
     } catch (e) { sendError(res, e, 'Failed to add source account'); }
   });
@@ -1348,6 +1373,7 @@ module.exports = (
       const doc = await databases.getDocument(DB, SOURCE_ACCOUNTS, req.params.id).catch(() => null);
       if (!doc) throw fail(404, 'Source account not found');
       await databases.updateDocument(DB, SOURCE_ACCOUNTS, doc.$id, { active: false });
+      await notifyPlatform({ type: 'source_accounts_changed', action: 'deactivated', label: doc.label });
       res.json({ success: true, message: 'Source account deactivated' });
     } catch (e) { sendError(res, e, 'Failed to deactivate source account'); }
   });
@@ -1633,6 +1659,7 @@ module.exports = (
       const reason = req.body.enabled ? null : (String(req.body.reason || '').trim().slice(0, 200) || null);
       await databases.updateDocument(DB, USERS_META, doc.$id, { payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
       await userMetaCache.invalidate(req.params.userId);
+      await notify(req.params.userId, { type: 'access_changed', userId: req.params.userId, payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
       res.json({ success: true, userId: req.params.userId, payoutDisabled: !req.body.enabled, payoutDisabledReason: reason });
     } catch (e) { sendError(res, e, 'Failed to update user payout access'); }
   });
@@ -2035,5 +2062,49 @@ module.exports = (
   router.get('/admin/commissions/monthly', commissionAuth, (req, res) => listTotals(req, res, MONTHLY_COMMISSION, true));
   router.get('/admin/commissions/all-time', commissionAuth, (req, res) => listTotals(req, res, ALLTIME_COMMISSION, false));
 
-  return { router, creditWalletFromWithdrawal };
+  // ─── stale-pending alert sweep ──────────────────────────────────────────────
+  // GET /admin/alerts computes stalePending on demand, so nobody learns a request has gone
+  // unpaid unless a human refreshes that page. This pushes it once per request, as soon as it
+  // crosses payout_pending_alert_minutes.
+  // ponytail: the "already alerted" set is in-memory (single instance, like reviewMode
+  // windows) and re-derived from the query each tick, so a restart re-alerts what is still
+  // stale — noisy at worst, never silent. Move it to Redis if this ever runs on two nodes.
+  let alertedStale = new Set();
+  let staleSweepRunning = false;
+  async function sweepStalePending() {
+    if (staleSweepRunning) return;           // an over-running tick must not stack
+    staleSweepRunning = true;
+    try {
+      const s = settingsView().alerts;
+      if (!s.enabled || !s.pendingAlertMinutes || !settingsView().realtimeEnabled) { alertedStale.clear(); return; }
+      const cutoff = new Date(Date.now() - s.pendingAlertMinutes * 60000).toISOString();
+      const r = await databases.listDocuments(DB, PAYOUTS, [
+        Query.equal('status', 'pending'), Query.lessThanEqual('createdAt', cutoff),
+        Query.orderAsc('createdAt'), Query.limit(100),
+      ]);
+      const stillStale = new Set();
+      for (const p of r.documents) {
+        stillStale.add(p.id);
+        if (alertedStale.has(p.id)) continue;   // already announced — don't re-ring every tick
+        await notify(p.userId, {
+          type: 'stale_pending', payoutId: p.id, userId: p.userId,
+          amountPaise: Number(p.amountPaise || 0), customerName: p.customerName || null,
+          requestedAt: p.createdAt, waitingMinutes: minutesBetween(p.createdAt, nowIso()),
+          thresholdMinutes: s.pendingAlertMinutes,
+        }, { event: 'payout:alert' });
+      }
+      alertedStale = stillStale;               // resolved rows drop out and may alert again if re-created
+    } catch (e) {
+      console.error('payout stale-pending sweep failed:', e?.message);
+    } finally {
+      staleSweepRunning = false;
+    }
+  }
+  const STALE_SWEEP_MS = Number(process.env.PAYOUT_STALE_SWEEP_MS) || 60000;
+  const staleSweepTimer = process.env.NODE_ENV === 'test'
+    ? null // would leak a Jest handle
+    : setInterval(() => sweepStalePending().catch(console.error), STALE_SWEEP_MS);
+  function stopJobs() { if (staleSweepTimer) clearInterval(staleSweepTimer); }
+
+  return { router, creditWalletFromWithdrawal, stopJobs, sweepStalePending };
 };

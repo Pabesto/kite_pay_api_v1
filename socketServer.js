@@ -6,7 +6,7 @@ const userMetaCache = require('./userMetaCache');
 
 let io; // Declare io in outer scope for access in emit functions
 
-function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
+function initSocket(app, { appwriteEndpoint, appwriteProjectId, resolveStaffRooms }) {
   // reuse the same HTTP server as Express
   const httpServer = http.createServer(app);
 
@@ -59,6 +59,25 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
     // Admins join the shared admin room — receives manual-review pending/resolved events.
     if (socket.data.userMeta?.role === 'admin') {
       socket.join('room:admins');
+    } else if (typeof resolveStaffRooms === 'function') {
+      // Payout staff (subadmins + employees holding a payout label) are NOT admins and so never
+      // saw a payout event before this. They join two kinds of room:
+      //   room:payout_staff          — platform-wide payout events (settings, pause switches)
+      //   room:payout_sub:<subadminId> — tenant-scoped events, the same boundary payout.js
+      //                                  enforces on its REST routes via visibleUserIds()
+      // A subadmin joins their own id; an employee joins one per assigned subadmin — so a
+      // subadmin can never receive another subadmin's customer names or amounts.
+      // Resolution is injected because socketServer has no Appwrite handle of its own.
+      // ponytail: joins land a tick after connect; a client that misses an event in that
+      // window still has the list it fetched on mount. Add an ack if that ever matters.
+      Promise.resolve()
+        .then(() => resolveStaffRooms(socket.data.userMeta))
+        .then((subadminIds) => {
+          if (!subadminIds) return; // null = not payout staff
+          socket.join('room:payout_staff');
+          for (const id of subadminIds) if (id) socket.join(`room:payout_sub:${id}`);
+        })
+        .catch((e) => console.error('resolveStaffRooms failed:', e.message));
     }
 
     // client asks to subscribe to specific QR codes it owns
@@ -106,11 +125,18 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId }) {
 
 // Customer-payout events (payout.js): to the affected user's room and/or admins.
 //   event: 'payout:update' (request/wallet changed) | 'payout:alert' (low balance, stale pending)
-function emitPayoutEvent({ userId, event = 'payout:update', payload, toAdmins = true }) {
+// staffRooms: subadmin ids whose staff may see this event (payout.js passes the subject's
+// parentId plus the subject's own id — usersUnder() counts a subadmin as visible to itself).
+// platform:true instead sends it to every payout staffer (settings/pause — not tenant data).
+function emitPayoutEvent({ userId, staffRooms, platform = false, event = 'payout:update', payload, toAdmins = true }) {
   try {
     if (!io || !payload) return;
     if (userId) io.to(`room:user:${userId}`).emit(event, payload);
-    if (toAdmins) io.to('room:admins').emit(event, payload);
+    if (!toAdmins) return;
+    let ch = io.to('room:admins'); // socket.io de-dupes a socket that is in several of these
+    if (platform) ch = ch.to('room:payout_staff');
+    else for (const id of staffRooms || []) if (id) ch = ch.to(`room:payout_sub:${id}`);
+    ch.emit(event, payload);
   } catch (e) {
     console.error('emitPayoutEvent error:', e.message);
   }
@@ -193,5 +219,5 @@ function emitReviewResolved(payload) {
     }
   }
 
-module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved };
+module.exports = { initSocket, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent };
 

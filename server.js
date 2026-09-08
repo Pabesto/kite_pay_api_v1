@@ -127,9 +127,26 @@ const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
 // Set LOG_RAZORPAY_WEBHOOK=false in .env to silence the full webhook payload log.
 const LOG_RAZORPAY_WEBHOOK = String(process.env.LOG_RAZORPAY_WEBHOOK ?? 'true').toLowerCase() !== 'false';
 
+const PAYOUT_STAFF_LABELS = ['view_payouts', 'edit_payouts', 'view_payout_commissions'];
+
 const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent } = initSocket(app, {
   appwriteEndpoint: APPWRITE_ENDPOINT,
   appwriteProjectId: APPWRITE_PROJECT_ID,
+  // Which payout rooms a non-admin socket may join. Mirrors payout.js visibleUserIds():
+  // subadmin → their own id; employee holding a payout label → one id per assigned subadmin.
+  // Returns null for anyone who is not payout staff, [] for staff who scope to nobody yet.
+  // Runs on connect, long after `databases` is constructed further down this file.
+  resolveStaffRooms: async (meta) => {
+    if (!meta) return null;
+    if (meta.role === 'subadmin') return [meta.userId];
+    if (meta.role !== 'employee') return null;
+    if (!Array.isArray(meta.labels) || !meta.labels.some((l) => PAYOUT_STAFF_LABELS.includes(l))) return null;
+    const keys = [...new Set([meta.$id, meta.userId].filter(Boolean))]; // older docs stamp either id
+    const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, [
+      Query.equal('assigned_to', keys), Query.equal('role', 'subadmin'), Query.limit(100),
+    ]);
+    return r.documents.map((d) => d.userId).filter(Boolean);
+  },
 });
 
 httpServer.listen(PORT, () => {
@@ -2256,6 +2273,7 @@ async function gracefulShutdown(signal) {
     isShuttingDown = true;                   // /health starts reporting 503 immediately
     console.log(`\n${signal} received — starting graceful shutdown`);
     try { pinelabPoller?.stop(); } catch (e) { console.error('Error stopping PineLabs poller:', e); }
+    try { payout?.stopJobs?.(); } catch (e) { console.error('Error stopping payout jobs:', e); }
 
     // Armed before the drain so the deadline is measured from the signal, not from
     // the end of draining — GRACEFUL_SHUTDOWN_MS is the whole budget, DRAIN_MS included.
