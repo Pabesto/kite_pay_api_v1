@@ -106,13 +106,31 @@ describe('POST /prod/axis-worldline-webhook', () => {
         expect(dbId).toBe('db1');
         expect(colId).toBe(WL_COL);
         expect(doc.paymentId).toBe('AGU0009976378167EA2312211854E180008');
-        expect(doc.qrCodeId).toBe('037111016290183'); // no tid → mid fallback
+        expect(doc.qrCodeId).toBe('037111016290183'); // mid is our qrCodeId, tid ignored
         expect(doc.rrnNumber).toBe('335601834589');
         expect(doc.amount).toBe(50000); // "500.00" rupees → paise, exactly once
         expect(doc.vpa).toBe('kapilayush81@okbank');
         expect(doc.provider).toBe('axis_worldline');
         expect(doc.status).toBe('normal');
+        // time_stamp is IST wall time: 20231222002458 IST == 2023-12-21T18:54:58Z
+        expect(doc.created_at).toBe('2023-12-21T18:54:58.000Z');
         expect(JSON.parse(doc.payload)).toEqual(UPI_SAMPLE);
+    });
+
+    test('tid is ignored — mid is always the qrCodeId', async () => {
+        const db = makeDb();
+        await post(buildApp(db), { ...UPI_SAMPLE, tid: '1152090A' });
+        expect(db.createDocument.mock.calls[0][3].qrCodeId).toBe('037111016290183');
+    });
+
+    test('no mid: qrCodeId null with a warning, still SUCCESS', async () => {
+        const db = makeDb();
+        const { mid, ...noMid } = UPI_SAMPLE;
+        const res = await post(buildApp(db), noMid);
+        expect(res.body.status).toBe('SUCCESS');
+        const doc = db.createDocument.mock.calls[0][3];
+        expect(doc.qrCodeId).toBeNull();
+        expect(JSON.parse(doc.warningsJson).join(' ')).toMatch(/no mid/);
     });
 
     test('BQR card sample: saved, no vpa, paise amount from rupee string', async () => {
@@ -125,6 +143,15 @@ describe('POST /prod/axis-worldline-webhook', () => {
         expect(doc.paymentId).toBe('27579509');
         expect(doc.amount).toBe(7761100);
         expect(doc.vpa).toBeNull();
+        expect(doc.created_at).toBe('2023-12-28T10:10:31.000Z'); // 20231228154031 IST
+    });
+
+    test('missing/garbled time_stamp: falls back to receipt time with a warning', async () => {
+        const db = makeDb();
+        await post(buildApp(db), { ...UPI_SAMPLE, time_stamp: 'not-a-date' });
+        const doc = db.createDocument.mock.calls[0][3];
+        expect(JSON.parse(doc.warningsJson).join(' ')).toMatch(/unparseable time_stamp/);
+        expect(Date.parse(doc.created_at)).toBeGreaterThan(Date.parse('2026-01-01'));
     });
 
     test('duplicate primary_id: 200 SUCCESS (stops Worldline retries), no second insert', async () => {
@@ -173,6 +200,63 @@ describe('POST /prod/axis-worldline-webhook', () => {
         }
         expect(db.updateDocument).not.toHaveBeenCalled();
         expect(db.deleteDocument).not.toHaveBeenCalled();
+    });
+});
+
+// ── §1.1 encryption: AES-256-GCM, IV(16) || ciphertext || tag(16), base64 ────
+describe('encrypted payloads (AES-256-GCM)', () => {
+    const crypto = require('crypto');
+    const KEY = Buffer.alloc(32, 7);
+
+    /** Mirrors Java AES/GCM/NoPadding output: IV prefixed, 128-bit tag appended. */
+    function encrypt(obj, key = KEY) {
+        const iv = crypto.randomBytes(16);
+        const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+        const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+        return Buffer.concat([iv, ct, c.getAuthTag()]).toString('base64');
+    }
+
+    beforeEach(() => { process.env.AXIS_WL_AES_KEY = KEY.toString('hex'); });
+    afterEach(() => { delete process.env.AXIS_WL_AES_KEY; });
+
+    test('decrypts and maps the same fields as a flat body; keeps raw + decrypted payload', async () => {
+        const db = makeDb();
+        const data = encrypt(UPI_SAMPLE);
+        const res = await post(buildApp(db), { data });
+
+        expect(res.body).toEqual({ status: 'SUCCESS', errorMsg: '' });
+        const doc = db.createDocument.mock.calls[0][3];
+        expect(doc.paymentId).toBe(UPI_SAMPLE.primary_id);
+        expect(doc.amount).toBe(50000);
+        expect(doc.vpa).toBe('kapilayush81@okbank');
+        expect(JSON.parse(doc.payload)).toEqual({ data, decrypted: UPI_SAMPLE });
+    });
+
+    test('percent-encoded base64 (spec sample style) decrypts too', async () => {
+        const db = makeDb();
+        await post(buildApp(db), { data: encodeURIComponent(encrypt(BQR_SAMPLE)) });
+        expect(db.createDocument.mock.calls[0][3].paymentId).toBe('27579509');
+    });
+
+    test('tampered ciphertext fails the GCM tag: captured raw with a warning, still SUCCESS', async () => {
+        const db = makeDb();
+        const buf = Buffer.from(encrypt(UPI_SAMPLE), 'base64');
+        buf[20] ^= 0xff;
+        const res = await post(buildApp(db), { data: buf.toString('base64') });
+
+        expect(res.body.status).toBe('SUCCESS');
+        const doc = db.createDocument.mock.calls[0][3];
+        expect(doc.paymentId).toBeNull();
+        expect(JSON.parse(doc.warningsJson).join(' ')).toMatch(/decryption failed/);
+    });
+
+    test('wrong key: no fields parsed, warning recorded, nothing rejected', async () => {
+        const db = makeDb();
+        const data = encrypt(UPI_SAMPLE, Buffer.alloc(32, 9));
+        const res = await post(buildApp(db), { data });
+        expect(res.body.status).toBe('SUCCESS');
+        expect(db.createDocument.mock.calls[0][3].amount).toBeNull();
+        expect(JSON.parse(db.createDocument.mock.calls[0][3].warningsJson).join(' ')).toMatch(/decryption failed/);
     });
 });
 

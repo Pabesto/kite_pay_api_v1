@@ -23,13 +23,19 @@
 // recorded and answered SUCCESS (a duplicate retry is also SUCCESS — that stops the retries);
 // only a genuinely failed save answers `{ "status": "FAILED", "errorMsg": "…" }`.
 //
-// ENCRYPTION (§1.1): the real request is `{ "data": "<encrypted string>" }`. Until the bank
-// shares the decryption key/algorithm, an encrypted-only body is captured raw with every
-// parsed field null and a warning — nothing is dropped. Decrypted/flat sample payloads
-// (§1.3.1–1.3.3) are parsed field-by-field.
+// ENCRYPTION (§1.1): the real request is `{ "data": "<encrypted string>" }` —
+// AES-256-GCM (AES/GCM/NoPadding), the 16 random IV bytes prefixed to the Java-style
+// ciphertext, i.e. IV || ciphertext || 16-byte auth tag, transport-encoded (base64, possibly
+// percent-encoded as in the spec's own sample; hex accepted too). Key comes from
+// AXIS_WL_AES_KEY (64 hex chars, base64, or 32 raw chars — must be 32 bytes). With no key
+// configured, or on any decrypt failure, the body is still captured raw with every parsed
+// field null and a warning — nothing is dropped, nothing is rejected. Decrypted/flat sample
+// payloads (§1.3.1–1.3.3) are parsed field-by-field.
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
+const moment = require('moment-timezone');
 
 // Max stored length per attribute — MUST stay in sync with
 // scripts/setup-axis-worldline-uat-schema.js. Values are truncated before writing so an
@@ -60,6 +66,55 @@ const wlLimiter = rateLimit({
     handler: (req, res) => res.status(429).json({ status: 'FAILED', errorMsg: 'Rate limit exceeded' }),
 });
 
+const IV_LEN = 16;
+const TAG_LEN = 16; // Java's AES/GCM/NoPadding appends the 128-bit tag to the ciphertext
+
+// AXIS_WL_AES_KEY as 64 hex chars, base64, or 32 raw chars. Returns null when unset;
+// throws nothing — a bad key must not stop the server booting.
+function loadAesKey(log = console.warn) {
+    const raw = (process.env.AXIS_WL_AES_KEY || '').trim();
+    if (!raw) return null;
+    const candidates = [
+        /^[0-9a-fA-F]{64}$/.test(raw) ? Buffer.from(raw, 'hex') : null,
+        Buffer.from(raw, 'base64'),
+        Buffer.from(raw, 'utf8'),
+    ];
+    const key = candidates.find((b) => b && b.length === 32);
+    if (!key) log('⚠️  AXIS_WL_AES_KEY is set but does not decode to 32 bytes — Worldline payloads will be captured encrypted.');
+    return key || null;
+}
+
+// base64, percent-encoded base64 (as in the spec's own sample), or hex → bytes.
+function decodeTransport(str) {
+    let text = String(str).trim();
+    if (text.includes('%')) { try { text = decodeURIComponent(text); } catch { /* not percent-encoded */ } }
+    return /^[0-9a-fA-F]+$/.test(text) && text.length % 2 === 0
+        ? Buffer.from(text, 'hex')
+        : Buffer.from(text, 'base64');
+}
+
+// How many bytes the transport string decodes to — for the failure log only.
+function decodedByteLength(str) {
+    try { return decodeTransport(str).length; } catch { return null; }
+}
+
+// IV || ciphertext || tag → parsed JSON object. Throws on any tampering (GCM auth failure).
+function decryptWorldlineData(str, key) {
+    const buf = decodeTransport(str);
+    if (buf.length <= IV_LEN + TAG_LEN) throw new Error(`encrypted payload too short (${buf.length} bytes, need > ${IV_LEN + TAG_LEN})`);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, IV_LEN));
+    decipher.setAuthTag(buf.subarray(buf.length - TAG_LEN));
+    const plain = Buffer.concat([
+        decipher.update(buf.subarray(IV_LEN, buf.length - TAG_LEN)),
+        decipher.final(),
+    ]).toString('utf8');
+
+    const obj = JSON.parse(plain);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('decrypted payload is not a JSON object');
+    return obj;
+}
+
 // Truncate-and-stringify. Returns null for absent values so Appwrite stores nothing.
 function cap(value, max) {
     if (value === undefined || value === null) return null;
@@ -75,6 +130,7 @@ module.exports = (
     authenticateAdmin
 ) => {
     const router = express.Router();
+    const AES_KEY = loadAesKey();
 
     // Matches partnerApi.js — Appwrite reports a bad/expired cursor as a 400, not a 404.
     function isCursorError(err) {
@@ -83,26 +139,26 @@ module.exports = (
     }
 
     // Map a decrypted Worldline notification onto webhook_data field names (§1.1.1).
-    // Never throws — every problem becomes a warning. An encrypted-only body
-    // ({ data: "<string>" }) yields all-null fields plus a warning.
+    // Never throws — every problem becomes a warning. A body still encrypted at this point
+    // (no key, or decrypt failed) yields all-null fields plus a warning.
     function normalize(body) {
         const warnings = [];
 
         const encryptedOnly = typeof body.data === 'string' && !body.primary_id && !body.ref_no;
         if (encryptedOnly) {
-            warnings.push('encrypted payload only — no decryption key configured, captured raw');
-            return { paymentId: null, qrCodeId: null, rrnNumber: null, amountPaise: null, vpa: null, warnings };
+            warnings.push('payload still encrypted — captured raw, no fields parsed');
+            return { paymentId: null, qrCodeId: null, rrnNumber: null, amountPaise: null, vpa: null, createdAtIso: null, warnings };
         }
 
         // §1.1.1: primary_id is the mandatory unique id; tr_id is the UPI txn id.
         const paymentId = body.primary_id || body.tr_id || null;
         if (!paymentId) warnings.push('no primary_id/tr_id — cannot dedup this notification');
 
-        // tid is optional in the spec; mid is mandatory. qrCodeId is the derived identifier
-        // the rest of the system would key on — the captures tell us what Worldline really
-        // sends before anyone writes the production mapping.
-        const qrCodeId = body.tid || body.mid || null;
-        if (!body.tid) warnings.push(qrCodeId ? 'no tid — fell back to mid' : 'no tid and no mid — QR unidentifiable');
+        // mid IS our qrCodeId for Worldline (decided; tid is optional in the spec and absent
+        // from the live UPI notifications — it stays in the raw payload). mid is mandatory,
+        // so a missing one is a malformed notification.
+        const qrCodeId = body.mid || null;
+        if (!qrCodeId) warnings.push('no mid — QR unidentifiable');
 
         const rrnNumber = body.ref_no || null;
         if (!rrnNumber) warnings.push('no ref_no (RRN)');
@@ -126,12 +182,23 @@ module.exports = (
         const vpa = body.customer_vpa || null;
         if (!vpa && body.transaction_type === '2') warnings.push('UPI txn without customer_vpa');
 
+        // §1.1.1 time_stamp is `yyyymmddHHmmss` IST WALL TIME (the §1.3.1 sample's
+        // 20231222002458 IST == 20231221185458 UTC, which is exactly the timestamp embedded
+        // in its own secondary_id). Store the transaction time like every other provider —
+        // Appwrite's $createdAt already records when we received it.
+        let createdAtIso = null;
+        if (body.time_stamp) {
+            const m = moment.tz(String(body.time_stamp), 'YYYYMMDDHHmmss', true, 'Asia/Kolkata');
+            if (m.isValid()) createdAtIso = m.toISOString();
+            else warnings.push(`unparseable time_stamp: ${body.time_stamp}`);
+        }
+
         if (body.txn_currency && body.txn_currency !== '356') warnings.push(`non-INR currency: ${body.txn_currency}`);
         if (!body.transaction_type) warnings.push('no transaction_type field');
         else if (body.transaction_type !== '1' && body.transaction_type !== '2') warnings.push(`unexpected transaction_type: ${body.transaction_type}`);
         if (!body.time_stamp) warnings.push('no time_stamp field');
 
-        return { paymentId, qrCodeId, rrnNumber, amountPaise, vpa, warnings };
+        return { paymentId, qrCodeId, rrnNumber, amountPaise, vpa, createdAtIso, warnings };
     }
 
     // ── POST /uat/axis-worldline-webhook ─────────────────────────────────────
@@ -149,7 +216,44 @@ module.exports = (
                 return res.status(400).json({ status: 'FAILED', errorMsg: 'Empty or unparseable body' });
             }
 
-            const parsed = normalize(body);
+            // §1.1: decrypt `{ data: "<IV+ciphertext+tag>" }` before mapping. Failures are
+            // warnings, never rejections — the raw envelope is still captured.
+            let mapped = body;
+            let payloadJson = JSON.stringify(body);
+            const cryptoWarnings = [];
+            if (typeof body.data === 'string' && !body.primary_id && !body.ref_no) {
+                if (!AES_KEY) {
+                    cryptoWarnings.push('encrypted payload — AXIS_WL_AES_KEY not configured, captured raw');
+                    console.warn('🔐 Axis Worldline: encrypted payload but AXIS_WL_AES_KEY is not set — captured raw. data.length=', body.data.length);
+                } else {
+                    try {
+                        mapped = decryptWorldlineData(body.data, AES_KEY);
+                        payloadJson = JSON.stringify({ data: body.data, decrypted: mapped });
+                        console.log('🔓 Axis Worldline: decrypted OK:', JSON.stringify(mapped));
+                    } catch (e) {
+                        mapped = body;
+                        cryptoWarnings.push(`decryption failed: ${e?.message || e}`);
+                        // UAT diagnostics: everything needed to compare notes with the bank —
+                        // the raw string, how it decoded, sizes. NEVER the key itself.
+                        console.error('🔐 Axis Worldline DECRYPTION FAILED', JSON.stringify({
+                            error: e?.message || String(e),
+                            sourceIp: req.ip,
+                            rawData: body.data,
+                            rawLength: body.data.length,
+                            percentEncoded: body.data.includes('%'),
+                            decodedBytes: decodedByteLength(body.data),
+                            keyBytes: AES_KEY.length,
+                            ivLen: IV_LEN,
+                            tagLen: TAG_LEN,
+                            fullBody: body,
+                        }, null, 2));
+                        console.error(e?.stack || e);
+                    }
+                }
+            }
+
+            const parsed = normalize(mapped);
+            parsed.warnings = [...cryptoWarnings, ...parsed.warnings];
             const receivedAt = new Date().toISOString();
 
             try {
@@ -173,14 +277,14 @@ module.exports = (
                     APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID,
                     ID.unique(),
                     {
-                        payload: cap(JSON.stringify(body), CAPS.payload),
+                        payload: cap(payloadJson, CAPS.payload),
                         qrCodeId: cap(parsed.qrCodeId, CAPS.qrCodeId),
                         paymentId: cap(parsed.paymentId, CAPS.paymentId),
                         rrnNumber: cap(parsed.rrnNumber, CAPS.rrnNumber),
                         amount: parsed.amountPaise,
                         vpa: cap(parsed.vpa, CAPS.vpa),
                         provider: 'axis_worldline',
-                        created_at: cap(receivedAt, CAPS.created_at),
+                        created_at: cap(parsed.createdAtIso || receivedAt, CAPS.created_at),
                         status: 'normal',
                         // ownerSubadminId deliberately unset — no owner resolution on the capture path
                         warningsJson: cap(JSON.stringify(parsed.warnings), CAPS.warningsJson),

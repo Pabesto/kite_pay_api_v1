@@ -43,7 +43,7 @@ for (const [name, val] of Object.entries({ APPWRITE_ENDPOINT: ENDPOINT, APPWRITE
 // the review fields from setup-review-schema.js), plus a warningsJson/sourceIp capture tail.
 const COLUMNS = [
   { key: 'payload',         kind: 'string',  size: 1000000, required: false, note: 'full raw notification JSON — source of truth (encrypted `data` or decrypted object)' },
-  { key: 'qrCodeId',        kind: 'string',  size: 64,  required: false, note: 'tid, else mid — terminal/QR identifier' },
+  { key: 'qrCodeId',        kind: 'string',  size: 64,  required: false, note: 'mid — the Worldline merchant id we key QRs on (tid stays in payload)' },
   { key: 'paymentId',       kind: 'string',  size: 64,  required: false, note: 'Worldline primary_id (spec max 40) — dedup key' },
   { key: 'rrnNumber',       kind: 'string',  size: 64,  required: false, note: 'ref_no (RRN as sent by issuer)' },
   { key: 'amount',          kind: 'integer',            required: false, note: 'paise — txn_amount rupees converted once at the boundary' },
