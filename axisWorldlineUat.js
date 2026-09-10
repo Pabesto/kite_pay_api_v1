@@ -247,7 +247,9 @@ module.exports = (
                             tagLen: TAG_LEN,
                             fullBody: body,
                         }, null, 2));
-                        console.error(e?.stack || e);
+                        // Handled — the request is still answered SUCCESS and the row is still
+                        // stored. Printed only so the failing line is visible in Render logs.
+                        console.error('🔐 (handled, response is still SUCCESS) stack:', e?.stack || e);
                     }
                 }
             }
