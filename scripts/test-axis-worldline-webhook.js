@@ -1,10 +1,13 @@
 // test-axis-worldline-webhook.js — poke POST /prod/axis-worldline-webhook and print what
 // came back. Sends nothing to any bank; it only exercises OUR receiver.
 //
-//   node scripts/test-axis-worldline-webhook.js                       # plain §1.3.1 body
-//   node scripts/test-axis-worldline-webhook.js --mode encrypted      # AES-256-GCM envelope
-//   node scripts/test-axis-worldline-webhook.js --mode garbage        # forces a decrypt failure
+//   node scripts/test-axis-worldline-webhook.js                       # plain §1.3.1 body → /uat (capture only)
+//   node scripts/test-axis-worldline-webhook.js --mode encrypted      # AES-256-GCM envelope → /prod (LIVE: credits the QR whose qrId = mid!)
+//   node scripts/test-axis-worldline-webhook.js --mode garbage        # forces a decrypt failure → /prod
 //   node scripts/test-axis-worldline-webhook.js --mode all            # all three, in order
+//
+// /prod is the LIVE money path and refuses plaintext (400) — plain bodies go to /uat. An
+// encrypted post against a real server with a registered mid WILL credit that QR.
 //
 //   --url  <base>        default AXIS_WL_TEST_URL, else http://localhost:3000
 //   --sample upi|bqr     which decrypted sample to send (default upi, spec §1.3.1 / §1.3.3)
@@ -24,7 +27,8 @@ const arg = (name, fallback) => {
 };
 
 const BASE = (arg('url', 'https://kite-pay-api-v3.onrender.com/')).replace(/\/+$/, '');
-const URL_ = `${BASE}/prod/axis-worldline-webhook`;
+const LIVE_URL = `${BASE}/prod/axis-worldline-webhook`;
+const UAT_URL = `${BASE}/uat/axis-worldline-webhook`;
 const MODE = arg('mode', 'plain');
 const ENCODING = arg('encoding', 'b64');
 
@@ -77,12 +81,12 @@ function encrypt(obj, key) {
     return buf.toString('base64');
 }
 
-async function send(label, body) {
+async function send(label, body, url = LIVE_URL) {
     console.log(`\n──────── ${label} ────────`);
-    console.log('POST', URL_);
+    console.log('POST', url);
     console.log('body:', JSON.stringify(body).slice(0, 300) + (JSON.stringify(body).length > 300 ? '…' : ''));
     try {
-        const res = await fetch(URL_, {
+        const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -98,17 +102,18 @@ async function send(label, body) {
 
 (async () => {
     const key = loadKey();
-    console.log(`target   : ${URL_}`);
+    console.log(`live     : ${LIVE_URL}`);
+    console.log(`uat      : ${UAT_URL}`);
     console.log(`key      : ${key ? `loaded (${key.length} bytes)` : 'NOT CONFIGURED — set AXIS_WL_AES_KEY in .env'}`);
     console.log(`encoding : ${ENCODING}`);
 
     const modes = MODE === 'all' ? ['plain', 'encrypted', 'garbage'] : [MODE];
     for (const mode of modes) {
         if (mode === 'plain') {
-            await send('PLAIN (decrypted-shape body)', sampleBody());
+            await send('PLAIN (decrypted-shape body → UAT capture only)', sampleBody(), UAT_URL);
         } else if (mode === 'encrypted') {
             if (!key) { console.error('\nSkipping encrypted: AXIS_WL_AES_KEY is missing or not 32 bytes.'); continue; }
-            await send('ENCRYPTED (AES-256-GCM, IV+ciphertext+tag)', { data: encrypt(sampleBody(), key) });
+            await send('ENCRYPTED (AES-256-GCM, IV+ciphertext+tag → LIVE)', { data: encrypt(sampleBody(), key) });
         } else if (mode === 'garbage') {
             await send('GARBAGE (must log DECRYPTION FAILED, still SUCCESS)', {
                 data: crypto.randomBytes(96).toString('base64'),
@@ -123,5 +128,5 @@ async function send(label, body) {
     console.log('  📩 received / body      — the request arrived at all');
     console.log('  🔓 decrypted OK         — key + format are right');
     console.log('  🔐 DECRYPTION FAILED    — full diagnostics (raw string, sizes, key length)');
-    console.log(`Stored rows: GET ${BASE}/prod/axis-worldline-webhook/captures  (admin auth)`);
+    console.log(`Rejected/UAT rows: GET ${BASE}/uat/axis-worldline-webhook/captures  (admin auth)`);
 })();

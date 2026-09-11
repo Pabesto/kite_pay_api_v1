@@ -6,9 +6,9 @@
 // UAT. It CAPTURES AND VALIDATES ONLY, into the `axis_worldline_uat` collection, whose columns
 // mirror webhook_data so post-UAT integration into the main table is a straight copy.
 //
-//   Give Worldline:
-//     URL     https://<host>/prod/axis-worldline-webhook    (HTTP POST, application/JSON)
-//   The /prod prefix is only the mount path (see server.js) — this router stays capture-only.
+//   Worldline's URL https://<host>/prod/axis-worldline-webhook is served by axisWorldline.js
+//   (the LIVE money path) — this router lives at /uat/axis-worldline-webhook and also receives
+//   the raw copy of every notification the live route rejects (decrypt/validation failure).
 //
 // HARD SAFETY RULES — same contract as uatWebhook.js, do not relax:
 //   1. NO LOCKS. Never acquire `lock:qr:<id>` or any production lock key here.
@@ -115,6 +115,69 @@ function decryptWorldlineData(str, key) {
     return obj;
 }
 
+// Map a decrypted Worldline notification onto webhook_data field names (§1.1.1).
+// Never throws — every problem becomes a warning. A body still encrypted at this point
+// (no key, or decrypt failed) yields all-null fields plus a warning.
+function normalizeWorldline(body, rupeesToPaiseStrict) {
+    const warnings = [];
+
+    const encryptedOnly = typeof body.data === 'string' && !body.primary_id && !body.ref_no;
+    if (encryptedOnly) {
+        warnings.push('payload still encrypted — captured raw, no fields parsed');
+        return { paymentId: null, qrCodeId: null, rrnNumber: null, amountPaise: null, vpa: null, createdAtIso: null, warnings };
+    }
+
+    // §1.1.1: primary_id is the mandatory unique id; tr_id is the UPI txn id.
+    const paymentId = body.primary_id || body.tr_id || null;
+    if (!paymentId) warnings.push('no primary_id/tr_id — cannot dedup this notification');
+
+    // mid IS our qrCodeId for Worldline (decided; tid is optional in the spec and absent
+    // from the live UPI notifications — it stays in the raw payload). mid is mandatory,
+    // so a missing one is a malformed notification.
+    const qrCodeId = body.mid || null;
+    if (!qrCodeId) warnings.push('no mid — QR unidentifiable');
+
+    const rrnNumber = body.ref_no || null;
+    if (!rrnNumber) warnings.push('no ref_no (RRN)');
+
+    // §1.1.1: txn_amount is a RUPEE string ("500.00"). Convert exactly once, string-based.
+    let amountPaise = null;
+    const amountNum = Number(body.txn_amount);
+    if (body.txn_amount === undefined || body.txn_amount === null || body.txn_amount === '' || !Number.isFinite(amountNum)) {
+        warnings.push('txn_amount missing or not numeric');
+    } else {
+        amountPaise = rupeesToPaiseStrict(body.txn_amount);
+        if (!Number.isFinite(amountPaise)) {
+            amountPaise = null;
+            warnings.push('txn_amount could not be converted to paise');
+        } else if (amountPaise < 0) {
+            warnings.push('negative txn_amount');
+        }
+    }
+
+    // customer_vpa is mandatory for UPI (transaction_type 2), absent on BQR card (type 1).
+    const vpa = body.customer_vpa || null;
+    if (!vpa && body.transaction_type === '2') warnings.push('UPI txn without customer_vpa');
+
+    // §1.1.1 time_stamp is `yyyymmddHHmmss` IST WALL TIME (the §1.3.1 sample's
+    // 20231222002458 IST == 20231221185458 UTC, which is exactly the timestamp embedded
+    // in its own secondary_id). Store the transaction time like every other provider —
+    // Appwrite's $createdAt already records when we received it.
+    let createdAtIso = null;
+    if (body.time_stamp) {
+        const m = moment.tz(String(body.time_stamp), 'YYYYMMDDHHmmss', true, 'Asia/Kolkata');
+        if (m.isValid()) createdAtIso = m.toISOString();
+        else warnings.push(`unparseable time_stamp: ${body.time_stamp}`);
+    }
+
+    if (body.txn_currency && body.txn_currency !== '356') warnings.push(`non-INR currency: ${body.txn_currency}`);
+    if (!body.transaction_type) warnings.push('no transaction_type field');
+    else if (body.transaction_type !== '1' && body.transaction_type !== '2') warnings.push(`unexpected transaction_type: ${body.transaction_type}`);
+    if (!body.time_stamp) warnings.push('no time_stamp field');
+
+    return { paymentId, qrCodeId, rrnNumber, amountPaise, vpa, createdAtIso, warnings };
+}
+
 // Truncate-and-stringify. Returns null for absent values so Appwrite stores nothing.
 function cap(value, max) {
     if (value === undefined || value === null) return null;
@@ -136,69 +199,6 @@ module.exports = (
     function isCursorError(err) {
         const msg = (err?.message || '').toLowerCase();
         return err?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'));
-    }
-
-    // Map a decrypted Worldline notification onto webhook_data field names (§1.1.1).
-    // Never throws — every problem becomes a warning. A body still encrypted at this point
-    // (no key, or decrypt failed) yields all-null fields plus a warning.
-    function normalize(body) {
-        const warnings = [];
-
-        const encryptedOnly = typeof body.data === 'string' && !body.primary_id && !body.ref_no;
-        if (encryptedOnly) {
-            warnings.push('payload still encrypted — captured raw, no fields parsed');
-            return { paymentId: null, qrCodeId: null, rrnNumber: null, amountPaise: null, vpa: null, createdAtIso: null, warnings };
-        }
-
-        // §1.1.1: primary_id is the mandatory unique id; tr_id is the UPI txn id.
-        const paymentId = body.primary_id || body.tr_id || null;
-        if (!paymentId) warnings.push('no primary_id/tr_id — cannot dedup this notification');
-
-        // mid IS our qrCodeId for Worldline (decided; tid is optional in the spec and absent
-        // from the live UPI notifications — it stays in the raw payload). mid is mandatory,
-        // so a missing one is a malformed notification.
-        const qrCodeId = body.mid || null;
-        if (!qrCodeId) warnings.push('no mid — QR unidentifiable');
-
-        const rrnNumber = body.ref_no || null;
-        if (!rrnNumber) warnings.push('no ref_no (RRN)');
-
-        // §1.1.1: txn_amount is a RUPEE string ("500.00"). Convert exactly once, string-based.
-        let amountPaise = null;
-        const amountNum = Number(body.txn_amount);
-        if (body.txn_amount === undefined || body.txn_amount === null || body.txn_amount === '' || !Number.isFinite(amountNum)) {
-            warnings.push('txn_amount missing or not numeric');
-        } else {
-            amountPaise = rupeesToPaiseStrict(body.txn_amount);
-            if (!Number.isFinite(amountPaise)) {
-                amountPaise = null;
-                warnings.push('txn_amount could not be converted to paise');
-            } else if (amountPaise < 0) {
-                warnings.push('negative txn_amount');
-            }
-        }
-
-        // customer_vpa is mandatory for UPI (transaction_type 2), absent on BQR card (type 1).
-        const vpa = body.customer_vpa || null;
-        if (!vpa && body.transaction_type === '2') warnings.push('UPI txn without customer_vpa');
-
-        // §1.1.1 time_stamp is `yyyymmddHHmmss` IST WALL TIME (the §1.3.1 sample's
-        // 20231222002458 IST == 20231221185458 UTC, which is exactly the timestamp embedded
-        // in its own secondary_id). Store the transaction time like every other provider —
-        // Appwrite's $createdAt already records when we received it.
-        let createdAtIso = null;
-        if (body.time_stamp) {
-            const m = moment.tz(String(body.time_stamp), 'YYYYMMDDHHmmss', true, 'Asia/Kolkata');
-            if (m.isValid()) createdAtIso = m.toISOString();
-            else warnings.push(`unparseable time_stamp: ${body.time_stamp}`);
-        }
-
-        if (body.txn_currency && body.txn_currency !== '356') warnings.push(`non-INR currency: ${body.txn_currency}`);
-        if (!body.transaction_type) warnings.push('no transaction_type field');
-        else if (body.transaction_type !== '1' && body.transaction_type !== '2') warnings.push(`unexpected transaction_type: ${body.transaction_type}`);
-        if (!body.time_stamp) warnings.push('no time_stamp field');
-
-        return { paymentId, qrCodeId, rrnNumber, amountPaise, vpa, createdAtIso, warnings };
     }
 
     // ── POST /uat/axis-worldline-webhook ─────────────────────────────────────
@@ -254,7 +254,7 @@ module.exports = (
                 }
             }
 
-            const parsed = normalize(mapped);
+            const parsed = normalizeWorldline(mapped, rupeesToPaiseStrict);
             parsed.warnings = [...cryptoWarnings, ...parsed.warnings];
             const receivedAt = new Date().toISOString();
 
@@ -360,3 +360,9 @@ module.exports = (
 
     return router;
 };
+
+// Shared with axisWorldline.js (the LIVE ingest path) so both routes decrypt and map the
+// notification identically — the UAT capture is the rehearsal for exactly this mapping.
+module.exports.loadAesKey = loadAesKey;
+module.exports.decryptWorldlineData = decryptWorldlineData;
+module.exports.normalizeWorldline = normalizeWorldline;

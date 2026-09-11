@@ -45,6 +45,7 @@ const partnerApiRoutes = require('./partnerApi');
 const partnerWebhooks = require('./partnerWebhooks');
 const uatWebhookRoutes = require('./uatWebhook'); // Razorpay UAT capture endpoint — no money path
 const axisWorldlineUatRoutes = require('./axisWorldlineUat'); // Axis Worldline UAT capture endpoint — no money path
+const axisWorldlineRoutes = require('./axisWorldline'); // Axis Worldline LIVE ingest — money path (full ingest choreography, encrypted envelope only)
 const extensionCaptureRoutes = require('./extensionCapture'); // PhonePe/BharatPe rows from the browser extensions — LIVE money path (full ingest choreography)
 const extensionAlertsRoutes = require('./extensionAlerts'); // PhonePe/BharatPe extension health alerts + heartbeats — NOT a money path
 const payoutRoutes = require('./payout'); // Customer Payout: payout wallet + customer payouts + payout commission — LIVE money path
@@ -979,10 +980,19 @@ app.use('/pinelabs', digiqrRoutes);
 // same as updateDailyQrTotal, which is passed to the mounts above from line 1782. Do not "fix".
 app.use('/uat',  uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
-// Axis Worldline UAT capture — same no-money contract as the Razorpay UAT router above.
-// Mounted at /prod per the URL handed to Worldline; still capture-only (the no-money
-// guarantee comes from the injected deps, not the path — see axisWorldlineUat.js header).
-app.use('/prod', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
+// Axis Worldline. The URL handed to Worldline is /prod/axis-worldline-webhook.
+//   /prod → LIVE ingest (axisWorldline.js): credits money via the same lock → dedup → review
+//           gate → finalizeTransaction sequence as the webhooks above; encrypted envelope only.
+//           AXIS_WORLDLINE_LIVE=false swaps the capture-only UAT router back in at /prod.
+//   /uat  → capture-only UAT router (axisWorldlineUat.js) + admin GET …/captures read-back.
+const AXIS_WORLDLINE_LIVE = process.env.AXIS_WORLDLINE_LIVE !== 'false';
+if (AXIS_WORLDLINE_LIVE) {
+  app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview));
+} else {
+  console.warn('⚠️  AXIS_WORLDLINE_LIVE=false — /prod/axis-worldline-webhook is capture-only; Worldline payments will NOT be credited.');
+  app.use('/prod', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
+}
+app.use('/uat', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 // Browser-extension ingest (/phonepe-capture, /bharatpe-capture) — X-API-Key checked against
 // <PROVIDER>_EXTENSION_API_KEY. Credits money: runs the same lock → dedup → review gate →
 // finalizeTransaction sequence as the webhooks above.
