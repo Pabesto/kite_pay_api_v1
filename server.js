@@ -746,6 +746,15 @@ app.use(compression());  // Add after CORS, before body-parser
 app.use(globalLimiter);
 // app.use(helmet()); // Set security headers
 
+// Browser-extension pushes (/<provider>-capture) carry up to MAX_BATCH=100 rows, each with the
+// provider's raw dashboard row, so a full batch is ~250KB+ and blows body-parser's 100kb default.
+// MUST stay ABOVE the global parser below: a JSON parser that has consumed the stream marks the
+// request parsed and every later parser skips it, so a larger limit mounted after the global one
+// is never consulted (verified: it still 413s). Prefix-mounted, so /alert and /ping share it.
+// This runs before the X-API-Key check, so the limit is the only pre-auth guard on these paths —
+// keep it as small as real batches allow (1mb ≈ 4× a full 100-row batch).
+app.use(['/phonepe-capture', '/bharatpe-capture'], express.json({ limit: '1mb' }));
+
 app.use(
   bodyParser.json({
     verify: (req, res, buf, encoding) => {
