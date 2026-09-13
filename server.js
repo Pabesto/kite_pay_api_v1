@@ -130,23 +130,28 @@ const LOG_RAZORPAY_WEBHOOK = String(process.env.LOG_RAZORPAY_WEBHOOK ?? 'true').
 
 const PAYOUT_STAFF_LABELS = ['view_payouts', 'edit_payouts', 'view_payout_commissions'];
 
-const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent } = initSocket(app, {
+const { httpServer, emitTxnNew, emitQrAlert, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent, emitWithdrawalEvent } = initSocket(app, {
   appwriteEndpoint: APPWRITE_ENDPOINT,
   appwriteProjectId: APPWRITE_PROJECT_ID,
-  // Which payout rooms a non-admin socket may join. Mirrors payout.js visibleUserIds():
-  // subadmin → their own id; employee holding a payout label → one id per assigned subadmin.
-  // Returns null for anyone who is not payout staff, [] for staff who scope to nobody yet.
+  // Which staff rooms a non-admin socket may join → { subadminIds, payoutStaff } or null.
+  //   subadminIds: the tenants this socket may see withdrawal events for. Mirrors
+  //                withdrawals_paginated — subadmin → own id; employee → every assigned subadmin,
+  //                no label needed (that route requires none).
+  //   payoutStaff: whether it ALSO joins the payout rooms — subadmins always, employees only
+  //                with a payout label (mirrors payout.js visibleUserIds()).
   // Runs on connect, long after `databases` is constructed further down this file.
   resolveStaffRooms: async (meta) => {
     if (!meta) return null;
-    if (meta.role === 'subadmin') return [meta.userId];
+    if (meta.role === 'subadmin') return { subadminIds: [meta.userId], payoutStaff: true };
     if (meta.role !== 'employee') return null;
-    if (!Array.isArray(meta.labels) || !meta.labels.some((l) => PAYOUT_STAFF_LABELS.includes(l))) return null;
+    const payoutStaff = Array.isArray(meta.labels) && meta.labels.some((l) => PAYOUT_STAFF_LABELS.includes(l));
     const keys = [...new Set([meta.$id, meta.userId].filter(Boolean))]; // older docs stamp either id
     const r = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, [
       Query.equal('assigned_to', keys), Query.equal('role', 'subadmin'), Query.limit(100),
     ]);
-    return r.documents.map((d) => d.userId).filter(Boolean);
+    const subadminIds = r.documents.map((d) => d.userId).filter(Boolean);
+    if (!subadminIds.length && !payoutStaff) return null; // scoped to nobody, holds no label — no rooms
+    return { subadminIds, payoutStaff };
   },
 });
 
@@ -956,7 +961,7 @@ app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databa
 const payout = payoutRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID, authenticateToken, authenticateAdminOrLabel, redisClient, APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, emitPayoutEvent, APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID);
 app.use('/api/payout', payout.router);
 
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, payout.creditWalletFromWithdrawal));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, payout.creditWalletFromWithdrawal, emitWithdrawalEvent));
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));

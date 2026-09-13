@@ -60,22 +60,29 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, resolveStaffRoom
     if (socket.data.userMeta?.role === 'admin') {
       socket.join('room:admins');
     } else if (typeof resolveStaffRooms === 'function') {
-      // Payout staff (subadmins + employees holding a payout label) are NOT admins and so never
-      // saw a payout event before this. They join two kinds of room:
-      //   room:payout_staff          — platform-wide payout events (settings, pause switches)
-      //   room:payout_sub:<subadminId> — tenant-scoped events, the same boundary payout.js
-      //                                  enforces on its REST routes via visibleUserIds()
+      // Staff (subadmins + employees) are NOT admins and so never saw a staff event before this.
+      // Two room families, because two REST routes draw two different audiences:
+      //   room:withdrawal_sub:<subadminId> — withdrawal events for that tenant. Mirrors
+      //                                      withdrawals_paginated: every subadmin, and every
+      //                                      employee for each subadmin assigned to them — NO label.
+      //   room:payout_sub:<subadminId>     — payout events for that tenant. Mirrors payout.js
+      //   room:payout_staff                  visibleUserIds(): employees only with a payout label.
       // A subadmin joins their own id; an employee joins one per assigned subadmin — so a
       // subadmin can never receive another subadmin's customer names or amounts.
-      // Resolution is injected because socketServer has no Appwrite handle of its own.
+      // Resolution is injected because socketServer has no Appwrite handle of its own. It
+      // returns null (no rooms) or { subadminIds, payoutStaff }; a bare array is the old
+      // contract and means "payout staff" — kept so nothing that still passes one breaks.
       // ponytail: joins land a tick after connect; a client that misses an event in that
       // window still has the list it fetched on mount. Add an ack if that ever matters.
       Promise.resolve()
         .then(() => resolveStaffRooms(socket.data.userMeta))
-        .then((subadminIds) => {
-          if (!subadminIds) return; // null = not payout staff
+        .then((resolved) => {
+          if (!resolved) return;
+          const { subadminIds, payoutStaff } = Array.isArray(resolved) ? { subadminIds: resolved, payoutStaff: true } : resolved;
+          for (const id of subadminIds || []) if (id) socket.join(`room:withdrawal_sub:${id}`);
+          if (!payoutStaff) return;
           socket.join('room:payout_staff');
-          for (const id of subadminIds) if (id) socket.join(`room:payout_sub:${id}`);
+          for (const id of subadminIds || []) if (id) socket.join(`room:payout_sub:${id}`);
         })
         .catch((e) => console.error('resolveStaffRooms failed:', e.message));
     }
@@ -120,26 +127,41 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, resolveStaffRoom
     });
   });
 
-  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent };
+  return { httpServer, io, emitTxnNew, emitQrAlert, emitQrLimit, emitForceRefresh, emitTxnStatusNew, emitPendingReview, emitReviewResolved, emitPayoutEvent, emitWithdrawalEvent };
 }
 
-// Customer-payout events (payout.js): to the affected user's room and/or admins.
-//   event: 'payout:update' (request/wallet changed) | 'payout:alert' (low balance, stale pending)
-// staffRooms: subadmin ids whose staff may see this event (payout.js passes the subject's
-// parentId plus the subject's own id — usersUnder() counts a subadmin as visible to itself).
-// platform:true instead sends it to every payout staffer (settings/pause — not tenant data).
-function emitPayoutEvent({ userId, staffRooms, platform = false, event = 'payout:update', payload, toAdmins = true }) {
+// Shared fan-out for tenant-scoped staff events: the subject's own room, then admins plus the
+// tenant rooms of one family (socket.io de-dupes a socket that is in several of these).
+//   subFamily: the per-subadmin room prefix ('payout_sub' | 'withdrawal_sub')
+//   staffRooms: subadmin ids whose staff may see this event (callers pass the subject's
+//   parentId plus the subject's own id — usersUnder() counts a subadmin as visible to itself).
+//   platformRoom: when `platform` is true, emit to this room instead of the tenant rooms.
+function emitScoped(label, subFamily, platformRoom, { userId, staffRooms, platform = false, event, payload, toAdmins = true }) {
   try {
     if (!io || !payload) return;
     if (userId) io.to(`room:user:${userId}`).emit(event, payload);
     if (!toAdmins) return;
-    let ch = io.to('room:admins'); // socket.io de-dupes a socket that is in several of these
-    if (platform) ch = ch.to('room:payout_staff');
-    else for (const id of staffRooms || []) if (id) ch = ch.to(`room:payout_sub:${id}`);
+    let ch = io.to('room:admins');
+    if (platform && platformRoom) ch = ch.to(platformRoom);
+    else for (const id of staffRooms || []) if (id) ch = ch.to(`room:${subFamily}:${id}`);
     ch.emit(event, payload);
   } catch (e) {
-    console.error('emitPayoutEvent error:', e.message);
+    console.error(`${label} error:`, e.message);
   }
+}
+
+// Customer-payout events (payout.js): to the affected user's room and/or admins.
+//   event: 'payout:update' (request/wallet changed) | 'payout:alert' (low balance, stale pending)
+// platform:true instead sends it to every payout staffer (settings/pause — not tenant data).
+function emitPayoutEvent({ event = 'payout:update', ...opts }) {
+  emitScoped('emitPayoutEvent', 'payout_sub', 'room:payout_staff', { event, ...opts });
+}
+
+// QR-withdrawal events (withdraw.js): request submitted / approved / rejected. Same fan-out, but
+// the room:withdrawal_sub family — its audience is every employee of the tenant, no label, the
+// same set withdrawals_paginated shows. No platform variant: there is no tenant-free withdrawal notice.
+function emitWithdrawalEvent({ event = 'withdrawal:update', ...opts }) {
+  emitScoped('emitWithdrawalEvent', 'withdrawal_sub', null, { event, ...opts, platform: false });
 }
 
 // Manual-review events — admins only (room:admins).

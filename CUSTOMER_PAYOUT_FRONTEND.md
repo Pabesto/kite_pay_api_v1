@@ -978,6 +978,11 @@ never receives another subadmin's customer names or amounts. Platform-wide notic
 (`settings_changed`, `source_accounts_changed`) go to `room:payout_staff` instead, since they
 carry no customer data.
 
+> **QR withdrawal requests** use a sibling event, `withdrawal:update`, on a separate room family
+> (`room:withdrawal_sub:<subadminId>`) that every subadmin and **every employee — no label** —
+> joins, matching `/withdrawals_paginated`. Same connection, same payload convention. Contract:
+> `WITHDRAWAL_REALTIME_FRONTEND.md`.
+
 > Room joins for staff complete a tick after `connect`. Always load the list once on screen mount
 > and treat every event as a **"refresh now" hint, never the source of truth** — re-fetch the
 > affected list/wallet rather than mutating local state from the payload.

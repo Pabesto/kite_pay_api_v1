@@ -23,7 +23,7 @@ const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdra
 
 // creditPayoutWallet(withdrawalDoc) — from payout.js; credits an approved mode:'wallet' withdrawal
 // into the user's payout wallet (idempotent). Appended last per the factory-signature rule.
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, creditPayoutWallet) => {
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, creditPayoutWallet, emitWithdrawalEvent) => {
 
   // Atomic lock release via Lua script — only deletes if value still matches ours
   const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
@@ -43,6 +43,44 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const timestamp = Date.now(); // milliseconds since epoch
     const random = Math.floor(100 + Math.random() * 900); // 3-digit random number
     return `${prefix}${timestamp}${random}`;
+  }
+
+  // ─── realtime (socket) — request submitted / approved / rejected; never throws ─────────
+  // Fires AFTER the commit point (doc written), fire-and-forget: a socket failure can never fail
+  // or roll back a withdrawal. Audience = the subject's own room + admins + the tenant's
+  // withdrawal staff rooms (parentId + own id, the same pair payout.js uses — usersUnder()
+  // counts a subadmin as one of their own visible users). Contract: WITHDRAWAL_REALTIME_FRONTEND.md.
+  // Bank/UPI details are deliberately NOT in the payload — rooms are broadcast, the dialog does
+  // not need them, and the list endpoint is where staff read account details with auth.
+  const rsToPaise = (rs) => { const n = Number(rs); return Number.isFinite(n) ? Math.round(n * 100) : 0; };
+  const pickWithdrawalEvent = (w) => ({
+    withdrawalId: w.id, docId: w.$id, userId: w.userId, qrId: w.qrId || null,
+    holderName: w.holderName || null, companyName: w.companyName || null, mode: w.mode || null,
+    status: w.status, utrNumber: w.utrNumber || null, rejectionReason: w.rejectionReason || null,
+    // Withdrawal docs store RUPEES (see CLAUDE.md unit table); paise are derived here, once.
+    // Display-only: 0 commission is a real value, so no null-for-zero like the handlers' toPaise.
+    amountRs: Number(w.amount || 0), preAmountRs: Number(w.preAmount || 0), commissionRs: Number(w.commission || 0),
+    amountPaise: rsToPaise(w.amount), preAmountPaise: rsToPaise(w.preAmount), commissionPaise: rsToPaise(w.commission),
+    walletCreditFailed: w.walletCreditFailed === true,
+    createdAt: w.createdAt || null, processedAt: w.processedAt || null,
+  });
+  async function notifyWithdrawal(type, w, actor) {
+    try {
+      if (typeof emitWithdrawalEvent !== 'function' || !cfgBool('withdrawal_realtime_enabled', true)) return;
+      const user = await getUserMeta(w.userId).catch(() => null);
+      emitWithdrawalEvent({
+        userId: w.userId,
+        staffRooms: [user?.parentId || null, w.userId],
+        event: 'withdrawal:update',
+        payload: {
+          type, userId: w.userId, withdrawalId: w.id,
+          userName: user?.name || null, parentId: user?.parentId || null,
+          actor: actor ? { userId: actor.userId || null, role: actor.role || null, name: actor.name || null } : null,
+          withdrawal: pickWithdrawalEvent(w),
+          at: new Date().toISOString(),
+        },
+      });
+    } catch (e) { console.error('withdrawal notify failed:', e?.message); }
   }
 
   // Helper to get user by userId — cached in Redis
@@ -518,6 +556,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             await releaseLock(wdLockKey, wdh_id);
         }
 
+        notifyWithdrawal('requested', response, req.user); // committed above; fire-and-forget
         return res.json({ success: true, data: response });
       } catch (err) {
         console.error('Error saving withdraw request:', err);
@@ -1152,6 +1191,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAmountPaid', preAmountPaise).catch(console.error);
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
+        // Approved is committed above and stays approved even if the wallet credit below fails —
+        // so notify here, once, ahead of every return path.
+        notifyWithdrawal('approved', { ...w, status: 'approved', utrNumber: isWalletWithdrawal ? 'PAYOUT_WALLET' : utrNumber.trim(), processedAt: approvedAtIST, rejectionReason: null }, req.user);
+
         // NOTE: the payout-wallet credit runs AFTER the commission block below, not here. The QR has
         // already been debited principal + commission at this point, so the commission ledger must be
         // written even if the wallet credit later fails (that failure is retryable; the QR debit is not).
@@ -1434,6 +1477,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // After rejecting a withdrawal
         await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalWithdrawalPendingAmount', -preAmountPaise).catch(console.error);
 
+        notifyWithdrawal('rejected', { ...w, status: 'rejected', rejectionReason: reason.trim(), utrNumber: null, processedAt: rejectedAtIST }, req.user); // committed above
         return res.json({ success: true, message: 'Withdrawal rejected' });
         } finally {
             await releaseLock(rejectLockKey, rejectLockVal);
