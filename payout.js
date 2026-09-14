@@ -56,8 +56,10 @@ module.exports = (
   // revert-to-QR, to refund the payin commission a wallet transfer charged. Reversal rows are posted
   // under withdraw.js's own lock keys so the two can never race.
   WD_COMMISSION_TXNS, WD_DAILY_COMMISSION, WD_MONTHLY_COMMISSION, WD_ALLTIME_COMMISSION,
+  DAILY_PAYOUT_SUMMARIES, // appended: daily_payout_summaries — per-IST-day, per-merchant paid rollup behind GET /admin/payout-summary
 ) => {
   const router = express.Router();
+  if (!DAILY_PAYOUT_SUMMARIES) console.warn('⚠️  payout.js: DAILY_PAYOUT_SUMMARIES collection id not injected — the day-wise payout rollup is OFF and GET /admin/payout-summary will 500.');
 
   // ─── helpers ───────────────────────────────────────────────────────────────
   function fail(status, message) { const e = new Error(message); e.status = status; return e; }
@@ -185,6 +187,15 @@ module.exports = (
   // subadmin caller's own users. Returns [] (unrestricted), [query], or null (provably empty).
   // 403 when a subadmin names a foreign user/subadmin.
   async function userScope(req, q = {}) {
+    const target = await scopeIdSet(req, q);
+    if (!target) return [];
+    if (!target.length) return null;
+    return [idsQuery('userId', target)];
+  }
+  // The same resolution as an id set — null = unrestricted, [] = provably empty, else the exact
+  // userIds to keep. userScope() wraps this for row queries; map-keyed reports (payout-summary)
+  // filter their JSON keys with it directly.
+  async function scopeIdSet(req, q = {}) {
     const allowed = await visibleUserIds(req);
     let target = null; // null = unrestricted
     const narrow = (ids) => { target = target ? target.filter((x) => ids.includes(x)) : [...new Set(ids)]; };
@@ -201,9 +212,7 @@ module.exports = (
       narrow(qr?.assignedUserId ? [qr.assignedUserId] : []);
     }
     if (allowed) narrow(allowed);
-    if (!target) return [];
-    if (!target.length) return null;
-    return [idsQuery('userId', target)];
+    return target;
   }
 
   // ─── wallet primitives (paise) ─────────────────────────────────────────────
@@ -666,6 +675,39 @@ module.exports = (
     if (!Object.keys(perUser).length) return;
     const day = istDay();
     await upsertDailyMap(DAILY_COMMISSION, day, perUser, `lock:payoutcommission:daily:${day}`);
+  }
+
+  // ─── daily payout summary — the rollup behind the day-wise payout report ─────
+  // One doc per IST day: { date, totalsJson: { [merchantUserId]: { paidPaise, commissionPaise, count } } }
+  // — the customer-payout twin of daily_qr_summaries (keyed by the PAYING merchant, unlike the
+  // commission map above, which is keyed by the earner). Merged under lock:payout:daily:<day> at
+  // mark-paid only: that is the one commit point where money leaves a wallet, and it is
+  // exactly-once per payout (status flips pending→paid under the wallet lock), so a re-run of
+  // the route can never double-count. Rejects and cancels never touch it. Day = IST day of
+  // paidAt — the same key the backfill uses, so a recompute always lands on the same doc.
+  // Backfill (recompute-and-overwrite, never increment): scripts/backfill-payout-daily-summaries.js
+  const emptyDayRow = () => ({ paidPaise: 0, commissionPaise: 0, count: 0 });
+  async function upsertDailyPayoutSummary(p) {
+    if (!DAILY_PAYOUT_SUMMARIES) return;
+    const day = istDay(p.paidAt || p.processedAt || new Date());
+    const lockKey = `lock:payout:daily:${day}`;
+    const val = await acquireRetry(lockKey);
+    if (!val) throw new Error(`Could not acquire ${lockKey}`);
+    try {
+      const doc = (await databases.listDocuments(DB, DAILY_PAYOUT_SUMMARIES, [Query.equal('date', day), Query.limit(1)])).documents[0] || null;
+      let obj = {};
+      try { obj = doc ? (JSON.parse(doc.totalsJson || '{}') || {}) : {}; } catch { obj = {}; }
+      const row = { ...emptyDayRow(), ...(obj[p.userId] || {}) };
+      row.paidPaise += Number(p.amountPaise || 0);
+      row.commissionPaise += Number(p.commissionPaise || 0);
+      row.count += 1;
+      obj[p.userId] = row;
+      const payload = { date: day, totalsJson: JSON.stringify(obj) };
+      if (doc) await databases.updateDocument(DB, DAILY_PAYOUT_SUMMARIES, doc.$id, payload);
+      else await databases.createDocument(DB, DAILY_PAYOUT_SUMMARIES, ID.unique(), payload);
+    } finally {
+      await releaseQuiet(lockKey, val);
+    }
   }
 
   // One row per (userId, month) and one per userId; totalCommissionPaise merged under a lock,
@@ -1423,6 +1465,9 @@ module.exports = (
 
   // ─── daily time series for the admin dashboard (scoped like the queue) ──
   // GET /admin/stats/daily?from&to&userId&subadminId  → per IST day: requested, paid, rejected, cancelled
+  // Each day also carries `users`: the same counters split per merchant (the wallet that paid) —
+  // the customer-payout analogue of the pay-in report's per-QR breakdown. `userNames` is one
+  // legend for the whole range so the screen can label rows without a second call.
   router.get('/admin/stats/daily', adminView, async (req, res) => {
     try {
       const from = req.query.from || istDay(), to = req.query.to || from;
@@ -1431,10 +1476,12 @@ module.exports = (
       if (!start.isValid() || !end.isValid() || end.isBefore(start)) throw fail(400, 'Invalid date range');
       if (end.diff(start, 'days') > 366) throw fail(400, 'Range too large (max 366 days)');
       const scope = await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId });
+      const emptyStats = () => ({ requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, paidMinutesTotal: 0, rejectedCount: 0, cancelledCount: 0 });
       const days = [];
       for (let d = start.clone(); !d.isAfter(end); d.add(1, 'day')) {
-        days.push({ date: d.format('YYYY-MM-DD'), requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, paidMinutesTotal: 0, rejectedCount: 0, cancelledCount: 0 });
+        days.push({ date: d.format('YYYY-MM-DD'), ...emptyStats(), users: {} });
       }
+      const userIds = new Set();
       const idx = new Map(days.map((x, i) => [x.date, i]));
       let truncated = false;
       const scan = async (attr, onDoc) => {
@@ -1450,18 +1497,77 @@ module.exports = (
           if (page === 99) truncated = true;
         }
       };
-      const bucket = (ts) => { const i = idx.get(istDay(ts)); return i === undefined ? null : days[i]; };
-      await scan('createdAt', (p) => { const b = bucket(p.createdAt); if (b) { b.requestedCount++; b.requestedAmountPaise += Number(p.amountPaise || 0); } });
+      // Every counter lands on the day AND on that day's per-user row.
+      const buckets = (ts, p) => {
+        const i = idx.get(istDay(ts)); if (i === undefined) return [];
+        const day = days[i]; const uid = p.userId || 'unknown';
+        userIds.add(uid);
+        return [day, (day.users[uid] = day.users[uid] || emptyStats())];
+      };
+      await scan('createdAt', (p) => { for (const b of buckets(p.createdAt, p)) { b.requestedCount++; b.requestedAmountPaise += Number(p.amountPaise || 0); } });
       await scan('processedAt', (p) => {
-        const b = bucket(p.processedAt); if (!b) return;
-        if (p.status === 'paid') { b.paidCount++; b.paidAmountPaise += Number(p.amountPaise || 0); b.paidCommissionPaise += Number(p.commissionPaise || 0); b.paidMinutesTotal += minutesBetween(p.createdAt, p.paidAt || p.processedAt) || 0; }
-        else if (p.status === 'rejected') b.rejectedCount++;
-        else if (p.status === 'cancelled') b.cancelledCount++;
+        for (const b of buckets(p.processedAt, p)) {
+          if (p.status === 'paid') { b.paidCount++; b.paidAmountPaise += Number(p.amountPaise || 0); b.paidCommissionPaise += Number(p.commissionPaise || 0); b.paidMinutesTotal += minutesBetween(p.createdAt, p.paidAt || p.processedAt) || 0; }
+          else if (p.status === 'rejected') b.rejectedCount++;
+          else if (p.status === 'cancelled') b.cancelledCount++;
+        }
       });
-      const out = days.map(({ paidMinutesTotal, ...d }) => ({ ...d, avgPaidInMinutes: d.paidCount ? Math.round(paidMinutesTotal / d.paidCount) : null }));
+      const finish = ({ paidMinutesTotal, ...d }) => ({ ...d, avgPaidInMinutes: d.paidCount ? Math.round(paidMinutesTotal / d.paidCount) : null });
+      const out = days.map((day) => ({ ...finish(day), users: Object.fromEntries(Object.entries(day.users).map(([uid, u]) => [uid, finish(u)])) }));
+      // One legend for the range; a missing/deleted user simply has no name (cache lookups are cheap and Redis-backed).
+      const userNames = {};
+      await Promise.all([...userIds].map(async (uid) => { const u = await userMetaCache.getUserMeta(uid).catch(() => null); userNames[uid] = u?.name || null; }));
       const totals = out.reduce((t, d) => ({ requestedCount: t.requestedCount + d.requestedCount, requestedAmountPaise: t.requestedAmountPaise + d.requestedAmountPaise, paidCount: t.paidCount + d.paidCount, paidAmountPaise: t.paidAmountPaise + d.paidAmountPaise, paidCommissionPaise: t.paidCommissionPaise + d.paidCommissionPaise, rejectedCount: t.rejectedCount + d.rejectedCount, cancelledCount: t.cancelledCount + d.cancelledCount }), { requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, rejectedCount: 0, cancelledCount: 0 });
-      res.json({ success: true, range: { from, to }, days: out, totals, truncated });
+      res.json({ success: true, range: { from, to }, days: out, totals, userNames, truncated });
     } catch (e) { sendError(res, e, 'Failed to fetch payout daily stats'); }
+  });
+
+  // ─── day-wise payout report (from the rollup: O(days), never a row scan) ─────
+  // GET /admin/payout-summary?from&to&userId&subadminId — the customer-payout twin of
+  // /api/admin/payin-summary: per IST day, paid amount + commission + count, split per merchant.
+  // Scoped like the queue: a subadmin's `users` map only ever holds their own merchants.
+  router.get('/admin/payout-summary', adminView, async (req, res) => {
+    try {
+      if (!DAILY_PAYOUT_SUMMARIES) throw fail(500, 'Daily payout summaries are not configured');
+      const todayStr = istDay(), yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+      const from = req.query.from || todayStr, to = req.query.to || from;
+      if (!DAY_RE.test(from) || !DAY_RE.test(to)) throw fail(400, 'Dates must be YYYY-MM-DD');
+      const start = moment.tz(from, 'Asia/Kolkata'), end = moment.tz(to, 'Asia/Kolkata');
+      if (!start.isValid() || !end.isValid() || end.isBefore(start)) throw fail(400, 'Invalid date range');
+      if (end.diff(start, 'days') > 366) throw fail(400, 'Range too large (max 366 days)');
+      const allowed = await scopeIdSet(req, { userId: req.query.userId, subadminId: req.query.subadminId }); // null = everyone
+
+      const days = [];
+      const userIds = new Set();
+      let grandTotalPaise = 0, grandCommissionPaise = 0, grandCount = 0, todayPaise = 0, yesterdayPaise = 0;
+      for (let d = start.clone(); !d.isAfter(end); d.add(1, 'day')) {
+        const date = d.format('YYYY-MM-DD');
+        const doc = (await databases.listDocuments(DB, DAILY_PAYOUT_SUMMARIES, [Query.equal('date', date), Query.limit(1)])).documents[0];
+        let obj = {};
+        try { obj = doc ? (JSON.parse(doc.totalsJson || '{}') || {}) : {}; } catch (e) { console.error('WARNING: corrupted totalsJson for payout day', date, '—', e.message); }
+        const users = {};
+        let totalPaise = 0, commissionPaise = 0, count = 0;
+        for (const [uid, raw] of Object.entries(obj)) {
+          if (allowed && !allowed.includes(uid)) continue;
+          const row = { paidPaise: Number(raw?.paidPaise || 0), commissionPaise: Number(raw?.commissionPaise || 0), count: Number(raw?.count || 0) };
+          users[uid] = row; userIds.add(uid);
+          totalPaise += row.paidPaise; commissionPaise += row.commissionPaise; count += row.count;
+        }
+        days.push({ date, totalPaise, totalRs: totalPaise / 100, commissionPaise, commissionRs: commissionPaise / 100, count, users });
+        grandTotalPaise += totalPaise; grandCommissionPaise += commissionPaise; grandCount += count;
+        if (date === todayStr) todayPaise = totalPaise;
+        if (date === yesterdayStr) yesterdayPaise = totalPaise;
+      }
+      const userNames = {};
+      await Promise.all([...userIds].map(async (uid) => { const u = await userMetaCache.getUserMeta(uid).catch(() => null); userNames[uid] = u?.name || null; }));
+      res.json({
+        success: true, range: { from, to }, days,
+        grandTotalPaise, grandTotalRs: grandTotalPaise / 100,
+        grandCommissionPaise, grandCommissionRs: grandCommissionPaise / 100, grandCount,
+        todayPaise, todayRs: todayPaise / 100, yesterdayPaise, yesterdayRs: yesterdayPaise / 100,
+        userNames,
+      });
+    } catch (e) { sendError(res, e, 'Failed to fetch payout summary'); }
   });
 
   // ─── alerts (on demand; admin toggles thresholds in settings) ──
@@ -1961,6 +2067,10 @@ module.exports = (
       // Commission is derived from the paid payout — never blocks the response (mirrors withdraw approve).
       try { await recordPayoutCommission(updated); }
       catch (e) { console.error(`CRITICAL: payout commission failed for ${updated.id}. Needs reconciliation.`, e); }
+      // Day-wise report rollup — same posture: the payout is paid regardless; a failure here is
+      // repaired by re-running the backfill for that day (recompute-and-overwrite).
+      try { await upsertDailyPayoutSummary(updated); }
+      catch (e) { console.error(`CRITICAL: daily payout summary failed for ${updated.id} (day ${istDay(updated.paidAt)}). Run: node scripts/backfill-payout-daily-summaries.js --from ${istDay(updated.paidAt)} --to ${istDay(updated.paidAt)} --write`, e); }
       await touchSource(paidVia, paidAmount, req.user.userId);
       await notify(updated.userId, { type: 'request_paid', userId: updated.userId, payoutId: updated.id, status: 'paid', amountPaise: paidAmount, referenceNumber });
 

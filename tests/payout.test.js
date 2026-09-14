@@ -114,6 +114,7 @@ const COLS = {
     ACCOUNTS: 'accounts', PAYOUTS: 'payouts', COMM: 'payout_comm', DAILY: 'daily_payout_comm',
     MONTHLY: 'monthly_payout_comm', ALLTIME: 'alltime_payout_comm', QRS: 'qr_col', SOURCES: 'source_accounts',
     WD_COMM: 'commission_txs', WD_DAILY: 'daily_commission', WD_MONTHLY: 'monthly_commission', WD_ALLTIME: 'all_time_commission',
+    DAILY_PAYOUTS: 'daily_payout_summaries',
 };
 
 // `label` = the authenticateAdminOrLabel factory; defaults to injecting admin1.
@@ -123,7 +124,8 @@ function buildPayout(db, redis, auth = asUser('user1'), label = adminOrLabel) {
         const factory = require('../payout.js');
         mod = factory(db, { unique: () => 'uid' }, Query, 'db1',
             COLS.USERS, COLS.WD, COLS.WALLETS, COLS.TXNS, COLS.ACCOUNTS, COLS.PAYOUTS, COLS.COMM, COLS.DAILY,
-            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS, mockEmit, COLS.SOURCES, COLS.WD_COMM, COLS.WD_DAILY, COLS.WD_MONTHLY, COLS.WD_ALLTIME);
+            auth, label, redis, COLS.MONTHLY, COLS.ALLTIME, COLS.QRS, mockEmit, COLS.SOURCES, COLS.WD_COMM, COLS.WD_DAILY, COLS.WD_MONTHLY, COLS.WD_ALLTIME,
+            COLS.DAILY_PAYOUTS);
     });
     const app = express();
     app.use(express.json());
@@ -365,6 +367,10 @@ describe('admin paid / reject', () => {
         expect(db.store[COLS.MONTHLY][0].month).toMatch(/^\d{4}-\d{2}$/);
         expect(db.store[COLS.ALLTIME].map((r) => [r.userId, r.totalCommissionPaise]).sort()).toEqual([['admin1', 100], ['sub1', 200]]);
         void month;
+        // Day-wise payout rollup: keyed by the PAYING merchant (user1), not the commission earners.
+        expect(db.store[COLS.DAILY_PAYOUTS]).toHaveLength(1);
+        expect(db.store[COLS.DAILY_PAYOUTS][0].date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+        expect(JSON.parse(db.store[COLS.DAILY_PAYOUTS][0].totalsJson)).toEqual({ user1: { paidPaise: 10000, commissionPaise: 300, count: 1 } });
     });
 
     test('paid twice for two requests accumulates monthly/all-time totals (merge, not overwrite)', async () => {
@@ -378,6 +384,9 @@ describe('admin paid / reject', () => {
         expect(db.store[COLS.MONTHLY]).toHaveLength(2);
         expect(db.store[COLS.ALLTIME].find((r) => r.userId === 'sub1').totalCommissionPaise).toBe(400);
         expect(db.store[COLS.MONTHLY].find((r) => r.userId === 'admin1').totalCommissionPaise).toBe(200);
+        // Same day, same merchant → one doc, merged (count 2), never a second doc or an overwrite.
+        expect(db.store[COLS.DAILY_PAYOUTS]).toHaveLength(1);
+        expect(JSON.parse(db.store[COLS.DAILY_PAYOUTS][0].totalsJson)).toEqual({ user1: { paidPaise: 20000, commissionPaise: 600, count: 2 } });
         expect(JSON.parse(db.store[COLS.DAILY][0].commissionsJson)).toEqual({ sub1: 400, admin1: 200 });
     });
 
@@ -1084,6 +1093,78 @@ describe('wallet statement export (CSV, admin only)', () => {
     });
 });
 
+describe('day-wise payout report (GET /admin/payout-summary, from the rollup)', () => {
+    const D = (date, totals) => ({ $id: `dp_${date}`, date, totalsJson: JSON.stringify(totals) });
+    const seed = () => makeDb({
+        [COLS.USERS]: [
+            { $id: 'admin1', userId: 'admin1', role: 'admin' },
+            { $id: 'sub1', userId: 'sub1', role: 'subadmin' },
+            { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' },
+            { $id: 'userX', userId: 'userX', role: 'user', parentId: 'subOther' },
+        ],
+        [COLS.DAILY_PAYOUTS]: [
+            D('2026-09-02', { user1: { paidPaise: 10000, commissionPaise: 300, count: 1 }, userX: { paidPaise: 99000, commissionPaise: 1, count: 3 } }),
+            D('2026-09-03', { user1: { paidPaise: 20000, commissionPaise: 600, count: 2 } }),
+        ],
+    });
+    beforeEach(() => {
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({ user1: { userId: 'user1', name: 'Ramesh Stores' }, userX: { userId: 'userX', name: 'Other Shop' } }[id] || null));
+    });
+
+    test('admin: one row per day (zeros for quiet days), per-merchant map sums to the day, grand totals, names legend', async () => {
+        const { app } = buildPayout(seed(), makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/payout-summary?from=2026-09-01&to=2026-09-03');
+        expect(res.status).toBe(200);
+        expect(res.body.days).toEqual([
+            { date: '2026-09-01', totalPaise: 0, totalRs: 0, commissionPaise: 0, commissionRs: 0, count: 0, users: {} },
+            { date: '2026-09-02', totalPaise: 109000, totalRs: 1090, commissionPaise: 301, commissionRs: 3.01, count: 4,
+              users: { user1: { paidPaise: 10000, commissionPaise: 300, count: 1 }, userX: { paidPaise: 99000, commissionPaise: 1, count: 3 } } },
+            { date: '2026-09-03', totalPaise: 20000, totalRs: 200, commissionPaise: 600, commissionRs: 6, count: 2,
+              users: { user1: { paidPaise: 20000, commissionPaise: 600, count: 2 } } },
+        ]);
+        expect(res.body).toMatchObject({ grandTotalPaise: 129000, grandTotalRs: 1290, grandCommissionPaise: 901, grandCount: 6, userNames: { user1: 'Ramesh Stores', userX: 'Other Shop' } });
+        // Reads are O(days): three day lookups, no scan of the payouts collection.
+        expect(res.body.days).toHaveLength(3);
+    });
+
+    test('subadmin: foreign merchants are filtered out of the map AND the totals; foreign ?userId is 403', async () => {
+        const sub = asUser('sub1', 'subadmin');
+        const { app } = buildPayout(seed(), makeRedis(), sub, () => sub);
+        const res = await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-02');
+        expect(res.status).toBe(200);
+        expect(res.body.days[0]).toMatchObject({ totalPaise: 10000, count: 1, users: { user1: { paidPaise: 10000 } } });
+        expect(res.body.days[0].users).not.toHaveProperty('userX');
+        expect(res.body.grandTotalPaise).toBe(10000);
+        expect(res.body.userNames).toEqual({ user1: 'Ramesh Stores' });
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-02&userId=userX')).status).toBe(403);
+    });
+
+    test('?userId narrows an admin; bad / inverted / oversized ranges are 400', async () => {
+        const { app } = buildPayout(seed(), makeRedis(), asUser('admin1', 'admin'));
+        const one = await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&userId=userX');
+        expect(one.body.grandTotalPaise).toBe(99000);
+        expect(Object.keys(one.body.days[1].users)).toEqual([]);
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-03&to=2026-09-01')).status).toBe(400);
+        expect((await request(app).get('/admin/payout-summary?from=bad&to=2026-09-01')).status).toBe(400);
+        expect((await request(app).get('/admin/payout-summary?from=2025-01-01&to=2026-09-01')).status).toBe(400);
+    });
+
+    test('a rollup write failure at mark-paid never fails the payment', async () => {
+        const db = makeDb({
+            [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }],
+            [COLS.PAYOUTS]: [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'Ravi', accountNumber: '12345678901', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, commissionRate: 3, userCommissionRate: 2, parentCommissionRate: 1, status: 'pending' }],
+            [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+        });
+        const realList = db.listDocuments.getMockImplementation();
+        db.listDocuments.mockImplementation(async (d, c, q) => { if (c === COLS.DAILY_PAYOUTS) throw new Error('appwrite down'); return realList(d, c, q); });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        expect(res.status).toBe(200);
+        expect(db.store[COLS.PAYOUTS][0].status).toBe('paid');
+        expect(db.store[COLS.DAILY_PAYOUTS] || []).toHaveLength(0);
+    });
+});
+
 describe('daily stats time series', () => {
     test('buckets requested by createdAt and paid/rejected/cancelled by processedAt (IST days), avg paid minutes, totals; subadmin scoped', async () => {
         const db = makeDb({
@@ -1097,18 +1178,39 @@ describe('daily stats time series', () => {
                 { $id: 'x', id: 'cpo_x', userId: 'userX', amountPaise: 99000, commissionPaise: 1, status: 'paid', createdAt: '2026-09-02T04:00:00.000Z', processedAt: '2026-09-02T04:05:00.000Z', paidAt: '2026-09-02T04:05:00.000Z' },
             ],
         });
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({ user1: { userId: 'user1', name: 'Ramesh Stores' }, userX: { userId: 'userX', name: 'Other Shop' } }[id] || null));
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
         const res = await request(app).get('/admin/stats/daily?from=2026-09-01&to=2026-09-03');
         expect(res.status).toBe(200);
-        expect(res.body.days).toEqual([
+        // Day-level counters (the `users` map is asserted separately below).
+        expect(res.body.days.map(({ users, ...d }) => d)).toEqual([
             { date: '2026-09-01', requestedCount: 0, requestedAmountPaise: 0, paidCount: 0, paidAmountPaise: 0, paidCommissionPaise: 0, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: null },
             { date: '2026-09-02', requestedCount: 3, requestedAmountPaise: 129000, paidCount: 2, paidAmountPaise: 109000, paidCommissionPaise: 301, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: 18 },
             { date: '2026-09-03', requestedCount: 3, requestedAmountPaise: 13000, paidCount: 1, paidAmountPaise: 20000, paidCommissionPaise: 600, rejectedCount: 1, cancelledCount: 1, avgPaidInMinutes: 1450 },
         ]);
         expect(res.body.totals).toEqual({ requestedCount: 6, requestedAmountPaise: 142000, paidCount: 3, paidAmountPaise: 129000, paidCommissionPaise: 901, rejectedCount: 1, cancelledCount: 1 });
+
+        // Per-merchant breakdown: the per-QR dimension of the pay-in report, keyed by userId.
+        expect(res.body.days[0].users).toEqual({});
+        expect(res.body.days[1].users).toEqual({
+            user1: { requestedCount: 2, requestedAmountPaise: 30000, paidCount: 1, paidAmountPaise: 10000, paidCommissionPaise: 300, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: 30 },
+            userX: { requestedCount: 1, requestedAmountPaise: 99000, paidCount: 1, paidAmountPaise: 99000, paidCommissionPaise: 1, rejectedCount: 0, cancelledCount: 0, avgPaidInMinutes: 5 },
+        });
+        expect(res.body.days[2].users).toEqual({
+            user1: { requestedCount: 3, requestedAmountPaise: 13000, paidCount: 1, paidAmountPaise: 20000, paidCommissionPaise: 600, rejectedCount: 1, cancelledCount: 1, avgPaidInMinutes: 1450 },
+        });
+        // Per-user rows always sum to the day.
+        for (const day of res.body.days) {
+            const sum = Object.values(day.users).reduce((t, u) => t + u.paidAmountPaise, 0);
+            expect(sum).toBe(day.paidAmountPaise);
+        }
+        expect(res.body.userNames).toEqual({ user1: 'Ramesh Stores', userX: 'Other Shop' });
+
         const sub = asUser('sub1', 'subadmin');
         const scoped = await request(buildPayout(db, makeRedis(), sub, () => sub).app).get('/admin/stats/daily?from=2026-09-02&to=2026-09-02');
         expect(scoped.body.days[0]).toMatchObject({ requestedCount: 2, paidCount: 1, paidAmountPaise: 10000 });
+        expect(Object.keys(scoped.body.days[0].users)).toEqual(['user1']);        // the other tenant never appears
+        expect(scoped.body.userNames).toEqual({ user1: 'Ramesh Stores' });
         expect((await request(app).get('/admin/stats/daily?from=2026-09-03&to=2026-09-01')).status).toBe(400);
     });
 });

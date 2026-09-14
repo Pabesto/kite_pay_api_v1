@@ -32,6 +32,7 @@ const {
     APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = 'monthly_payout_commission_totals',
     APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID = 'all_time_payout_commission_totals',
     APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID = 'payout_source_accounts',
+    APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID = 'daily_payout_summaries',
 } = process.env;
 
 if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT_ID || !APPWRITE_API_KEY || !APPWRITE_DATABASE_ID || !APPWRITE_USERS_META_COLLECTION_ID || !APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID) {
@@ -238,6 +239,18 @@ async function main() {
     await sleep(3000);
     await idx(DAILY, 'idx_date', 'unique', ['date']);
 
+    // 6a. daily_payout_summaries — the day-wise payout REPORT rollup (mirrors daily_qr_summaries).
+    // Keyed by the paying merchant: { date, totalsJson: { [userId]: { paidPaise, commissionPaise, count } } }.
+    // Distinct from 6 above, which is keyed by the commission EARNER. Written at mark-paid only.
+    // After creating it on an existing deployment, run scripts/backfill-payout-daily-summaries.js --write.
+    const DAILY_PAYOUTS = APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID;
+    console.log(`\n${DAILY_PAYOUTS}:`);
+    await collection(DAILY_PAYOUTS, 'Daily Payout Summaries');
+    await str(DAILY_PAYOUTS, 'date', 30, true);
+    await str(DAILY_PAYOUTS, 'totalsJson', 999999);
+    await sleep(3000);
+    await idx(DAILY_PAYOUTS, 'idx_date', 'unique', ['date']);
+
     // 6b. monthly / all-time totals (mirror monthly_commission_totals / all_time_commission_totals)
     const MONTHLY = APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID;
     console.log(`\n${MONTHLY}:`);
@@ -291,7 +304,11 @@ async function main() {
         APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID: ACCOUNTS, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID: PAYOUTS,
         APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID: COMM, APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID: DAILY,
         APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID: MONTHLY, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID: ALLTIME,
+        APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID: DAILY_PAYOUTS,
     })) console.log(`  ${k}=${v}`);
+    console.log('\nIf customer payouts were already paid before this run, backfill the day-wise report:');
+    console.log('  node scripts/backfill-payout-daily-summaries.js          # plan');
+    console.log('  node scripts/backfill-payout-daily-summaries.js --write  # rebuild every day');
     console.log('\nNext: set payoutCommission (%) per user via PUT /api/admin/edit-user/:id, then deploy.\n');
 }
 

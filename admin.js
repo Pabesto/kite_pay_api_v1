@@ -381,8 +381,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 role,
                 parentId: creatorId,
                 status: true,
+                // Commission rates (%). `commission` = payin rate on withdrawals, `payoutCommission` =
+                // customer-payout rate; each is the cut that flows to the user's PARENT (their subadmin)
+                // — the parent's own rate flows to admin regardless. A user a subadmin creates therefore
+                // starts at 0 on both: the subadmin earns nothing off their own user until they
+                // deliberately set a rate (edit-user allows it). Admin-created users keep the platform
+                // default for payouts. Explicit 0 is honoured downstream (`??`, never `||`) — do not
+                // "simplify" it to null, that would silently re-apply the default.
                 commission: 0,
-                payoutCommission: Number(ConfigManager.get("default_payout_commission", 1.5)), // Customer Payout rate (%), see payout.js
+                payoutCommission: req.user.role === 'subadmin' ? 0 : Number(ConfigManager.get("default_payout_commission", 1.5)), // Customer Payout rate (%), see payout.js
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 

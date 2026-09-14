@@ -77,7 +77,7 @@ const asUser = (userId = 'user1') => (req, _res, next) => {
  * doesn't accumulate duplicate route handlers across tests.
  */
 
-function buildAdminApp(db, redis, authUser = asAdmin) {
+function buildAdminApp(db, redis, authUser = asAdmin, users = {}) {
     let router;
     jest.isolateModules(() => {
         const adminFactory = require('../admin.js');
@@ -87,7 +87,7 @@ function buildAdminApp(db, redis, authUser = asAdmin) {
             'proj1',                      // APPWRITE_PROJECT_ID
             db,
             {},
-            {},
+            users,                        // Appwrite Users API (create-user needs create/updateLabels)
             { unique: () => 'newId1' },
             Query,
             'db1',
@@ -643,5 +643,38 @@ describe('GET /dashboard/user/:userId — payout block', () => {
     test('another plain user is forbidden', async () => {
         const app = buildAdminApp(dbWithPayouts(), makeRedis(), asUser('user2'));
         expect((await request(app).get('/dashboard/user/user1')).status).toBe(403);
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /create-user — commission defaults. Both rates are the cut that flows to the new user's
+// PARENT, so a subadmin-created user must start at 0/0 (the subadmin earns nothing off their own
+// user until they set a rate); an admin-created user keeps the platform payout default.
+// Explicit 0 is load-bearing: payout.js reads payoutCommission with `??`, so null would silently
+// re-apply the default.
+describe('create-user commission defaults', () => {
+    const fakeUsers = () => ({
+        create: jest.fn(async (_id, email, _phone, _pw, name) => ({ $id: 'newAuthId', email, name })),
+        updateLabels: jest.fn().mockResolvedValue({}),
+    });
+    const asSubadmin = (req, _res, next) => { req.user = { userId: 'sub1', role: 'subadmin', $id: 'sub1', labels: [] }; next(); };
+    // This file's makeDb is a plain mock — the written doc is the 4th arg of the users_meta createDocument call.
+    const created = (db) => db.createDocument.mock.calls.find((c) => c[1] === 'users_meta' && c[2] === 'newAuthId')[3];
+
+    test('subadmin creates a user → commission 0 AND payoutCommission 0 (explicit, not null), parentId = subadmin', async () => {
+        const db = makeDb();
+        const app = buildAdminApp(db, makeRedis(), asSubadmin, fakeUsers());
+        const res = await request(app).post('/create-user').send({ name: 'Ramesh', email: 'r@x.in', password: 'secret12', role: 'user' });
+        expect(res.status).toBe(201);
+        expect(created(db)).toMatchObject({ role: 'user', parentId: 'sub1', commission: 0, payoutCommission: 0 });
+        expect(created(db).payoutCommission).toBe(0);           // strictly 0 — never null/undefined
+    });
+
+    test('admin creates a user → commission 0, payoutCommission = platform default (1.5), no parent', async () => {
+        const db = makeDb();
+        const app = buildAdminApp(db, makeRedis(), asAdmin, fakeUsers());
+        const res = await request(app).post('/create-user').send({ name: 'Ramesh', email: 'r@x.in', password: 'secret12', role: 'user' });
+        expect(res.status).toBe(201);
+        expect(created(db)).toMatchObject({ role: 'user', parentId: null, commission: 0, payoutCommission: 1.5 });
     });
 });
