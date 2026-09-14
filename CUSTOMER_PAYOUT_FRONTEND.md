@@ -777,43 +777,198 @@ toggle in the user detail. Both switches return `403` for labelled employees; on
 pause. Pausing never touches money or existing requests — admin can still pay/reject the queue.
 
 ### 6.5b-1 Day-wise payout report — `GET /api/payout/admin/payout-summary?from&to&userId&subadminId`
-**This is the report to build the "daily payout" screen from** — the customer-payout twin of
-`/api/admin/payin-summary`, same shape: where pay-in breaks each day down per QR, this breaks
-each day down **per merchant, keyed by `userId`** (the wallet that paid), so the UI can join it to
-name / email / phone the same way it joins `qrId` today. Served from a per-day rollup
-(`daily_payout_summaries`, written at mark-paid), so a month costs 31 small reads and a year 366 —
-it never scans payout rows. Scoped like the queue; defaults to today; max 366 days.
-```jsonc
-{ "success": true, "range": { "from": "2026-09-01", "to": "2026-09-03" },
-  "days": [
-    { "date": "2026-09-01", "totalPaise": 0, "totalRs": 0, "commissionPaise": 0, "commissionRs": 0, "count": 0, "users": {} },
-    { "date": "2026-09-02", "totalPaise": 109000, "totalRs": 1090, "commissionPaise": 301, "commissionRs": 3.01, "count": 4,
-      "users": { "user_8f2…": { "paidPaise": 10000, "commissionPaise": 300, "count": 1 },
-                 "user_c41…": { "paidPaise": 99000, "commissionPaise": 1,   "count": 3 } } }, …],
-  "grandTotalPaise": 129000, "grandTotalRs": 1290, "grandCommissionPaise": 901, "grandCommissionRs": 9.01, "grandCount": 6,
-  "todayPaise": 0, "todayRs": 0, "yesterdayPaise": 0, "yesterdayRs": 0,       // 0 when today/yesterday are outside the range
-  "userNames": { "user_8f2…": "Ramesh Stores", "user_c41…": "Other Shop" } }  // null = name unknown (deleted user)
-```
-| Field | Meaning |
-|---|---|
-| `days[].totalPaise` | what left merchants' wallets that day (sum of `users[*].paidPaise`) |
-| `days[].commissionPaise` | what the platform kept on top (sum of `users[*].commissionPaise`) |
-| `days[].count` | **number of payouts paid that day** (sum of `users[*].count`) |
-| `days[].users[userId]` | `{ paidPaise, commissionPaise, count }` for one merchant — the per-QR slot of the pay-in report |
-| `grand*` | the same three over the whole range |
-| `userNames` | one legend for the range; use `userNames[userId] ?? userId` as the row label, fetch email etc. by id if the screen needs them |
 
-Rules of the data:
-- **"Paid" day = the IST day the payout was marked paid** (`paidAt`), not the day it was requested.
-  A request made at 23:50 and paid at 00:10 counts on the second day. This matches the wallet ledger.
-- Only **paid** payouts are in here. Requested / rejected / cancelled counts live in 6.5b-2 below.
-- Per-merchant rows always sum to the day, and the map is scoped **before** summing — a subadmin's
-  `totalPaise` is their merchants' total, never the platform's.
-- A quiet day is a row with zeros and `users: {}` — render it, don't skip it.
-- `*Rs` mirrors are provided on this endpoint (unlike 6.5b-2) so the pay-in screen can be reused as-is.
-- The rollup is written once per payout at the moment it is paid. If a day ever looks wrong, ops
-  re-runs `node scripts/backfill-payout-daily-summaries.js --from D --to D --write` — the UI
-  should not try to reconcile it against 6.5b-2.
+**This is the report to build the "daily payout" screen from** — the customer-payout twin of the
+pay-in report (`GET /api/admin/payin-summary`) with the **same response shape** and one
+substitution: where pay-in breaks a day down per `qrId`, this breaks it down per `userId` (the
+merchant whose payout wallet paid). If you already have the pay-in report screen, clone it, swap
+the QR column for a merchant column, and you are done.
+
+**Nothing on this screen moves money.** It is read-only. All amounts are **paise** (integers);
+`*Rs` mirrors are provided for display only — never total the two together.
+
+Served from a per-day rollup (`daily_payout_summaries`) written the moment a payout is marked
+paid. Reads are one small document per day in range — fast at any fleet size, never a row scan.
+
+#### Auth and visibility
+
+```
+GET /api/payout/admin/payout-summary
+Authorization: Bearer <appwrite JWT>
+```
+
+| Caller | May call | Sees |
+|---|---|---|
+| `role: 'admin'` | yes | every merchant, all tenants |
+| `role: 'subadmin'` | yes | **only their own merchants** — foreign merchants are removed from `users` *and* from every total |
+| `role: 'employee'` with `view_payouts` | yes | merchants under the subadmins assigned to them |
+| employee without the label, `role: 'user'` | no | — |
+
+| Status | Body | UI |
+|---|---|---|
+| 401 | `{"error": …}` — missing/invalid token | login |
+| 403 | `{"error":"Not authorized: …"}` — role/label | hide the screen |
+| 403 | `{"error":"Not authorized for this user"}` / `"…for this subadmin"` — a filter named a merchant outside the caller's scope | clear the filter; don't show a dialog |
+| 400 | see *Validation* below | inline validation |
+| 503 | `{"error":"Service temporarily unavailable. Please retry."}` | retry with backoff, keep the last good data |
+
+Scoping is applied **before** summing: a subadmin's `grandTotalPaise` is *their* merchants' total,
+never the platform's. There is nothing to filter client-side for security.
+
+
+#### The request
+
+| Query param | Default | Meaning |
+|---|---|---|
+| `from` | today (IST) | first day, `YYYY-MM-DD`, IST calendar day |
+| `to` | `from` | last day, inclusive |
+| `userId` | — | one merchant only (403 if outside your scope) |
+| `subadminId` | — | one subadmin's merchants only (admin/employee use; 403 if outside your scope) |
+
+Both filters may be combined; they intersect.
+
+##### Validation (400)
+
+| Condition | `error` |
+|---|---|
+| a date is not `YYYY-MM-DD` | `Dates must be YYYY-MM-DD` |
+| `to` before `from`, or an impossible date | `Invalid date range` |
+| more than 366 days | `Range too large (max 366 days)` |
+
+Send calendar days, not timestamps. **Days are IST**, so the picker must produce IST dates — do
+not convert a local `DateTime` through UTC first.
+
+
+#### The response
+
+```jsonc
+{
+  "success": true,
+  "range": { "from": "2026-09-01", "to": "2026-09-03" },
+  "days": [
+    { "date": "2026-09-01",
+      "totalPaise": 0, "totalRs": 0, "commissionPaise": 0, "commissionRs": 0, "count": 0,
+      "users": {} },
+    { "date": "2026-09-02",
+      "totalPaise": 109000, "totalRs": 1090, "commissionPaise": 301, "commissionRs": 3.01, "count": 4,
+      "users": {
+        "user_8f2…": { "paidPaise": 10000, "commissionPaise": 300, "count": 1 },
+        "user_c41…": { "paidPaise": 99000, "commissionPaise": 1,   "count": 3 }
+      } },
+    { "date": "2026-09-03",
+      "totalPaise": 20000, "totalRs": 200, "commissionPaise": 600, "commissionRs": 6, "count": 2,
+      "users": { "user_8f2…": { "paidPaise": 20000, "commissionPaise": 600, "count": 2 } } }
+  ],
+  "grandTotalPaise": 129000,   "grandTotalRs": 1290,
+  "grandCommissionPaise": 901, "grandCommissionRs": 9.01,
+  "grandCount": 6,
+  "todayPaise": 0,     "todayRs": 0,
+  "yesterdayPaise": 0, "yesterdayRs": 0,
+  "userNames": { "user_8f2…": "Ramesh Stores", "user_c41…": "Other Shop" }
+}
+```
+
+##### Field reference
+
+| Field | Type | Meaning |
+|---|---|---|
+| `days` | array | **one entry per calendar day in range, in order, no gaps.** A quiet day is present with zeros and `users: {}` |
+| `days[].date` | `YYYY-MM-DD` | IST day |
+| `days[].totalPaise` / `totalRs` | int / number | amount paid out to customers that day — what left merchants' wallets. Equals the sum of `users[*].paidPaise` |
+| `days[].commissionPaise` / `commissionRs` | int / number | platform commission earned on those payouts. Sum of `users[*].commissionPaise` |
+| `days[].count` | int | **number of payouts paid that day**. Sum of `users[*].count` |
+| `days[].users` | object | per-merchant breakdown, keyed by the merchant's `userId` — the pay-in report's per-QR slot |
+| `days[].users[uid].paidPaise` | int | that merchant's payouts that day |
+| `days[].users[uid].commissionPaise` | int | commission on them |
+| `days[].users[uid].count` | int | how many |
+| `grandTotalPaise` / `grandTotalRs` | | `totalPaise` over the whole range |
+| `grandCommissionPaise` / `grandCommissionRs` | | `commissionPaise` over the range |
+| `grandCount` | int | payouts over the range |
+| `todayPaise` / `todayRs`, `yesterdayPaise` / `yesterdayRs` | | convenience for the two header tiles. **`0` when that day is outside the requested range** — not "nothing was paid" |
+| `userNames` | object | `userId → name` for every merchant that appears anywhere in `days`. `null` = name unknown (deleted user). Only ids in the caller's scope are listed |
+
+##### What "paid on day D" means
+
+A payout is counted on the **IST day it was marked paid** (`paidAt`) — not the day it was
+requested. A request made at 23:50 and paid at 00:10 belongs to the second day. This matches the
+wallet ledger and the wallet statement export, so the three always agree.
+
+Only **paid** payouts are here. Requested / rejected / cancelled counts are on the analytics
+endpoint (`/api/payout/admin/stats/daily`, §6.5b-2 below); don't try to
+derive them from this one.
+
+##### Identity: `userId`, and how to get name / email
+
+Rows are keyed by the merchant's **`userId`** deliberately — it is the stable key every other
+screen already uses, so the report joins to whatever you have: `userNames` for the label,
+the user detail / list you already fetch for email, phone, subadmin, and so on. Nothing beyond
+the name is in this response, on purpose: it is a report, not a user directory.
+
+Label rule: `userNames[userId] ?? userId`. Never drop a row because its name is `null`.
+
+
+#### Building the screen
+
+The pay-in report layout, verbatim, with these substitutions and rules:
+
+1. **Header tiles**: `todayRs`, `yesterdayRs`, `grandTotalRs` for the range, `grandCount`
+   payouts, `grandCommissionRs` commission. Show the range on the total tile.
+2. **Table rows = days** (`days`, already in order). Columns: date · paid · commission · count.
+   Render every day, including zero days — the operator is looking for the gap.
+3. **Expand a day → merchant rows** from `users`, sorted by `paidPaise` desc. Columns:
+   merchant (`userNames`) · paid · commission · count. Tapping a merchant → their payout list
+   filtered to that day (`/api/payout/admin/requests?userId=&from=&to=&status=paid`).
+4. **Filters**: date range (default: last 7 days, cap the picker at 366), merchant (`userId`),
+   and for admins/employees a subadmin picker (`subadminId`). A 403 on a filter means "not
+   yours" — clear it silently.
+5. **Amounts**: use `*Paise` for any arithmetic (sorting, client-side sums, comparisons) and
+   `*Rs` only to print. Never add a `Paise` field to an `Rs` field.
+6. **Refresh**: on screen open and on pull-to-refresh. The data changes only when a payout is
+   marked paid, so if you already listen for `payout:update` with `type: 'request_paid'`
+   (§9), use it as a "refresh now" hint — never patch the table from the
+   event payload.
+7. **Export**: if you offer CSV, build it from `days` + `users` client-side; there is no server
+   export for this report.
+
+
+#### Consistency and what to do when a day looks wrong
+
+The rollup is written once per payout at the moment it is marked paid. A failed rollup write is
+logged server-side and repaired by ops re-running the backfill for that day
+(`scripts/backfill-payout-daily-summaries.js --from D --to D --write`), which rebuilds the day from
+the source rows. So:
+
+- The UI must **not** reconcile this report against `stats/daily` or the payout list and flag
+  mismatches — that is an ops job, and the two are bucketed by different timestamps anyway.
+- Right after a deploy of this feature, history is empty until the backfill has run. An empty
+  report for past days is "backfill not run yet", not "no payouts" — worth a one-line hint in
+  the empty state if `to` is before today.
+
+
+#### Not available (don't design around these)
+
+| Wanted | Status |
+|---|---|
+| Per-mode split (UPI / IMPS / NEFT / RTGS) | not in the rollup |
+| Per-source-account ("paid via") split | not in the rollup |
+| Requested / rejected / cancelled per day | use `/api/payout/admin/stats/daily` (§6.5b-2) |
+| Email / phone in the response | by design — join on `userId` |
+| Hourly resolution | days only, IST |
+| Server-side CSV | none for this report (the wallet statement export is per merchant, not per day) |
+| Realtime push of report changes | none — refresh, or use `payout:update` / `request_paid` as a hint |
+
+
+#### Quick client checklist
+
+- [ ] Route guarded for admin / subadmin / `view_payouts` employee; 403 hides the screen
+- [ ] Date picker emits IST calendar days, default last 7, max 366
+- [ ] Every day rendered, zero days included; `users: {}` handled
+- [ ] Merchant rows labelled `userNames[userId] ?? userId`, sorted by `paidPaise` desc
+- [ ] `count` shown per day and per merchant; `grandCount` in the header
+- [ ] Arithmetic on `*Paise`, display via `*Rs`
+- [ ] `todayRs` / `yesterdayRs` tiles understand "0 because out of range"
+- [ ] 403 on a filter clears the filter; 400 shown inline
+- [ ] Empty past range hints "backfill may not have run" rather than asserting no payouts
 
 ### 6.5b-2 Daily time series — `GET /api/payout/admin/stats/daily?from&to&userId&subadminId`
 Scoped like the queue (subadmins/employees see their users). Defaults to today; max 366 days.
