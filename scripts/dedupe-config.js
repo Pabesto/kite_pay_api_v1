@@ -16,7 +16,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const { Client, Databases, Query } = require('node-appwrite');
+const { Client, Query } = require('node-appwrite');
 
 const {
   APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY,
@@ -32,7 +32,7 @@ for (const [k, v] of Object.entries({
 
 const WRITE = process.argv.includes('--write');
 
-const databases = new Databases(
+const databases = require('../appwriteDb')(
   new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY)
 );
 

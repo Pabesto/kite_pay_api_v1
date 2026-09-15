@@ -19,7 +19,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const { Client, Databases, Query } = require('node-appwrite');
+const { Client, Query } = require('node-appwrite');
 
 const DRY_RUN = !process.argv.includes('--write');
 const OVERWRITE_SAMPLES = process.argv.includes('--overwrite-samples');
@@ -44,7 +44,7 @@ for (const [name, val] of Object.entries({
 }
 
 const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY);
-const db = new Databases(client);
+const db = require('../appwriteDb')(client);
 
 function slug(name) {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');

@@ -14,7 +14,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const { Client, Databases, Query } = require('node-appwrite');
+const { Client, Query } = require('node-appwrite');
 
 const args = process.argv.slice(2);
 const WRITE = args.includes('--write');
@@ -33,7 +33,7 @@ if (!isFinite(RATE) || RATE < 0 || RATE > 100) {
 }
 
 const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY);
-const db = new Databases(client);
+const db = require('../appwriteDb')(client);
 const DB = APPWRITE_DATABASE_ID;
 const COL = APPWRITE_USERS_META_COLLECTION_ID;
 

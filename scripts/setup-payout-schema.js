@@ -18,7 +18,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const { Client, Databases } = require('node-appwrite');
+const { Client } = require('node-appwrite');
 
 const {
     APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY, APPWRITE_DATABASE_ID,
@@ -41,7 +41,7 @@ if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT_ID || !APPWRITE_API_KEY || !APPWRITE
 }
 
 const client = new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY);
-const db = new Databases(client);
+const db = require('../appwriteDb')(client);
 const DB = APPWRITE_DATABASE_ID;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

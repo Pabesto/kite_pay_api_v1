@@ -20,7 +20,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-const { Client, Databases, ID, Query } = require('node-appwrite');
+const { Client, ID, Query } = require('node-appwrite');
 const moment = require('moment-timezone');
 
 const args = process.argv.slice(2);
@@ -42,7 +42,7 @@ if ((FROM && !DAY_RE.test(FROM)) || (TO && !DAY_RE.test(TO)) || (!!FROM !== !!TO
     process.exit(1);
 }
 
-const db = new Databases(new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY));
+const db = require('../appwriteDb')(new Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT_ID).setKey(APPWRITE_API_KEY));
 const DB = APPWRITE_DATABASE_ID, PAYOUTS = APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, DAILY = APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID;
 const istDay = (ts) => moment.tz(ts, 'Asia/Kolkata').format('YYYY-MM-DD');
 

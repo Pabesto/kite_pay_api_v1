@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const cors = require('cors');
 const compression = require('compression'); // Added compression middleware
-const { Client, Databases, Storage, Users, Account, ID, Query, InputFile, TablesDB } = require('node-appwrite');
+const { Client, Storage, Users, Account, ID, Query, InputFile, TablesDB } = require('node-appwrite');
 
 const { createServer } = require('http');
 const { Server } = require('socket.io');
@@ -199,7 +199,7 @@ client
     .setProject(APPWRITE_PROJECT_ID)
     .setKey(APPWRITE_API_KEY);
 
-const databases = new Databases(client);
+const databases = require('./appwriteDb')(client); // legacy-shaped adapter over TablesDB — see appwriteDb.js
 const account = new Account(client);
 const storage = new Storage(client);
 const users = new Users(client);

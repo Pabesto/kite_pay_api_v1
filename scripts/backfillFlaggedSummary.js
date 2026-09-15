@@ -21,7 +21,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const moment = require('moment-timezone');
-const { Client, Databases, Query, ID } = require('node-appwrite');
+const { Client, Query, ID } = require('node-appwrite');
 
 // ----- config / flags -----
 const DRY_RUN = !process.argv.includes('--write');
@@ -52,7 +52,7 @@ const client = new Client()
     .setEndpoint(APPWRITE_ENDPOINT)
     .setProject(APPWRITE_PROJECT_ID)
     .setKey(APPWRITE_API_KEY);
-const databases = new Databases(client);
+const databases = require('../appwriteDb')(client);
 
 // Fetch every flagged transaction using cursor pagination.
 async function fetchFlaggedTransactions() {
