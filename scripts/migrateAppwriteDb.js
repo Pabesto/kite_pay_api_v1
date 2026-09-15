@@ -23,16 +23,16 @@
 
 const SOURCE = {
   endpoint:   'https://sgp.cloud.appwrite.io/v1',
-  projectId:  '69fbf3d100025d91e8d5',
-  apiKey:     'standard_cbe1d7b44195f9ddd89443d29adfdce5bce20bece882e0702037f71832c69915d5e6e89b1edfe1f944eac197b22289f7190895e2bd3dbca5fdf68d29123106ae70674ac2b0ba70b2b5bfa8eeeb504b39eca5054d81db7edcb27ca6ada6dc4ae93949d0fb1c623cc585090cfb21a3bb2c527ab6773037b837de2e33f11cdf3854',
-  databaseId: '69fbf49100207103019a',
+  projectId:  '6a788fcd001d540868ef',
+  apiKey:     'standard_0e2204b5f230c3d9c08735b1afedb9a86aa64f90765f3b0dde25efd15c5cf504c522c7081e2974e829796c65f107dc3bb987ef798c00cdf4986fff2a2ed945f5636f4a051bfa4e28e49c353a4e4b9c2c664622f873429a46e83f851106c19d01e2c5d895f364ac63b1aa288726a5f8eeb6a7a3d99c84c8d74f860a3d9aaf9170',
+  databaseId: '6a789095000fcaf71dd7',
 };
 
 const TARGET = {
   endpoint:   'https://sgp.cloud.appwrite.io/v1',
-  projectId:  '6a788fcd001d540868ef',
-  apiKey:     'standard_0e2204b5f230c3d9c08735b1afedb9a86aa64f90765f3b0dde25efd15c5cf504c522c7081e2974e829796c65f107dc3bb987ef798c00cdf4986fff2a2ed945f5636f4a051bfa4e28e49c353a4e4b9c2c664622f873429a46e83f851106c19d01e2c5d895f364ac63b1aa288726a5f8eeb6a7a3d99c84c8d74f860a3d9aaf9170',
-  databaseId: '6a789095000fcaf71dd7',
+  projectId:  '6aa9b6130009273fe673',
+  apiKey:     'standard_4af66fd1b1ffc7a340aacd9d47c38ec0d4f0912f168530950125d02bead4f389b268d1be50a12777ff314edac3dc92cd48503719f10784efa0203f894ef85784320c90486872726fdbb396cdc7a759a1a19eb23318124ef6eaf8f0c0facffaf51a49c83c211c9ed2cccd4c95316ed297a1eb92786d9daf7a0e9c549dbb407b53',
+  databaseId: '6aa9b66d003a80c98510',
 };
 
 // The only two tables whose rows are copied. Everything else is schema-only.
@@ -44,7 +44,7 @@ const USERS_META_TABLE_ID = 'users_meta_test';    // live users table, despite t
 // generates the auth user id; that same id becomes both users_meta.userId and the
 // row's $id, which is what every ownership check in the app compares against.
 const ADMIN = {
-  email:    'admin@kitepay3.com',
+  email:    'admin@citypay.in',
   password: 'Batman1234@A',   // min 8 chars — Appwrite requires one at creation
   name:     'Admin',
 };
