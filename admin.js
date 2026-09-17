@@ -4974,10 +4974,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     //   to          — end date   YYYY-MM-DD (default: today)
     //   userId      — (admin/subadmin only) filter to a specific user's QRs
     //   qrId        — filter to a single QR code
+    //   companyName — filter to QRs whose qr_codes.companyName matches (case-insensitive, trimmed)
     //
     // Response shape:
-    //   { days: [ { date, totalPaise, totalRs, qrs: { qrId: paise, ... } } ],
-    //     grandTotalPaise, grandTotalRs, todayPaise, todayRs, yesterdayPaise, yesterdayRs }
+    //   { days: [ { date, totalPaise, totalRs, qrs: { qrId: paise, ... }, companies: { companyName: paise, ... } } ],
+    //     grandTotalPaise, grandTotalRs, todayPaise, todayRs, yesterdayPaise, yesterdayRs,
+    //     companies: [ { companyName, totalPaise, totalRs } ] }   // whole range, desc; every company_names
+    //                                                            // config entry is listed even at 0
     // ─────────────────────────────────────────────────────────────────────────
     // ─────────────────────────────────────────────────────────────────────────
     // T+0 early release (ADMIN ROLE ONLY — a risk decision, not a permission)
@@ -5104,6 +5107,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const to = req.query.to || todayStr;
             const filterUserId = req.query.userId || null;
             const filterQrId = req.query.qrId || null;
+            const filterCompany = String(req.query.companyName || '').trim().toLowerCase() || null;
 
             // 1) Determine which QR IDs the caller can see
             let allowedQrIds = null; // null = all (admin)
@@ -5143,6 +5147,31 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 allowedQrIds = [filterQrId];
             }
 
+            // Companies: the company_names config ({companyName: email}, legacy array of names) is the
+            // canonical list — every configured company appears in the response even with zero pay-in,
+            // and a QR's companyName matches it case-insensitively/trimmed (same rule as the hold email),
+            // grouping under the config spelling. Names only on QR docs still get their own bucket;
+            // blank/unknown → NO_COMPANY. Archived "<qrId>_hold[N]" docs keep companyName, so held history
+            // rolls up under the same company.
+            // ponytail: full qr_codes scan per request; cache the map if the table grows past a few thousand.
+            const NO_COMPANY = '(no company)';
+            const cfg = ConfigManager.get('company_names', {});
+            const canonical = {};                      // lower-cased → config spelling
+            for (const n of Array.isArray(cfg) ? cfg : Object.keys(cfg || {})) {
+                const name = String(n || '').trim();
+                if (name) canonical[name.toLowerCase()] = name;
+            }
+            const companyOf = {};                      // qrId → company bucket
+            for (const q of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
+                const name = String(q.companyName || '').trim();
+                companyOf[q.qrId] = name ? (canonical[name.toLowerCase()] || name) : NO_COMPANY;
+            }
+            if (filterCompany) {
+                const ids = Object.keys(companyOf).filter(id => companyOf[id].toLowerCase() === filterCompany);
+                allowedQrIds = allowedQrIds ? allowedQrIds.filter(id => ids.includes(id)) : ids;
+            }
+            const rangeCompanies = Object.fromEntries(Object.values(canonical).map(n => [n, 0]));   // companyName → paise, whole range
+
             // 2) Fetch daily summary docs for the date range
             const startDate = moment.tz(from, 'Asia/Kolkata');
             const endDate = moment.tz(to, 'Asia/Kolkata');
@@ -5168,6 +5197,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 let dayTotal = 0;
                 let qrBreakdown = {};
+                const companies = {};
 
                 if (summaryDocs.total > 0) {
                     let totalsObj = {};
@@ -5184,6 +5214,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         const amount = parseInt(paise || 0, 10);
                         qrBreakdown[qrId] = amount;
                         dayTotal += amount;
+                        const company = companyOf[qrId] || NO_COMPANY;
+                        companies[company] = (companies[company] || 0) + amount;
+                        rangeCompanies[company] = (rangeCompanies[company] || 0) + amount;
                     }
                 }
 
@@ -5192,6 +5225,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     totalPaise: dayTotal,
                     totalRs: dayTotal / 100,
                     qrs: qrBreakdown,
+                    companies,
                 });
 
                 grandTotalPaise += dayTotal;
@@ -5209,6 +5243,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 todayRs: todayPaise / 100,
                 yesterdayPaise,
                 yesterdayRs: yesterdayPaise / 100,
+                companies: Object.entries(rangeCompanies)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([companyName, totalPaise]) => ({ companyName, totalPaise, totalRs: totalPaise / 100 })),
             });
         } catch (err) {
             console.error('Payin summary error:', err);
