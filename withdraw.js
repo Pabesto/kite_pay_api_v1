@@ -9,6 +9,7 @@ const moment = require('moment-timezone');
 const { updateDashboardCounter } = require('./dashboardCounters');
 const qrSettlement = require('./qrSettlement');
 const ConfigManager = require('./configManager');
+const withdrawalSummary = require('./withdrawalSummary'); // day-wise withdrawal report rollup — written at approve only
 const userMetaCache = require('./userMetaCache');
 
 const router = express.Router();
@@ -1194,6 +1195,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Approved is committed above and stays approved even if the wallet credit below fails —
         // so notify here, once, ahead of every return path.
         notifyWithdrawal('approved', { ...w, status: 'approved', utrNumber: isWalletWithdrawal ? 'PAYOUT_WALLET' : utrNumber.trim(), processedAt: approvedAtIST, rejectionReason: null }, req.user);
+
+        // Day-wise withdrawal report rollup (withdrawalSummary.js) — report-only, same posture as the
+        // commission rollups below: the approval is committed regardless; a failure here is repaired by
+        // re-running the backfill for that day (recompute-and-overwrite).
+        try { await withdrawalSummary.record({ ...w, processedAt: approvedAtIST }); }
+        catch (e) { const d = withdrawalSummary.istDay(approvedAtIST); console.error(`CRITICAL: daily withdrawal summary failed for ${w.id} (day ${d}). Run: node scripts/backfill-withdrawal-daily-summaries.js --from ${d} --to ${d} --write`, e); }
 
         // NOTE: the payout-wallet credit runs AFTER the commission block below, not here. The QR has
         // already been debited principal + commission at this point, so the commission ledger must be

@@ -5,6 +5,7 @@
  *   • finalized / already-resolved transactions stay on the original id (moved out-of-band)
  *   • rejected log rows + the daily rejected summary key move
  *   • today's T+0 release row moves (qrSettlement.repointReleases)
+ *   • the day-wise withdrawal rollup key moves (withdrawalSummary.repointQr)
  *   • dry run reports all of the above and mutates nothing
  */
 
@@ -23,7 +24,7 @@ jest.mock('../userMetaCache', () => ({ getUserMeta: jest.fn(async () => null), i
 jest.mock('../qrOwnerCache', () => ({ reload: jest.fn().mockResolvedValue(null), invalidateQr: jest.fn(), resolve: jest.fn().mockResolvedValue(null), get: jest.fn() }));
 
 const QRS = 'qr_col', TXNS = 'webhook_col', DAILY = 'daily_qr', DELETED = 'daily_deleted', FLAGGED = 'daily_flagged',
-    WD = 'withdrawal_col', HOLDS = 'manual_hold', REJECTED = 'rejected_txns', DAILY_REJ = 'daily_rejected', RELEASES = 'qr_daily_releases';
+    WD = 'withdrawal_col', HOLDS = 'manual_hold', REJECTED = 'rejected_txns', DAILY_REJ = 'daily_rejected', RELEASES = 'qr_daily_releases', DAILY_WD = 'daily_withdrawal';
 const SRC = '193893', HOLD = '193893_hold';
 const today = () => require('moment-timezone')().tz('Asia/Kolkata').format('YYYY-MM-DD');
 
@@ -80,6 +81,7 @@ function seed() {
         [REJECTED]: [{ $id: 'rj1', qrId: SRC }, { $id: 'rj2', qrId: 'other' }],
         [DAILY_REJ]: [{ $id: 'r1', date: today(), totalsJson: JSON.stringify({ [SRC]: 700, other: 5 }) }],
         [RELEASES]: [{ $id: 'rel1', qrId: SRC, date: today(), releasedPaise: 2000, changeCount: 1, historyJson: '[]' }],
+        [DAILY_WD]: [{ $id: 'wd_d1', date: today(), totalsJson: JSON.stringify({ [SRC]: { direct: { paidPaise: 900, commissionPaise: 9, count: 1 } }, other: { wallet: { paidPaise: 1, commissionPaise: 0, count: 1 } } }) }],
     };
 }
 
@@ -88,6 +90,7 @@ function buildApp(db, redis = makeRedis()) {
     let router;
     jest.isolateModules(() => {
         require('../qrSettlement').init({ databases: db, Query, APPWRITE_DATABASE_ID: 'db1', APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID: DAILY, APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID: RELEASES });
+        require('../withdrawalSummary').init({ databases: db, Query, ID: { unique: () => 'unique' }, redisClient: redis, APPWRITE_DATABASE_ID: 'db1', APPWRITE_DAILY_WITHDRAWAL_SUMMARIES_COLLECTION_ID: DAILY_WD });
         // Positional args mirror the app.use('/api/admin', adminRoutes(...)) mount in server.js (42 args).
         router = require('../admin.js')(
             'https://appwrite.test/v1', 'proj1', db, storage, {}, { unique: () => 'unique' }, Query, 'db1',
@@ -114,7 +117,7 @@ describe('hold-and-reset moves the later-added QR references', () => {
         expect(res.body.steps).toMatchObject({
             archivedQrDoc: true, createdFreshQrDoc: true, transactionsMoved: 'skipped (intentional)',
             pendingReviewTxnsAtStart: 1, pendingReviewTxnsMoved: 1, rejectedTxnsMoved: 1, rejectedSummaryDocsMoved: 1,
-            releasesMoved: { scanned: 1, moved: 1, merged: 0 },
+            releasesMoved: { scanned: 1, moved: 1, merged: 0 }, withdrawalSummaryDocsMoved: 1,
         });
 
         // QR docs: original archived, fresh one live and unassigned.
@@ -133,6 +136,7 @@ describe('hold-and-reset moves the later-added QR references', () => {
         expect(byId(db, REJECTED, 'rj2').qrId).toBe('other');
         expect(JSON.parse(byId(db, DAILY_REJ, 'r1').totalsJson)).toEqual({ [HOLD]: 700, other: 5 });
         expect(JSON.parse(byId(db, DAILY, 'd1').totalsJson)).toEqual({ [HOLD]: 5000, other: 1 });
+        expect(JSON.parse(byId(db, DAILY_WD, 'wd_d1').totalsJson)).toEqual({ [HOLD]: { direct: { paidPaise: 900, commissionPaise: 9, count: 1 } }, other: { wallet: { paidPaise: 1, commissionPaise: 0, count: 1 } } });
 
         // The T+0 gate follows today's pay-in to the hold — the fresh QR starts fully T+1.
         expect(byId(db, RELEASES, 'rel1')).toMatchObject({ qrId: HOLD, releasedPaise: 2000 });

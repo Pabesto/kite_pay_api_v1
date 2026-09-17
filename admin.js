@@ -22,6 +22,7 @@ const tz = require('dayjs/plugin/timezone');
 
 const { updateDashboardCounter } = require('./dashboardCounters');
 const qrSettlement = require('./qrSettlement');
+const withdrawalSummary = require('./withdrawalSummary'); // day-wise withdrawal rollup — read by GET /withdrawal-summary
 
 const ConfigManager = require('./configManager'); // Import ConfigManager to access configuration values
 const userMetaCache = require('./userMetaCache');
@@ -5093,12 +5094,87 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     });
 
+    // Which QR ids the caller may see in a QR-keyed report (payin / withdrawal summaries).
+    // Returns { allowedQrIds } (null = every QR) or { error: { status, message } }.
+    async function scopeQrIdsForReport(actor, filterUserId, filterQrId) {
+        const isAdmin = actor.role === 'admin';
+        const isSubadmin = actor.role === 'subadmin';
+        const isEmployee = actor.role === 'employee';
+        let allowedQrIds = null; // null = all (admin)
+
+        if (isAdmin || isEmployee) {
+            if (filterUserId) {
+                // Admin filtering by a specific user
+                allowedQrIds = await getQrIdsForUser(filterUserId);
+            }
+            // else null = show all QRs (admin sees everything)
+        } else if (isSubadmin) {
+            if (filterUserId) {
+                // Subadmin filtering by a user — must be under them
+                const managedUsers = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
+                    [Query.equal('parentId', actor.userId)]
+                );
+                const managedUserIds = managedUsers.documents.map(u => u.userId);
+                if (filterUserId !== actor.userId && !managedUserIds.includes(filterUserId)) {
+                    return { error: { status: 403, message: 'You can only view your own users' } };
+                }
+                allowedQrIds = await getQrIdsForUser(filterUserId);
+            } else {
+                // Subadmin sees all QRs under their management
+                allowedQrIds = [...(await getQrIdsForSubadmin(actor.userId))];
+            }
+        } else {
+            // Regular user — only their own QRs
+            allowedQrIds = await getQrIdsForUser(actor.userId);
+        }
+
+        // Apply single QR filter if provided
+        if (filterQrId) {
+            if (allowedQrIds && !allowedQrIds.includes(filterQrId)) {
+                return { error: { status: 403, message: 'You do not have access to this QR code' } };
+            }
+            allowedQrIds = [filterQrId];
+        }
+        return { allowedQrIds };
+    }
+
+    // Companies for the QR-keyed reports: the company_names config ({companyName: email}, legacy
+    // array of names) is the canonical list — every configured company appears in a report even
+    // with zero activity, and a QR's companyName matches it case-insensitively/trimmed (same rule
+    // as the hold email), grouping under the config spelling. Names only on QR docs still get their
+    // own bucket; blank/unknown → NO_COMPANY. Archived "<qrId>_hold[N]" docs keep companyName, so
+    // held history rolls up under the same company.
+    // ponytail: full qr_codes scan per request; cache the map if the table grows past a few thousand.
+    const NO_COMPANY = '(no company)';
+    async function companyMapForReport() {
+        const cfg = ConfigManager.get('company_names', {});
+        const canonical = {};                      // lower-cased → config spelling
+        for (const n of Array.isArray(cfg) ? cfg : Object.keys(cfg || {})) {
+            const name = String(n || '').trim();
+            if (name) canonical[name.toLowerCase()] = name;
+        }
+        const companyOf = {};                      // qrId → company bucket
+        for (const q of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
+            const name = String(q.companyName || '').trim();
+            companyOf[q.qrId] = name ? (canonical[name.toLowerCase()] || name) : NO_COMPANY;
+        }
+        return {
+            of: (qrId) => companyOf[qrId] || NO_COMPANY,
+            // Narrow allowedQrIds (null = all) to one company; lower-cased filter, '(no company)' allowed.
+            restrict: (allowedQrIds, filterCompany) => {
+                if (!filterCompany) return allowedQrIds;
+                const ids = Object.keys(companyOf).filter(id => companyOf[id].toLowerCase() === filterCompany);
+                return allowedQrIds ? allowedQrIds.filter(id => ids.includes(id)) : ids;
+            },
+            // { companyName: init() } for every configured company — the zero rows of a report.
+            seed: (init) => Object.fromEntries(Object.values(canonical).map(n => [n, init()])),
+        };
+    }
+
     router.get('/payin-summary', authenticateToken, async (req, res) => {
         try {
             const actor = req.user;
-            const isAdmin = actor.role === 'admin';
-            const isSubadmin = actor.role === 'subadmin';
-            const isEmployee = actor.role === 'employee';
 
             const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
             const yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
@@ -5110,67 +5186,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const filterCompany = String(req.query.companyName || '').trim().toLowerCase() || null;
 
             // 1) Determine which QR IDs the caller can see
-            let allowedQrIds = null; // null = all (admin)
-
-            if (isAdmin || isEmployee) {
-                if (filterUserId) {
-                    // Admin filtering by a specific user
-                    allowedQrIds = await getQrIdsForUser(filterUserId);
-                }
-                // else null = show all QRs (admin sees everything)
-            } else if (isSubadmin) {
-                if (filterUserId) {
-                    // Subadmin filtering by a user — must be under them
-                    const managedUsers = await databases.listDocuments(
-                        APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID,
-                        [Query.equal('parentId', actor.userId)]
-                    );
-                    const managedUserIds = managedUsers.documents.map(u => u.userId);
-                    if (filterUserId !== actor.userId && !managedUserIds.includes(filterUserId)) {
-                        return res.status(403).json({ error: 'You can only view your own users' });
-                    }
-                    allowedQrIds = await getQrIdsForUser(filterUserId);
-                } else {
-                    // Subadmin sees all QRs under their management
-                    allowedQrIds = [...(await getQrIdsForSubadmin(actor.userId))];
-                }
-            } else {
-                // Regular user — only their own QRs
-                allowedQrIds = await getQrIdsForUser(actor.userId);
-            }
-
-            // Apply single QR filter if provided
-            if (filterQrId) {
-                if (allowedQrIds && !allowedQrIds.includes(filterQrId)) {
-                    return res.status(403).json({ error: 'You do not have access to this QR code' });
-                }
-                allowedQrIds = [filterQrId];
-            }
-
-            // Companies: the company_names config ({companyName: email}, legacy array of names) is the
-            // canonical list — every configured company appears in the response even with zero pay-in,
-            // and a QR's companyName matches it case-insensitively/trimmed (same rule as the hold email),
-            // grouping under the config spelling. Names only on QR docs still get their own bucket;
-            // blank/unknown → NO_COMPANY. Archived "<qrId>_hold[N]" docs keep companyName, so held history
-            // rolls up under the same company.
-            // ponytail: full qr_codes scan per request; cache the map if the table grows past a few thousand.
-            const NO_COMPANY = '(no company)';
-            const cfg = ConfigManager.get('company_names', {});
-            const canonical = {};                      // lower-cased → config spelling
-            for (const n of Array.isArray(cfg) ? cfg : Object.keys(cfg || {})) {
-                const name = String(n || '').trim();
-                if (name) canonical[name.toLowerCase()] = name;
-            }
-            const companyOf = {};                      // qrId → company bucket
-            for (const q of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
-                const name = String(q.companyName || '').trim();
-                companyOf[q.qrId] = name ? (canonical[name.toLowerCase()] || name) : NO_COMPANY;
-            }
-            if (filterCompany) {
-                const ids = Object.keys(companyOf).filter(id => companyOf[id].toLowerCase() === filterCompany);
-                allowedQrIds = allowedQrIds ? allowedQrIds.filter(id => ids.includes(id)) : ids;
-            }
-            const rangeCompanies = Object.fromEntries(Object.values(canonical).map(n => [n, 0]));   // companyName → paise, whole range
+            const scope = await scopeQrIdsForReport(actor, filterUserId, filterQrId);
+            if (scope.error) return res.status(scope.error.status).json({ error: scope.error.message });
+            const companies = await companyMapForReport();
+            const allowedQrIds = companies.restrict(scope.allowedQrIds, filterCompany);
+            const rangeCompanies = companies.seed(() => 0);   // companyName → paise, whole range
 
             // 2) Fetch daily summary docs for the date range
             const startDate = moment.tz(from, 'Asia/Kolkata');
@@ -5197,7 +5217,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 let dayTotal = 0;
                 let qrBreakdown = {};
-                const companies = {};
+                const dayCompanies = {};
 
                 if (summaryDocs.total > 0) {
                     let totalsObj = {};
@@ -5214,8 +5234,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         const amount = parseInt(paise || 0, 10);
                         qrBreakdown[qrId] = amount;
                         dayTotal += amount;
-                        const company = companyOf[qrId] || NO_COMPANY;
-                        companies[company] = (companies[company] || 0) + amount;
+                        const company = companies.of(qrId);
+                        dayCompanies[company] = (dayCompanies[company] || 0) + amount;
                         rangeCompanies[company] = (rangeCompanies[company] || 0) + amount;
                     }
                 }
@@ -5225,7 +5245,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     totalPaise: dayTotal,
                     totalRs: dayTotal / 100,
                     qrs: qrBreakdown,
-                    companies,
+                    companies: dayCompanies,
                 });
 
                 grandTotalPaise += dayTotal;
@@ -5250,6 +5270,106 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         } catch (err) {
             console.error('Payin summary error:', err);
             return res.status(500).json({ error: 'Failed to fetch payin summary' });
+        }
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GET /withdrawal-summary — the withdrawal twin of /payin-summary, read from the
+    // daily_withdrawal_summaries rollup (withdrawalSummary.js; written at approve, O(days) reads).
+    // Same auth/scoping/company rules as /payin-summary, plus the direct-vs-wallet split.
+    //
+    // Query params: from, to, userId, qrId, companyName (as /payin-summary),
+    //   mode — 'direct' (upi/bank) or 'wallet' (payout wallet); omitted = both.
+    //
+    // Every row is { paidPaise, commissionPaise, count, direct: {paidPaise, commissionPaise, count},
+    // wallet: {…} } — paidPaise is what the merchant received (preAmount), commissionPaise the
+    // payin commission charged; the QR was debited the sum of the two. All paise; *Rs derived.
+    //
+    // Response shape:
+    //   { days: [ { date, totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet,
+    //               qrs: { qrId: row }, companies: { companyName: row } } ],
+    //     grandTotalPaise, grandTotalRs, grandCommissionPaise, grandCommissionRs, grandCount, direct, wallet,
+    //     todayPaise, todayRs, yesterdayPaise, yesterdayRs,
+    //     companies: [ { companyName, totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet } ] }
+    //   — companies is the whole range, desc by totalPaise; every company_names entry listed even at 0.
+    // ─────────────────────────────────────────────────────────────────────────
+    router.get('/withdrawal-summary', authenticateToken, async (req, res) => {
+        try {
+            const todayStr = moment.tz('Asia/Kolkata').format('YYYY-MM-DD');
+            const yesterdayStr = moment.tz('Asia/Kolkata').subtract(1, 'day').format('YYYY-MM-DD');
+            const from = req.query.from || todayStr;
+            const to = req.query.to || todayStr;
+            const filterUserId = req.query.userId || null;
+            const filterQrId = req.query.qrId || null;
+            const filterCompany = String(req.query.companyName || '').trim().toLowerCase() || null;
+            const mode = req.query.mode ? String(req.query.mode) : null;
+            if (mode && !withdrawalSummary.MODES.includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be direct or wallet.' });
+            const modes = mode ? [mode] : withdrawalSummary.MODES;
+
+            const scope = await scopeQrIdsForReport(req.user, filterUserId, filterQrId);
+            if (scope.error) return res.status(scope.error.status).json({ error: scope.error.message });
+            const companies = await companyMapForReport();
+            const allowedQrIds = companies.restrict(scope.allowedQrIds, filterCompany);
+
+            const startDate = moment.tz(from, 'Asia/Kolkata');
+            const endDate = moment.tz(to, 'Asia/Kolkata');
+            if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+                return res.status(400).json({ error: 'Invalid date range' });
+            }
+            if (endDate.diff(startDate, 'days') > 366) return res.status(400).json({ error: 'Range too large (max 366 days)' });
+
+            const { emptyRow, addRow } = withdrawalSummary;
+            const newAgg = () => ({ ...emptyRow(), direct: emptyRow(), wallet: emptyRow() });
+            // agg += the selected mode buckets of one QR's day entry (mutates and returns agg)
+            const fold = (agg, qrDay) => { for (const m of modes) { addRow(agg, qrDay?.[m]); addRow(agg[m], qrDay?.[m]); } return agg; };
+            const withRs = (row) => ({ ...row, totalPaise: row.paidPaise, totalRs: row.paidPaise / 100, commissionRs: row.commissionPaise / 100 });
+
+            const days = [];
+            const grand = newAgg();
+            const rangeCompanies = companies.seed(newAgg);
+            let todayPaise = 0, yesterdayPaise = 0;
+
+            for (const cursor = startDate.clone(); cursor.isSameOrBefore(endDate, 'day'); cursor.add(1, 'day')) {
+                const dateStr = cursor.format('YYYY-MM-DD');
+                const totals = await withdrawalSummary.readDay(dateStr);
+                const dayAgg = newAgg(), qrs = {}, dayCompanies = {};
+                for (const [qrId, qrDay] of Object.entries(totals)) {
+                    if (allowedQrIds && !allowedQrIds.includes(qrId)) continue;
+                    const q = fold(newAgg(), qrDay);
+                    if (!q.count) continue;                            // nothing in the selected mode(s)
+                    qrs[qrId] = q;
+                    const company = companies.of(qrId);
+                    fold(dayCompanies[company] = dayCompanies[company] || newAgg(), qrDay);
+                    fold(rangeCompanies[company] = rangeCompanies[company] || newAgg(), qrDay);
+                    fold(dayAgg, qrDay);
+                    fold(grand, qrDay);
+                }
+                days.push({
+                    date: dateStr,
+                    totalPaise: dayAgg.paidPaise, totalRs: dayAgg.paidPaise / 100,
+                    commissionPaise: dayAgg.commissionPaise, commissionRs: dayAgg.commissionPaise / 100,
+                    count: dayAgg.count, direct: dayAgg.direct, wallet: dayAgg.wallet,
+                    qrs, companies: dayCompanies,
+                });
+                if (dateStr === todayStr) todayPaise = dayAgg.paidPaise;
+                if (dateStr === yesterdayStr) yesterdayPaise = dayAgg.paidPaise;
+            }
+
+            return res.json({
+                days,
+                grandTotalPaise: grand.paidPaise, grandTotalRs: grand.paidPaise / 100,
+                grandCommissionPaise: grand.commissionPaise, grandCommissionRs: grand.commissionPaise / 100,
+                grandCount: grand.count, direct: grand.direct, wallet: grand.wallet,
+                todayPaise, todayRs: todayPaise / 100,
+                yesterdayPaise, yesterdayRs: yesterdayPaise / 100,
+                companies: Object.entries(rangeCompanies)
+                    .sort((a, b) => b[1].paidPaise - a[1].paidPaise)
+                    .map(([companyName, row]) => ({ companyName, ...withRs(row) })),
+            });
+        } catch (err) {
+            if (err?.status) return res.status(err.status).json({ error: err.message });
+            console.error('Withdrawal summary error:', err);
+            return res.status(500).json({ error: 'Failed to fetch withdrawal summary' });
         }
     });
 
@@ -5707,7 +5827,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // UNASSIGNED, active QR that reuses the original "193893" id — as if the QR started over from zero.
     // These references are moved to the "_hold" id (all BOUNDED work, so the request stays fast):
     //   • QR doc            — qrId renamed, isActive:false (counters/balances kept on the archived record)
-    //   • daily_qr_summaries / daily_deleted_summary / daily_flagged_summary — totalsJson key renamed
+    //   • daily_qr_summaries / daily_deleted_summary / daily_flagged_summary / daily_withdrawal_summaries — totalsJson key renamed
     //   • withdrawal requests + manual-hold audit — qrId re-pointed
     //   • PENDING-REVIEW transactions (webhook_data, reviewStatus:'pending_review') — qrCodeId re-pointed. Bounded
     //     (review windows are minutes) and money-relevant: a pre-reset payment approved later must credit the
@@ -5915,7 +6035,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         needsPendingReviewConfirmation: Number(pendingReviewTxns) > 0 && !allowPendingReview,
                         existingHoldId: highest ? highest.id : null },
                     willMove: { withdrawalRequests: withdrawals, manualHolds, pendingReviewTxns, rejectedTxns, releases,
-                        note: 'summary date-docs (qr/deleted/flagged/rejected) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
+                        note: 'summary date-docs (qr/deleted/flagged/rejected/withdrawal) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
                     willNOTMove: { transactions: txns,
                         note: 'Transactions keep qrCodeId="' + sourceQrId + '" by design (unbounded → would time out). The fresh QR\'s summary/reporting resets to 0, but its raw txn list still shows pre-reset history.' },
                     sourceQr: srcDoc ? {
@@ -6036,6 +6156,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 report.steps.rejectedSummaryDocsMoved = await moveSummaryKey(
                     APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, (d) => `rej:${d}`, mergeNumbers);
                 report.steps.releasesMoved = await qrSettlement.repointReleases(sourceQrId, holdQrId);
+                // Day-wise withdrawal report keys follow the archived ledger too — the withdrawal docs above were
+                // re-pointed, so a backfill after the reset would land on the _hold key; keep live and backfill equal.
+                report.steps.withdrawalSummaryDocsMoved = await withdrawalSummary.repointQr(sourceQrId, holdQrId);
             } finally {
                 await releaseLock(qrLockKey, qrLockVal);
             }
