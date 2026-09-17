@@ -5672,6 +5672,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     //   • QR doc            — qrId renamed, isActive:false (counters/balances kept on the archived record)
     //   • daily_qr_summaries / daily_deleted_summary / daily_flagged_summary — totalsJson key renamed
     //   • withdrawal requests + manual-hold audit — qrId re-pointed
+    //   • PENDING-REVIEW transactions (webhook_data, reviewStatus:'pending_review') — qrCodeId re-pointed. Bounded
+    //     (review windows are minutes) and money-relevant: a pre-reset payment approved later must credit the
+    //     archived ledger its balances moved to, not the fresh QR.
+    //   • rejected_transactions.qrId + daily_rejected_summary totalsJson key — re-pointed (reporting)
+    //   • qr_daily_releases (T+0 early-release gate, qrSettlement.js) — moved so today's release follows today's
+    //     pay-in to the hold; left behind it would govern the FRESH QR's new money instead.
     //
     // Transactions (webhook_data.qrCodeId) are INTENTIONALLY NOT moved — that set is unbounded and would
     // make the request time out. So reporting/summaries reset to 0 for the fresh QR, but the raw transaction
@@ -5679,7 +5685,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // deliberate trade-off that keeps the endpoint synchronous and fast.
     //
     // Body: { confirm: true (required for real run), dryRun: true (preview counts, no writes),
-    //         allowIncrement: true (acknowledge a REPEAT reset — see below) }
+    //         allowIncrement: true (acknowledge a REPEAT reset — see below),
+    //         allowPendingReview: true (acknowledge resetting while held-for-review payments exist — see below) }
+    //
+    // Pending-review payments: resolveReview (admin click OR the automatic expiry sweep) holds lock:review only,
+    // not lock:qr, so an approve that lands after step A credits the FRESH QR's ledger instead of the archived one.
+    // Checked under lock:qr, "none pending" is a hard fact — no new doc can be created while we hold the lock —
+    // so the real run refuses with 409 { needsPendingReviewConfirmation, pendingReviewTxns } while any exist.
+    // Resolve them (or let them expire, ≤10 min) and retry; allowPendingReview:true overrides knowingly.
     //
     // Repeat resets: if the QR was already archived once ("<qrId>_hold" exists) and the fresh QR is live again,
     // a new reset archives to the next free slot ("<qrId>_hold2", "_hold3", …). The real run refuses this with
@@ -5702,6 +5715,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         // explicitly acknowledges via allowIncrement:true — otherwise we return needsHoldConfirmation so the UI
         // can ask "already held; archive again to <next>?".
         const allowIncrement = req.body?.allowIncrement === true;
+        const allowPendingReview = req.body?.allowPendingReview === true;
 
         if (!sourceQrId) return res.status(400).json({ error: 'qrId is required' });
         if (/_hold\d*$/.test(sourceQrId)) return res.status(400).json({ error: 'qrId is already a _hold id' });
@@ -5722,22 +5736,22 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
 
         // Count rows referencing sourceQrId in a collection by the given field (uses Appwrite's .total).
-        const countBy = async (collectionId, field) => {
+        const countBy = async (collectionId, field, extraQueries = []) => {
             if (!collectionId) return null;
             const r = await databases.listDocuments(APPWRITE_DATABASE_ID, collectionId,
-                [Query.equal(field, sourceQrId), Query.limit(1)]);
+                [Query.equal(field, sourceQrId), ...extraQueries, Query.limit(1)]);
             return r.total;
         };
 
         // Re-point every doc whose <field> === sourceQrId to holdQrId. Because we mutate the very field we
         // filter on, each updated doc drops out of the next query — so we just keep querying until none match.
         // Idempotent and resumable. Returns the number of docs moved.
-        const repointField = async (collectionId, field, label) => {
+        const repointField = async (collectionId, field, label, extraQueries = []) => {
             if (!collectionId) return 0;
             let moved = 0;
             for (let page = 0; page < MAX_PAGES; page++) {
                 const r = await databases.listDocuments(APPWRITE_DATABASE_ID, collectionId,
-                    [Query.equal(field, sourceQrId), Query.limit(PAGE)]);
+                    [Query.equal(field, sourceQrId), ...extraQueries, Query.limit(PAGE)]);
                 if (r.documents.length === 0) break;
                 let progressed = 0;
                 for (const doc of r.documents) {
@@ -5849,18 +5863,22 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // ---- Dry run: report what WOULD move, mutate nothing. ----
             if (dryRun) {
-                const [txns, withdrawals, manualHolds] = await Promise.all([
+                const [txns, withdrawals, manualHolds, pendingReviewTxns, rejectedTxns, releases] = await Promise.all([
                     countBy(webhook_collectionId, 'qrCodeId'),
                     countBy(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'qrId'),
                     countBy(APPWRITE_MANUAL_HOLD_COLLECTION_ID, 'qrId'),
+                    countBy(webhook_collectionId, 'qrCodeId', [Query.equal('reviewStatus', 'pending_review')]),
+                    countBy(APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, 'qrId'),
+                    qrSettlement.repointReleases(sourceQrId, holdQrId, { dryRun: true }).then((r) => r.scanned),
                 ]);
                 return res.status(200).json({
                     dryRun: true, sourceQrId, holdQrId,
                     state: { finishingInterruptedRun: !srcDoc, isRepeatReset,
                         needsHoldConfirmation: isRepeatReset && !allowIncrement,
+                        needsPendingReviewConfirmation: Number(pendingReviewTxns) > 0 && !allowPendingReview,
                         existingHoldId: highest ? highest.id : null },
-                    willMove: { withdrawalRequests: withdrawals, manualHolds,
-                        note: 'summary date-docs (qr/deleted/flagged) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
+                    willMove: { withdrawalRequests: withdrawals, manualHolds, pendingReviewTxns, rejectedTxns, releases,
+                        note: 'summary date-docs (qr/deleted/flagged/rejected) are moved key-by-key; counts are reported on the real run. The fresh QR gets its own COPY of the image file so deleting the _hold QR later cannot break it.' },
                     willNOTMove: { transactions: txns,
                         note: 'Transactions keep qrCodeId="' + sourceQrId + '" by design (unbounded → would time out). The fresh QR\'s summary/reporting resets to 0, but its raw txn list still shows pre-reset history.' },
                     sourceQr: srcDoc ? {
@@ -5885,6 +5903,19 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const report = { sourceQrId, holdQrId, isRepeatReset, finishingInterruptedRun: !srcDoc, steps: {} };
             try {
+                // Counted UNDER lock:qr, so a zero here cannot change beneath us (see header). Returning from inside
+                // the try still runs the finally → the lock is released.
+                const pendingReview = await countBy(webhook_collectionId, 'qrCodeId', [Query.equal('reviewStatus', 'pending_review')]);
+                if (pendingReview > 0 && !allowPendingReview) {
+                    return res.status(409).json({
+                        needsPendingReviewConfirmation: true,
+                        pendingReviewTxns: pendingReview,
+                        message: `QR "${sourceQrId}" has ${pendingReview} payment(s) held for manual review. Approve or reject them first (or let them expire) so none can be credited to the fresh QR mid-reset.`,
+                        hint: 'Re-send with { confirm:true, allowPendingReview:true } to reset anyway — they will be moved to the hold, but one resolved at the same instant could still credit the fresh QR.',
+                    });
+                }
+                report.steps.pendingReviewTxnsAtStart = pendingReview;
+
                 // A + B) Archive the original QR doc and stand up the fresh one. Skipped on resume once done.
                 if (!holdDoc) {
                     // Fresh run: rename the original -> _hold and deactivate it. We update ONLY qrId + isActive,
@@ -5958,6 +5989,16 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, (d) => `flag:${d}`, mergeFlagged);
                 report.steps.withdrawalRequestsMoved = await repointField(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'qrId', 'withdrawal-request');
                 report.steps.manualHoldsMoved = await repointField(APPWRITE_MANUAL_HOLD_COLLECTION_ID, 'qrId', 'manual-hold');
+                // Pending-review docs are the one slice of webhook_data that IS moved here: bounded, and a later
+                // approve → finalizeTransaction → updateQrTotalAtomic resolves the QR by qrCodeId, so the credit
+                // must land on the archived ledger the balances went to. (resolveReview holds lock:review, not
+                // lock:qr, so a resolve in the same instant can still credit the fresh QR — accepted, tiny window.)
+                report.steps.pendingReviewTxnsMoved = await repointField(webhook_collectionId, 'qrCodeId', 'pending-review txn',
+                    [Query.equal('reviewStatus', 'pending_review')]);
+                report.steps.rejectedTxnsMoved = await repointField(APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, 'qrId', 'rejected-txn');
+                report.steps.rejectedSummaryDocsMoved = await moveSummaryKey(
+                    APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, (d) => `rej:${d}`, mergeNumbers);
+                report.steps.releasesMoved = await qrSettlement.repointReleases(sourceQrId, holdQrId);
             } finally {
                 await releaseLock(qrLockKey, qrLockVal);
             }

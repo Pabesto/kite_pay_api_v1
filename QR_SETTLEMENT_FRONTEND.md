@@ -331,3 +331,10 @@ the new, larger ceiling.
   or drop the expected fields to make it go away.
 - **There is no realtime event for a release yet.** After an admin sets one, the merchant's screen
   updates on its next fetch, so make sure the QR screen re-fetches on resume and on pull-to-refresh.
+- **Hold-and-reset moves the release with the money.** When an admin archives a QR
+  (`POST /api/admin/qr/:qrId/hold-and-reset`), today's pay-in moves to `<qrId>_hold` and so does its
+  release row: the archived QR keeps exactly the T+0 amount that was granted, and the fresh QR that
+  reuses the original id starts with **no** release (full T+1). If `_hold` already had a row for that
+  day the two amounts are added, with a `hold-reset-merge` entry in `history`. The dialog for the
+  fresh id will therefore show `releasedPaise: 0` right after a reset — that is correct, not a loss;
+  open `<qrId>_hold` to see the carried-over release.

@@ -389,3 +389,46 @@ describe('the withdrawal endpoint honours the release', () => {
         expect((await ask(app, 0.01)).status).toBe(400);
     });
 });
+
+describe('repointReleases (hold-and-reset moves the gate with the money)', () => {
+    const day = istToday();
+    test('rows move to the hold id; other QRs and other days are untouched', async () => {
+        const db = makeDb({ [RELEASES]: [
+            { $id: 'a', qrId: 'qr1', date: day, releasedPaise: 2000 },
+            { $id: 'b', qrId: 'qr1', date: '2020-01-01', releasedPaise: 100 },
+            { $id: 'c', qrId: 'qr9', date: day, releasedPaise: 5 },
+        ] });
+        const s = freshSettlement(db);
+        expect(await s.repointReleases('qr1', 'qr1_hold')).toEqual({ scanned: 2, moved: 2, merged: 0 });
+        expect(db.store[RELEASES].map((r) => [r.$id, r.qrId])).toEqual([['a', 'qr1_hold'], ['b', 'qr1_hold'], ['c', 'qr9']]);
+        expect(db.deleteDocument).not.toHaveBeenCalled();
+        // Nothing left on the source: the fresh QR is fully T+1 again.
+        expect((await s.forQr('qr1', 500000)).releasedPaise).toBe(0);
+        expect((await s.forQr('qr1_hold', 500000)).releasedPaise).toBe(2000);
+    });
+
+    test('collision on (hold, date): source is DELETED FIRST, then merge-added — never double-released on retry', async () => {
+        const db = makeDb({ [RELEASES]: [
+            { $id: 'src', qrId: 'qr1', date: day, releasedPaise: 2000 },
+            { $id: 'dst', qrId: 'qr1_hold', date: day, releasedPaise: 500, changeCount: 2, historyJson: '[]' },
+        ] });
+        const s = freshSettlement(db);
+        expect(await s.repointReleases('qr1', 'qr1_hold')).toEqual({ scanned: 1, moved: 0, merged: 1 });
+        expect(db.deleteDocument).toHaveBeenCalledWith('db1', RELEASES, 'src');
+        expect(db.deleteDocument.mock.invocationCallOrder[0]).toBeLessThan(db.updateDocument.mock.invocationCallOrder[0]);
+        const dst = db.store[RELEASES].find((r) => r.$id === 'dst');
+        expect(dst).toMatchObject({ releasedPaise: 2500, changeCount: 3 });
+        expect(JSON.parse(dst.historyJson)[0]).toMatchObject({ fromPaise: 500, toPaise: 2500, mode: 'hold-reset-merge' });
+    });
+
+    test('dryRun only counts', async () => {
+        const db = makeDb({ [RELEASES]: [{ $id: 'a', qrId: 'qr1', date: day, releasedPaise: 1 }] });
+        const s = freshSettlement(db);
+        expect(await s.repointReleases('qr1', 'qr1_hold', { dryRun: true })).toEqual({ scanned: 1, moved: 0, merged: 0 });
+        expect(db.updateDocument).not.toHaveBeenCalled();
+        expect(db.deleteDocument).not.toHaveBeenCalled();
+        // uninitialised module (release schema not deployed yet) → nothing to move, no throw
+        let bare; jest.isolateModules(() => { bare = require('../qrSettlement'); });
+        expect(await bare.repointReleases('qr1', 'qr1_hold')).toEqual({ scanned: 0, moved: 0, merged: 0 });
+    });
+});

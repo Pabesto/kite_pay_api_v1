@@ -266,6 +266,59 @@ async function setRelease({ ID, qrId, releasedPaise = null, percent = null, addP
     }
 }
 
+/**
+ * Move every release row from one qrId to another — used by admin hold-and-reset, which archives a QR
+ * under "<qrId>_hold" and stands up a fresh QR with the original id. Today's pay-in moves to the hold
+ * with the summary key, so the gate that was granted against it must follow; left behind it would let
+ * the FRESH QR withdraw new money on T+0 under a decision made for the old one, while the archived QR
+ * fell back to full T+1 (safe, but not what the admin decided). Bounded: at most one row per day.
+ *
+ * Idempotent and resumable. The unique (qrId, date) index means the target may already hold a row for
+ * a date (an admin released on "_hold" between an interrupted run and its retry): then the amounts are
+ * merge-added, a history entry records it, and the source row is deleted. `dryRun` only counts.
+ * Errors propagate — the caller's retry hint covers it.
+ */
+async function repointReleases(fromQrId, toQrId, { dryRun = false } = {}) {
+    if (!_db || !_releasesCol) return { scanned: 0, moved: 0, merged: 0 };
+    let scanned = 0, moved = 0, merged = 0;
+    const seen = new Set();   // a row that comes back after we handled it means no progress — stop, don't spin
+    for (let page = 0; page < 1000; page++) {
+        // Mutating the filter field (qrId) drops each moved row out of the next query — no cursor needed.
+        // In dryRun nothing is mutated, so one page is counted and we stop.
+        const r = await _db.listDocuments(_dbId, _releasesCol, [_Query.equal('qrId', fromQrId), _Query.limit(100)]);
+        if (dryRun) { scanned = r.total ?? r.documents.length; break; }
+        const todo = r.documents.filter((d) => !seen.has(d.$id));
+        if (!todo.length) break;
+        for (const src of todo) {
+            seen.add(src.$id);
+            scanned++;
+            const dst = await getRelease(toQrId, src.date);
+            if (!dst) {
+                await _db.updateDocument(_dbId, _releasesCol, src.$id, { qrId: toQrId });
+                moved++;
+                continue;
+            }
+            const fromPaise = Number(dst.releasedPaise || 0), addPaise = Number(src.releasedPaise || 0);
+            let history = [];
+            try { history = JSON.parse(dst.historyJson || '[]') || []; } catch { history = []; }
+            history.unshift({ at: new Date().toISOString(), by: null, fromPaise, toPaise: fromPaise + addPaise, mode: 'hold-reset-merge',
+                reason: `merged release of ${rs(addPaise)} from ${fromQrId} (hold-and-reset)`.slice(0, 200) });
+            // Delete FIRST, then add. A crash in between loses the source amount (the hold QR simply holds
+            // more — fails closed, an admin can re-release). The other order would double-add on retry and
+            // release MORE than was ever decided, past the cap.
+            await _db.deleteDocument(_dbId, _releasesCol, src.$id);
+            await _db.updateDocument(_dbId, _releasesCol, dst.$id, {
+                releasedPaise: fromPaise + addPaise,
+                changeCount: Number(dst.changeCount || 0) + 1,
+                historyJson: JSON.stringify(history.slice(0, HISTORY_LIMIT)),
+                updatedAt: new Date().toISOString(),
+            });
+            merged++;
+        }
+    }
+    return { scanned, moved, merged };
+}
+
 /** Releases for one day, newest first. Cursor-paginated like every other list endpoint. */
 async function listReleases({ day = istDay(), qrId = null, limit = 25, cursor = null } = {}) {
     if (!_db || !_releasesCol) return { total: 0, documents: [] };
@@ -293,5 +346,5 @@ module.exports = {
     init, istDay, maxPercent, maxReleasablePaise,
     heldPaise, withdrawablePaise, todayPayIns, releasesFor,
     forQr, forQrDocs, row, totalsOf,
-    getRelease, setRelease, listReleases, pickRelease,
+    getRelease, setRelease, listReleases, pickRelease, repointReleases,
 };
