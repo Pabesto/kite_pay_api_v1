@@ -1,6 +1,6 @@
 /**
  * axisWorldline.test.js — POST /prod/axis-worldline-webhook (LIVE money path)
- * Pins: encrypted-envelope-only auth, exactly-once per primary_id, lock acquire/release incl.
+ * Pins: encrypted-envelope-only auth, exactly-once per ref_no (RRN), lock acquire/release incl.
  * error path, held-for-review never finalizes, mapping to webhook_data columns, raw capture of
  * rejected notifications, Worldline's §1.2 JSON response shape.
  */
@@ -85,7 +85,7 @@ describe('happy path', () => {
         const doc = webhookWrites(deps.databases)[0][3];
         expect(doc).toMatchObject({
             qrCodeId: '037216061150011',              // mid
-            paymentId: 'T2609111602372587513907',     // primary_id
+            paymentId: '758103148736',                // ref_no (RRN) — primary_id repeats on a static QR
             rrnNumber: '758103148736',                // ref_no
             amount: 100,                              // "1.00" rupees → paise, once
             vpa: '8826005071-2@ybl',                  // customer_vpa
@@ -106,13 +106,13 @@ describe('happy path', () => {
     test('lock is taken on lock:qr:<mid> with paymentId and released in finally', async () => {
         const { app, deps } = build();
         await post(app, { data: encrypt(LIVE_SAMPLE) });
-        expect(deps.acquireLock).toHaveBeenCalledWith('lock:qr:037216061150011', 'T2609111602372587513907', 15);
-        expect(deps.releaseLock).toHaveBeenCalledWith('lock:qr:037216061150011', 'T2609111602372587513907');
+        expect(deps.acquireLock).toHaveBeenCalledWith('lock:qr:037216061150011', '758103148736', 15);
+        expect(deps.releaseLock).toHaveBeenCalledWith('lock:qr:037216061150011', '758103148736');
     });
 });
 
 describe('exactly-once', () => {
-    test('duplicate primary_id: 200 SUCCESS, no insert, no finalize', async () => {
+    test('duplicate ref_no: 200 SUCCESS, no insert, no finalize', async () => {
         const { app, deps } = build({ db: { listDocuments: jest.fn().mockResolvedValue({ documents: [{ $id: 'old' }], total: 1 }) } });
         const res = await post(app, { data: encrypt(LIVE_SAMPLE) });
         expect(res.status).toBe(200);
@@ -140,6 +140,31 @@ describe('exactly-once', () => {
         expect(res.body).toEqual({ status: 'FAILED', errorMsg: 'Failed to record notification' });
         expect(deps.finalizeTransaction).not.toHaveBeenCalled();
         expect(deps.releaseLock).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('static-QR primary_id reuse (live 2026-09-18)', () => {
+    test('same primary_id, different ref_no → both stored as separate payments', async () => {
+        const { app, deps } = build();
+        const second = { ...LIVE_SAMPLE, ref_no: '288692485751', time_stamp: '20260911160324' };
+        await post(app, { data: encrypt(LIVE_SAMPLE) });
+        await post(app, { data: encrypt(second) });
+        const ids = webhookWrites(deps.databases).map((c) => c[3].paymentId);
+        expect(ids).toEqual(['758103148736', '288692485751']);
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(2);
+        // dedup is keyed on the RRN, never on primary_id
+        for (const call of deps.databases.listDocuments.mock.calls) {
+            expect(JSON.stringify(call[2])).not.toContain(LIVE_SAMPLE.primary_id);
+        }
+    });
+
+    test('missing ref_no: 400 FAILED naming ref_no, captured raw', async () => {
+        const { app, deps } = build();
+        const { ref_no, ...noRrn } = LIVE_SAMPLE;
+        const res = await post(app, { data: encrypt(noRrn) });
+        expect(res.status).toBe(400);
+        expect(res.body.errorMsg).toBe('Missing or invalid ref_no');
+        expect(uatWrites(deps.databases)).toHaveLength(1);
     });
 });
 

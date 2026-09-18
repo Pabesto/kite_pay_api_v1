@@ -105,7 +105,7 @@ describe('POST /prod/axis-worldline-webhook', () => {
         const [dbId, colId, , doc] = db.createDocument.mock.calls[0];
         expect(dbId).toBe('db1');
         expect(colId).toBe(WL_COL);
-        expect(doc.paymentId).toBe('AGU0009976378167EA2312211854E180008');
+        expect(doc.paymentId).toBe('335601834589'); // ref_no (RRN) — primary_id is the QR's own ref, not unique per payment
         expect(doc.qrCodeId).toBe('037111016290183'); // mid is our qrCodeId, tid ignored
         expect(doc.rrnNumber).toBe('335601834589');
         expect(doc.amount).toBe(50000); // "500.00" rupees → paise, exactly once
@@ -140,7 +140,7 @@ describe('POST /prod/axis-worldline-webhook', () => {
         expect(res.status).toBe(200);
         expect(res.body.status).toBe('SUCCESS');
         const doc = db.createDocument.mock.calls[0][3];
-        expect(doc.paymentId).toBe('27579509');
+        expect(doc.paymentId).toBe('336215000718'); // ref_no
         expect(doc.amount).toBe(7761100);
         expect(doc.vpa).toBeNull();
         expect(doc.created_at).toBe('2023-12-28T10:10:31.000Z'); // 20231228154031 IST
@@ -154,7 +154,7 @@ describe('POST /prod/axis-worldline-webhook', () => {
         expect(Date.parse(doc.created_at)).toBeGreaterThan(Date.parse('2026-01-01'));
     });
 
-    test('duplicate primary_id: 200 SUCCESS (stops Worldline retries), no second insert', async () => {
+    test('duplicate ref_no: 200 SUCCESS (stops Worldline retries), no second insert', async () => {
         const db = makeDb({
             listDocuments: jest.fn().mockResolvedValue({ documents: [{ $id: 'existing1' }], total: 1 }),
         });
@@ -226,7 +226,7 @@ describe('encrypted payloads (AES-256-GCM)', () => {
 
         expect(res.body).toEqual({ status: 'SUCCESS', errorMsg: '' });
         const doc = db.createDocument.mock.calls[0][3];
-        expect(doc.paymentId).toBe(UPI_SAMPLE.primary_id);
+        expect(doc.paymentId).toBe(UPI_SAMPLE.ref_no);
         expect(doc.amount).toBe(50000);
         expect(doc.vpa).toBe('kapilayush81@okbank');
         expect(JSON.parse(doc.payload)).toEqual({ data, decrypted: UPI_SAMPLE });
@@ -235,7 +235,7 @@ describe('encrypted payloads (AES-256-GCM)', () => {
     test('percent-encoded base64 (spec sample style) decrypts too', async () => {
         const db = makeDb();
         await post(buildApp(db), { data: encodeURIComponent(encrypt(BQR_SAMPLE)) });
-        expect(db.createDocument.mock.calls[0][3].paymentId).toBe('27579509');
+        expect(db.createDocument.mock.calls[0][3].paymentId).toBe('336215000718');
     });
 
     test('tampered ciphertext fails the GCM tag: captured raw with a warning, still SUCCESS', async () => {

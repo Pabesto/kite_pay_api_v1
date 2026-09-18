@@ -66,6 +66,11 @@ const wlLimiter = rateLimit({
     handler: (req, res) => res.status(429).json({ status: 'FAILED', errorMsg: 'Rate limit exceeded' }),
 });
 
+// AXIS_WL_LOG=false silences the per-notification chatter (received / body / decrypted /
+// saved / duplicate / held / lock-busy). Errors — decrypt failures, write failures, and
+// "saved but NOT credited" — always log.
+const wlLog = process.env.AXIS_WL_LOG === 'false' ? () => {} : (...a) => console.log(...a);
+
 const IV_LEN = 16;
 const TAG_LEN = 16; // Java's AES/GCM/NoPadding appends the 128-bit tag to the ciphertext
 
@@ -127,18 +132,20 @@ function normalizeWorldline(body, rupeesToPaiseStrict) {
         return { paymentId: null, qrCodeId: null, rrnNumber: null, amountPaise: null, vpa: null, createdAtIso: null, warnings };
     }
 
-    // §1.1.1: primary_id is the mandatory unique id; tr_id is the UPI txn id.
-    const paymentId = body.primary_id || body.tr_id || null;
-    if (!paymentId) warnings.push('no primary_id/tr_id — cannot dedup this notification');
+    // paymentId (our dedup key) = ref_no, the RRN — NOT primary_id. The spec calls primary_id
+    // "unique", but for UPI it is Tag 27 subtag 01, the reference baked into the QR itself, so
+    // every payment on a static QR carries the same primary_id (two live ₹1 payments 44s apart
+    // shared one on 2026-09-18 and the second was dropped as a duplicate). The RRN is the
+    // per-payment id; primary_id/tr_id stay in the raw payload.
+    const rrnNumber = body.ref_no || null;
+    const paymentId = rrnNumber;
+    if (!paymentId) warnings.push('no ref_no (RRN) — cannot dedup this notification');
 
     // mid IS our qrCodeId for Worldline (decided; tid is optional in the spec and absent
     // from the live UPI notifications — it stays in the raw payload). mid is mandatory,
     // so a missing one is a malformed notification.
     const qrCodeId = body.mid || null;
     if (!qrCodeId) warnings.push('no mid — QR unidentifiable');
-
-    const rrnNumber = body.ref_no || null;
-    if (!rrnNumber) warnings.push('no ref_no (RRN)');
 
     // §1.1.1: txn_amount is a RUPEE string ("500.00"). Convert exactly once, string-based.
     let amountPaise = null;
@@ -209,9 +216,9 @@ module.exports = (
         express.json({ type: '*/*', limit: '1mb' }),
         wlLimiter,
         async (req, res) => {
-            console.log('📩 Axis Worldline UAT webhook received from', req.ip);
+            wlLog('📩 Axis Worldline UAT webhook received from', req.ip);
             const body = req.body;
-            console.log('📩 Axis Worldline UAT webhook body:', JSON.stringify(body));
+            wlLog('📩 Axis Worldline UAT webhook body:', JSON.stringify(body));
             if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length === 0) {
                 return res.status(400).json({ status: 'FAILED', errorMsg: 'Empty or unparseable body' });
             }
@@ -229,7 +236,7 @@ module.exports = (
                     try {
                         mapped = decryptWorldlineData(body.data, AES_KEY);
                         payloadJson = JSON.stringify({ data: body.data, decrypted: mapped });
-                        console.log('🔓 Axis Worldline: decrypted OK:', JSON.stringify(mapped));
+                        wlLog('🔓 Axis Worldline: decrypted OK:', JSON.stringify(mapped));
                     } catch (e) {
                         mapped = body;
                         cryptoWarnings.push(`decryption failed: ${e?.message || e}`);
@@ -366,3 +373,4 @@ module.exports = (
 module.exports.loadAesKey = loadAesKey;
 module.exports.decryptWorldlineData = decryptWorldlineData;
 module.exports.normalizeWorldline = normalizeWorldline;
+module.exports.wlLog = wlLog;

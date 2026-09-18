@@ -14,7 +14,9 @@
 // MAPPING (decrypted §1.1.1 → webhook_data):
 //   mid → qrCodeId  (the QR doc must be registered with qrId = mid, else the txn is stored but
 //                    never credited — same as every provider; see updateQrTotalAtomic)
-//   primary_id → paymentId (dedup key)   ref_no → rrnNumber   customer_vpa → vpa
+//   ref_no (RRN) → paymentId (dedup key) AND rrnNumber   customer_vpa → vpa
+//     (NOT primary_id: for a static QR it is the QR's own Tag-27 reference, identical on every
+//      payment — see normalizeWorldline)
 //   txn_amount "1.00" rupee string → amount 100 paise (rupeesToPaiseStrict, exactly once)
 //   time_stamp yyyymmddHHmmss IST → created_at UTC ISO   provider 'axis_worldline'   status 'normal'
 //   payload = JSON { data: <raw envelope>, decrypted: {...} }
@@ -28,7 +30,7 @@
 // collection so a bad notification can be replayed once the cause is fixed.
 
 const express = require('express');
-const { loadAesKey, decryptWorldlineData, normalizeWorldline } = require('./axisWorldlineUat');
+const { loadAesKey, decryptWorldlineData, normalizeWorldline, wlLog } = require('./axisWorldlineUat');
 
 const PROVIDER = 'axis_worldline';
 const LOCK_TTL_SECONDS = 15;
@@ -83,7 +85,7 @@ module.exports = (
         express.json({ type: '*/*', limit: '1mb' }),
         async (req, res) => {
             const body = req.body;
-            console.log('📩 Axis Worldline LIVE webhook received from', req.ip);
+            wlLog('📩 Axis Worldline LIVE webhook received from', req.ip);
 
             // 1. Validate — encrypted envelope only (see AUTH above).
             if (!body || typeof body !== 'object' || typeof body.data !== 'string' || !body.data) {
@@ -103,15 +105,15 @@ module.exports = (
                 await captureRaw(req, [`decryption failed: ${e?.message || e}`]);
                 return failed(res, 400, 'Unable to decrypt notification');
             }
-            console.log('🔓 Axis Worldline LIVE decrypted:', JSON.stringify(decrypted));
+            wlLog('🔓 Axis Worldline LIVE decrypted:', JSON.stringify(decrypted));
 
             const n = normalizeWorldline(decrypted, rupeesToPaiseStrict);
-            const missing = !n.paymentId ? 'primary_id' : !n.qrCodeId ? 'mid' : !(n.amountPaise > 0) ? 'txn_amount' : null;
+            const missing = !n.paymentId ? 'ref_no' : !n.qrCodeId ? 'mid' : !(n.amountPaise > 0) ? 'txn_amount' : null;
             if (missing) {
                 await captureRaw(req, [`mandatory field missing/invalid: ${missing}`, ...n.warnings]);
                 return failed(res, 400, `Missing or invalid ${missing}`);
             }
-            if (n.warnings.length) console.warn('⚠️  Axis Worldline LIVE mapping warnings:', n.paymentId, n.warnings);
+            if (n.warnings.length) wlLog('⚠️  Axis Worldline LIVE mapping warnings:', n.paymentId, n.warnings);
 
             const { paymentId, qrCodeId, rrnNumber, amountPaise, vpa } = n;
             const isoDate = n.createdAtIso || new Date().toISOString();
@@ -124,7 +126,7 @@ module.exports = (
                 acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
             }
             if (!acquired) {
-                console.warn('⏳ Axis Worldline LIVE lock busy, answered 503:', paymentId, lockKey);
+                wlLog('⏳ Axis Worldline LIVE lock busy, answered 503:', paymentId, lockKey);
                 return failed(res, 503, 'Processing conflict, retry');
             }
 
@@ -135,7 +137,7 @@ module.exports = (
                     [Query.equal('paymentId', paymentId), Query.limit(1)]
                 );
                 if (existing.documents.length) {
-                    console.log('↩️  Axis Worldline LIVE duplicate, answered SUCCESS:', paymentId, 'existing doc', existing.documents[0].$id);
+                    wlLog('↩️  Axis Worldline LIVE duplicate, answered SUCCESS:', paymentId, 'existing doc', existing.documents[0].$id);
                     return success(res);
                 }
 
@@ -168,14 +170,14 @@ module.exports = (
                         $id: created.$id, qrCodeId, paymentId, amount: amountPaise, provider: PROVIDER,
                         vpa, rrnNumber, created_at: isoDate, reviewExpiresAt: reviewFields.reviewExpiresAt, ownerSubadminId,
                     });
-                    console.log('🕒 Axis Worldline LIVE held for review:', paymentId, 'doc', created.$id);
+                    wlLog('🕒 Axis Worldline LIVE held for review:', paymentId, 'doc', created.$id);
                     return success(res);
                 }
                 const qrDoc = await finalizeTransaction(created);
                 // qrDoc === null means no QR is registered with qrId === mid: the transaction is
                 // stored (admin list) but no ledger moved and no user/partner sees it.
                 if (qrDoc) {
-                    console.log(`✅ Axis Worldline LIVE saved+credited: ${paymentId} qr=${qrCodeId} paise=${amountPaise} doc=${created.$id} assignedUserId=${qrDoc.assignedUserId || '-'} owner=${ownerSubadminId || '-'}`);
+                    wlLog(`✅ Axis Worldline LIVE saved+credited: ${paymentId} qr=${qrCodeId} paise=${amountPaise} doc=${created.$id} assignedUserId=${qrDoc.assignedUserId || '-'} owner=${ownerSubadminId || '-'}`);
                 } else {
                     console.error(`🚫 Axis Worldline LIVE saved but NOT credited: ${paymentId} paise=${amountPaise} doc=${created.$id} — no QR registered with qrId="${qrCodeId}" (Worldline mid). Create/assign that QR in the admin panel; this row will not appear on any merchant dashboard.`);
                 }
