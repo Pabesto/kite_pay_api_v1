@@ -10,9 +10,10 @@ const { Query } = require('node-appwrite');
 
 jest.mock('../scripts/transactionStatusMailer', () => ({ sendMerchantHoldEmail: jest.fn() }));
 jest.mock('../configManager', () => ({
-    get: jest.fn((key, def = null) => key === 'company_names'
-        ? { 'SCANSERVE AI PRIVATE LIMITED': 'scanserve2@gmail.com', 'PABESTO TECH PVT. LTD.': '' }
-        : def),
+    get: jest.fn((key, def = null) => ({
+        company_names: { 'SCANSERVE AI PRIVATE LIMITED': 'scanserve2@gmail.com', 'PABESTO TECH PVT. LTD.': '' },
+        integrations: ['Razorpay', 'Paytm', 'PhonePe'],
+    })[key] ?? def),
     refresh: jest.fn().mockResolvedValue({}),
     getConfig: jest.fn().mockResolvedValue({}),
     set: jest.fn().mockResolvedValue(),
@@ -60,9 +61,9 @@ function buildApp(db) {
 
 const db = makeDb({
     [QRS]: [
-        { $id: 'q1', qrId: 'A', companyName: 'scanserve ai private limited' },   // lower-case on the QR → config spelling
-        { $id: 'q2', qrId: 'B', companyName: 'Other Shop' },                     // not in config → own bucket
-        { $id: 'q3', qrId: 'C' },                                                // blank → (no company)
+        { $id: 'q1', qrId: 'A', companyName: 'scanserve ai private limited', integrationName: 'razorpay' },   // lower-case on the QR → config spelling
+        { $id: 'q2', qrId: 'B', companyName: 'Other Shop', integrationName: 'Razorpay' },                     // company not in config → own bucket
+        { $id: 'q3', qrId: 'C', integrationName: 'Pinelabs' },                                                // blank company; integration not in config
     ],
     [DAILY]: [{ $id: 'd1', date: today(), totalsJson: JSON.stringify({ A: 1000, B: 500, C: 250, ghost: 5 }) }],
 });
@@ -78,6 +79,24 @@ test('company breakdown: config spelling, zero rows for unused companies, unknow
         { companyName: 'PABESTO TECH PVT. LTD.', totalPaise: 0, totalRs: 0 },
     ]);
     expect(res.body.days[0].companies).toEqual({ 'SCANSERVE AI PRIVATE LIMITED': 1000, 'Other Shop': 500, '(no company)': 255 });
+    // integrations: A+B → Razorpay (config spelling), C → Pinelabs (own bucket), ghost → (no integration); Paytm/PhonePe at 0
+    expect(res.body.integrations).toEqual([
+        { integrationName: 'Razorpay', totalPaise: 1500, totalRs: 15 },
+        { integrationName: 'Pinelabs', totalPaise: 250, totalRs: 2.5 },
+        { integrationName: '(no integration)', totalPaise: 5, totalRs: 0.05 },
+        { integrationName: 'Paytm', totalPaise: 0, totalRs: 0 },
+        { integrationName: 'PhonePe', totalPaise: 0, totalRs: 0 },
+    ]);
+    expect(res.body.days[0].integrations).toEqual({ Razorpay: 1500, Pinelabs: 250, '(no integration)': 5 });
+});
+
+test('?integrationName= narrows (case-insensitive) and stacks with ?companyName=', async () => {
+    const rz = await request(buildApp(db)).get('/payin-summary').query({ integrationName: 'RAZORPAY' });
+    expect(rz.status).toBe(200);
+    expect(rz.body.days[0].qrs).toEqual({ A: 1000, B: 500 });
+    const both = await request(buildApp(db)).get('/payin-summary').query({ integrationName: 'razorpay', companyName: 'other shop' });
+    expect(both.body.days[0].qrs).toEqual({ B: 500 });
+    expect(both.body.grandTotalPaise).toBe(500);
 });
 
 test('?companyName= narrows to that company (case-insensitive)', async () => {

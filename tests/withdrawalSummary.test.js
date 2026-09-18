@@ -16,7 +16,7 @@ jest.mock('../scripts/transactionStatusMailer', () => ({ sendMerchantHoldEmail: 
 jest.mock('../dashboardCounters', () => ({ updateDashboardCounter: jest.fn().mockResolvedValue() }));
 jest.mock('../userMetaCache', () => ({ getUserMeta: jest.fn(async () => null), invalidate: jest.fn() }));
 jest.mock('../qrOwnerCache', () => ({ reload: jest.fn().mockResolvedValue(null), invalidateQr: jest.fn(), resolve: jest.fn().mockResolvedValue(null), get: jest.fn() }));
-const mockConfig = { max_withdrawal_requests: 2, company_names: { 'SCANSERVE AI PRIVATE LIMITED': 'x@y.z', 'PABESTO TECH PVT. LTD.': '' } };
+const mockConfig = { max_withdrawal_requests: 2, company_names: { 'SCANSERVE AI PRIVATE LIMITED': 'x@y.z', 'PABESTO TECH PVT. LTD.': '' }, integrations: ['Razorpay', 'Paytm'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}), getConfig: jest.fn().mockResolvedValue({}), set: jest.fn().mockResolvedValue(),
@@ -170,9 +170,9 @@ describe('approve_new writes the rollup', () => {
 describe('GET /withdrawal-summary', () => {
     const seed = () => ({
         [QRS]: [
-            { $id: 'q1', qrId: 'A', companyName: 'scanserve ai private limited', assignedUserId: 'u1' },   // lower-case on the QR → config spelling
-            { $id: 'q2', qrId: 'B', companyName: 'Other Shop', assignedUserId: 'u2' },                     // not in config → own bucket
-            { $id: 'q3', qrId: 'C', assignedUserId: 'u2' },                                                // blank → (no company)
+            { $id: 'q1', qrId: 'A', companyName: 'scanserve ai private limited', integrationName: 'razorpay', assignedUserId: 'u1' },   // lower-case on the QR → config spelling
+            { $id: 'q2', qrId: 'B', companyName: 'Other Shop', integrationName: 'Razorpay', assignedUserId: 'u2' },                     // company not in config → own bucket
+            { $id: 'q3', qrId: 'C', assignedUserId: 'u2' },                                                                            // blank → (no company) / (no integration)
         ],
         [DAILY_WD]: [{ $id: 'd1', date: today(), totalsJson: JSON.stringify({
             A: { direct: { paidPaise: 10000, commissionPaise: 200, count: 1 }, wallet: { paidPaise: 4000, commissionPaise: 0, count: 1 } },
@@ -209,6 +209,23 @@ describe('GET /withdrawal-summary', () => {
             ['(no company)', 100, 1, 1, 1],
             ['PABESTO TECH PVT. LTD.', 0, 0, 0, 0],
         ]);
+        expect(res.body.days[0].integrations).toEqual({
+            Razorpay: row(19000, 200, 4, R(10000, 200, 1), R(9000, 0, 3)),
+            '(no integration)': row(100, 1, 1, R(100, 1, 1), R()),
+        });
+        expect(res.body.integrations.map((c) => [c.integrationName, c.totalPaise, c.commissionPaise, c.count])).toEqual([
+            ['Razorpay', 19000, 200, 4], ['(no integration)', 100, 1, 1], ['Paytm', 0, 0, 0],
+        ]);
+    });
+
+    test('?integrationName= narrows and stacks with mode/companyName', async () => {
+        const { admin } = build(makeDb(seed()), makeRedis(), { admin: true });
+        const rz = await request(admin).get('/withdrawal-summary').query({ integrationName: 'RAZORPAY', mode: 'direct' });
+        expect(rz.status).toBe(200);
+        expect(Object.keys(rz.body.days[0].qrs)).toEqual(['A']);
+        expect(rz.body.grandTotalPaise).toBe(10000);
+        const none = await request(admin).get('/withdrawal-summary').query({ integrationName: '(no integration)' });
+        expect(Object.keys(none.body.days[0].qrs)).toEqual(['C']);
     });
 
     test('?mode=wallet drops QRs with no wallet activity; ?companyName= narrows; bad mode → 400', async () => {

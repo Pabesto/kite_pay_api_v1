@@ -4975,13 +4975,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     //   to          — end date   YYYY-MM-DD (default: today)
     //   userId      — (admin/subadmin only) filter to a specific user's QRs
     //   qrId        — filter to a single QR code
-    //   companyName — filter to QRs whose qr_codes.companyName matches (case-insensitive, trimmed)
+    //   companyName     — filter to QRs whose qr_codes.companyName matches (case-insensitive, trimmed)
+    //   integrationName — filter to QRs whose qr_codes.integrationName matches (same rule; config `integrations` list)
     //
     // Response shape:
-    //   { days: [ { date, totalPaise, totalRs, qrs: { qrId: paise, ... }, companies: { companyName: paise, ... } } ],
+    //   { days: [ { date, totalPaise, totalRs, qrs: { qrId: paise, ... },
+    //               companies: { companyName: paise, ... }, integrations: { integrationName: paise, ... } } ],
     //     grandTotalPaise, grandTotalRs, todayPaise, todayRs, yesterdayPaise, yesterdayRs,
-    //     companies: [ { companyName, totalPaise, totalRs } ] }   // whole range, desc; every company_names
-    //                                                            // config entry is listed even at 0
+    //     companies:    [ { companyName, totalPaise, totalRs } ],      // whole range, desc; every config entry
+    //     integrations: [ { integrationName, totalPaise, totalRs } ] } // listed even at 0
     // ─────────────────────────────────────────────────────────────────────────
     // ─────────────────────────────────────────────────────────────────────────
     // T+0 early release (ADMIN ROLE ONLY — a risk decision, not a permission)
@@ -5139,36 +5141,43 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         return { allowedQrIds };
     }
 
-    // Companies for the QR-keyed reports: the company_names config ({companyName: email}, legacy
-    // array of names) is the canonical list — every configured company appears in a report even
-    // with zero activity, and a QR's companyName matches it case-insensitively/trimmed (same rule
-    // as the hold email), grouping under the config spelling. Names only on QR docs still get their
-    // own bucket; blank/unknown → NO_COMPANY. Archived "<qrId>_hold[N]" docs keep companyName, so
-    // held history rolls up under the same company.
+    // Grouping for the QR-keyed reports (companies, integrations). A config list is the canonical set —
+    // every configured name appears in a report even with zero activity — and a QR's field value matches
+    // it case-insensitively/trimmed (same rule as the hold email), grouping under the config spelling.
+    // Names only on QR docs still get their own bucket; blank/unknown → the `none` bucket. Archived
+    // "<qrId>_hold[N]" docs keep these fields, so held history rolls up under the same group.
+    //   companies    ← qr_codes.companyName     vs config company_names ({companyName: email} map, legacy array)
+    //   integrations ← qr_codes.integrationName vs config integrations  (array, e.g. ["Razorpay","Paytm",…])
     // ponytail: full qr_codes scan per request; cache the map if the table grows past a few thousand.
-    const NO_COMPANY = '(no company)';
-    async function companyMapForReport() {
-        const cfg = ConfigManager.get('company_names', {});
+    const NO_COMPANY = '(no company)', NO_INTEGRATION = '(no integration)';
+    function groupMap(qrDocs, field, cfg, none) {
         const canonical = {};                      // lower-cased → config spelling
         for (const n of Array.isArray(cfg) ? cfg : Object.keys(cfg || {})) {
             const name = String(n || '').trim();
             if (name) canonical[name.toLowerCase()] = name;
         }
-        const companyOf = {};                      // qrId → company bucket
-        for (const q of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
-            const name = String(q.companyName || '').trim();
-            companyOf[q.qrId] = name ? (canonical[name.toLowerCase()] || name) : NO_COMPANY;
+        const groupOf = {};                        // qrId → bucket
+        for (const q of qrDocs) {
+            const name = String(q[field] || '').trim();
+            groupOf[q.qrId] = name ? (canonical[name.toLowerCase()] || name) : none;
         }
         return {
-            of: (qrId) => companyOf[qrId] || NO_COMPANY,
-            // Narrow allowedQrIds (null = all) to one company; lower-cased filter, '(no company)' allowed.
-            restrict: (allowedQrIds, filterCompany) => {
-                if (!filterCompany) return allowedQrIds;
-                const ids = Object.keys(companyOf).filter(id => companyOf[id].toLowerCase() === filterCompany);
+            of: (qrId) => groupOf[qrId] || none,
+            // Narrow allowedQrIds (null = all) to one bucket; lower-cased filter, the `none` name is allowed.
+            restrict: (allowedQrIds, filter) => {
+                if (!filter) return allowedQrIds;
+                const ids = Object.keys(groupOf).filter(id => groupOf[id].toLowerCase() === filter);
                 return allowedQrIds ? allowedQrIds.filter(id => ids.includes(id)) : ids;
             },
-            // { companyName: init() } for every configured company — the zero rows of a report.
+            // { name: init() } for every configured entry — the zero rows of a report.
             seed: (init) => Object.fromEntries(Object.values(canonical).map(n => [n, init()])),
+        };
+    }
+    async function reportGroups() {
+        const qrDocs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')]);
+        return {
+            companies: groupMap(qrDocs, 'companyName', ConfigManager.get('company_names', {}), NO_COMPANY),
+            integrations: groupMap(qrDocs, 'integrationName', ConfigManager.get('integrations', []), NO_INTEGRATION),
         };
     }
 
@@ -5184,13 +5193,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const filterUserId = req.query.userId || null;
             const filterQrId = req.query.qrId || null;
             const filterCompany = String(req.query.companyName || '').trim().toLowerCase() || null;
+            const filterIntegration = String(req.query.integrationName || '').trim().toLowerCase() || null;
 
             // 1) Determine which QR IDs the caller can see
             const scope = await scopeQrIdsForReport(actor, filterUserId, filterQrId);
             if (scope.error) return res.status(scope.error.status).json({ error: scope.error.message });
-            const companies = await companyMapForReport();
-            const allowedQrIds = companies.restrict(scope.allowedQrIds, filterCompany);
-            const rangeCompanies = companies.seed(() => 0);   // companyName → paise, whole range
+            const { companies, integrations } = await reportGroups();
+            const allowedQrIds = integrations.restrict(companies.restrict(scope.allowedQrIds, filterCompany), filterIntegration);
+            const rangeCompanies = companies.seed(() => 0);         // companyName → paise, whole range
+            const rangeIntegrations = integrations.seed(() => 0);   // integrationName → paise, whole range
 
             // 2) Fetch daily summary docs for the date range
             const startDate = moment.tz(from, 'Asia/Kolkata');
@@ -5217,7 +5228,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 let dayTotal = 0;
                 let qrBreakdown = {};
-                const dayCompanies = {};
+                const dayCompanies = {}, dayIntegrations = {};
 
                 if (summaryDocs.total > 0) {
                     let totalsObj = {};
@@ -5237,6 +5248,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         const company = companies.of(qrId);
                         dayCompanies[company] = (dayCompanies[company] || 0) + amount;
                         rangeCompanies[company] = (rangeCompanies[company] || 0) + amount;
+                        const integration = integrations.of(qrId);
+                        dayIntegrations[integration] = (dayIntegrations[integration] || 0) + amount;
+                        rangeIntegrations[integration] = (rangeIntegrations[integration] || 0) + amount;
                     }
                 }
 
@@ -5246,6 +5260,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     totalRs: dayTotal / 100,
                     qrs: qrBreakdown,
                     companies: dayCompanies,
+                    integrations: dayIntegrations,
                 });
 
                 grandTotalPaise += dayTotal;
@@ -5266,6 +5281,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 companies: Object.entries(rangeCompanies)
                     .sort((a, b) => b[1] - a[1])
                     .map(([companyName, totalPaise]) => ({ companyName, totalPaise, totalRs: totalPaise / 100 })),
+                integrations: Object.entries(rangeIntegrations)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([integrationName, totalPaise]) => ({ integrationName, totalPaise, totalRs: totalPaise / 100 })),
             });
         } catch (err) {
             console.error('Payin summary error:', err);
@@ -5278,7 +5296,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // daily_withdrawal_summaries rollup (withdrawalSummary.js; written at approve, O(days) reads).
     // Same auth/scoping/company rules as /payin-summary, plus the direct-vs-wallet split.
     //
-    // Query params: from, to, userId, qrId, companyName (as /payin-summary),
+    // Query params: from, to, userId, qrId, companyName, integrationName (as /payin-summary),
     //   mode — 'direct' (upi/bank) or 'wallet' (payout wallet); omitted = both.
     //
     // Every row is { paidPaise, commissionPaise, count, direct: {paidPaise, commissionPaise, count},
@@ -5287,11 +5305,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     //
     // Response shape:
     //   { days: [ { date, totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet,
-    //               qrs: { qrId: row }, companies: { companyName: row } } ],
+    //               qrs: { qrId: row }, companies: { companyName: row }, integrations: { integrationName: row } } ],
     //     grandTotalPaise, grandTotalRs, grandCommissionPaise, grandCommissionRs, grandCount, direct, wallet,
     //     todayPaise, todayRs, yesterdayPaise, yesterdayRs,
-    //     companies: [ { companyName, totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet } ] }
-    //   — companies is the whole range, desc by totalPaise; every company_names entry listed even at 0.
+    //     companies:    [ { companyName,     totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet } ],
+    //     integrations: [ { integrationName, totalPaise, totalRs, commissionPaise, commissionRs, count, direct, wallet } ] }
+    //   — both lists are the whole range, desc by totalPaise; every config entry listed even at 0.
     // ─────────────────────────────────────────────────────────────────────────
     router.get('/withdrawal-summary', authenticateToken, async (req, res) => {
         try {
@@ -5302,14 +5321,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const filterUserId = req.query.userId || null;
             const filterQrId = req.query.qrId || null;
             const filterCompany = String(req.query.companyName || '').trim().toLowerCase() || null;
+            const filterIntegration = String(req.query.integrationName || '').trim().toLowerCase() || null;
             const mode = req.query.mode ? String(req.query.mode) : null;
             if (mode && !withdrawalSummary.MODES.includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be direct or wallet.' });
             const modes = mode ? [mode] : withdrawalSummary.MODES;
 
             const scope = await scopeQrIdsForReport(req.user, filterUserId, filterQrId);
             if (scope.error) return res.status(scope.error.status).json({ error: scope.error.message });
-            const companies = await companyMapForReport();
-            const allowedQrIds = companies.restrict(scope.allowedQrIds, filterCompany);
+            const { companies, integrations } = await reportGroups();
+            const allowedQrIds = integrations.restrict(companies.restrict(scope.allowedQrIds, filterCompany), filterIntegration);
 
             const startDate = moment.tz(from, 'Asia/Kolkata');
             const endDate = moment.tz(to, 'Asia/Kolkata');
@@ -5327,12 +5347,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const days = [];
             const grand = newAgg();
             const rangeCompanies = companies.seed(newAgg);
+            const rangeIntegrations = integrations.seed(newAgg);
             let todayPaise = 0, yesterdayPaise = 0;
 
             for (const cursor = startDate.clone(); cursor.isSameOrBefore(endDate, 'day'); cursor.add(1, 'day')) {
                 const dateStr = cursor.format('YYYY-MM-DD');
                 const totals = await withdrawalSummary.readDay(dateStr);
-                const dayAgg = newAgg(), qrs = {}, dayCompanies = {};
+                const dayAgg = newAgg(), qrs = {}, dayCompanies = {}, dayIntegrations = {};
                 for (const [qrId, qrDay] of Object.entries(totals)) {
                     if (allowedQrIds && !allowedQrIds.includes(qrId)) continue;
                     const q = fold(newAgg(), qrDay);
@@ -5341,6 +5362,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     const company = companies.of(qrId);
                     fold(dayCompanies[company] = dayCompanies[company] || newAgg(), qrDay);
                     fold(rangeCompanies[company] = rangeCompanies[company] || newAgg(), qrDay);
+                    const integration = integrations.of(qrId);
+                    fold(dayIntegrations[integration] = dayIntegrations[integration] || newAgg(), qrDay);
+                    fold(rangeIntegrations[integration] = rangeIntegrations[integration] || newAgg(), qrDay);
                     fold(dayAgg, qrDay);
                     fold(grand, qrDay);
                 }
@@ -5349,7 +5373,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     totalPaise: dayAgg.paidPaise, totalRs: dayAgg.paidPaise / 100,
                     commissionPaise: dayAgg.commissionPaise, commissionRs: dayAgg.commissionPaise / 100,
                     count: dayAgg.count, direct: dayAgg.direct, wallet: dayAgg.wallet,
-                    qrs, companies: dayCompanies,
+                    qrs, companies: dayCompanies, integrations: dayIntegrations,
                 });
                 if (dateStr === todayStr) todayPaise = dayAgg.paidPaise;
                 if (dateStr === yesterdayStr) yesterdayPaise = dayAgg.paidPaise;
@@ -5365,6 +5389,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 companies: Object.entries(rangeCompanies)
                     .sort((a, b) => b[1].paidPaise - a[1].paidPaise)
                     .map(([companyName, row]) => ({ companyName, ...withRs(row) })),
+                integrations: Object.entries(rangeIntegrations)
+                    .sort((a, b) => b[1].paidPaise - a[1].paidPaise)
+                    .map(([integrationName, row]) => ({ integrationName, ...withRs(row) })),
             });
         } catch (err) {
             if (err?.status) return res.status(err.status).json({ error: err.message });
