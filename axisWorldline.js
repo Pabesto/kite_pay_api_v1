@@ -123,7 +123,10 @@ module.exports = (
                 if (i) await sleep(LOCK_RETRY_MS);
                 acquired = await acquireLock(lockKey, paymentId, LOCK_TTL_SECONDS);
             }
-            if (!acquired) return failed(res, 503, 'Processing conflict, retry');
+            if (!acquired) {
+                console.warn('⏳ Axis Worldline LIVE lock busy, answered 503:', paymentId, lockKey);
+                return failed(res, 503, 'Processing conflict, retry');
+            }
 
             try {
                 // 3. Idempotency under the lock — a retry of a saved notification is SUCCESS.
@@ -131,7 +134,10 @@ module.exports = (
                     APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID,
                     [Query.equal('paymentId', paymentId), Query.limit(1)]
                 );
-                if (existing.documents.length) return success(res);
+                if (existing.documents.length) {
+                    console.log('↩️  Axis Worldline LIVE duplicate, answered SUCCESS:', paymentId, 'existing doc', existing.documents[0].$id);
+                    return success(res);
+                }
 
                 // 4. Owner + review gate.
                 const { ownerSubadminId, ownerIds } = await resolveReviewOwners(qrCodeId);
@@ -162,9 +168,17 @@ module.exports = (
                         $id: created.$id, qrCodeId, paymentId, amount: amountPaise, provider: PROVIDER,
                         vpa, rrnNumber, created_at: isoDate, reviewExpiresAt: reviewFields.reviewExpiresAt, ownerSubadminId,
                     });
+                    console.log('🕒 Axis Worldline LIVE held for review:', paymentId, 'doc', created.$id);
                     return success(res);
                 }
-                await finalizeTransaction(created);
+                const qrDoc = await finalizeTransaction(created);
+                // qrDoc === null means no QR is registered with qrId === mid: the transaction is
+                // stored (admin list) but no ledger moved and no user/partner sees it.
+                if (qrDoc) {
+                    console.log(`✅ Axis Worldline LIVE saved+credited: ${paymentId} qr=${qrCodeId} paise=${amountPaise} doc=${created.$id} assignedUserId=${qrDoc.assignedUserId || '-'} owner=${ownerSubadminId || '-'}`);
+                } else {
+                    console.error(`🚫 Axis Worldline LIVE saved but NOT credited: ${paymentId} paise=${amountPaise} doc=${created.$id} — no QR registered with qrId="${qrCodeId}" (Worldline mid). Create/assign that QR in the admin panel; this row will not appear on any merchant dashboard.`);
+                }
                 return success(res);
             } catch (error) {
                 console.error('❌ Axis Worldline LIVE ingest failed:', paymentId, error?.message || error);
