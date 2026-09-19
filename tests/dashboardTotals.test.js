@@ -41,6 +41,19 @@ describe('deriveDashboardTotals', () => {
         expect(d.totalCustomerPayoutAll).toBe(18000);     // paid + pending
     });
 
+    test('money-flow panel: commission is inside netFlow, never inside totalPaidOut', () => {
+        const d = derive(base);
+        expect(d.totalWithdrawnFromQr).toBe(60000);       // = day-wise withdrawal report grand total
+        expect(d.walletFundedNotYetPaid).toBe(5000);      // 20000 funded − 15000 paid to customers
+        expect(d.totalWithdrawalProfit).toBe(1700);
+        expect(d.totalPayoutProfit).toBe(800);
+        expect(d.totalWithdrawalProfit + d.totalPayoutProfit).toBe(d.totalPlatformProfit);
+        expect(d.heldOnPlatform).toBe(42500);             // 45000 netFlow − 2500 profit
+        expect(d.netFlow).toBe(d.heldOnPlatform + d.totalPlatformProfit);
+        // report total − dashboard total payout === wallet money not yet paid out
+        expect(d.totalWithdrawnFromQr - d.totalPaidOut).toBe(d.walletFundedNotYetPaid);
+    });
+
     test('avgTxAmount is integer paise and never divides by zero', () => {
         expect(derive(base).avgTxAmount).toBe(25000);
         expect(derive({ ...base, totalTxCount: 0 }).avgTxAmount).toBe(0);

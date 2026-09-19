@@ -1111,6 +1111,42 @@ revert-to-QR refunds a payin commission — still withdrawal commission.)
 > until that is reconciled. Rare (it needs a mid-approval failure) and it never affects a
 > balance, only this tile.
 
+#### 6.6b Money-flow panel (recommended layout — removes the netFlow / commission confusion)
+
+The same endpoint returns these extra derived keys (all **paise**). Render the panel exactly as
+below, with the tooltips; every number is server-computed, the app adds nothing up.
+
+| key | formula | tile label / tooltip |
+|---|---|---|
+| `totalWithdrawnFromQr` | `totalAmountPaid` | **Merchant withdrawals (all)** — "Approved withdrawals out of QR balances, to bank/UPI *and* into payout wallets. This is the number the day-wise Withdrawal report totals." |
+| `withdrawalsToBank` | `totalAmountPaid − totalPayoutWalletFunded` | **→ to bank / UPI** — "Left the platform." |
+| `totalPayoutWalletFunded` | counter | **→ into payout wallets** — "Still on the platform until paid to a customer." |
+| `totalCustomerPayoutPaid` | counter | **Customer payouts paid** — "Left the platform. Excludes payout commission." |
+| `walletFundedNotYetPaid` | `totalPayoutWalletFunded − totalCustomerPayoutPaid` | **Wallet money not yet paid out** — "= current wallet float + payout commission earned. This is exactly why the Withdrawal report total is higher than Total Payout." |
+| `totalPaidOut` | `withdrawalsToBank + totalCustomerPayoutPaid` | **Total Payout** — "Money that actually left the platform. Commission is *not* subtracted anywhere here." |
+| `netFlow` | `totalAmountReceived − totalPaidOut` | **Net Flow** — "Pay-in minus money that left. **Includes** all commission, plus balances still held (QR available, pending withdrawals, wallet float, pending payouts)." |
+| `totalWithdrawalProfit` | `totalAdminProfit + totalMerchantProfit` | **Profit — withdrawals** |
+| `totalPayoutProfit` | `totalPayoutAdminProfit + totalPayoutMerchantProfit` | **Profit — customer payouts** |
+| `totalPlatformProfit` | sum of the two | **Profit (total)** — "Part of Net Flow, not in addition to it." |
+| `heldOnPlatform` | `netFlow − totalPlatformProfit` | **Held on platform (excl. profit)** — "Money still owed to merchants/customers: QR balances + pending withdrawals + wallet float + pending payouts. May be negative." |
+
+Suggested layout — one card, three rows, so the identities are visible on screen:
+
+```
+Pay In ₹A
+  − Total Payout ₹B      = to bank ₹B1 + customer payouts paid ₹B2
+  = Net Flow ₹C          = Profit ₹P + Held on platform ₹H
+
+Merchant withdrawals (all) ₹W  = to bank ₹B1 + into payout wallets ₹W2
+  Wallet not yet paid out ₹G   = W2 − B2   (matches: Withdrawal report − Total Payout)
+```
+
+Identities the app may assert in a debug build (they hold to the paisa on live data):
+`netFlow === heldOnPlatform + totalPlatformProfit`,
+`totalWithdrawnFromQr − totalPaidOut === walletFundedNotYetPaid`,
+`totalWithdrawalProfit + totalPayoutProfit === totalPlatformProfit`.
+Do **not** show Profit and Net Flow as if they add up — Profit is inside Net Flow.
+
 ### 6.7 Set a user's payout commission — `PUT /api/admin/edit-user/:id` (existing)
 ```jsonc
 { "payoutCommission": 2.5 }     // percent, 0–100; independent of "commission"

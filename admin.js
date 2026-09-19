@@ -63,16 +63,26 @@ function deriveDashboardTotals(get) {
     const totalPaidOut = withdrawalsToBank + get('totalCustomerPayoutPaid');
     const totalAdminProfitAll = get('totalAdminProfit') + get('totalPayoutAdminProfit');
     const totalMerchantProfitAll = get('totalMerchantProfit') + get('totalPayoutMerchantProfit');
+    const totalPlatformProfit = totalAdminProfitAll + totalMerchantProfitAll;
+    const netFlow = received - totalPaidOut;
     return {
         totalPaidOut,
         withdrawalsToBank,
-        netFlow: received - totalPaidOut,                                   // may be negative
+        netFlow,                                                            // may be negative
         avgTxAmount: txCount > 0 ? Math.round(received / txCount) : 0,      // never divide by zero
         totalAdminProfitAll,
         totalMerchantProfitAll,
-        totalPlatformProfit: totalAdminProfitAll + totalMerchantProfitAll,
+        totalPlatformProfit,
         totalCustomerPayoutAll: get('totalCustomerPayoutPaid') + get('totalCustomerPayoutPendingAmount'),
         adminMarginPercent: received > 0 ? Math.round((totalAdminProfitAll / received) * 10000) / 100 : 0,
+        // Money-flow panel (CUSTOMER_PAYOUT_FRONTEND.md §6.6b) — makes the netFlow/commission relation
+        // explicit so the tiles never have to be explained twice. Commission is never part of
+        // totalPaidOut (both legs are net-of-commission), so it always sits INSIDE netFlow.
+        totalWithdrawnFromQr: get('totalAmountPaid'),                       // what the day-wise withdrawal report totals (bank + wallet)
+        walletFundedNotYetPaid: get('totalPayoutWalletFunded') - get('totalCustomerPayoutPaid'), // = wallet float + payout commission
+        totalWithdrawalProfit: get('totalAdminProfit') + get('totalMerchantProfit'),
+        totalPayoutProfit: get('totalPayoutAdminProfit') + get('totalPayoutMerchantProfit'),
+        heldOnPlatform: netFlow - totalPlatformProfit,                      // netFlow with our earnings taken out; may be negative
     };
 }
 
