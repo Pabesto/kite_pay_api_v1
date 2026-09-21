@@ -691,6 +691,37 @@ describe('create-user commission defaults', () => {
         expect(created(db)).toMatchObject({ role: 'subadmin', parentId: null, commission: 2.2, payoutCommission: 1.5 });
     });
 
+    // PUT /assign-user — moving an account across the "has a parent" boundary changes what its rates
+    // mean, so they are re-stamped: → subadmin = 0/0 (subadmin markup), → no parent = platform defaults.
+    const assignDb = (currentParent) => makeDb({
+        getDocument: jest.fn(async (_d, _c, id) => (id === 'sub1' ? { $id: 'sub1', userId: 'sub1', role: 'subadmin' } : { $id: 'u1', userId: 'u1', role: 'user', parentId: currentParent, commission: 2.2, payoutCommission: 1.5 })),
+    });
+    const updated = (db) => db.updateDocument.mock.calls.find((c) => c[2] === 'u1')[3];
+
+    test('assign-user: admin-created user (2.2/1.5) handed to a subadmin → rates reset to 0/0', async () => {
+        const db = assignDb(null);
+        const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1' });
+        expect(res.status).toBe(200);
+        expect(updated(db)).toEqual({ parentId: 'sub1', commission: 0, payoutCommission: 0 });
+        expect(res.body).toMatchObject({ parentId: 'sub1', commission: 0, payoutCommission: 0, ratesReset: true });
+    });
+
+    test('assign-user: unassign from a subadmin → rates become the platform defaults (admin share, never 0)', async () => {
+        const db = assignDb('sub1');
+        const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1', unassign: true });
+        expect(res.status).toBe(200);
+        expect(updated(db)).toEqual({ parentId: null, commission: 2.2, payoutCommission: 1.5 });
+        expect(res.body.ratesReset).toBe(true);
+    });
+
+    test('assign-user: move between two subadmins keeps the rates (still the subadmin markup)', async () => {
+        const db = assignDb('subOld');
+        const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1' });
+        expect(res.status).toBe(200);
+        expect(updated(db)).toEqual({ parentId: 'sub1' });
+        expect(res.body).toMatchObject({ commission: 2.2, payoutCommission: 1.5, ratesReset: false });
+    });
+
     test('config keys override the fallbacks; an out-of-range value falls back', async () => {
         const ConfigManager = require('../configManager');
         const orig = ConfigManager.get;

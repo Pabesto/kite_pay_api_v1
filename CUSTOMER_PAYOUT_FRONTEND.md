@@ -762,7 +762,15 @@ the cut that goes to its parent — or to admin when it has none. So a **subadmi
 creates directly) starts at these rates, which go to admin; a **user created by a subadmin** starts
 at 0 / 0 (the subadmin's own cut — raise it via edit-user; admin's cut comes from the subadmin's
 own rate). Changing these never touches existing accounts."* The server refuses any withdrawal whose
-admin share is 0% (§8), so these fields are what keeps a new subadmin from withdrawing for free. Add a "Payout modes" row with
+admin share is 0% (§8), so these fields are what keeps a new subadmin from withdrawing for free.
+
+**Assigning a user to / from a subadmin** (`PUT /api/admin/assign-user/:subadminId`, body
+`{ userId, unassign? }`) now re-stamps the rates because their meaning flips: handed **to** a subadmin
+→ `commission: 0, payoutCommission: 0` (the subadmin's markup; admin's share comes from the subadmin's
+own rate); **unassigned** → the platform defaults (now admin's share). Moving between two subadmins
+keeps the rates. Response: `{ message, parentId, commission, payoutCommission, ratesReset }` — when
+`ratesReset` is true, show a toast "Commission rates were reset to <commission>% / <payoutCommission>%
+because the account's parent changed" and refresh the user's detail card. Add a "Payout modes" row with
 four switches (NEFT / IMPS / RTGS / UPI) bound to `modes`; switching one off hides nothing for admin
 but greys the mode out for users and subadmins (§4.1a). Switching all four off is allowed and
 behaves like a pause with a per-mode message.

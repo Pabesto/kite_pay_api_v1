@@ -548,11 +548,24 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             //     }
             // }
 
+            // An account's rates mean "what it pays to whoever is above it": with no parent that is
+            // ADMIN's share, with a parent it is the SUBADMIN's markup (admin's share then comes from
+            // the subadmin's own doc). Crossing the null boundary changes what the numbers mean, so
+            // re-stamp them — otherwise an admin-created user (2.2/1.5) handed to a subadmin would pay
+            // those 2.2/1.5 to the subadmin (plus the subadmin's rate on top), and an unassigned user
+            // would sit at 0/0 = admin share 0 and be refused by withdraw.js. A move between two
+            // subadmins keeps the rates (still the subadmin markup). Reported back so the app can show it.
+            const current = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId);
+            const hadParent = !!current.parentId, willHaveParent = !unassign;
             const update = { parentId: unassign ? null : subadminId };
+            if (hadParent !== willHaveParent) {
+                update.commission = willHaveParent ? 0 : defaultRate('default_payin_commission', 2.2);
+                update.payoutCommission = willHaveParent ? 0 : defaultRate('default_payout_commission', 1.5);
+            }
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId, update);
             await userMetaCache.invalidate(userId);
 
-            return res.status(200).json({ message: 'Assignment updated.' });
+            return res.status(200).json({ message: 'Assignment updated.', parentId: update.parentId, commission: update.commission ?? current.commission ?? 0, payoutCommission: update.payoutCommission ?? current.payoutCommission ?? null, ratesReset: hadParent !== willHaveParent });
         } catch (err) {
             console.error('Assign user error:', err);
             return res.status(500).json({ message: 'Failed to update assignment', error: err.message });
