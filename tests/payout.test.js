@@ -298,6 +298,19 @@ describe('default payout commission', () => {
         expect(b.body).toMatchObject({ commissionRate: 1.5, commissionPaise: 150 }); // 0 + default parent
     });
 
+    test('admin payout share of 0 → 422 (explicit 0 on a parentless account); subadmin share 0 is fine', async () => {
+        const { app } = buildPayout(makeDb(), makeRedis());
+        userMetaCache.getUserMeta.mockResolvedValue({ userId: 'user1', role: 'user', parentId: null, payoutCommission: 0 });
+        const r = await request(app).get('/commission-preview?amount=100');
+        expect(r.status).toBe(422);
+        expect(r.body.error).toMatch(/Admin payout commission rate is not configured/);
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { userId: 'user1', role: 'user', parentId: 'sub1', payoutCommission: 0 },   // subadmin's cut 0 — allowed
+            sub1: { userId: 'sub1', role: 'subadmin', parentId: null, payoutCommission: 1.5 },
+        })[id] || null);
+        expect((await request(app).get('/commission-preview?amount=100')).status).toBe(200);
+    });
+
     test('config key default_payout_commission overrides the 1.5 fallback', async () => {
         mockConfig.default_payout_commission = 2;
         try {
@@ -929,7 +942,7 @@ describe('employee scoping (assigned subadmins → their users)', () => {
 
 describe('per-user limits (0 = unlimited, null = inherit platform)', () => {
     const rich = () => ({ [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 100000000, holdPaise: 0 }] });
-    const meta = (extra = {}) => userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, payoutCommission: 0, ...extra } : id === 'admin1' ? { userId: 'admin1', role: 'admin' } : null));
+    const meta = (extra = {}) => userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, payoutCommission: 1, ...extra } : id === 'admin1' ? { userId: 'admin1', role: 'admin' } : null)); // 1% admin share (0 is refused); limits compare amountPaise, so nothing below moves
     const req = (app, amount) => request(app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount });
 
     test('platform limits: per request, max pending, daily total; 0 switches each off', async () => {
@@ -1249,8 +1262,8 @@ describe('alerts (admin toggle)', () => {
             // a new request whose hold crosses the threshold alerts too (that is where available really drops)
             await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'credit', amount: 100, notes: 'back above' }); // 53700
             mockEmit.mockClear();
-            userMetaCache.getUserMeta.mockResolvedValue({ userId: 'user1', role: 'user', parentId: null, payoutCommission: 0 });
-            expect((await request(buildPayout(db, makeRedis()).app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 })).status).toBe(201); // hold 10000 → 43700
+            userMetaCache.getUserMeta.mockResolvedValue({ userId: 'user1', role: 'user', parentId: null, payoutCommission: 1 });
+            expect((await request(buildPayout(db, makeRedis()).app).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 100 })).status).toBe(201); // hold 10100 → 43600
             expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(1);
         } finally { clearCfg('payout_alerts_enabled', 'payout_low_balance_threshold', 'payout_pending_alert_minutes'); }
     });
@@ -1697,19 +1710,19 @@ describe('payin commission on wallet transfers + refund on revert', () => {
     test('a payout consumed part of the wallet: only the reverted share of commission comes back', async () => {
         const ctx = buildBoth();
         await transferToWallet(ctx);
-        // pay ₹400 to a customer (payout rate 0 here), leaving ₹600 of principal in the wallet
-        userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, commission: RATE, payoutCommission: 0 } : { userId: 'admin1', role: 'admin' }));
+        // pay ₹400 to a customer at a 1% payout rate (₹4 commission), leaving ₹596 of principal in the wallet
+        userMetaCache.getUserMeta.mockImplementation(async (id) => (id === 'user1' ? { userId: 'user1', role: 'user', parentId: null, commission: RATE, payoutCommission: 1 } : { userId: 'admin1', role: 'admin' }));
         const { app: userApp } = buildPayout(ctx.db, makeRedis(), asUser('user1'));
         const req1 = await userApp && await request(userApp).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 400 });
         expect(req1.status).toBe(201);
         expect((await request(ctx.payoutApp).post(`/admin/requests/${req1.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' })).status).toBe(200);
-        expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(60000);
+        expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(59600);
 
-        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, amount: 600, notes: 'return the rest' });
+        const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, amount: 596, notes: 'return the rest' });
         expect(rv.status).toBe(200);
-        expect(rv.body.commissionRefundPaise).toBe(1320);            // floor(2200 * 60000/100000)
-        expect(qr(ctx.db).commissionPaid).toBe(COMMISSION_PAISE - 1320); // the ₹400 that left keeps its cut
-        expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE - 1320);
+        expect(rv.body.commissionRefundPaise).toBe(1311);            // floor(2200 * 59600/100000)
+        expect(qr(ctx.db).commissionPaid).toBe(COMMISSION_PAISE - 1311); // the ₹404 that left keeps its cut
+        expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE - 1311);
     });
 
     test('rollups reverse against the ORIGINAL day and month, never today', async () => {

@@ -1223,6 +1223,18 @@ data; hide Paid/Reject/Adjust/Mark-added/Delete).
   admin's share (the parent's rate, or the account's own rate when it has no parent, e.g. a subadmin
   withdrawing for itself) is 0. Every charged withdrawal must earn admin > 0; the subadmin's share may
   be 0. Wallet transfers with `payout_wallet_charge_payin_commission` off are exempt (they are free by design).
+  The withdrawal preview (`POST /withdraw_commission_preview`) applies the same rules — it now takes an
+  optional `mode` (`'wallet'` quotes 0 while that switch is off) and returns this 422 too, so block submit
+  from the preview instead of waiting for the request to fail.
+- `422 Admin payout commission rate is not configured for this account. Please contact support.` — the
+  customer-payout twin (`GET /commission-preview`, `POST /requests`): admin's payout share (the parent's
+  `payoutCommission`, or the account's own when it has no parent) is 0. The subadmin's share may be 0.
+- `400` on `DELETE /api/admin/delete-user/:id` — the account still has something hanging off it. Show
+  `error` verbatim; each names what to clear: *"Cannot delete this sub-admin: N user(s) are assigned to
+  them. Unassign or reassign those users first."* · *"…N pending withdrawal request(s). Approve or reject
+  them first."* · *"…N pending payout request(s). Mark them paid or reject them first."* · *"…payout wallet
+  still holds ₹X. Pay it out or revert it to the QR first."* (plus the existing assigned-QR message). A
+  delete never moves money.
 - Rejected request: the hold is gone, so "Request again" must go through the normal create flow
   (re-checks balance and current commission).
 - The withdrawal `utrNumber` for wallet rows is a `pwt_…` ledger id — label it "Wallet ref", not "UTR".

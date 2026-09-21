@@ -657,6 +657,95 @@ describe('GET /dashboard/user/:userId — payout block', () => {
 // defaults (default_payin_commission 2.2 / default_payout_commission 1.5) so admin is never on 0%.
 // Explicit 0 is load-bearing: payout.js reads payoutCommission with `??`, so null would silently
 // re-apply the default.
+// DELETE /delete-user — refuses while anything still hangs off the account (users under a sub-admin,
+// pending withdrawals / payouts, payout-wallet balance). A delete never moves money.
+describe('delete-user guards', () => {
+    const parse = (r) => { try { return JSON.parse(r); } catch { return null; } };
+    // per-collection answers; users_meta answers both the userId lookup and the parentId count
+    const dbFor = ({ role = 'user', usersUnder = 0, pendingWd = 0, pendingPo = 0, wallet = null }) => (mockDb = makeDb({
+        listDocuments: jest.fn(async (_d, col, queries = []) => {
+            const qs = queries.map(parse).filter(Boolean);
+            const attr = (a) => qs.find((q) => q.attribute === a);
+            if (col === 'users_meta' && attr('userId')) return { documents: [{ $id: 'x1', userId: 'x1', role, status: true }], total: 1 };
+            if (col === 'users_meta' && attr('parentId')) return { documents: [], total: usersUnder };
+            if (col === 'withdrawal_col') return { documents: [], total: pendingWd };
+            if (col === 'customer_payouts') return { documents: [], total: pendingPo };
+            if (col === 'payout_wallets') return { documents: wallet ? [wallet] : [], total: wallet ? 1 : 0 };
+            return { documents: [], total: 0 }; // qr_col and anything else
+        }),
+    }));
+    const users = () => ({ get: jest.fn(async () => ({ $id: 'x1', labels: ['user'] })), delete: jest.fn().mockResolvedValue({}) });
+    const del = (db, u) => request(buildAdminApp(db, makeRedis(), asAdmin, u)).delete('/delete-user/x1');
+
+    test('sub-admin with users under them → 400, nothing deleted', async () => {
+        const db = dbFor({ role: 'subadmin', usersUnder: 3 }), u = users();
+        const res = await del(db, u);
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/3 user\(s\) are assigned to them/);
+        expect(db.deleteDocument).not.toHaveBeenCalled(); expect(u.delete).not.toHaveBeenCalled();
+    });
+    test('pending withdrawal request → 400', async () => {
+        const res = await del(dbFor({ pendingWd: 2 }), users());
+        expect(res.status).toBe(400); expect(res.body.error).toMatch(/2 pending withdrawal request/);
+    });
+    test('pending payout request → 400', async () => {
+        const res = await del(dbFor({ pendingPo: 1 }), users());
+        expect(res.status).toBe(400); expect(res.body.error).toMatch(/1 pending payout request/);
+    });
+    test('payout wallet still holds money → 400 with the amount', async () => {
+        const res = await del(dbFor({ wallet: { $id: 'w', userId: 'x1', balancePaise: 250050, holdPaise: 0 } }), users());
+        expect(res.status).toBe(400); expect(res.body.error).toMatch(/still holds ₹2500.50/);
+    });
+    test('clean account → deleted', async () => {
+        const db = dbFor({ wallet: { $id: 'w', userId: 'x1', balancePaise: 0, holdPaise: 0 } }), u = users();
+        const res = await del(db, u);
+        expect(res.status).toBe(200);
+        expect(db.deleteDocument).toHaveBeenCalled(); expect(u.delete).toHaveBeenCalledWith('x1');
+    });
+});
+
+// PUT /edit-user — payin commission has the same 0–100 bounds as payoutCommission
+describe('edit-user commission bounds', () => {
+    const db = () => (mockDb = makeDb({ listDocuments: jest.fn(async () => ({ documents: [{ $id: 'u1', userId: 'u1', role: 'user', parentId: null }], total: 1 })) }));
+    const users = { get: jest.fn(async () => ({ $id: 'u1', labels: ['user'] })), updateName: jest.fn(), updateEmail: jest.fn() };
+    test('101 and -1 → 400; 2.2 → stored', async () => {
+        for (const bad of [101, -1, 'abc']) {
+            const res = await request(buildAdminApp(db(), makeRedis(), asAdmin, users)).put('/edit-user/u1').send({ commission: bad });
+            expect(res.status).toBe(400); expect(res.body.error).toMatch(/Commission must be a number between 0 and 100/);
+        }
+        const d = db();
+        expect((await request(buildAdminApp(d, makeRedis(), asAdmin, users)).put('/edit-user/u1').send({ commission: 2.2 })).status).toBe(200);
+        expect(d.updateDocument.mock.calls[0][3]).toEqual({ commission: 2.2 });
+    });
+});
+
+// POST /withdraw_commission_preview — same rate rules as /withdraw_new, so the quote never differs from the charge
+describe('withdraw preview parity', () => {
+    const parse = (r) => { try { return JSON.parse(r); } catch { return null; } };
+    const previewDb = (user) => makeDb({
+        listDocuments: jest.fn(async (_d, _col, queries = []) => {
+            const qs = queries.map(parse).filter(Boolean);
+            if (qs.some((q) => q.attribute === 'qrId')) return { documents: [{ $id: 'q1', qrId: 'qr1', amountAvailableForWithdrawal: 100000000 }], total: 1 };
+            if (qs.some((q) => q.attribute === 'userId')) return { documents: [user], total: 1 };
+            return { documents: [], total: 0 };
+        }),
+    });
+    const preview = (user, body) => request(buildWithdrawApp(previewDb(user), makeRedis())).post('/withdraw_commission_preview').send({ userId: 'u1', qrId: 'qr1', preAmount: 1000, ...body });
+
+    test('admin share 0 → 422 at preview time (not only at submit)', async () => {
+        const res = await preview({ $id: 'u1', userId: 'u1', role: 'user', parentId: null, commission: 0 }, {});
+        expect(res.status).toBe(422); expect(res.body.error).toMatch(/Admin commission rate is not configured/);
+    });
+    test('normal account quotes its rate', async () => {
+        const res = await preview({ $id: 'u1', userId: 'u1', role: 'user', parentId: null, commission: 2.2 }, {});
+        expect(res.status).toBe(200); expect(res.body.commissionRate).toBe(2.2);
+    });
+    test("mode:'wallet' with the charge switch off (the default) quotes 0 and is not refused", async () => {
+        const res = await preview({ $id: 'u1', userId: 'u1', role: 'user', parentId: null, commission: 2.2 }, { mode: 'wallet' });
+        expect(res.status).toBe(200); expect(res.body.commissionRate).toBe(0); expect(res.body.commissionRs).toBe(0);
+    });
+});
+
 describe('create-user commission defaults', () => {
     const fakeUsers = () => ({
         create: jest.fn(async (_id, email, _phone, _pw, name) => ({ $id: 'newAuthId', email, name })),
@@ -693,9 +782,15 @@ describe('create-user commission defaults', () => {
 
     // PUT /assign-user — moving an account across the "has a parent" boundary changes what its rates
     // mean, so they are re-stamped: → subadmin = 0/0 (subadmin markup), → no parent = platform defaults.
-    const assignDb = (currentParent) => makeDb({
-        getDocument: jest.fn(async (_d, _c, id) => (id === 'sub1' ? { $id: 'sub1', userId: 'sub1', role: 'subadmin' } : { $id: 'u1', userId: 'u1', role: 'user', parentId: currentParent, commission: 2.2, payoutCommission: 1.5 })),
+    const byUserId = (docs) => jest.fn(async (_d, _c, queries = []) => {
+        const q = queries.map((r) => { try { return JSON.parse(r); } catch { return null; } }).find((x) => x && x.attribute === 'userId');
+        const hit = q ? docs.find((d) => d.userId === q.values[0]) : null;
+        return { documents: hit ? [hit] : [], total: hit ? 1 : 0 };
     });
+    // getUserMeta is routed to `mockDb` (see the userMetaCache mock at the top) — point it at this db.
+    const assignDb = (currentParent) => (mockDb = makeDb({
+        listDocuments: byUserId([{ $id: 'sub1', userId: 'sub1', role: 'subadmin' }, { $id: 'u1', userId: 'u1', role: 'user', parentId: currentParent, commission: 2.2, payoutCommission: 1.5 }]),
+    }));
     const updated = (db) => db.updateDocument.mock.calls.find((c) => c[2] === 'u1')[3];
 
     test('assign-user: admin-created user (2.2/1.5) handed to a subadmin → rates reset to 0/0', async () => {
@@ -720,6 +815,14 @@ describe('create-user commission defaults', () => {
         expect(res.status).toBe(200);
         expect(updated(db)).toEqual({ parentId: 'sub1' });
         expect(res.body).toMatchObject({ commission: 2.2, payoutCommission: 1.5, ratesReset: false });
+    });
+
+    test('employee creates a subadmin → parentId null (never the employee), assigned_to = employee, defaults 2.2 / 1.5', async () => {
+        const asEmployee = (req, _res, next) => { req.user = { userId: 'emp1', role: 'employee', $id: 'emp1', labels: ['create_subadmin'] }; next(); };
+        const db = makeDb();
+        const res = await request(buildAdminApp(db, makeRedis(), asEmployee, fakeUsers())).post('/create-user').send({ name: 'Company', email: 'c@x.in', password: 'secret12', role: 'subadmin' });
+        expect(res.status).toBe(201);
+        expect(created(db)).toMatchObject({ role: 'subadmin', parentId: null, assigned_to: 'emp1', commission: 2.2, payoutCommission: 1.5 });
     });
 
     test('config keys override the fallbacks; an out-of-range value falls back', async () => {

@@ -617,6 +617,10 @@ module.exports = (
     if (bad(userRate)) throw fail(422, 'Your payout commission rate is invalid. Please contact support.');
     if (bad(parentRate)) throw fail(422, 'Parent payout commission rate is invalid. Please contact support.');
     if (userRate + parentRate > 100) throw fail(422, 'Combined payout commission rate exceeds 100%. Please contact support.');
+    // Same rule as withdraw.js: the ADMIN's share (parent's rate, or the account's own rate when it has
+    // no parent) can never be 0 — an explicit payoutCommission: 0 on a subadmin would otherwise make
+    // every payout under it free. The subadmin's share (the user's own rate) may be 0.
+    if (user.role !== 'admin' && (user.parentId ? parentRate : userRate) <= 0) throw fail(422, 'Admin payout commission rate is not configured for this account. Please contact support.');
     return { user, parentId: user.parentId || null, userRate, parentRate, totalRate: userRate + parentRate };
   }
 

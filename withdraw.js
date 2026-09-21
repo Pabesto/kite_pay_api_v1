@@ -144,7 +144,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     router.post('/withdraw_commission_preview', authenticateToken , async (req, res) => {
-      const { userId, qrId, preAmount } = req.body;
+      const { userId, qrId, preAmount, mode } = req.body; // mode optional; 'wallet' mirrors the free-transfer switch
 
       // console.log('Withdraw commission preview request received:', req.body);
 
@@ -156,11 +156,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const preAmountPaise = preAmount * 100;
 
       const usrDet = await getUserMeta(userId);
-      let commissionRate = Number(usrDet.commission || 0);
-
-      if (usrDet.parentId) {
-        const parentDet = await getUserMeta(usrDet.parentId);
-        commissionRate += Number(parentDet.commission || 0);
+      // Same rate rules as /withdraw_new so the quote can never differ from the charge: wallet
+      // transfers are free while the switch is off, and a 0% admin share is refused here too
+      // (otherwise the screen shows a valid quote and the submit 422s).
+      const zeroWalletRates = mode === 'wallet' && !cfgBool('payout_wallet_charge_payin_commission', false);
+      const userCommissionRate = zeroWalletRates ? 0 : Number(usrDet.commission || 0);
+      const parentCommissionRate = (zeroWalletRates || !usrDet.parentId) ? 0 : Number((await getUserMeta(usrDet.parentId))?.commission || 0);
+      let commissionRate = userCommissionRate + parentCommissionRate;
+      if (!zeroWalletRates && usrDet.role !== 'admin' && (usrDet.parentId ? parentCommissionRate : userCommissionRate) <= 0) {
+        return res.status(422).json({ error: 'Admin commission rate is not configured for this account. Please contact support.' });
       }
 
       const commissionRs = calculateCommission(preAmount, commissionRate);
@@ -1228,71 +1232,59 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } else {
           let commissionTxs = [];
 
-          if (user.parentId) {
-            const parent = await getUserMeta(user.parentId);
-            if (parent) {
-              // Subadmin commission
-              const subadminCommissionAmount = calculateCommissionPaise(
-                Math.round(w.preAmount * 100),
-                w.userCommissionRate
-              );
+          // Who earns is decided from the REQUEST-TIME snapshot on the doc, not from whoever the user's
+          // parent happens to be now. `parentCommissionRate` was admin's share when it was charged, so
+          // it always goes to admin. `userCommissionRate` was the subadmin's markup ONLY if the user had
+          // a parent at request time — and since /withdraw_new refuses a 0% admin share, a parented
+          // request always carries parentCommissionRate > 0. Everything else (no parent then, parent
+          // gone/deleted now) goes to admin in one row that equals what the QR was actually debited,
+          // so commission can never be charged to a QR and booked to nobody. (Mirrors payout.js.)
+          const preAmountPaiseForCommission = Math.round(w.preAmount * 100);
+          const snapUserRate = Number(w.userCommissionRate || 0);
+          const snapParentRate = Number(w.parentCommissionRate || 0);
+          const liveParent = user.parentId ? await getUserMeta(user.parentId) : null;
+          const splitWithSubadmin = !!liveParent && snapParentRate > 0;
 
-              if (subadminCommissionAmount > 0) {
-                commissionTxs.push({
-                  userId: user.parentId,
-                  sourceWithdrawalId: w.id,
-                  amount: subadminCommissionAmount,
-                  commissionRate: w.userCommissionRate,
-                  earningType: 'subadmin',
-                  createdAt: new Date().toISOString(),
-                });
-
-                await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', subadminCommissionAmount).catch(console.error);
-              }
-
-              if (admin) {
-                // Admin commission
-                const adminCommissionAmount = calculateCommissionPaise(
-                  Math.round(w.preAmount * 100),
-                  w.parentCommissionRate
-                );
-
-                if (adminCommissionAmount > 0) {
-                  commissionTxs.push({
-                    userId: admin.userId,
-                    sourceWithdrawalId: w.id,
-                    amount: adminCommissionAmount,
-                    commissionRate: w.parentCommissionRate,
-                    earningType: 'admin',
-                    createdAt: new Date().toISOString(),
-                  });
-
-                  await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
-                }
-              }
-
+          if (splitWithSubadmin) {
+            const subadminCommissionAmount = calculateCommissionPaise(preAmountPaiseForCommission, snapUserRate);
+            if (subadminCommissionAmount > 0) {
+              commissionTxs.push({
+                userId: liveParent.userId,
+                sourceWithdrawalId: w.id,
+                amount: subadminCommissionAmount,
+                commissionRate: snapUserRate,
+                earningType: 'subadmin',
+                createdAt: new Date().toISOString(),
+              });
+              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalMerchantProfit', subadminCommissionAmount).catch(console.error);
             }
-          } else {
-            // User has no parent, so admin earns commission only
             if (admin) {
-              const adminCommissionAmount = calculateCommissionPaise(
-                Math.round(w.preAmount * 100),
-                w.userCommissionRate
-              );
-
+              const adminCommissionAmount = calculateCommissionPaise(preAmountPaiseForCommission, snapParentRate);
               if (adminCommissionAmount > 0) {
                 commissionTxs.push({
                   userId: admin.userId,
                   sourceWithdrawalId: w.id,
                   amount: adminCommissionAmount,
-                  commissionRate: w.userCommissionRate,
+                  commissionRate: snapParentRate,
                   earningType: 'admin',
                   createdAt: new Date().toISOString(),
                 });
-
                 await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
               }
-
+            }
+          } else if (admin) {
+            // Single ceil on the combined rate = exactly the commission the QR was debited at request time.
+            const adminCommissionAmount = calculateCommissionPaise(preAmountPaiseForCommission, snapUserRate + snapParentRate);
+            if (adminCommissionAmount > 0) {
+              commissionTxs.push({
+                userId: admin.userId,
+                sourceWithdrawalId: w.id,
+                amount: adminCommissionAmount,
+                commissionRate: snapUserRate + snapParentRate,
+                earningType: 'admin',
+                createdAt: new Date().toISOString(),
+              });
+              await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalAdminProfit', adminCommissionAmount).catch(console.error);
             }
           }
           // Create commission transaction docs (source of truth — must never be skipped)

@@ -379,8 +379,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             return res.status(403).json({ error: 'Employees can only create sub-admins' });
         }
 
-        if(req.user.role === 'admin'){
-            creatorId = null; // if users have been created by admin, parentId will be null
+        // parentId is the commission chain, not the audit trail: admin-created accounts have none, and a
+        // SUBADMIN never has one (an employee-created subadmin used to get parentId = the employee, which
+        // routed the subadmin's own rate — admin's share — to the employee). Employee ↔ subadmin is
+        // `assigned_to`, set below.
+        if (req.user.role === 'admin' || role === 'subadmin') {
+            creatorId = null;
         }
 
         try {
@@ -534,8 +538,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             //     return res.status(403).json({ message: 'Subadmin can only assign to self' });
             // }
 
-            // Validate target is a SUBADMIN
-            const targetSubadmin = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, subadminId);
+            // Validate target is a SUBADMIN (by business key — older users_meta docs have $id !== userId)
+            const targetSubadmin = await userMetaCache.getUserMeta(subadminId);
+            if (!targetSubadmin) {
+                return res.status(404).json({ message: 'Target sub-admin not found' });
+            }
             if (targetSubadmin.role !== 'subadmin') {
                 return res.status(400).json({ message: 'Target is not a SUBADMIN' });
             }
@@ -555,14 +562,17 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // those 2.2/1.5 to the subadmin (plus the subadmin's rate on top), and an unassigned user
             // would sit at 0/0 = admin share 0 and be refused by withdraw.js. A move between two
             // subadmins keeps the rates (still the subadmin markup). Reported back so the app can show it.
-            const current = await databases.getDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId);
+            const current = await userMetaCache.getUserMeta(userId);
+            if (!current) {
+                return res.status(404).json({ message: 'User not found' });
+            }
             const hadParent = !!current.parentId, willHaveParent = !unassign;
             const update = { parentId: unassign ? null : subadminId };
             if (hadParent !== willHaveParent) {
                 update.commission = willHaveParent ? 0 : defaultRate('default_payin_commission', 2.2);
                 update.payoutCommission = willHaveParent ? 0 : defaultRate('default_payout_commission', 1.5);
             }
-            await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userId, update);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, current.$id, update);
             await userMetaCache.invalidate(userId);
 
             return res.status(200).json({ message: 'Assignment updated.', parentId: update.parentId, commission: update.commission ?? current.commission ?? 0, payoutCommission: update.payoutCommission ?? current.payoutCommission ?? null, ratesReset: hadParent !== willHaveParent });
@@ -618,8 +628,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         if (labels !== undefined) updatePayload.labels = labels;
         if (commission !== undefined) {
         const commissionNum = Number(commission);
-        if (isNaN(commissionNum)) {
-            return res.status(400).json({ error: 'Commission must be a valid number' });
+        if (isNaN(commissionNum) || commissionNum < 0 || commissionNum > 100) {
+            return res.status(400).json({ error: 'Commission must be a number between 0 and 100' });
         }
         updatePayload.commission = commissionNum;
         }
@@ -854,6 +864,27 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
                 if (response.total > 0) {
                     return res.status(400).json({ message: "Cannot delete user with assigned QR codes. Please unassign them first." }); 
+                }
+
+                // Nothing may still hang off the account: users under a sub-admin would be orphaned
+                // (their approvals would then book commission to nobody), and pending money requests
+                // or a payout-wallet balance would be stranded. Same posture as the QR check above —
+                // refuse and tell the admin what to clear first. Money is never moved by a delete.
+                const refuse = (why) => res.status(400).json({ error: why, message: why });
+                const count = async (col, filters) => col ? (await databases.listDocuments(APPWRITE_DATABASE_ID, col, [...filters, Query.limit(1)])).total : 0;
+                if (userMetaDoc.role === 'subadmin') {
+                    const under = await count(APPWRITE_USERS_META_COLLECTION_ID, [Query.equal('parentId', userIdofUserDeleting)]);
+                    if (under > 0) return refuse(`Cannot delete this sub-admin: ${under} user(s) are assigned to them. Unassign or reassign those users first.`);
+                }
+                const pendingWithdrawals = await count(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, [Query.equal('userId', userIdofUserDeleting), Query.equal('status', 'pending')]);
+                if (pendingWithdrawals > 0) return refuse(`Cannot delete this user: ${pendingWithdrawals} pending withdrawal request(s). Approve or reject them first.`);
+                const pendingPayouts = await count(APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, [Query.equal('userId', userIdofUserDeleting), Query.equal('status', 'pending')]);
+                if (pendingPayouts > 0) return refuse(`Cannot delete this user: ${pendingPayouts} pending payout request(s). Mark them paid or reject them first.`);
+                if (APPWRITE_PAYOUT_WALLETS_COLLECTION_ID) {
+                    const wallets = await databases.listDocuments(APPWRITE_DATABASE_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, [Query.equal('userId', userIdofUserDeleting), Query.limit(1)]);
+                    const wallet = wallets.documents[0];
+                    const balancePaise = Number(wallet?.balancePaise || 0), holdPaise = Number(wallet?.holdPaise || 0);
+                    if (balancePaise > 0 || holdPaise > 0) return refuse(`Cannot delete this user: payout wallet still holds ₹${(balancePaise / 100).toFixed(2)}. Pay it out or revert it to the QR first.`);
                 }
 
                 await databases.deleteDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, userMetaDoc.$id);
