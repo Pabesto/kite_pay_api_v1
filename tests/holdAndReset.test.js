@@ -68,7 +68,7 @@ const asAdmin = (req, _res, next) => { req.user = { userId: 'admin1', role: 'adm
 
 function seed() {
     return {
-        [QRS]: [{ $id: 'q1', qrId: SRC, fileId: 'f1', type: 'upi', companyName: 'Shop', assignedUserId: 'u1', isActive: true,
+        [QRS]: [{ $id: 'q1', qrId: SRC, fileId: 'f1', type: 'upi', companyName: 'Shop', integrationName: 'BharatPe', assignedUserId: 'u1', isActive: true,
             totalTransactions: 3, totalPayInAmount: 5000, amountAvailableForWithdrawal: 5000, amountOnHold: 0 }],
         [TXNS]: [
             { $id: 't_final', qrCodeId: SRC, amount: 1000, status: 'normal' },
@@ -124,6 +124,8 @@ describe('hold-and-reset moves the later-added QR references', () => {
         expect(byId(db, QRS, 'q1')).toMatchObject({ qrId: HOLD, isActive: false, assignedUserId: 'u1', totalPayInAmount: 5000 });
         const fresh = db.store[QRS].find((d) => d.qrId === SRC);
         expect(fresh).toMatchObject({ isActive: true, assignedUserId: null, totalPayInAmount: 0, amountAvailableForWithdrawal: 0, fileId: 'file_fresh' });
+        // descriptive attributes carry over — the reports group by both, so the fresh QR must not fall into "(no integration)"
+        expect(fresh).toMatchObject({ type: 'upi', companyName: 'Shop', integrationName: 'BharatPe' });
 
         // Only the pending-review doc moved; finalized/approved history stays for the out-of-band job.
         expect(byId(db, TXNS, 't_pending').qrCodeId).toBe(HOLD);

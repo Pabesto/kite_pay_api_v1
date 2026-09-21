@@ -6193,11 +6193,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         throw new Error(`Failed to copy QR image file — aborting. Retry the request to finish the interrupted run. (${e.message})`);
                     }
 
-                    // Create the fresh, empty, UNASSIGNED, active QR reusing the original id. Template from holdDoc.
+                    // Create the fresh, empty, UNASSIGNED, active QR reusing the original id. Template from holdDoc:
+                    // every descriptive attribute carries over (the reports group by companyName AND
+                    // integrationName, so a fresh QR missing either would land under "(no company)" /
+                    // "(no integration)"); only ownership and money start from zero.
                     srcDoc = await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, ID.unique(), {
                         qrId: sourceQrId,
                         type: holdDoc.type,
                         companyName: holdDoc.companyName,
+                        ...(holdDoc.integrationName ? { integrationName: holdDoc.integrationName } : {}),
                         fileId: freshFileId,
                         imageUrl: freshImageUrl,
                         assignedUserId: null,
