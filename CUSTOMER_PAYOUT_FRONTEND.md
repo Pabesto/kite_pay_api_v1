@@ -1201,6 +1201,10 @@ data; hide Paid/Reject/Adjust/Mark-added/Delete).
 - `409 Payout wallet is busy…` — transient (a concurrent operation on the same wallet). Retry once.
 - `409 Request was already resolved` — another admin got there first; refresh the row.
 - `422` on preview/request — commission rate misconfigured for this user or their parent; block submit.
+  Includes `Admin commission rate is not configured for this account. Please contact support.` — the
+  admin's share (the parent's rate, or the account's own rate when it has no parent, e.g. a subadmin
+  withdrawing for itself) is 0. Every charged withdrawal must earn admin > 0; the subadmin's share may
+  be 0. Wallet transfers with `payout_wallet_charge_payin_commission` off are exempt (they are free by design).
 - Rejected request: the hold is gone, so "Request again" must go through the normal create flow
   (re-checks balance and current commission).
 - The withdrawal `utrNumber` for wallet rows is a `pwt_…` ledger id — label it "Wallet ref", not "UTR".

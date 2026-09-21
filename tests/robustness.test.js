@@ -533,17 +533,13 @@ describe('POST /withdraw_new — commission rate bounds', () => {
                 if (colId === 'withdrawal_col') {
                     return Promise.resolve({ documents: [], total: 0 }); // no pending
                 }
-                // getUserMeta for user and parent
-                const isParentQuery = queries && queries.some
-                    && queries.some(q => q.toString().includes('parentId'));
+                // getUserMeta for user and parent (the parent lookup queries by 'parent1')
+                const isParentQuery = !!(queries && queries.some && queries.some(q => q.toString().includes('parent1')));
 
                 return Promise.resolve({
-                    documents: [{
-                        $id: 'umeta1',
-                        userId: 'user1',
-                        commission: userCommission,
-                        parentId: parentCommission > 0 ? 'parent1' : null,
-                    }],
+                    documents: [isParentQuery
+                        ? { $id: 'pmeta1', userId: 'parent1', commission: parentCommission, parentId: null }
+                        : { $id: 'umeta1', userId: 'user1', commission: userCommission, parentId: parentCommission > 0 ? 'parent1' : null }],
                     total: 1,
                 });
             }),
@@ -569,10 +565,18 @@ describe('POST /withdraw_new — commission rate bounds', () => {
         expect(res.body.error).toMatch(/commission rate/i);
     });
 
-    test('User commission rate of 0 (valid) does NOT trigger 422', async () => {
+    test('User commission rate of 0 with no parent (admin share 0) → 422', async () => {
+        // The admin's share can never be 0 on a charged withdrawal (a subadmin created with the
+        // create-user default of commission:0 could otherwise withdraw for free until the rate is set).
         const app = makeAppWithUser(0);
         const res = await request(app).post('/withdraw_new').send(baseBody);
-        // Should pass commission check (may fail later on amount mismatch — that's fine)
+        expect(res.status).toBe(422);
+        expect(res.body.error).toMatch(/Admin commission rate is not configured/);
+    });
+
+    test('User commission rate of 0 WITH a parent rate (subadmin share 0, admin share > 0) is allowed', async () => {
+        const app = makeAppWithUser(0, 2);
+        const res = await request(app).post('/withdraw_new').send(baseBody);
         expect(res.status).not.toBe(422);
     });
 

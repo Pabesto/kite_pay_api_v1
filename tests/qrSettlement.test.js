@@ -26,7 +26,7 @@ jest.mock('../configManager', () => ({
 }));
 jest.mock('../scripts/transactionStatusMailer', () => ({ sendMerchantHoldEmail: jest.fn() }));
 jest.mock('../dashboardCounters', () => ({ init: jest.fn(), updateDashboardCounter: jest.fn().mockResolvedValue() }));
-let mockMetaDoc = { userId: 'user1', role: 'user', parentId: null, commission: 0 };
+let mockMetaDoc = { userId: 'user1', role: 'user', parentId: null, commission: 1 }; // 1% admin share (0 is rejected)
 jest.mock('../userMetaCache', () => ({ getUserMeta: jest.fn(async () => mockMetaDoc), invalidate: jest.fn() }));
 
 const DAILY = 'daily_qr', RELEASES = 'qr_daily_releases', QRS = 'qr_col', WD = 'withdrawal_col', USERS = 'users_meta';
@@ -74,7 +74,7 @@ function freshSettlement(db) {
 beforeEach(() => {
     jest.clearAllMocks();
     for (const k of Object.keys(mockConfig)) delete mockConfig[k];
-    mockMetaDoc = { userId: 'user1', role: 'user', parentId: null, commission: 0 };
+    mockMetaDoc = { userId: 'user1', role: 'user', parentId: null, commission: 1 };
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -345,7 +345,7 @@ describe('the withdrawal endpoint honours the release', () => {
     function build(releases = []) {
         mockConfig.qr_daily_release_max_percent = 50;
         mockConfig.max_withdrawal_requests = 99;
-        const db = makeDb({ [QRS]: [QR()], [DAILY]: daily({ qr1: 400000 }), [RELEASES]: releases, [USERS]: [{ $id: 'u', userId: 'user1', commission: 0 }] });
+        const db = makeDb({ [QRS]: [QR()], [DAILY]: daily({ qr1: 400000 }), [RELEASES]: releases, [USERS]: [{ $id: 'u', userId: 'user1', commission: 1 }] });
         const asUser = (req, _r, next) => { req.user = { userId: 'user1', role: 'user', $id: 'user1', labels: [] }; next(); };
         let router;
         jest.isolateModules(() => {
@@ -358,35 +358,39 @@ describe('the withdrawal endpoint honours the release', () => {
         const app = express(); app.use(express.json()); app.use('/', router);
         return { db, app };
     }
-    const ask = (app, rs) => request(app).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: rs, amount: rs, commission: 0 });
+    // 1% commission is charged on top, so a request for `pre` paise needs pre + ceil(pre/100) of room.
+    const ask = (app, prePaise) => {
+        const commission = Math.ceil(prePaise / 100);
+        return request(app).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: prePaise / 100, amount: (prePaise + commission) / 100, commission: commission / 100 });
+    };
+    // largest preAmount whose principal + commission fits in `cap` paise
+    const maxPre = (cap) => { let p = Math.floor(cap * 100 / 101); while (p + 1 + Math.ceil((p + 1) / 100) <= cap) p++; return p; };
 
     test('without a release, today\'s pay-in is held back', async () => {
-        const { app } = build();
-        expect((await ask(app, 1000)).status).toBe(200);              // ₹1,000 ≤ ₹1,000 free
-        const over = await ask(app, 1000.01);
+        expect((await ask(build().app, maxPre(100000))).status).toBe(200);   // fits in the ₹1,000 free
+        const over = await ask(build().app, maxPre(100000) + 1);
         expect(over.status).toBe(400);
         expect(over.body.error).toMatch(/exceeds available balance/i);
     });
 
     test('with a release, exactly that much more becomes withdrawable — and not a paise beyond', async () => {
-        const { app } = build([{ $id: 'r1', qrId: 'qr1', date: istToday(), releasedPaise: 200000 }]);
-        expect((await ask(app, 3000)).status).toBe(200);              // ₹1,000 + ₹2,000 released
-        const over = await ask(app, 0.01);                            // ledger now has ₹3,000 requested
-        expect(over.status).toBe(400);
+        const release = () => [{ $id: 'r1', qrId: 'qr1', date: istToday(), releasedPaise: 200000 }];
+        expect((await ask(build(release()).app, maxPre(300000))).status).toBe(200);   // ₹1,000 + ₹2,000 released
+        expect((await ask(build(release()).app, maxPre(300000) + 1)).status).toBe(400);
     });
 
     test('a release can never let more out than the QR actually holds', async () => {
         // released far beyond today's pay-in: the ceiling is still the available balance
         const { app } = build([{ $id: 'r1', qrId: 'qr1', date: istToday(), releasedPaise: 99999999 }]);
-        expect((await ask(app, 5000)).status).toBe(200);              // the whole ₹5,000 available
-        const over = await ask(app, 0.01);
+        expect((await ask(app, maxPre(500000))).status).toBe(200);              // the whole ₹5,000 available
+        const over = await ask(app, 1);
         expect(over.status).toBe(400);
     });
 
     test('a release for yesterday does not loosen today', async () => {
         const { app } = build([{ $id: 'r1', qrId: 'qr1', date: '2020-01-01', releasedPaise: 400000 }]);
-        expect((await ask(app, 1000)).status).toBe(200);
-        expect((await ask(app, 0.01)).status).toBe(400);
+        expect((await ask(app, maxPre(100000))).status).toBe(200);
+        expect((await ask(app, 1)).status).toBe(400);
     });
 });
 

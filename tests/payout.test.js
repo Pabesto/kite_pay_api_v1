@@ -2279,9 +2279,9 @@ describe('withdraw.js — mode:wallet', () => {
 
     test('direct withdrawal is still capped, and pending wallet rows do not count toward the cap', async () => {
         const db = makeDb({ 'qr_col': [QR()], 'withdrawal_col': [pendingBank('a'), { ...pendingBank('w'), mode: 'wallet' }] }); // 1 direct + 1 wallet pending
-        userMetaCache.getUserMeta.mockResolvedValue({ $id: 'user1', userId: 'user1', commission: 0, parentId: null });
+        userMetaCache.getUserMeta.mockResolvedValue({ $id: 'user1', userId: 'user1', commission: 5, parentId: null });
         const app = buildWithdraw(db, makeRedis(), jest.fn());
-        const body = { userId: 'user1', qrId: 'qr1', holderName: 'A', mode: 'upi', upiId: 'a@ybl', amount: 10, preAmount: 10, commission: 0 };
+        const body = { userId: 'user1', qrId: 'qr1', holderName: 'A', mode: 'upi', upiId: 'a@ybl', amount: 10.5, preAmount: 10, commission: 0.5 };
         expect((await request(app).post('/withdraw_new').send(body)).status).toBe(200); // 1 direct pending < cap 2
         const capped = await request(app).post('/withdraw_new').send(body);            // now 2 direct pending
         expect(capped.status).toBe(400);

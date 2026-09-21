@@ -427,6 +427,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           if (totalCommissionRate > 100) {
             return res.status(422).json({ error: 'Combined commission rate exceeds 100%. Please contact support.' });
           }
+          // The ADMIN's share can never be 0 on a charged withdrawal; the subadmin's share may be.
+          // Admin's share = the parent's rate when the account has a parent, else the account's own rate
+          // (a subadmin withdrawing for itself — see the approve-time split). Closes the create-user
+          // default of commission:0 being usable before an admin has set the rate. Wallet transfers with
+          // the charge switch OFF are deliberately free and skip this.
+          const adminCommissionRate = usrDet.parentId ? parentCommissionRate : userCommissionRate;
+          if (!zeroWalletRates && usrDet.role !== 'admin' && adminCommissionRate <= 0) {
+            return res.status(422).json({ error: 'Admin commission rate is not configured for this account. Please contact support.' });
+          }
 
           const recalculatedCommissionPaise = calculateCommissionPaise(preAmountPaise, totalCommissionRate);
           const recalculatedCommissionRs = recalculatedCommissionPaise / 100;

@@ -20,7 +20,7 @@ jest.mock('../dashboardCounters', () => ({ init: jest.fn(), updateDashboardCount
 const META = {
     user1: { $id: 'user1', userId: 'user1', role: 'user', name: 'Ramesh Stores', parentId: 'sub1', commission: 0 },
     admin1: { $id: 'admin1', userId: 'admin1', role: 'admin', name: 'Ops Admin' },
-    sub1: { $id: 'sub1', userId: 'sub1', role: 'subadmin', name: 'Sub One', parentId: null, commission: 0 },
+    sub1: { $id: 'sub1', userId: 'sub1', role: 'subadmin', name: 'Sub One', parentId: null, commission: 2 }, // admin share 2% (0 is rejected)
 };
 jest.mock('../userMetaCache', () => ({ getUserMeta: jest.fn(async (id) => META[id] || null), invalidate: jest.fn() }));
 
@@ -73,7 +73,7 @@ function build(emit) {
     return { db, app };
 }
 const ask = (app, rs = 1000) => request(app).post('/withdraw_new')
-    .send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'ramesh@ybl', holderName: 'Ramesh', preAmount: rs, amount: rs, commission: 0 });
+    .send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'ramesh@ybl', holderName: 'Ramesh', preAmount: rs, amount: rs * 1.02, commission: rs * 0.02 });
 
 beforeEach(() => { for (const k of Object.keys(mockConfig)) delete mockConfig[k]; });
 
@@ -93,7 +93,7 @@ describe('withdrawal:update', () => {
         });
         expect(call.payload.withdrawal).toMatchObject({
             withdrawalId: res.body.data.id, userId: 'user1', qrId: 'qr1', mode: 'upi', status: 'pending',
-            amountRs: 1000, preAmountRs: 1000, commissionRs: 0, amountPaise: 100000, preAmountPaise: 100000, commissionPaise: 0,
+            amountRs: 1020, preAmountRs: 1000, commissionRs: 20, amountPaise: 102000, preAmountPaise: 100000, commissionPaise: 2000,
             holderName: 'Ramesh',
         });
         for (const secret of ['upiId', 'accountNumber', 'ifscCode', 'bankName']) expect(call.payload.withdrawal).not.toHaveProperty(secret);
