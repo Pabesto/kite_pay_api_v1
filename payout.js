@@ -24,10 +24,15 @@ const { updateDashboardCounter } = require('./dashboardCounters');
 // Applied when a users_meta doc has no payoutCommission at all (null/undefined). An explicit 0 stays 0.
 // Admin-tunable via config key `default_payout_commission` (type double); fallback 1.5%.
 const DEFAULT_PAYOUT_COMMISSION = 1.5;
-const defaultPayoutCommission = () => {
-  const v = Number(ConfigManager.get('default_payout_commission', DEFAULT_PAYOUT_COMMISSION));
-  return isFinite(v) && v >= 0 && v <= 100 ? v : DEFAULT_PAYOUT_COMMISSION;
+// Payin twin (`default_payin_commission`, fallback 2.2%): admin.js stamps it on every account whose
+// payin rate flows to admin (subadmins, admin-created users) at create-user. Read here only for the
+// settings screen — withdraw.js never falls back to it (a missing rate there is a real 0 and is refused).
+const DEFAULT_PAYIN_COMMISSION = 2.2;
+const defaultRate = (key, fallback) => {
+  const v = Number(ConfigManager.get(key, fallback));
+  return isFinite(v) && v >= 0 && v <= 100 ? v : fallback;
 };
+const defaultPayoutCommission = () => defaultRate('default_payout_commission', DEFAULT_PAYOUT_COMMISSION);
 
 const CURSOR_RE = /^[a-zA-Z0-9_:-]{1,255}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
@@ -303,6 +308,8 @@ module.exports = (
       // ON = a QR → payout-wallet transfer is charged the payin commission like any withdrawal, and a
       // revert back to the QR refunds it. OFF = transfers are free (original behaviour).
       walletTransferChargesPayinCommission: parseBool(ConfigManager.get('payout_wallet_charge_payin_commission', false), false),
+      // Rates (%) stamped on NEW accounts at create-user when their cut flows to admin (§6.5a). Existing users are not touched.
+      defaultCommission: { payin: defaultRate('default_payin_commission', DEFAULT_PAYIN_COMMISSION), payout: defaultPayoutCommission() },
       alerts: {
         enabled: parseBool(ConfigManager.get('payout_alerts_enabled', false), false),
         lowBalanceThresholdPaise: cfgRupeesPaise('payout_low_balance_threshold'),
@@ -1319,13 +1326,17 @@ module.exports = (
   //   requireVerifiedAccount                   → payout_require_verified_account
   //   alertsEnabled, lowBalanceThreshold, pendingAlertMinutes → payout_alerts_enabled / payout_low_balance_threshold / payout_pending_alert_minutes
   //   maxPerRequest, dailyLimit, maxPending    → payout_max_per_request / payout_daily_limit / payout_max_pending
+  //   defaultPayinCommission, defaultPayoutCommission (percent 0–100) → default_payin_commission / default_payout_commission
   router.patch('/admin/settings', adminEdit, async (req, res) => {
     try {
       adminOnly(req);
       const b = req.body || {};
       const bool = (k) => { if (b[k] === undefined) return null; if (typeof b[k] !== 'boolean') throw fail(400, `${k} must be true or false`); return b[k] ? 'true' : 'false'; };
       const nonNeg = (k) => { if (b[k] === undefined || b[k] === null) return null; const n = Number(b[k]); if (!isFinite(n) || n < 0) throw fail(400, `${k} must be a number >= 0`); return String(n); };
+      const percent = (k) => { if (b[k] === undefined || b[k] === null) return null; const n = Number(b[k]); if (!isFinite(n) || n < 0 || n > 100) throw fail(400, `${k} must be a number between 0 and 100`); return String(n); };
       const writes = {
+        default_payin_commission: percent('defaultPayinCommission'),
+        default_payout_commission: percent('defaultPayoutCommission'),
         customer_payouts_enabled: bool('enabled'),
         customer_payouts_disabled_message: b.message !== undefined ? String(b.message || '').trim().slice(0, 200) : null,
         payout_realtime_enabled: bool('realtimeEnabled'),

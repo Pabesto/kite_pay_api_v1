@@ -736,6 +736,7 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
   "customerPayouts": { "enabled": true, "message": "Customer payouts are temporarily disabled…" },
   "modes": { "NEFT": true, "IMPS": true, "RTGS": false, "UPI": true },   // per-mode availability
   "walletTransferChargesPayinCommission": false,   // see §3.1 and §12
+  "defaultCommission": { "payin": 2.2, "payout": 1.5 },   // % stamped on NEW accounts whose cut flows to admin (see below)
   "realtimeEnabled": true,
   "requireVerifiedAccount": false,
   "alerts": { "enabled": false, "lowBalanceThresholdPaise": 0, "pendingAlertMinutes": 0 },
@@ -746,13 +747,22 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
 { "enabled": false, "message": "Bank maintenance till 6 PM",   // pause everyone (message ≤200 shown to users)
   "modes": { "RTGS": false },                                   // partial: only the modes you send change; keys NEFT/IMPS/RTGS/UPI, boolean
   "walletTransferChargesPayinCommission": true,                 // ⚠️ changes what the app must send on a wallet transfer (§3.1, §12)
+  "defaultPayinCommission": 2.2, "defaultPayoutCommission": 1.5, // percent 0–100; 400 outside that range
   "realtimeEnabled": true,                                      // live socket updates on/off for the whole platform
   "requireVerifiedAccount": false,                              // only verified beneficiaries may be paid
   "alertsEnabled": true, "lowBalanceThreshold": 500, "pendingAlertMinutes": 60,   // §6.8; 0 = that alert off
   "maxPerRequest": 1000, "dailyLimit": 0, "maxPending": 2 }     // platform limits; 0 = no limit
 ```
 → the same shape as GET. `400` on a wrong type or a negative number. Build a settings screen with
-toggles and number fields; label every numeric field "0 = no limit". Add a "Payout modes" row with
+toggles and number fields; label every numeric field "0 = no limit".
+
+**Default commission** (`defaultCommission`) — show two percent fields under a "New-account
+commission" heading with this note: *"Applied when an account is created. The rate on an account is
+the cut that goes to its parent — or to admin when it has none. So a **subadmin** (and a user admin
+creates directly) starts at these rates, which go to admin; a **user created by a subadmin** starts
+at 0 / 0 (the subadmin's own cut — raise it via edit-user; admin's cut comes from the subadmin's
+own rate). Changing these never touches existing accounts."* The server refuses any withdrawal whose
+admin share is 0% (§8), so these fields are what keeps a new subadmin from withdrawing for free. Add a "Payout modes" row with
 four switches (NEFT / IMPS / RTGS / UPI) bound to `modes`; switching one off hides nothing for admin
 but greys the mode out for users and subadmins (§4.1a). Switching all four off is allowed and
 behaves like a pause with a per-mode message.

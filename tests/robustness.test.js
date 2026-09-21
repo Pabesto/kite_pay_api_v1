@@ -651,9 +651,10 @@ describe('GET /dashboard/user/:userId — payout block', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /create-user — commission defaults. Both rates are the cut that flows to the new user's
-// PARENT, so a subadmin-created user must start at 0/0 (the subadmin earns nothing off their own
-// user until they set a rate); an admin-created user keeps the platform payout default.
+// POST /create-user — commission defaults. Both rates are the cut that flows to the new account's
+// PARENT — or to ADMIN when there is none. A subadmin-created user must start at 0/0 (the subadmin
+// earns nothing off their own user until they set a rate); every other account starts at the platform
+// defaults (default_payin_commission 2.2 / default_payout_commission 1.5) so admin is never on 0%.
 // Explicit 0 is load-bearing: payout.js reads payoutCommission with `??`, so null would silently
 // re-apply the default.
 describe('create-user commission defaults', () => {
@@ -674,11 +675,31 @@ describe('create-user commission defaults', () => {
         expect(created(db).payoutCommission).toBe(0);           // strictly 0 — never null/undefined
     });
 
-    test('admin creates a user → commission 0, payoutCommission = platform default (1.5), no parent', async () => {
+    test('admin creates a user → platform defaults 2.2 / 1.5 (its rates flow to admin), no parent', async () => {
         const db = makeDb();
         const app = buildAdminApp(db, makeRedis(), asAdmin, fakeUsers());
         const res = await request(app).post('/create-user').send({ name: 'Ramesh', email: 'r@x.in', password: 'secret12', role: 'user' });
         expect(res.status).toBe(201);
-        expect(created(db)).toMatchObject({ role: 'user', parentId: null, commission: 0, payoutCommission: 1.5 });
+        expect(created(db)).toMatchObject({ role: 'user', parentId: null, commission: 2.2, payoutCommission: 1.5 });
+    });
+
+    test('admin creates a subadmin → platform defaults 2.2 / 1.5 (the 19-Sep hole: a 0% subadmin could withdraw free)', async () => {
+        const db = makeDb();
+        const app = buildAdminApp(db, makeRedis(), asAdmin, fakeUsers());
+        const res = await request(app).post('/create-user').send({ name: 'Company', email: 'c@x.in', password: 'secret12', role: 'subadmin' });
+        expect(res.status).toBe(201);
+        expect(created(db)).toMatchObject({ role: 'subadmin', parentId: null, commission: 2.2, payoutCommission: 1.5 });
+    });
+
+    test('config keys override the fallbacks; an out-of-range value falls back', async () => {
+        const ConfigManager = require('../configManager');
+        const orig = ConfigManager.get;
+        ConfigManager.get = (k, d) => ({ default_payin_commission: '3', default_payout_commission: '250' }[k] ?? d);
+        try {
+            const db = makeDb();
+            const app = buildAdminApp(db, makeRedis(), asAdmin, fakeUsers());
+            await request(app).post('/create-user').send({ name: 'Company', email: 'c@x.in', password: 'secret12', role: 'subadmin' });
+            expect(created(db)).toMatchObject({ commission: 3, payoutCommission: 1.5 });
+        } finally { ConfigManager.get = orig; }
     });
 });

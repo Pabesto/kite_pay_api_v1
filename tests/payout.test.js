@@ -1469,7 +1469,11 @@ describe('realtime events (platform toggle + user opt-out)', () => {
     test('admin settings PATCH writes every toggle/limit key; GET reflects them', async () => {
         const ConfigManager = require('../configManager');
         const { app } = buildPayout(makeDb(), makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).patch('/admin/settings').send({ realtimeEnabled: false, requireVerifiedAccount: true, alertsEnabled: true, lowBalanceThreshold: 500, pendingAlertMinutes: 30, maxPerRequest: 1000, dailyLimit: 0, maxPending: 3 });
+        const res = await request(app).patch('/admin/settings').send({ realtimeEnabled: false, requireVerifiedAccount: true, alertsEnabled: true, lowBalanceThreshold: 500, pendingAlertMinutes: 30, maxPerRequest: 1000, dailyLimit: 0, maxPending: 3, defaultPayinCommission: 2.5, defaultPayoutCommission: 1 });
+        expect(ConfigManager.set).toHaveBeenCalledWith('default_payin_commission', '2.5');
+        expect(ConfigManager.set).toHaveBeenCalledWith('default_payout_commission', '1');
+        expect((await request(app).patch('/admin/settings').send({ defaultPayinCommission: 101 })).status).toBe(400);
+        expect((await request(app).get('/admin/settings')).body.defaultCommission).toEqual({ payin: 2.2, payout: 1.5 }); // fallbacks when unset
         expect(res.status).toBe(200);
         const written = Object.fromEntries(ConfigManager.set.mock.calls);
         expect(written).toMatchObject({ payout_realtime_enabled: 'false', payout_require_verified_account: 'true', payout_alerts_enabled: 'true', payout_low_balance_threshold: '500', payout_pending_alert_minutes: '30', payout_max_per_request: '1000', payout_daily_limit: '0', payout_max_pending: '3' });

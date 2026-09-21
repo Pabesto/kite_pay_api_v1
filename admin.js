@@ -93,6 +93,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         return moment().utc().format('YYYY-MM-DDTHH:mm:ss.SSS[Z]');
     }
 
+    // Platform default commission rate (%) from config; an unparseable/out-of-range value falls back.
+    function defaultRate(key, fallback) {
+        const v = Number(ConfigManager.get(key, fallback));
+        return isFinite(v) && v >= 0 && v <= 100 ? v : fallback;
+    }
+
     function isExportTimeAllowed() {
         const windows = [
             { from: '09:00 AM', to: '10:00 AM' },
@@ -393,14 +399,16 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 parentId: creatorId,
                 status: true,
                 // Commission rates (%). `commission` = payin rate on withdrawals, `payoutCommission` =
-                // customer-payout rate; each is the cut that flows to the user's PARENT (their subadmin)
-                // — the parent's own rate flows to admin regardless. A user a subadmin creates therefore
-                // starts at 0 on both: the subadmin earns nothing off their own user until they
-                // deliberately set a rate (edit-user allows it). Admin-created users keep the platform
-                // default for payouts. Explicit 0 is honoured downstream (`??`, never `||`) — do not
-                // "simplify" it to null, that would silently re-apply the default.
-                commission: 0,
-                payoutCommission: req.user.role === 'subadmin' ? 0 : Number(ConfigManager.get("default_payout_commission", 1.5)), // Customer Payout rate (%), see payout.js
+                // customer-payout rate; each is the cut that flows to the account's PARENT — and when
+                // there is no parent (a subadmin, or a user admin created directly) it flows to ADMIN.
+                // So: a user a subadmin creates starts at 0/0 (the subadmin earns nothing off their own
+                // user until they set a rate via edit-user; admin's cut comes from the subadmin's own
+                // doc). Every other account starts at the platform defaults so admin is never
+                // accidentally on 0% (config `default_payin_commission` / `default_payout_commission`,
+                // fallback 2.2 / 1.5 — withdraw.js refuses a withdrawal whose admin share is 0).
+                // Explicit 0 is honoured downstream (`??`, never `||`) — do not "simplify" it to null.
+                commission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payin_commission', 2.2),
+                payoutCommission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payout_commission', 1.5), // Customer Payout rate (%), see payout.js
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
