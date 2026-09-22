@@ -281,17 +281,22 @@ fee            = ceil(earlySlice × (userRate + parentRate) / 100)   // paise, r
 ```
 
 So a withdrawal fully covered by older money pays nothing, and one that dips into today's released
-money pays only on the dip. Rates are percentages with the same meaning as the payin rate: the user's
-own `earlyReleaseCommission` is the subadmin's markup when the user has a parent, the parent's is admin's
-share; an account with no parent pays its own rate to admin. A missing rate means the platform default
-`default_early_release_commission` (**0 until admin sets it — the fee is off by default**).
+money pays only on the dip. **The fee is admin's alone.** Unlike the payin rate there is no subadmin
+markup: a subadmin never earns a share of it, whoever the user hangs under. The `rate` is one percentage,
+the user's own `earlyReleaseCommission` (set by admin = admin's rate for that user), or, when the user
+has none, the platform default `default_early_release_commission` (**0 until admin sets it — the fee is
+off by default**). A subadmin's own `earlyReleaseCommission` only matters for the subadmin's own
+withdrawals, never for their users'.
 
 **Admin controls**
 - Platform default rate: `PATCH /api/payout/admin/settings { "defaultEarlyReleaseCommission": 1 }`; shown at
   `GET /api/payout/admin/settings` as `defaultCommission.earlyRelease`.
-- Per-user rate: `PUT /api/admin/edit-user/:id { "earlyReleaseCommission": 0.5 }`; every user list/profile
-  returns `earlyReleaseCommission` next to `commission` and `payoutCommission`. Assigning a user to a subadmin
-  resets it to 0 (the subadmin's markup); unassigning clears it back to the platform default.
+- Per-user rate: `PUT /api/admin/edit-user/:id { "earlyReleaseCommission": 0.5 }` — **admin only** (a
+  subadmin sending it gets `403 Only admin can set the early release commission`, since it is admin's own
+  earning). Every user list/profile returns `earlyReleaseCommission` next to `commission` and
+  `payoutCommission` (the platform default when the user has none). It is never re-stamped on create-user
+  or on assign/unassign: the value means the same thing wherever the user sits. Show it on the edit-user
+  screen as a read-only field for subadmins.
 - Per release: the `chargeCommission` flag on `PUT …/release` (§6.2). Show it as a checkbox in the release
   dialog, default on. `GET …/qr-settlement/:qrId` returns it inside `release.chargeCommission`.
 

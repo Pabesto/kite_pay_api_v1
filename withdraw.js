@@ -80,9 +80,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
   // that an admin's T+0 release made withdrawable — money that without the release would still be held
   // until tomorrow. Priced at request time from the live settlement row, held in commissionOnHold with
   // the payin commission, and earned at approve. The release row's `chargeCommission` (admin's choice
-  // per release) and a rate of 0 both make it free. Rates live on users_meta.earlyReleaseCommission with
-  // the payin semantics (parent's rate = admin share, own rate = subadmin markup); a missing value means
-  // the config default `default_early_release_commission` (fallback 0 = feature off until admin sets it).
+  // per release) and a rate of 0 both make it free. UNLIKE payin, the fee is ADMIN's alone: a subadmin
+  // never earns a share of it, whoever the user hangs under. The rate is the user's own
+  // users_meta.earlyReleaseCommission (admin-set, = admin's rate for that user) or, when missing, the
+  // config default `default_early_release_commission` (fallback 0 = feature off until admin sets it).
   const PAYIN_ROLLUPS = { daily: APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, monthly: APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, allTime: APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID };
   function defaultEarlyRate() {
     const v = Number(ConfigManager.get('default_early_release_commission', 0));
@@ -95,12 +96,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
     const portionPaise = Math.min(Number(settle.releasedPaise), Math.max(0, requestedTotalPaise - withoutRelease));
     if (portionPaise <= 0) return none;
-    const def = defaultEarlyRate();
-    const userRate = Number(usrDet?.earlyReleaseCommission ?? def);
-    const parentRate = usrDet?.parentId ? Number((await getUserMeta(usrDet.parentId))?.earlyReleaseCommission ?? def) : 0;
-    const rate = userRate + parentRate;
-    if (!isFinite(rate) || userRate < 0 || parentRate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };
-    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate, parentRate, rate };
+    // One rate, admin's: the user's own value (admin-set) or the platform default. No parent lookup —
+    // the subadmin's share is always 0 by design.
+    const rate = Number(usrDet?.earlyReleaseCommission ?? defaultEarlyRate());
+    if (!isFinite(rate) || rate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };
+    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate: rate, parentRate: 0, rate };
   }
 
   function generateWithdrawalId() {
@@ -1427,25 +1427,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         }
 
-        // Early-release fee → its OWN commission rows (commissionType:'early_release'), counters and
-        // rollups, so it never blends into the payin figures. Same request-time-snapshot routing as payin:
-        // parent rate → admin; own rate → the live parent only if one exists and the parent rate > 0.
+        // Early-release fee → its OWN commission row (commissionType:'early_release'), counter and
+        // rollups, so it never blends into the payin figures. ADMIN earns all of it, whoever the user
+        // hangs under (no subadmin split, by design): one row = exactly the fee the ledger was debited.
         const earlyPortionPaise = Number(w.earlyReleasePortionPaise || 0);
         const earlyFeePaise = Math.round((w.earlyReleaseCommission || 0) * 100);
-        if (user && earlyPortionPaise > 0 && earlyFeePaise > 0) {
-          const snapU = Number(w.earlyUserRate || 0), snapP = Number(w.earlyParentRate || 0);
-          const liveParentE = user.parentId ? await getUserMeta(user.parentId) : null;
-          const earlyTxs = [];
-          const at = new Date().toISOString();
-          if (liveParentE && snapP > 0) {
-            const subAmt = calculateCommissionPaise(earlyPortionPaise, snapU);
-            if (subAmt > 0) { earlyTxs.push({ userId: liveParentE.userId, sourceWithdrawalId: w.id, amount: subAmt, commissionRate: snapU, earningType: 'subadmin', commissionType: 'early_release', createdAt: at }); await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseMerchantProfit', subAmt).catch(console.error); }
-            if (admin) { const admAmt = calculateCommissionPaise(earlyPortionPaise, snapP); if (admAmt > 0) { earlyTxs.push({ userId: admin.userId, sourceWithdrawalId: w.id, amount: admAmt, commissionRate: snapP, earningType: 'admin', commissionType: 'early_release', createdAt: at }); await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', admAmt).catch(console.error); } }
-          } else if (admin) {
-            // one row = exactly the fee the ledger was debited (single ceil on the combined rate)
-            earlyTxs.push({ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: snapU + snapP, earningType: 'admin', commissionType: 'early_release', createdAt: at });
-            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', earlyFeePaise).catch(console.error);
-          }
+        if (admin && earlyPortionPaise > 0 && earlyFeePaise > 0) {
+          const earlyTxs = [{ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: Number(w.earlyUserRate || 0), earningType: 'admin', commissionType: 'early_release', createdAt: new Date().toISOString() }];
+          await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', earlyFeePaise).catch(console.error);
           for (const tx of earlyTxs) await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, ID.unique(), tx);
           try {
             if (!earlyRelease?.daily) throw new Error('early-release rollup collections not configured');

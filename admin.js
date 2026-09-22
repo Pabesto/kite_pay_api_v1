@@ -421,10 +421,9 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // Explicit 0 is honoured downstream (`??`, never `||`) — do not "simplify" it to null.
                 commission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payin_commission', 2.2),
                 payoutCommission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payout_commission', 1.5), // Customer Payout rate (%), see payout.js
-                // Early-release fee rate (%): a subadmin's own user starts at 0 (their markup); every other
-                // account is NOT stamped, so the live config default `default_early_release_commission`
-                // applies until admin sets a per-user value (withdraw.js earlyFeeFor reads it with `??`).
-                ...(req.user.role === 'subadmin' ? { earlyReleaseCommission: 0 } : {}),
+                // Early-release fee rate (%) is deliberately NOT stamped: it is ADMIN's fee for every user
+                // (a subadmin never earns a share), so the live config default applies until admin sets a
+                // per-user value via edit-user (withdraw.js earlyFeeFor reads it with `??`).
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
@@ -583,7 +582,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (hadParent !== willHaveParent) {
                 update.commission = willHaveParent ? 0 : defaultRate('default_payin_commission', 2.2);
                 update.payoutCommission = willHaveParent ? 0 : defaultRate('default_payout_commission', 1.5);
-                update.earlyReleaseCommission = willHaveParent ? 0 : null; // null = live config default (admin share)
             }
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, current.$id, update);
             await userMetaCache.invalidate(userId);
@@ -656,8 +654,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         updatePayload.payoutCommission = payoutNum;
         }
         // Early-release fee rate (%), charged on the slice of a withdrawal that an admin T+0 release made
-        // withdrawable (withdraw.js earlyFeeFor). Same parent semantics as `commission`.
+        // withdrawable (withdraw.js earlyFeeFor). It is ADMIN's fee for this user — no subadmin share —
+        // so only admin may set it (a subadmin could otherwise zero admin's own earnings on their users).
         if (earlyReleaseCommission !== undefined) {
+        if (userRequested.role !== 'admin') {
+            return res.status(403).json({ error: 'Only admin can set the early release commission' });
+        }
         const earlyNum = Number(earlyReleaseCommission);
         if (isNaN(earlyNum) || earlyNum < 0 || earlyNum > 100) {
             return res.status(400).json({ error: 'Early release commission must be a number between 0 and 100' });

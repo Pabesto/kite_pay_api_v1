@@ -1,7 +1,8 @@
 /**
  * Early-release fee (withdraw.js earlyFeeFor) + bank-account insta credit (qrSettlement holdEnabled) — pins:
  *   • the fee is priced ONLY on the slice of a withdrawal that today's admin release makes withdrawable
- *     (min(released, requested − withdrawable-without-release)), rounded up, at user + parent rates
+ *     (min(released, requested − withdrawable-without-release)), rounded up, at ONE rate that is admin's:
+ *     the user's own earlyReleaseCommission (admin-set) or the platform default — a subadmin never earns a share
  *   • preview and /withdraw_new agree; the client must echo the fee (400 on mismatch); it is held in
  *     commissionOnHold with the payin commission, earned at approve, freed at reject
  *   • approve writes SEPARATE commission rows (commissionType 'early_release'), separate counters and
@@ -100,7 +101,7 @@ const seedQr = (release = { releasedPaise: 100000 }) => ({
     [QR_RELEASES]: release ? [{ $id: 'r1', qrId: 'qr1', date: today(), changeCount: 1, historyJson: '[]', ...release }] : [],
 });
 // ₹1,000 out; payin 3% (user 1 + parent 2) = ₹30. The early slice = min(₹1,000 released, ₹1,030 − ₹500) = ₹530;
-// early rate 2% (user 0.5 + parent 1.5) → ceil(53000 × 2%) = 1060 paise = ₹10.60.
+// admin's early-release rate for user1 is 2% → ceil(53000 × 2%) = 1060 paise = ₹10.60, all of it admin's.
 const preview = (app) => request(app).post('/user/withdraw_commission_preview').set(as('user1')).send({ userId: 'user1', qrId: 'qr1', preAmount: 1000 });
 const wd = (app, over = {}) => request(app).post('/user/withdraw_new').set(as('user1')).send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: 1000, commission: 30, amount: 1030, ...over });
 const approve = (app, id) => request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id, utrNumber: 'UTR123456' });
@@ -112,8 +113,9 @@ beforeEach(() => {
     counters.length = 0;
     mockConfig.max_withdrawal_requests = 99;
     META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin' };
-    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 1.5 };
-    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 0.5 };
+    // sub1's own earlyReleaseCommission is irrelevant to user1's fee — it is admin's rate for user1 (2%).
+    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 9 };
+    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 2 };
 });
 
 describe('early-release fee on withdrawals', () => {
@@ -134,7 +136,7 @@ describe('early-release fee on withdrawals', () => {
 
         const ok = await wd(app, { earlyReleaseCommission: 10.6, amount: 1040.6 });
         expect(ok.status).toBe(200);
-        expect(ok.body.data).toMatchObject({ commission: 30, earlyReleaseCommission: 10.6, earlyReleasePortionPaise: 53000, earlyUserRate: 0.5, earlyParentRate: 1.5 });
+        expect(ok.body.data).toMatchObject({ commission: 30, earlyReleaseCommission: 10.6, earlyReleasePortionPaise: 53000, earlyUserRate: 2, earlyParentRate: 0 });
         expect(qr(db)).toMatchObject({ withdrawalRequestedAmount: 100000, commissionOnHold: 4060, amountAvailableForWithdrawal: 95940 });
     });
 
@@ -146,15 +148,15 @@ describe('early-release fee on withdrawals', () => {
         expect(rows(db)).toEqual([
             { userId: 'sub1', amount: 1000, rate: 1, type: 'subadmin', kind: null },
             { userId: 'admin1', amount: 2000, rate: 2, type: 'admin', kind: null },
-            { userId: 'sub1', amount: 265, rate: 0.5, type: 'subadmin', kind: 'early_release' },   // ceil(53000 × 0.5%)
-            { userId: 'admin1', amount: 795, rate: 1.5, type: 'admin', kind: 'early_release' },    // ceil(53000 × 1.5%)
+            { userId: 'admin1', amount: 1060, rate: 2, type: 'admin', kind: 'early_release' },     // the whole fee, admin only — sub1 gets no early row
         ]);
-        expect(counters).toEqual(expect.arrayContaining([['totalMerchantProfit', 1000], ['totalAdminProfit', 2000], ['totalEarlyReleaseMerchantProfit', 265], ['totalEarlyReleaseAdminProfit', 795]]));
+        expect(counters).toEqual(expect.arrayContaining([['totalMerchantProfit', 1000], ['totalAdminProfit', 2000], ['totalEarlyReleaseAdminProfit', 1060]]));
+        expect(counters.find(([k]) => k === 'totalEarlyReleaseMerchantProfit')).toBeUndefined();
         // payin rollups untouched by the fee; the fee has its own three rollups
         expect(JSON.parse(db.store[DAILY_COMM][0].commissionsJson)).toEqual({ sub1: 1000, admin1: 2000 });
-        expect(JSON.parse(db.store[EARLY_DAILY][0].commissionsJson)).toEqual({ sub1: 265, admin1: 795 });
-        expect(db.store[EARLY_ALLTIME].map((r) => [r.userId, r.totalCommissionPaise])).toEqual([['sub1', 265], ['admin1', 795]]);
-        expect(db.store[EARLY_MONTHLY].map((r) => [r.userId, r.totalCommissionPaise])).toEqual([['sub1', 265], ['admin1', 795]]);
+        expect(JSON.parse(db.store[EARLY_DAILY][0].commissionsJson)).toEqual({ admin1: 1060 });
+        expect(db.store[EARLY_ALLTIME].map((r) => [r.userId, r.totalCommissionPaise])).toEqual([['admin1', 1060]]);
+        expect(db.store[EARLY_MONTHLY].map((r) => [r.userId, r.totalCommissionPaise])).toEqual([['admin1', 1060]]);
         expect(db.store[ALLTIME_COMM].map((r) => [r.userId, r.totalCommissionPaise])).toEqual([['sub1', 1000], ['admin1', 2000]]);
         expect(JSON.parse(db.store[DAILY_QR_WD][0].totalsJson)).toEqual({ qr1: { direct: { paidPaise: 100000, commissionPaise: 3000, earlyReleaseCommissionPaise: 1060, count: 1 } } });
     });
@@ -176,15 +178,15 @@ describe('early-release fee on withdrawals', () => {
         expect(qr(db).commissionOnHold).toBe(3000);
     });
 
-    test('no rates set anywhere → 0% (fee off by default); a config default applies to users without their own rate', async () => {
-        delete META.user1.earlyReleaseCommission; delete META.sub1.earlyReleaseCommission;
+    test('no rate on the user → config default (0 = fee off); the subadmin\'s own rate never matters', async () => {
+        delete META.user1.earlyReleaseCommission;            // sub1 still has 9% — must be ignored
         const { app } = build(seedQr());
         expect((await preview(app)).body.earlyReleaseCommissionPaise).toBe(0);
         expect((await wd(app)).status).toBe(200);
 
-        mockConfig.default_early_release_commission = 1;     // admin sets 1% platform-wide: user 1% + parent 1% = 2%
+        mockConfig.default_early_release_commission = 1;     // admin sets 1% platform-wide → ceil(53000 × 1%) = 530
         const { app: app2 } = build(seedQr());
-        expect((await preview(app2)).body).toMatchObject({ earlyReleaseCommissionPaise: 1060, earlyReleaseRate: 2 });
+        expect((await preview(app2)).body).toMatchObject({ earlyReleaseCommissionPaise: 530, earlyReleaseRate: 1 });
     });
 
     test('a request fully covered without the release pays nothing; one that dips into it pays only on the dip', async () => {
