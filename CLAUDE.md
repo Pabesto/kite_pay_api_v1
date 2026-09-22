@@ -175,7 +175,7 @@ Response shapes — there is deliberately **no single envelope**; match the near
 - Lists: `{ <pluralNoun>: docs, nextCursor }` or `{ success, total, nextCursor, records }` per family. Summaries: `{ days, grandTotalPaise, grandTotalRs, … }`. Merchant API: `{ success: bool, message/error, data }`.
 - Always project documents through an explicit pick/whitelist function before responding (`pickTxn`, `simplifiedUsers`, …) — never return raw Appwrite docs from list endpoints.
 
-Route modules are factory functions taking long **positional** dependency lists from server.js (9–42 args; admin.js takes 43, payout.js 26, withdraw.js 31, bankAccounts.js 16). New dependency = **append to the end** of the factory signature. Any signature change (even an append) must update, in the same commit: the `app.use(...)` mount in server.js **and every test file that constructs the router** (grep `require('../<file>` under `tests/`). Inserting mid-list silently shifts every later argument — this has already broken the test suite once (see Testing bar).
+Route modules are factory functions taking long **positional** dependency lists from server.js (9–42 args; admin.js takes 44, payout.js 26, withdraw.js 31, bankAccounts.js 16). New dependency = **append to the end** of the factory signature. Any signature change (even an append) must update, in the same commit: the `app.use(...)` mount in server.js **and every test file that constructs the router** (grep `require('../<file>` under `tests/`). Inserting mid-list silently shifts every later argument — this has already broken the test suite once (see Testing bar).
 
 ## Sockets
 

@@ -271,6 +271,44 @@ Withdrawals on bank accounts still emit the normal `withdrawal:update` (with `ba
 
 `avgTxAmount`, `netFlow` and the other derived roll-ups now include the bank channel.
 
+### 10.1 What `netFlow` is, and `netBreakdown`
+
+`netFlow = totalAmountReceived − totalPaidOut` — every rupee that came in through QR **and** bank
+pay-ins, minus every rupee that actually left the platform (direct withdrawals to merchants' banks or
+UPI, plus customer payouts). Money moved into payout wallets is *not* "left" until a customer payout is
+paid. So `netFlow` is **everything still on the platform**: merchant balances *and* our commissions.
+
+`netBreakdown` says exactly where that money sits, summed live from the QR and bank-account ledgers:
+
+```jsonc
+"netBreakdown": {
+  "netFlowPaise": 12345600, "netFlowRs": 123456,
+  "qr":   { "count": 42, "totalPayInPaise": …, "withdrawalApprovedPaise": …, "pendingWithdrawalPaise": …, "onHoldPaise": …,
+            "commissionOnHoldPaise": …, "commissionPaidPaise": …, "availablePaise": …, "balancePaise": … },
+  "bank": { …same keys over bank_accounts… },
+  "payoutWallet": { "balancePaise": …, "customerPayoutPendingPaise": … },
+  "commission": { "payinAdminPaise": …, "payinMerchantPaise": …, "payoutAdminPaise": …, "payoutMerchantPaise": …,
+                  "earlyReleaseAdminPaise": …, "earlyReleaseMerchantPaise": …,
+                  "adminTotalPaise": …, "merchantTotalPaise": …, "totalPaise": … },
+  "merchantBalancePaise": …,        // qr.balance + bank.balance + payoutWallet.balance
+  "explainedPaise": …, "explainedRs": …,   // merchantBalance + commission.total
+  "unexplainedPaise": 0             // netFlow − explained
+}
+```
+
+| Piece | Meaning |
+|---|---|
+| `qr.balancePaise` / `bank.balancePaise` | merchant money still on those ledgers = `availablePaise` (withdrawable, subject to T+1) + `pendingWithdrawalPaise` (requested, not yet approved) + `onHoldPaise` (flagged transactions) + `commissionOnHoldPaise` (commission reserved for pending withdrawals) |
+| `qr.commissionPaidPaise` / `bank.commissionPaidPaise` | commission already earned from that ledger (payin + early-release); shown for reference, already inside `commission.totalPaise` |
+| `payoutWallet.balancePaise` | float sitting in payout wallets (including amounts held for pending customer payouts) |
+| `commission.*` | the three earnings pots split admin / subadmin: payin (withdrawals), customer payout, early release |
+| `merchantBalancePaise` | what we owe merchants in total |
+| `explainedPaise` | `merchantBalancePaise + commission.totalPaise` — should equal `netFlowPaise` |
+| `unexplainedPaise` | the gap. 0 or a few paise of rounding is normal. A large value means a counter and a ledger disagree (a failed counter increment, a manual ledger edit, a deleted transaction whose reversal went wrong) — surface it as a warning tile |
+
+Suggested tile: **Net on platform** = `netFlowRs`, with a drill-down showing QR balance, bank balance,
+wallet float, commission, and the unexplained gap.
+
 ---
 
 ## 11. Config keys (admin, `POST /api/admin/config`)

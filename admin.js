@@ -91,7 +91,7 @@ function deriveDashboardTotals(get) {
     };
 }
 
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -4402,6 +4402,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // Derived roll-ups (see deriveDashboardTotals at the top of this file)
             ...deriveDashboardTotals(get),
+            // WHERE netFlow sits — an exact decomposition from the live ledgers (see ledgerTotals)
+            netBreakdown: await netBreakdown(get),
             };
 
             return res.status(200).json(payload);
@@ -5075,6 +5077,52 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             return res.status(500).json({ message: 'Failed to build user dashboard', error: e.message });
         }
     });
+
+    // Sum the seven ledger fields over every doc of a ledger collection (qr_codes or bank_accounts —
+    // "_hold" archives included, they still hold real balances). `balancePaise` = merchant money still
+    // sitting on the ledger: available + pending withdrawals + on-hold + commission-on-hold.
+    // ponytail: full scan per dashboard read, like reportGroups(); cache if the tables grow past a few thousand.
+    async function ledgerTotals(colId) {
+        const docs = colId ? await listAllDocuments(APPWRITE_DATABASE_ID, colId, [Query.limit(100), Query.orderAsc('$id')]) : [];
+        const t = { count: docs.length, totalPayInPaise: 0, withdrawalApprovedPaise: 0, pendingWithdrawalPaise: 0, onHoldPaise: 0, commissionOnHoldPaise: 0, commissionPaidPaise: 0, availablePaise: 0 };
+        for (const d of docs) {
+            t.totalPayInPaise += Number(d.totalPayInAmount || 0);
+            t.withdrawalApprovedPaise += Number(d.withdrawalApprovedAmount || 0);
+            t.pendingWithdrawalPaise += Number(d.withdrawalRequestedAmount || 0);
+            t.onHoldPaise += Number(d.amountOnHold || 0);
+            t.commissionOnHoldPaise += Number(d.commissionOnHold || 0);
+            t.commissionPaidPaise += Number(d.commissionPaid || 0);
+            t.availablePaise += Number(d.amountAvailableForWithdrawal || 0);
+        }
+        t.balancePaise = t.availablePaise + t.pendingWithdrawalPaise + t.onHoldPaise + t.commissionOnHoldPaise;
+        return t;
+    }
+    // netFlow (= pay-ins − money that left the platform) decomposed into what still holds it:
+    //   netFlow ≈ qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise
+    // The three balances are merchant money (QR ledgers, bank ledgers, payout-wallet float, including the
+    // commission held against pending withdrawals); commission.totalPaise is the platform's earnings
+    // (payin, customer-payout and early-release pots, admin + subadmin). `unexplainedPaise` is the gap
+    // between netFlow and that sum — normally 0 or a few paise of ceil rounding; a large value means a
+    // counter and a ledger disagree (a failed counter increment, or a manual ledger edit) and is worth a look.
+    async function netBreakdown(get) {
+        const [qr, bank] = await Promise.all([ledgerTotals(APPWRITE_QRCODE_COLLECTION_ID), ledgerTotals(APPWRITE_BANK_ACCOUNTS_COLLECTION_ID)]);
+        const d = deriveDashboardTotals(get);
+        const commission = {
+            payinAdminPaise: get('totalAdminProfit'), payinMerchantPaise: get('totalMerchantProfit'),
+            payoutAdminPaise: get('totalPayoutAdminProfit'), payoutMerchantPaise: get('totalPayoutMerchantProfit'),
+            earlyReleaseAdminPaise: get('totalEarlyReleaseAdminProfit'), earlyReleaseMerchantPaise: get('totalEarlyReleaseMerchantProfit'),
+            adminTotalPaise: d.totalAdminProfitAll, merchantTotalPaise: d.totalMerchantProfitAll, totalPaise: d.totalPlatformProfit,
+        };
+        const payoutWallet = { balancePaise: get('totalPayoutWalletBalance'), customerPayoutPendingPaise: get('totalCustomerPayoutPendingAmount') };
+        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise;
+        return {
+            netFlowPaise: d.netFlow, netFlowRs: d.netFlow / 100,
+            qr, bank, payoutWallet, commission,
+            merchantBalancePaise: qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise,
+            explainedPaise, explainedRs: explainedPaise / 100,
+            unexplainedPaise: d.netFlow - explainedPaise,
+        };
+    }
 
     async function listAllDocuments(dbId, colId, baseQueries, pageSize = 100) {
         let out = [];
