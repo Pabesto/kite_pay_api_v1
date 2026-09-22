@@ -47,7 +47,7 @@ const REF_RE = /^[A-Z0-9-]{6,40}$/;                 // UTR / reference number, s
 const CURSOR_RE = /^[a-zA-Z0-9_:-]{1,255}$/;
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const FILE_ID_RE = /^[a-zA-Z0-9_.-]{1,64}$/;
-const ACCOUNT_TYPES = ['savings', 'current'];
+const ACCOUNT_TYPES = ['savings', 'current', 'corporate'];
 const TXN_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'];
 const LOCK_TTL_LEDGER = 15, LOCK_TTL_REVIEW = 20, LOCK_TTL_DELETE = 20, LOCK_TTL_HOLD_RESET = 180;
 const LEDGER_FIELDS = ['totalTransactions', 'totalPayInAmount', 'withdrawalRequestedAmount', 'withdrawalApprovedAmount', 'amountAvailableForWithdrawal', 'amountOnHold', 'commissionOnHold', 'commissionPaid'];

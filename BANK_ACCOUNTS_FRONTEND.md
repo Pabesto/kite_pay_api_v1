@@ -84,7 +84,7 @@ recompute it. `t1HoldApplies` is `false` while the admin switch `bank_account_in
 |---|---|---|---|
 | `GET /` | admin, employee `view_bank_acs`, subadmin | `?limit≤100 &cursor &isActive=true|false &assignedUserId &bankAcId` | `{ bankAccounts: [Account], nextCursor }` |
 | `GET /user/:userId` | the user themselves, their subadmin, admin, employee | `?limit &cursor` | `{ bankAccounts, nextCursor }` |
-| `POST /` | admin | `{ bankAcId, bankName, accountHolderName, ifscCode, accountType: "savings"\|"current", upiId?, notes?, perTxnLimit?, dailyLimit? }` (limits in rupees) | `201 { message, bankAccount }` · `409` duplicate number |
+| `POST /` | admin | `{ bankAcId, bankName, accountHolderName, ifscCode, accountType: "savings"\|"current"\|"corporate", upiId?, notes?, perTxnLimit?, dailyLimit? }` (limits in rupees; accountType is case-insensitive, stored lower-case) | `201 { message, bankAccount }` · `409` duplicate number |
 | `PATCH /:bankAcId` | admin | any of `bankName, accountHolderName, ifscCode, accountType, upiId, notes, perTxnLimit, dailyLimit` — **not** `bankAcId` (400) | `{ message, bankAccount }` |
 | `PUT /:bankAcId/status` | admin, employee `toggle_bank_acs` | `{ isActive: boolean }` | `{ message, isActive }` |
 | `DELETE /:bankAcId` | admin | — | `{ message }` · `400` while assigned, claims/withdrawals pending, or balance > 0 |
