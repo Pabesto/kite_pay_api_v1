@@ -736,7 +736,8 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
   "customerPayouts": { "enabled": true, "message": "Customer payouts are temporarily disabled…" },
   "modes": { "NEFT": true, "IMPS": true, "RTGS": false, "UPI": true },   // per-mode availability
   "walletTransferChargesPayinCommission": false,   // see §3.1 and §12
-  "defaultCommission": { "payin": 2.2, "payout": 1.5 },   // % stamped on NEW accounts whose cut flows to admin (see below)
+  "defaultCommission": { "payin": 2.2, "payout": 1.5, "earlyRelease": 0 },   // % — payin/payout stamped on NEW accounts; earlyRelease = live default for the early-release fee (0 = off), see QR_SETTLEMENT_FRONTEND.md §6.5
+  "bankAccountInstaCredit": false,                 // true = approved bank-account pay-ins are withdrawable at once (no T+1, no early release), see BANK_ACCOUNTS_FRONTEND.md §7
   "realtimeEnabled": true,
   "requireVerifiedAccount": false,
   "alerts": { "enabled": false, "lowBalanceThresholdPaise": 0, "pendingAlertMinutes": 0 },
@@ -748,6 +749,8 @@ Rows are sorted highest earner first. Subadmins always get just their own row. U
   "modes": { "RTGS": false },                                   // partial: only the modes you send change; keys NEFT/IMPS/RTGS/UPI, boolean
   "walletTransferChargesPayinCommission": true,                 // ⚠️ changes what the app must send on a wallet transfer (§3.1, §12)
   "defaultPayinCommission": 2.2, "defaultPayoutCommission": 1.5, // percent 0–100; 400 outside that range
+  "defaultEarlyReleaseCommission": 1,                           // percent 0–100; the early-release fee rate for users without their own (0 = fee off)
+  "bankAccountInstaCredit": true,                               // bank-account pay-ins: true = credited instantly, false = T+1 + early release like QRs
   "realtimeEnabled": true,                                      // live socket updates on/off for the whole platform
   "requireVerifiedAccount": false,                              // only verified beneficiaries may be paid
   "alertsEnabled": true, "lowBalanceThreshold": 500, "pendingAlertMinutes": 60,   // §6.8; 0 = that alert off

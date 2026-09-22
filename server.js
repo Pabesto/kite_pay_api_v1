@@ -50,6 +50,7 @@ const axisWorldlineRoutes = require('./axisWorldline'); // Axis Worldline LIVE i
 const extensionCaptureRoutes = require('./extensionCapture'); // PhonePe/BharatPe rows from the browser extensions — LIVE money path (full ingest choreography)
 const extensionAlertsRoutes = require('./extensionAlerts'); // PhonePe/BharatPe extension health alerts + heartbeats — NOT a money path
 const payoutRoutes = require('./payout'); // Customer Payout: payout wallet + customer payouts + payout commission — LIVE money path
+const bankAccountsRoutes = require('./bankAccounts'); // Bank Account pay-ins (manual claims → admin approve) — LIVE money path, own tables
 
 const fs = require('fs');
 const path = require('path');
@@ -127,6 +128,18 @@ const APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY
 const APPWRITE_DAILY_WITHDRAWAL_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_WITHDRAWAL_SUMMARIES_COLLECTION_ID || 'daily_withdrawal_summaries';
 // One row per (qrId, IST day): how much of that day's pay-in an admin released early (T+0).
 const APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID = process.env.APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID || 'qr_daily_releases';
+// Bank Account pay-in channel (bankAccounts.js) — its own tables, never qr_codes/webhook_data.
+// Schema: scripts/setup-bank-accounts-schema.js. Contract: BANK_ACCOUNTS_FRONTEND.md.
+const APPWRITE_BANK_ACCOUNTS_COLLECTION_ID = process.env.APPWRITE_BANK_ACCOUNTS_COLLECTION_ID || 'bank_accounts';
+const APPWRITE_BANK_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_BANK_TRANSACTIONS_COLLECTION_ID || 'bank_transactions';
+const APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID || 'daily_bankac_summaries';
+const APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID = process.env.APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID || 'bankac_daily_releases';
+const APPWRITE_DAILY_BANKAC_WITHDRAWAL_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_BANKAC_WITHDRAWAL_SUMMARIES_COLLECTION_ID || 'daily_bankac_withdrawal_summaries';
+// Early-release fee rollups (withdraw.js) — the third commission pot, same shapes as the payin rollups,
+// own tables so the earnings show separately. Schema: scripts/setup-early-release-commission-schema.js.
+const APPWRITE_DAILY_EARLY_RELEASE_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_EARLY_RELEASE_COMMISSION_SUMMARIES_COLLECTION_ID || 'daily_early_release_commissions';
+const APPWRITE_MONTHLY_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_MONTHLY_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID || 'monthly_early_release_totals';
+const APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID = process.env.APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID || 'all_time_early_release_totals';
 const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
 
 // Razorpay webhook secret (from dashboard → Settings → Webhooks)
@@ -565,9 +578,15 @@ async function releaseLock(key, value) {
     memRelease(key, value);
 }
 
+// The Redis-maintained counters (atomic INCRBY; flushed to / re-seeded from Appwrite below).
+// The first three are the QR/API channel; the bank pair is written only by bankAccounts.js, so a
+// re-seed of totalAmountReceived from webhook_data stays exact. The dashboard's totalAmountReceived
+// is the SUM of totalAmountReceived (QR) + totalBankAmountReceived (admin.js).
+const REDIS_COUNTERS = ['totalTxCount', 'totalApiTx', 'totalAmountReceived', 'totalBankAcTxCount', 'totalBankAmountReceived'];
+
 // On startup: seed Redis counters from Appwrite if Redis is empty (e.g. after a restart)
 async function syncCountersFromAppwrite() {
-    const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
+    const counterNames = REDIS_COUNTERS;
     try {
         // Check which counters are missing in Redis
         const missing = [];
@@ -603,7 +622,7 @@ async function flushCountersToAppwrite() {
         // Redis missed increments — re-seed from Appwrite to avoid overwriting with stale values
         console.warn('Counters marked stale — re-syncing from Appwrite instead of flushing');
         try {
-            const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
+            const counterNames = REDIS_COUNTERS;
             const list = await databases.listDocuments(
                 APPWRITE_DATABASE_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID,
                 [Query.equal('id', counterNames), Query.limit(counterNames.length)]
@@ -623,7 +642,7 @@ async function flushCountersToAppwrite() {
 
     if (!redisClient.countersDirty) return; // nothing changed since last flush
 
-    const counterNames = ['totalTxCount', 'totalApiTx', 'totalAmountReceived'];
+    const counterNames = REDIS_COUNTERS;
     try {
         // Single batch query to get all counter doc IDs
         const list = await databases.listDocuments(
@@ -652,6 +671,11 @@ dashboardCounters.init({ APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID });
 qrSettlement.init({ databases, Query, APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID });
 // Day-wise withdrawal report rollup — withdraw.js writes it at approve, admin.js reads it.
 withdrawalSummary.init({ databases, Query, ID, redisClient, APPWRITE_DATABASE_ID, APPWRITE_DAILY_WITHDRAWAL_SUMMARIES_COLLECTION_ID });
+// Bank-account twins of the two above: same formulas, own tables, keyed by bankAcId (bankAccounts.js,
+// withdraw.js `bankAc` source, payout.js revert). Never mix these with the QR instances.
+const bankSettlement = qrSettlement.create({ databases, Query, APPWRITE_DATABASE_ID, dailySummariesCollectionId: APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID, releasesCollectionId: APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID, keyField: 'bankAcId', label: 'bank account',
+  instaCreditKey: 'bank_account_insta_credit' }); // config true = approved bank pay-ins withdrawable at once (no T+1, no early release)
+const bankWithdrawalSummary = withdrawalSummary.create({ databases, Query, ID, redisClient, APPWRITE_DATABASE_ID, collectionId: APPWRITE_DAILY_BANKAC_WITHDRAWAL_SUMMARIES_COLLECTION_ID, keyField: 'bankAcId', lockPrefix: 'lock:bankac:withdrawal:daily:' });
 
 // Init qrOwnerCache — maps each QR code to the single subadmin who owns it, so every
 // transaction can be stamped with `ownerSubadminId` at write time and partners can
@@ -962,15 +986,21 @@ const finalizeTransaction = require('./transactionFinalize')({
 app.use('/api', qrCodeRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID));
+app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID));
 
 // Admin routes use the admin authentication middleware
 // Customer Payout module — built before the withdraw mount because /withdrawals/approve_new
 // credits mode:'wallet' withdrawals through payout.creditWalletFromWithdrawal.
-const payout = payoutRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID, authenticateToken, authenticateAdminOrLabel, redisClient, APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, emitPayoutEvent, APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID);
+const payout = payoutRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_PAYOUT_WALLET_TRANSACTIONS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUT_ACCOUNTS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_COMMISSION_SUMMARIES_COLLECTION_ID, authenticateToken, authenticateAdminOrLabel, redisClient, APPWRITE_MONTHLY_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, emitPayoutEvent, APPWRITE_PAYOUT_SOURCE_ACCOUNTS_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_DAILY_PAYOUT_SUMMARIES_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID);
 app.use('/api/payout', payout.router);
 
-app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, payout.creditWalletFromWithdrawal, emitWithdrawalEvent));
+app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, payout.creditWalletFromWithdrawal, emitWithdrawalEvent,
+  { collectionId: APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, settlement: bankSettlement, withdrawalSummary: bankWithdrawalSummary }, // 30th: bank-account ledger source (bankAcId on /withdraw_new)
+  { daily: APPWRITE_DAILY_EARLY_RELEASE_COMMISSION_SUMMARIES_COLLECTION_ID, monthly: APPWRITE_MONTHLY_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, allTime: APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID })); // 31st: early-release fee rollups
+
+// Bank Account pay-ins — accounts, payment claims, approve/reject, reports, T+0 release, hold-and-reset.
+// 16 positional args (see the header of bankAccounts.js); tests/bankAccounts.test.js mirrors this call.
+app.use('/api/bank-acs', bankAccountsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, APPWRITE_BANK_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, redisClient, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, emitWithdrawalEvent, bankSettlement, bankWithdrawalSummary));
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));

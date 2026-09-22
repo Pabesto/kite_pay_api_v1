@@ -27,6 +27,7 @@ const RENAME = {
   createEnumAttribute: 'createEnumColumn',
   createDatetimeAttribute: 'createDatetimeColumn',
   updateEnumAttribute: 'updateEnumColumn',
+  updateStringAttribute: 'updateStringColumn',
   getAttribute: 'getColumn',
   createIndex: 'createIndex',
 };

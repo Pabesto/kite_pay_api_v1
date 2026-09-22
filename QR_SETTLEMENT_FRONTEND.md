@@ -167,6 +167,7 @@ the day can never add up past the ceiling.
 | `percent` | release this share of the day's pay-in | `expectedTodayPayInPaise` |
 | `amount` | make the total release this many **rupees** (`0` revokes) | nothing, guards recommended |
 | `addAmount` | release this many **rupees more** on top of the current release | `expectedReleasedPaise` |
+| `chargeCommission` | optional boolean, default `true`: charge the **early-release fee** (§6.5) on withdrawals that use this release; `false` = release is free of the fee | — |
 
 **The slider (recommended).** Range `0` to `maxPercent`, stepping in whole percent. Show the rupee
 value live as `todayPayInPaise × percent ÷ 100`, rounded **down**, which is exactly what the server
@@ -265,6 +266,71 @@ Cursor pagination, default 25 and max 100 per page, same as every other list. Us
 today" screen so there is one place to review the day's decisions.
 
 ---
+
+### 6.5 Early-release fee (new)
+
+A **third commission**, separate from the payin and payout ones, that a merchant pays for taking money
+out **before** T+1. It is charged only on the slice of a withdrawal that the admin's release made
+withdrawable — money that without the release would still be held until tomorrow:
+
+```
+withoutRelease = max(0, availablePaise − todayPayInPaise)          // what could go out with no release
+requested      = preAmountPaise + payinCommissionPaise
+earlySlice     = min(releasedPaise, max(0, requested − withoutRelease))
+fee            = ceil(earlySlice × (userRate + parentRate) / 100)   // paise, rounded UP like every commission
+```
+
+So a withdrawal fully covered by older money pays nothing, and one that dips into today's released
+money pays only on the dip. Rates are percentages with the same meaning as the payin rate: the user's
+own `earlyReleaseCommission` is the subadmin's markup when the user has a parent, the parent's is admin's
+share; an account with no parent pays its own rate to admin. A missing rate means the platform default
+`default_early_release_commission` (**0 until admin sets it — the fee is off by default**).
+
+**Admin controls**
+- Platform default rate: `PATCH /api/payout/admin/settings { "defaultEarlyReleaseCommission": 1 }`; shown at
+  `GET /api/payout/admin/settings` as `defaultCommission.earlyRelease`.
+- Per-user rate: `PUT /api/admin/edit-user/:id { "earlyReleaseCommission": 0.5 }`; every user list/profile
+  returns `earlyReleaseCommission` next to `commission` and `payoutCommission`. Assigning a user to a subadmin
+  resets it to 0 (the subadmin's markup); unassigning clears it back to the platform default.
+- Per release: the `chargeCommission` flag on `PUT …/release` (§6.2). Show it as a checkbox in the release
+  dialog, default on. `GET …/qr-settlement/:qrId` returns it inside `release.chargeCommission`.
+
+**Client contract on withdrawals — this changes what you send.** The commission preview now returns the
+fee, and `/withdraw_new` requires you to echo it:
+
+```jsonc
+// POST /api/user/withdraw_commission_preview  { userId, qrId | bankAcId, preAmount, mode? }
+{ "commissionRs": 30, "commissionRate": 3, "preAmount": 1000,
+  "earlyReleaseCommissionRs": 10.6, "earlyReleaseCommissionPaise": 1060, "earlyReleaseRate": 2, "earlyReleasePortionPaise": 53000,
+  "totalAmount": 1040.6 }                      // preAmount + commission + earlyReleaseCommission
+
+// POST /api/user/withdraw_new — send all three figures from the preview
+{ "userId": "…", "qrId": "…", "mode": "upi", "upiId": "…", "holderName": "…",
+  "preAmount": 1000, "commission": 30, "earlyReleaseCommission": 10.6, "amount": 1040.6 }
+```
+
+- `earlyReleaseCommission` may be omitted when the preview said `0` (every existing client keeps working
+  while the fee is off). When a fee applies and it is missing or wrong → `400 Early release commission
+  mismatch. Re-run the commission preview and try again.` with `earlyReleaseCommissionPaise` in the body.
+- `amount` must equal `preAmount + commission + earlyReleaseCommission` → otherwise `400 Amount mismatch…`
+  (the body carries `hint` and the fee when one applies). Re-run the preview and resubmit.
+- The fee is held with the payin commission (`commissionOnHold`), earned at approve (`commissionPaid`),
+  freed at reject. It is **not refunded** when payout-wallet money is later reverted to the QR: the early
+  release was already used.
+
+**Where it shows**
+- Withdrawal rows (`withdrawals_paginated`, `user_withdrawals_paginated`, `withdrawal:update`) carry
+  `earlyReleaseCommission` (rupees) and `earlyReleasePortionPaise`, beside `commission`.
+- Day-wise withdrawal reports (`/api/admin/withdrawal-summary`, `/api/bank-acs/withdrawal-summary`) carry
+  `earlyReleaseCommissionPaise` on every row that has one, beside `commissionPaise`.
+- Dashboard (`/api/admin/dashboard/counters`): `totalEarlyReleaseAdminProfit`, `totalEarlyReleaseMerchantProfit`,
+  `totalEarlyReleaseProfit`; the `…ProfitAll` roll-ups now include this pot. Subadmin dashboard:
+  `totalEarlyReleaseMerchantProfit`.
+- Commission ledger: `GET /api/admin/commissions?commissionType=early_release` (or `payin`) filters the rows;
+  early rows carry `commissionType: "early_release"`.
+- Bank accounts: identical rules on `/api/bank-acs/:bankAcId/release` and on bank withdrawals — unless
+  `bank_account_insta_credit` is on, in which case bank accounts hold nothing, so there is no release and no
+  fee (see `BANK_ACCOUNTS_FRONTEND.md`).
 
 ## 7. The cap, and one gotcha
 

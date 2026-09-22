@@ -57,12 +57,16 @@ dayjs.tz.setDefault('Asia/Kolkata');
 // Customer-payout commission lives in totalPayoutAdminProfit / totalPayoutMerchantProfit
 // (payout.js on paid), so the *All roll-ups below add two disjoint pots.
 function deriveDashboardTotals(get) {
-    const received = get('totalAmountReceived');
-    const txCount = get('totalTxCount');
+    // Pay-ins across BOTH channels: QR/API (Redis counter totalAmountReceived) + bank accounts
+    // (totalBankAmountReceived, bankAccounts.js). Withdrawals from either debit totalAmountPaid.
+    const received = get('totalAmountReceived') + get('totalBankAmountReceived');
+    const txCount = get('totalTxCount') + get('totalBankAcTxCount');
     const withdrawalsToBank = get('totalAmountPaid') - get('totalPayoutWalletFunded');
     const totalPaidOut = withdrawalsToBank + get('totalCustomerPayoutPaid');
-    const totalAdminProfitAll = get('totalAdminProfit') + get('totalPayoutAdminProfit');
-    const totalMerchantProfitAll = get('totalMerchantProfit') + get('totalPayoutMerchantProfit');
+    // Three disjoint commission pots: withdrawal (payin), customer payout, and the early-release fee
+    // (withdraw.js on approve, on the slice a T+0 release made withdrawable — its own counters/rollups).
+    const totalAdminProfitAll = get('totalAdminProfit') + get('totalPayoutAdminProfit') + get('totalEarlyReleaseAdminProfit');
+    const totalMerchantProfitAll = get('totalMerchantProfit') + get('totalPayoutMerchantProfit') + get('totalEarlyReleaseMerchantProfit');
     const totalPlatformProfit = totalAdminProfitAll + totalMerchantProfitAll;
     const netFlow = received - totalPaidOut;
     return {
@@ -82,11 +86,12 @@ function deriveDashboardTotals(get) {
         walletFundedNotYetPaid: get('totalPayoutWalletFunded') - get('totalCustomerPayoutPaid'), // = wallet float + payout commission
         totalWithdrawalProfit: get('totalAdminProfit') + get('totalMerchantProfit'),
         totalPayoutProfit: get('totalPayoutAdminProfit') + get('totalPayoutMerchantProfit'),
+        totalEarlyReleaseProfit: get('totalEarlyReleaseAdminProfit') + get('totalEarlyReleaseMerchantProfit'),
         heldOnPlatform: netFlow - totalPlatformProfit,                      // netFlow with our earnings taken out; may be negative
     };
 }
 
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -232,6 +237,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 labels: doc.labels,
                 commission : doc.commission || 0,
                 payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+                earlyReleaseCommission : doc.earlyReleaseCommission ?? defaultRate('default_early_release_commission', 0), // % fee on the early-released slice of a withdrawal (null = live config default)
                 payoutDisabled : doc.payoutDisabled === true,
                 payoutDisabledReason : doc.payoutDisabledReason || null,
             }));
@@ -292,6 +298,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             labels: doc.labels,
             commission : doc.commission || 0,
             payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+                earlyReleaseCommission : doc.earlyReleaseCommission ?? defaultRate('default_early_release_commission', 0), // % fee on the early-released slice of a withdrawal (null = live config default)
             payoutDisabled : doc.payoutDisabled === true,
             payoutDisabledReason : doc.payoutDisabledReason || null,
             }));
@@ -343,6 +350,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         labels: doc.labels,
         commission : doc.commission || 0,
         payoutCommission : doc.payoutCommission ?? Number(ConfigManager.get("default_payout_commission", 1.5)),
+                earlyReleaseCommission : doc.earlyReleaseCommission ?? defaultRate('default_early_release_commission', 0), // % fee on the early-released slice of a withdrawal (null = live config default)
         payoutDisabled : doc.payoutDisabled === true,
         payoutDisabledReason : doc.payoutDisabledReason || null,
         }));
@@ -413,6 +421,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // Explicit 0 is honoured downstream (`??`, never `||`) — do not "simplify" it to null.
                 commission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payin_commission', 2.2),
                 payoutCommission: req.user.role === 'subadmin' ? 0 : defaultRate('default_payout_commission', 1.5), // Customer Payout rate (%), see payout.js
+                // Early-release fee rate (%): a subadmin's own user starts at 0 (their markup); every other
+                // account is NOT stamped, so the live config default `default_early_release_commission`
+                // applies until admin sets a per-user value (withdraw.js earlyFeeFor reads it with `??`).
+                ...(req.user.role === 'subadmin' ? { earlyReleaseCommission: 0 } : {}),
                 assigned_to: (req.user.role === 'employee' && role === 'subadmin') ? req.user.userId : null,
             };
 
@@ -571,6 +583,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (hadParent !== willHaveParent) {
                 update.commission = willHaveParent ? 0 : defaultRate('default_payin_commission', 2.2);
                 update.payoutCommission = willHaveParent ? 0 : defaultRate('default_payout_commission', 1.5);
+                update.earlyReleaseCommission = willHaveParent ? 0 : null; // null = live config default (admin share)
             }
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, current.$id, update);
             await userMetaCache.invalidate(userId);
@@ -585,7 +598,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // ✏️ Edit user endpoint ( admin/sub-admin or employee with all_users allowed )
     router.put('/edit-user/:id', authenticateAdminOrSubAdmin, async (req, res) => {
     const userIdtoEdit = req.params.id;
-    const { name, email, labels, commission, payoutCommission } = req.body;
+    const { name, email, labels, commission, payoutCommission, earlyReleaseCommission } = req.body;
     const userRequested = req.user;
 
     if (!userIdtoEdit) {
@@ -597,7 +610,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         email === undefined &&
         labels === undefined &&
         commission === undefined &&
-        payoutCommission === undefined
+        payoutCommission === undefined &&
+        earlyReleaseCommission === undefined
     ) {
         return res.status(400).json({ error: 'At least one field must be provided to update' });
     }
@@ -640,6 +654,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             return res.status(400).json({ error: 'Payout commission must be a number between 0 and 100' });
         }
         updatePayload.payoutCommission = payoutNum;
+        }
+        // Early-release fee rate (%), charged on the slice of a withdrawal that an admin T+0 release made
+        // withdrawable (withdraw.js earlyFeeFor). Same parent semantics as `commission`.
+        if (earlyReleaseCommission !== undefined) {
+        const earlyNum = Number(earlyReleaseCommission);
+        if (isNaN(earlyNum) || earlyNum < 0 || earlyNum > 100) {
+            return res.status(400).json({ error: 'Early release commission must be a number between 0 and 100' });
+        }
+        updatePayload.earlyReleaseCommission = earlyNum;
         }
 
         // Update specialized user data (name/email) and metadata in parallel
@@ -3127,6 +3150,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 filters.push(Query.equal('earningType', et));
             }
 
+            // 'early_release' rows are the early-release fee; payin rows carry no commissionType (legacy).
+            if (req.query.commissionType) {
+                const ct = String(req.query.commissionType).toLowerCase();
+                if (!['early_release', 'payin'].includes(ct)) return res.status(400).json({ error: 'Invalid commissionType' });
+                filters.push(ct === 'early_release' ? Query.equal('commissionType', 'early_release') : Query.isNull('commissionType'));
+            }
+
             if (sourceWithdrawalId) {
                 filters.push(Query.equal('sourceWithdrawalId', sourceWithdrawalId));
             }
@@ -4275,14 +4305,18 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // Redis is the source of truth for these 3.
             if (redisClient?.isReady) {
                 try {
-                    const [rTxCount, rApiTx, rAmountReceived] = await Promise.all([
+                    const [rTxCount, rApiTx, rAmountReceived, rBankTxCount, rBankAmount] = await Promise.all([
                         redisClient.get('counter:totalTxCount'),
                         redisClient.get('counter:totalApiTx'),
                         redisClient.get('counter:totalAmountReceived'),
+                        redisClient.get('counter:totalBankAcTxCount'),
+                        redisClient.get('counter:totalBankAmountReceived'),
                     ]);
                     if (rTxCount !== null) map.set('totalTxCount', Number(rTxCount));
                     if (rApiTx !== null) map.set('totalApiTx', Number(rApiTx));
                     if (rAmountReceived !== null) map.set('totalAmountReceived', Number(rAmountReceived));
+                    if (rBankTxCount !== null) map.set('totalBankAcTxCount', Number(rBankTxCount));
+                    if (rBankAmount !== null) map.set('totalBankAmountReceived', Number(rBankAmount));
                 } catch (e) {
                     console.error('Redis counter read failed, using Appwrite values:', e?.message);
                 }
@@ -4292,7 +4326,19 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const payload = {
             // Totals
             totalTxCount: get('totalTxCount'),
-            totalAmountReceived: get('totalAmountReceived'),
+            // Pay-in split by channel. totalAmountReceived stays the platform-wide figure (QR + bank) so
+            // existing tiles keep working; the two channel figures sit beside it.
+            totalAmountReceived: get('totalAmountReceived') + get('totalBankAmountReceived'),
+            totalQrAmountReceived: get('totalAmountReceived'),
+            totalBankAmountReceived: get('totalBankAmountReceived'),
+            totalBankAcTxCount: get('totalBankAcTxCount'),
+            // Bank accounts (bankAccounts.js) — paise unless *Count
+            totalBankAcsUploaded: get('totalBankAcsUploaded'),
+            totalBankAcsAssignedToMerchant: get('totalBankAcsAssignedToMerchant'),
+            bankAcsActive: get('bankAcsActive'),
+            bankAcsDisabled: get('bankAcsDisabled'),
+            totalBankAcTxPendingCount: get('totalBankAcTxPendingCount'),
+            totalBankAcTxPendingAmount: get('totalBankAcTxPendingAmount'),
             todayPayInAllQrs: todayPayInAllQrs,
             yesterdayPayInAllQrs: yesterdayPayInAllQrs,
             totalAdminProfit: get('totalAdminProfit'),
@@ -4335,6 +4381,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             totalCustomerPayoutPaidCount: get('totalCustomerPayoutPaidCount'),
             totalPayoutAdminProfit: get('totalPayoutAdminProfit'),
             totalPayoutMerchantProfit: get('totalPayoutMerchantProfit'),
+
+            // Early-release fee (withdraw.js) — the third commission pot, shown on its own
+            totalEarlyReleaseAdminProfit: get('totalEarlyReleaseAdminProfit'),
+            totalEarlyReleaseMerchantProfit: get('totalEarlyReleaseMerchantProfit'),
 
             // Users/Merchants
             activeUsers: get('activeUsers'),
@@ -4648,6 +4698,16 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     totalPayoutMerchantProfit = Number(payoutCommissionList.documents[0].totalCommissionPaise || 0);
                 }
             }
+            // Early-release fee earned by this subadmin (withdraw.js, own rollup collection)
+            let totalEarlyReleaseMerchantProfit = 0;
+            if (APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID) {
+                const earlyList = await databases.listDocuments(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID,
+                    [ Query.equal('userId', merchantId), Query.limit(1) ]
+                ).catch((e) => { console.error('early-release commission total read failed:', e?.message); return { total: 0, documents: [] }; });
+                if (earlyList.total > 0) totalEarlyReleaseMerchantProfit = Number(earlyList.documents[0].totalCommissionPaise || 0);
+            }
 
             const activeUsers = usersAll.filter(u => u.status === true && u.role === 'user').length;
             const disabledUsers = usersAll.filter(u => u.status !== true && u.role === 'user').length;
@@ -4735,6 +4795,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // --- Other ---
                 totalMerchantProfit,
                 totalPayoutMerchantProfit,   // paise, from customer payouts
+                totalEarlyReleaseMerchantProfit, // paise, early-release fee (withdraw.js)
 
                 // Users
                 activeUsers,
@@ -5115,6 +5176,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 expectedTodayPayInPaise: req.body.expectedTodayPayInPaise,
                 expectedReleasedPaise: req.body.expectedReleasedPaise,
                 reason: req.body.reason, byUserId: req.user.userId, day,
+                chargeCommission: req.body.chargeCommission, // optional: false = no early-release fee on this release
             });
             const settle = await qrSettlement.forQrDocs([qr], day);
             return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved) });

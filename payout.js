@@ -62,12 +62,22 @@ module.exports = (
   // under withdraw.js's own lock keys so the two can never race.
   WD_COMMISSION_TXNS, WD_DAILY_COMMISSION, WD_MONTHLY_COMMISSION, WD_ALLTIME_COMMISSION,
   DAILY_PAYOUT_SUMMARIES, // appended: daily_payout_summaries — per-IST-day, per-merchant paid rollup behind GET /admin/payout-summary
+  BANK_ACCOUNTS, // appended: bank_accounts (bankAccounts.js) — a mode:'wallet' withdrawal raised on a bank account (doc.bankAcId) reverts to THAT ledger, never to a QR
 ) => {
   const router = express.Router();
   if (!DAILY_PAYOUT_SUMMARIES) console.warn('⚠️  payout.js: DAILY_PAYOUT_SUMMARIES collection id not injected — the day-wise payout rollup is OFF and GET /admin/payout-summary will 500.');
 
   // ─── helpers ───────────────────────────────────────────────────────────────
   function fail(status, message) { const e = new Error(message); e.status = status; return e; }
+  // The ledger a withdrawal was raised against: a QR (qrId) or a bank account (bankAcId). Mirrors
+  // withdraw.js sourceOf() — same seven ledger fields, different collection/key/lock family.
+  function ledgerSourceOf(w) {
+    if (w?.bankAcId) {
+      if (!BANK_ACCOUNTS) throw fail(400, 'Bank account withdrawals are not configured on this server');
+      return { kind: 'bankAc', id: String(w.bankAcId), key: 'bankAcId', col: BANK_ACCOUNTS, lock: `lock:bankac:${w.bankAcId}`, label: 'Bank account', notFound: 'Bank account not found for withdrawal' };
+    }
+    return { kind: 'qr', id: String(w?.qrId || ''), key: 'qrId', col: QRCODES, lock: `lock:qr:${w?.qrId}`, label: 'QR', notFound: 'QR not found for withdrawal' };
+  }
   // Admin dashboard counters (paise / counts). Fire-and-forget: never fails the money operation.
   //   totalPayoutWalletBalance        — sum of all payout wallets' balancePaise (platform liability)
   //   totalCustomerPayoutPendingAmount / Count — customer payouts awaiting admin (amount excl. commission)
@@ -216,6 +226,10 @@ module.exports = (
       const qr = (await databases.listDocuments(DB, QRCODES, [Query.equal('qrId', String(q.qrId)), Query.limit(1)])).documents[0];
       narrow(qr?.assignedUserId ? [qr.assignedUserId] : []);
     }
+    if (q.bankAcId && BANK_ACCOUNTS) {
+      const ac = (await databases.listDocuments(DB, BANK_ACCOUNTS, [Query.equal('bankAcId', String(q.bankAcId).trim()), Query.limit(1)])).documents[0];
+      narrow(ac?.assignedUserId ? [ac.assignedUserId] : []);
+    }
     if (allowed) narrow(allowed);
     return target;
   }
@@ -309,7 +323,10 @@ module.exports = (
       // revert back to the QR refunds it. OFF = transfers are free (original behaviour).
       walletTransferChargesPayinCommission: parseBool(ConfigManager.get('payout_wallet_charge_payin_commission', false), false),
       // Rates (%) stamped on NEW accounts at create-user when their cut flows to admin (§6.5a). Existing users are not touched.
-      defaultCommission: { payin: defaultRate('default_payin_commission', DEFAULT_PAYIN_COMMISSION), payout: defaultPayoutCommission() },
+      defaultCommission: { payin: defaultRate('default_payin_commission', DEFAULT_PAYIN_COMMISSION), payout: defaultPayoutCommission(), earlyRelease: defaultRate('default_early_release_commission', 0) }, // early-release fee is OFF (0%) until admin sets it
+      // ON = an approved bank-account pay-in is withdrawable at once (no T+1, no early release on bank
+      // accounts). OFF = bank accounts hold T+1 and use early release exactly like QRs (bankAccounts.js).
+      bankAccountInstaCredit: parseBool(ConfigManager.get('bank_account_insta_credit', false), false),
       alerts: {
         enabled: parseBool(ConfigManager.get('payout_alerts_enabled', false), false),
         lowBalanceThresholdPaise: cfgRupeesPaise('payout_low_balance_threshold'),
@@ -481,7 +498,7 @@ module.exports = (
           userId: w.userId, type: 'withdrawal_credit', direction: 'credit',
           amountPaise, commissionPaise: 0, totalPaise: amountPaise,
           refType: 'withdrawal', refId: w.id, referenceNumber: null,
-          notes: `Withdrawal ${w.id} from QR ${w.qrId}`, createdBy: null,
+          notes: `Withdrawal ${w.id} from ${w.bankAcId ? `bank account ${w.bankAcId}` : `QR ${w.qrId}`}`, createdBy: null,
         },
       });
       await notify(w.userId, { type: 'wallet_changed', userId: w.userId, reason: 'withdrawal_credit', withdrawalId: w.id, amountPaise, wallet: walletView(w.userId, r.wallet) });
@@ -1341,6 +1358,8 @@ module.exports = (
       const writes = {
         default_payin_commission: percent('defaultPayinCommission'),
         default_payout_commission: percent('defaultPayoutCommission'),
+        default_early_release_commission: percent('defaultEarlyReleaseCommission'),
+        bank_account_insta_credit: bool('bankAccountInstaCredit'),
         customer_payouts_enabled: bool('enabled'),
         customer_payouts_disabled_message: b.message !== undefined ? String(b.message || '').trim().slice(0, 200) : null,
         payout_realtime_enabled: bool('realtimeEnabled'),
@@ -1813,7 +1832,7 @@ module.exports = (
         const revertedPaise = Number(w.walletRevertedPaise || 0);
         const revertablePaise = Math.max(0, creditedPaise - revertedPaise);
         return {
-          withdrawalId: w.id, qrId: w.qrId, approvedAt: w.processedAt || null, requestedAt: w.createdAt || null,
+          withdrawalId: w.id, qrId: w.qrId || null, bankAcId: w.bankAcId || null, approvedAt: w.processedAt || null, requestedAt: w.createdAt || null,
           creditedPaise, revertedPaise, revertablePaise, creditedRs: creditedPaise / 100, revertablePaise_capped: Math.min(revertablePaise, Math.max(0, wallet.availablePaise)),
           walletCreditFailed: w.walletCreditFailed === true,
         };
@@ -1852,10 +1871,11 @@ module.exports = (
       if (!found) throw fail(404, 'Withdrawal request not found');
       if (found.mode !== 'wallet') throw fail(400, 'Withdrawal is not a payout-wallet withdrawal');
       if (found.status !== 'approved') throw fail(400, `Cannot revert a ${found.status} withdrawal`);
-      if (!found.qrId || !found.userId) throw fail(400, 'Invalid withdrawal document data');
+      if ((!found.qrId && !found.bankAcId) || !found.userId) throw fail(400, 'Invalid withdrawal document data');
+      const src = ledgerSourceOf(found); // QR or bank account — the money goes back where it came from
       const ref = refId || genId('rvt_');
 
-      const result = await withLock(`lock:qr:${found.qrId}`, LOCK_TTL_QR, async () => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+      const result = await withLock(src.lock, LOCK_TTL_QR, async () => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
         const existing = refId ? await findWalletTxn('revert_to_qr', ref) : null;
         if (existing) return { duplicate: true, txn: existing, wallet: await getWallet(found.userId) };
 
@@ -1871,8 +1891,8 @@ module.exports = (
         if (amountPaise > remaining) throw fail(409, `Amount exceeds the revertable balance of this withdrawal (${remaining} paise)`);
 
         // 2. QR fresh read + new ledger values (computed before any write so both guards run first)
-        const qr = (await databases.listDocuments(DB, QRCODES, [Query.equal('qrId', w.qrId), Query.limit(1)])).documents[0];
-        if (!qr) throw fail(404, 'QR not found for withdrawal');
+        const qr = (await databases.listDocuments(DB, src.col, [Query.equal(src.key, src.id), Query.limit(1)])).documents[0];
+        if (!qr) throw fail(404, src.notFound);
         const total = Number(qr.totalPayInAmount || 0), approved = Number(qr.withdrawalApprovedAmount || 0);
         const requestedW = Number(qr.withdrawalRequestedAmount || 0), onHold = Number(qr.amountOnHold || 0);
         const commissionOnHold = Number(qr.commissionOnHold || 0), commissionPaid = Number(qr.commissionPaid || 0);
@@ -1890,13 +1910,13 @@ module.exports = (
           txn: {
             userId: w.userId, type: 'revert_to_qr', direction: 'debit', amountPaise, commissionPaise: 0, totalPaise: amountPaise,
             refType: 'withdrawal_revert', refId: ref, referenceNumber: w.id,
-            notes: `Reverted to QR ${w.qrId} (withdrawal ${w.id}): ${notes}`.slice(0, 500), createdBy: req.user.userId,
+            notes: `Reverted to ${src.label} ${src.id} (withdrawal ${w.id}): ${notes}`.slice(0, 500), createdBy: req.user.userId,
           },
         });
 
         // 4. QR credit-back: principal AND the payin commission refund, in one write
         try {
-          await databases.updateDocument(DB, QRCODES, qr.$id, { withdrawalApprovedAmount: newApproved, commissionPaid: newCommissionPaid, amountAvailableForWithdrawal: newAvailable });
+          await databases.updateDocument(DB, src.col, qr.$id, { withdrawalApprovedAmount: newApproved, commissionPaid: newCommissionPaid, amountAvailableForWithdrawal: newAvailable });
         } catch (qrErr) {
           try {
             await databases.deleteDocument(DB, WALLET_TXNS, moved.txn.$id);
@@ -1919,14 +1939,14 @@ module.exports = (
         await inc('totalAmountPaid', -amountPaise);
         return {
           duplicate: false, txn: moved.txn, wallet: moved.wallet, amountPaise,
-          remainingPaise: remaining - amountPaise, qrId: w.qrId, newQrAvailablePaise: newAvailable,
+          remainingPaise: remaining - amountPaise, qrId: w.qrId || null, bankAcId: w.bankAcId || null, newQrAvailablePaise: newAvailable,
           commissionRefundPaise, commissionReversedPaise: refund.refundedPaise, commissionRefundFailed: !!refund.failed,
         };
-      }), 'QR is currently being processed. Please try again in a moment.');
+      }), `${src.label} is currently being processed. Please try again in a moment.`);
 
-      if (!result.duplicate) await notify(found.userId, { type: 'wallet_changed', userId: found.userId, reason: 'revert_to_qr', qrId: found.qrId, amountPaise: result.amountPaise, wallet: walletView(found.userId, result.wallet) });
+      if (!result.duplicate) await notify(found.userId, { type: 'wallet_changed', userId: found.userId, reason: 'revert_to_qr', qrId: found.qrId || null, bankAcId: found.bankAcId || null, amountPaise: result.amountPaise, wallet: walletView(found.userId, result.wallet) });
       res.json({
-        success: true, duplicate: !!result.duplicate, withdrawalId: found.id, qrId: found.qrId, userId: found.userId,
+        success: true, duplicate: !!result.duplicate, withdrawalId: found.id, qrId: found.qrId || null, bankAcId: found.bankAcId || null, userId: found.userId,
         amountPaise: result.amountPaise ?? Number(result.txn.amountPaise), remainingPaise: result.remainingPaise ?? null,
         qrAvailablePaise: result.newQrAvailablePaise ?? null,
         // payin commission handed back to the QR with this revert (0 when the transfer was free)

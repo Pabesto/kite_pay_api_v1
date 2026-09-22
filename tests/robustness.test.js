@@ -797,7 +797,7 @@ describe('create-user commission defaults', () => {
         const db = assignDb(null);
         const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1' });
         expect(res.status).toBe(200);
-        expect(updated(db)).toEqual({ parentId: 'sub1', commission: 0, payoutCommission: 0 });
+        expect(updated(db)).toEqual({ parentId: 'sub1', commission: 0, payoutCommission: 0, earlyReleaseCommission: 0 }); // early-release fee: the subadmin's markup starts at 0 too
         expect(res.body).toMatchObject({ parentId: 'sub1', commission: 0, payoutCommission: 0, ratesReset: true });
     });
 
@@ -805,7 +805,7 @@ describe('create-user commission defaults', () => {
         const db = assignDb('sub1');
         const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1', unassign: true });
         expect(res.status).toBe(200);
-        expect(updated(db)).toEqual({ parentId: null, commission: 2.2, payoutCommission: 1.5 });
+        expect(updated(db)).toEqual({ parentId: null, commission: 2.2, payoutCommission: 1.5, earlyReleaseCommission: null }); // null = live config default (admin share)
         expect(res.body.ratesReset).toBe(true);
     });
 

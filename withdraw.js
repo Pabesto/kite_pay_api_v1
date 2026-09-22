@@ -23,8 +23,16 @@ const LOCK_TTL_WITHDRAW       = 15;  // Redis lock TTL (seconds) for new withdra
 // ─────────────────────────────────────────────────────────────────────────────
 
 // creditPayoutWallet(withdrawalDoc) — from payout.js; credits an approved mode:'wallet' withdrawal
-// into the user's payout wallet (idempotent). Appended last per the factory-signature rule.
-module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, creditPayoutWallet, emitWithdrawalEvent) => {
+// into the user's payout wallet (idempotent). Appended per the factory-signature rule.
+// bankAc (30th, optional) — { collectionId, settlement, withdrawalSummary } from server.js: lets a
+// withdrawal be raised against a BANK ACCOUNT ledger (bankAccounts.js) instead of a QR. The body/doc
+// carries `bankAcId` instead of `qrId`; everything else (commission, 422 zero-share rule, lock
+// choreography, wallet credit) is the same code path — see sourceOf(). undefined = bank withdrawals
+// are refused with 400.
+module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, Qr_collectionId, Withdrawal_request_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, creditPayoutWallet, emitWithdrawalEvent, bankAc, earlyRelease) => {
+  // earlyRelease (31st, optional) — { daily, monthly, allTime } collection ids for the early-release fee
+  // rollups. undefined = the fee is still charged to the ledger and its commission rows written, but no
+  // rollups (the CRITICAL log + commissionRollupFailed flag fire, exactly like a payin rollup failure).
 
   // Atomic lock release via Lua script — only deletes if value still matches ours
   const RELEASE_LOCK_SCRIPT = `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`;
@@ -37,6 +45,62 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
   function cfgBool(key, def) {
     const v = ConfigManager.get(key, def);
     return v == null ? def : !['false', '0', 'no', ''].includes(String(v).toLowerCase());
+  }
+
+  // The ledger a withdrawal draws on: a QR (qrId) or a bank account (bankAcId). Same seven ledger
+  // fields, same formula, same lock choreography — only the collection, the key field, the lock
+  // family and the settlement/report instances differ. Every route that reads a QR by qrId goes
+  // through this so a bank withdrawal can never touch the QR table.
+  function sourceOf(o) {
+    const bankAcId = o?.bankAcId ? String(o.bankAcId).trim() : '';
+    if (bankAcId) {
+      if (!bankAc?.collectionId) return { error: { status: 400, message: 'Bank account withdrawals are not configured on this server' } };
+      return {
+        kind: 'bankAc', id: bankAcId, key: 'bankAcId', col: bankAc.collectionId,
+        lock: `lock:bankac:${bankAcId}`, settlement: bankAc.settlement, summary: bankAc.withdrawalSummary,
+        notFound: 'Bank account not found for withdrawal',
+        busy: 'Bank account is currently being processed. Please try again in a moment.',
+        busyRequest: 'Another withdrawal for this bank account is being processed. Please try again.',
+        backfill: 'node scripts/backfill-withdrawal-daily-summaries.js --bank',
+      };
+    }
+    const qrId = o?.qrId ? String(o.qrId) : '';
+    return {
+      kind: 'qr', id: qrId, key: 'qrId', col: Qr_collectionId,
+      lock: `lock:qr:${qrId}`, settlement: qrSettlement, summary: withdrawalSummary,
+      notFound: 'QR not found for withdrawal',
+      busy: 'QR is currently being processed. Please try again in a moment.',
+      busyRequest: 'Another withdrawal for this QR is being processed. Please try again.',
+      backfill: 'node scripts/backfill-withdrawal-daily-summaries.js',
+    };
+  }
+
+  // ─── early-release fee ──────────────────────────────────────────────────────
+  // A separate commission (its own rate, counters and rollups) charged ONLY on the slice of a withdrawal
+  // that an admin's T+0 release made withdrawable — money that without the release would still be held
+  // until tomorrow. Priced at request time from the live settlement row, held in commissionOnHold with
+  // the payin commission, and earned at approve. The release row's `chargeCommission` (admin's choice
+  // per release) and a rate of 0 both make it free. Rates live on users_meta.earlyReleaseCommission with
+  // the payin semantics (parent's rate = admin share, own rate = subadmin markup); a missing value means
+  // the config default `default_early_release_commission` (fallback 0 = feature off until admin sets it).
+  const PAYIN_ROLLUPS = { daily: APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, monthly: APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, allTime: APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID };
+  function defaultEarlyRate() {
+    const v = Number(ConfigManager.get('default_early_release_commission', 0));
+    return isFinite(v) && v >= 0 && v <= 100 ? v : 0;
+  }
+  async function earlyFeeFor(usrDet, settle, requestedTotalPaise) {
+    const none = { portionPaise: 0, feePaise: 0, userRate: 0, parentRate: 0, rate: 0 };
+    if (!settle || settle.chargeCommission === false || !(settle.releasedPaise > 0)) return none;
+    // What could be withdrawn with NO release = available − today's pay-in (may be negative → nothing).
+    const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
+    const portionPaise = Math.min(Number(settle.releasedPaise), Math.max(0, requestedTotalPaise - withoutRelease));
+    if (portionPaise <= 0) return none;
+    const def = defaultEarlyRate();
+    const userRate = Number(usrDet?.earlyReleaseCommission ?? def);
+    const parentRate = usrDet?.parentId ? Number((await getUserMeta(usrDet.parentId))?.earlyReleaseCommission ?? def) : 0;
+    const rate = userRate + parentRate;
+    if (!isFinite(rate) || userRate < 0 || parentRate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };
+    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate, parentRate, rate };
   }
 
   function generateWithdrawalId() {
@@ -55,13 +119,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
   // not need them, and the list endpoint is where staff read account details with auth.
   const rsToPaise = (rs) => { const n = Number(rs); return Number.isFinite(n) ? Math.round(n * 100) : 0; };
   const pickWithdrawalEvent = (w) => ({
-    withdrawalId: w.id, docId: w.$id, userId: w.userId, qrId: w.qrId || null,
+    withdrawalId: w.id, docId: w.$id, userId: w.userId, qrId: w.qrId || null, bankAcId: w.bankAcId || null,
     holderName: w.holderName || null, companyName: w.companyName || null, mode: w.mode || null,
     status: w.status, utrNumber: w.utrNumber || null, rejectionReason: w.rejectionReason || null,
     // Withdrawal docs store RUPEES (see CLAUDE.md unit table); paise are derived here, once.
     // Display-only: 0 commission is a real value, so no null-for-zero like the handlers' toPaise.
     amountRs: Number(w.amount || 0), preAmountRs: Number(w.preAmount || 0), commissionRs: Number(w.commission || 0),
     amountPaise: rsToPaise(w.amount), preAmountPaise: rsToPaise(w.preAmount), commissionPaise: rsToPaise(w.commission),
+    earlyReleaseCommissionRs: Number(w.earlyReleaseCommission || 0), earlyReleaseCommissionPaise: rsToPaise(w.earlyReleaseCommission),
+    earlyReleasePortionPaise: Number(w.earlyReleasePortionPaise || 0),
     walletCreditFailed: w.walletCreditFailed === true,
     createdAt: w.createdAt || null, processedAt: w.processedAt || null,
   });
@@ -151,6 +217,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       if (!userId || !preAmount) {
         return res.status(400).json({ error: 'userId and name are required' });
       }
+      const source = sourceOf(req.body); // qrId or bankAcId — same quote either way
+      if (source.error) return res.status(source.error.status).json({ error: source.error.message });
 
       // Normalize preAmount
       const preAmountPaise = preAmount * 100;
@@ -170,17 +238,23 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const commissionRs = calculateCommission(preAmount, commissionRate);
       const totalAmount = Number(preAmount) + Number(commissionRs);
 
-      // Load QR document
+      // Load the source ledger document (QR or bank account)
       const qrList = await databases.listDocuments(
         APPWRITE_DATABASE_ID,
-        Qr_collectionId,
-        [Query.equal('qrId', qrId), Query.limit(1)]
+        source.col,
+        [Query.equal(source.key, source.id), Query.limit(1)]
       );
       if (!qrList.documents.length) {
-        return res.status(404).json({ error: 'QR not found for withdrawal' });
+        return res.status(404).json({ error: source.notFound });
       }
       const qr = qrList.documents[0];
       const amountAvailableForWithdrawal = Number(qr.amountAvailableForWithdrawal || 0);
+      // Early-release fee quote: same rule as /withdraw_new, priced from the live settlement row.
+      const previewSettle = await source.settlement.forQr(source.id, amountAvailableForWithdrawal);
+      const early = await earlyFeeFor(usrDet, previewSettle, preAmountPaise + Math.round(commissionRs * 100));
+      if (early.error) return res.status(422).json({ error: early.error });
+      const earlyReleaseCommissionRs = early.feePaise / 100;
+      const totalAmountWithEarly = Number(preAmount) + Number(commissionRs) + earlyReleaseCommissionRs;
 
       // console.log(`Preview Withdrawal - PreAmountPaise: ${preAmountPaise}, CommissionRs: ${commissionRs}, Available: ${amountAvailableForWithdrawal}`);
 
@@ -220,11 +294,17 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
 
       // Return breakdown
+      // totalAmount includes the early-release fee (0 when no release applies). Clients send exactly
+      // these three figures back on /withdraw_new: commission, earlyReleaseCommission, amount.
       return res.json({
         commissionRs,
         commissionRate,
         preAmount,
-        totalAmount,
+        totalAmount: totalAmountWithEarly,
+        earlyReleaseCommissionRs,
+        earlyReleaseCommissionPaise: early.feePaise,
+        earlyReleaseRate: early.rate,
+        earlyReleasePortionPaise: early.portionPaise,
       });
     });
 
@@ -307,7 +387,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     // Users can post a withdrawal request (new version with validations and balance checks)
     router.post('/withdraw_new', authenticateToken, async (req, res) => {
-      const { userId, qrId, companyName, holderName, amount, preAmount, commission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
+      const { userId, qrId, bankAcId, companyName, holderName, amount, preAmount, commission, earlyReleaseCommission, upiId, bankName, accountNumber, ifscCode, mode } = req.body;
 
       // Ownership: the body's userId must be the caller (user), the caller or one of their own users
       // (subadmin), or anyone (admin / employee). Without this a logged-in user could raise a
@@ -348,7 +428,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       // details, and NO commission — amount must equal preAmount and commission must be 0.
       if (!['upi', 'bank', 'wallet'].includes(mode)) return res.status(400).json({ error: 'Invalid mode. Must be upi, bank or wallet.' });
       if (!userId || (!holderName && !isWallet)) return res.status(400).json({ error: 'userId and name are required' });
-      if (!qrId) return res.status(400).json({ error: 'qrId is required' });  // ← add
+      if (!qrId && !bankAcId) return res.status(400).json({ error: 'qrId is required' });  // ← add
+      if (qrId && bankAcId) return res.status(400).json({ error: 'Send either qrId or bankAcId, not both' });
+      const source = sourceOf(req.body);
+      if (source.error) return res.status(source.error.status).json({ error: source.error.message });
       if (mode === 'upi') {
         if (!upiId) return res.status(400).json({ error: 'UPI ID is required for UPI withdrawal' });
         // UPI ID must contain exactly one @ and have non-empty handle on both sides
@@ -445,11 +528,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const recalculatedCommissionRs = recalculatedCommissionPaise / 100;
           const recalculatedTotalPaise = preAmountPaise + recalculatedCommissionPaise;
 
-          // Validation check — compare in integer paise to avoid floating-point drift
-          // (e.g. 100.1 + 0.3 !== 100.4 in IEEE 754, but 10010 + 30 === 10040 always)
-          if (Math.round(Number(amount) * 100) !== recalculatedTotalPaise) {
-            return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.' });
-          }
+          // The total-amount check (amount === preAmount + commission + earlyReleaseCommission) runs under
+          // the source lock below, because the early-release fee is priced from the live settlement row.
+          // Integer paise throughout (100.1 + 0.3 !== 100.4 in IEEE 754, but 10010 + 30 === 10040 always).
 
           if (Math.round(Number(commission) * 100) !== recalculatedCommissionPaise) {
             return res.status(400).json({ error: 'Commission mismatch. Please check the commission and try again.' });
@@ -458,7 +539,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Acquire per-QR lock before reading balance — prevents two simultaneous withdrawal
         // requests from both passing the balance check on the same stale QR data.
         // Same lock key pattern used in webhooks: lock:qr:{qrId}
-        const wdLockKey = `lock:qr:${qrId}`;
+        const wdLockKey = source.lock;
         let wdLockAcquired = false;
         try {
             const lockResult = await redisClient.set(wdLockKey, wdh_id, { NX: true, EX: LOCK_TTL_WITHDRAW });
@@ -468,20 +549,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             wdLockAcquired = false; // fail safe — reject rather than proceed unprotected
         }
         if (!wdLockAcquired) {
-            return res.status(409).json({ error: 'Another withdrawal for this QR is being processed. Please try again.' });
+            return res.status(409).json({ error: source.busyRequest });
         }
 
         let qr;
         let response;
         try {
-        // Load QR and validate available balance under lock — fresh read, no stale data
+        // Load the source ledger (QR or bank account) and validate available balance under lock — fresh read, no stale data
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          [Query.equal('qrId', qrId), Query.limit(1)]
+          source.col,
+          [Query.equal(source.key, source.id), Query.limit(1)]
         );
-        if (!qrList.documents.length) return res.status(404).json({ error: 'QR not found' });
+        if (!qrList.documents.length) return res.status(404).json({ error: source.kind === 'qr' ? 'QR not found' : 'Bank account not found' });
         qr = qrList.documents[0]; // totals in paise
+        if (source.kind === 'bankAc' && qr.isActive === false) return res.status(400).json({ error: 'Bank account is inactive' });
 
         // All amounts below are in PAISE (1 rupee = 100 paise)
         const total = Number(qr.totalPayInAmount || 0);           // paise
@@ -496,13 +578,24 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // T+1 hold, minus anything an admin released early for this QR today. ONE definition, shared
         // with the dashboards and the QR lists (qrSettlement.js). Fails closed: if the release lookup
         // errors it behaves as full T+1, never as "everything is available".
-        const settlement = await qrSettlement.forQr(qr.qrId, available);
+        const settlement = await source.settlement.forQr(source.id, available);
         const todayWithdrawAmount = settlement.withdrawablePaise;
 
         // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
         // Commission already computed in paise — no conversion needed
         const commissionPaiseRequired = recalculatedCommissionPaise;
-        if ((preAmountPaise + commissionPaiseRequired) > todayWithdrawAmount) {
+
+        // Early-release fee on the slice only today's release makes withdrawable (0 when none applies).
+        const early = await earlyFeeFor(usrDet, settlement, preAmountPaise + commissionPaiseRequired);
+        if (early.error) return res.status(422).json({ error: early.error });
+        const earlyPaise = early.feePaise;
+        if (Math.round(Number(earlyReleaseCommission || 0) * 100) !== earlyPaise) {
+          return res.status(400).json({ error: 'Early release commission mismatch. Re-run the commission preview and try again.', earlyReleaseCommissionPaise: earlyPaise, earlyReleaseRate: early.rate, earlyReleasePortionPaise: early.portionPaise });
+        }
+        if (Math.round(Number(amount) * 100) !== recalculatedTotalPaise + earlyPaise) {
+          return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.', ...(earlyPaise > 0 ? { earlyReleaseCommissionPaise: earlyPaise, hint: 'amount must equal preAmount + commission + earlyReleaseCommission' } : {}) });
+        }
+        if ((preAmountPaise + commissionPaiseRequired + earlyPaise) > todayWithdrawAmount) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
         }
 
@@ -511,7 +604,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // }
 
         const newRequested = requested + preAmountPaise;                        // paise
-        const newCommissionOnHold = commissionOnHold + commissionPaiseRequired; // paise
+        const newCommissionOnHold = commissionOnHold + commissionPaiseRequired + earlyPaise; // paise — payin + early-release fee held together
         // recompute available after deducting this request
         const newAvailable = total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid; // paise
 
@@ -525,12 +618,21 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             id: wdh_id,
             userId,
-            qrId: qrId,
+            qrId: qrId || null,
+            bankAcId: source.kind === 'bankAc' ? source.id : null,
             companyName: companyName || null,
             holderName: isWallet ? (holderName || 'Payout Wallet') : holderName,
             amount: amount, // Rs
             preAmount: preAmount, // Rs
             commission: recalculatedCommissionRs, // Rs
+            // Early-release fee snapshot (Rs + the priced slice + the rates at request time). Written only
+            // when a fee applies so a schema without these attributes still accepts plain withdrawals.
+            ...(earlyPaise > 0 || early.portionPaise > 0 ? {
+              earlyReleaseCommission: earlyPaise / 100, // Rs
+              earlyReleasePortionPaise: early.portionPaise,
+              earlyUserRate: early.userRate,
+              earlyParentRate: early.parentRate,
+            } : {}),
             userCommissionRate: userCommissionRate,
             parentCommissionRate: parentCommissionRate,
             totalCommissionRate: totalCommissionRate,
@@ -548,7 +650,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
           await databases.updateDocument(
             APPWRITE_DATABASE_ID,
-            Qr_collectionId,
+            source.col,
             qr.$id,
             {
               withdrawalRequestedAmount: newRequested,
@@ -559,7 +661,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         } catch (qrUpdateErr) {
           // Rollback: delete the withdrawal doc so balance and records stay in sync
           await databases.deleteDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, response.$id)
-            .catch(e => console.error(`CRITICAL: QR update failed and rollback also failed. Orphaned withdrawal id=${response.$id} for qrId=${qrId}`, e));
+            .catch(e => console.error(`CRITICAL: ledger update failed and rollback also failed. Orphaned withdrawal id=${response.$id} for ${source.key}=${source.id}`, e));
           throw qrUpdateErr;
         }
         // Update dashboard counter inside lock scope
@@ -639,7 +741,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
       try {
-        const {userId, qrId, status, from, to, limit: limitStr, cursor } = req.query;
+        const {userId, qrId, bankAcId, status, from, to, limit: limitStr, cursor } = req.query;
 
         // 1) Parse limit with sane default + cap
         const DEFAULT_LIMIT = 25;
@@ -747,6 +849,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                     return res.status(200).json({ transactions: [] });
                 }
             }
+        // Bank-account withdrawals (bankAccounts.js): exact key, stacks with the filters above.
+        if (bankAcId) queries.push(Query.equal('bankAcId', String(bankAcId).trim()));
 
         if (status) {
           queries.push(Query.equal('status', status));
@@ -804,12 +908,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             $id: doc.$id,
             id: doc.id,
             userId: doc.userId,
-            qrId: doc.qrId,
+            qrId: doc.qrId || null,
+            bankAcId: doc.bankAcId || null,
             companyName: doc.companyName || null,
             holderName: doc.holderName,
             amount: doc.amount,
             preAmount: doc.preAmount || 0,
             commission: doc.commission || 0,
+            earlyReleaseCommission: Number(doc.earlyReleaseCommission || 0), // Rs — early-release fee, separate from commission
+            earlyReleasePortionPaise: Number(doc.earlyReleasePortionPaise || 0), // the slice priced at the early rate
             mode: doc.mode,
             upiId: doc.upiId,
             bankName: doc.bankName,
@@ -921,12 +1028,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             $id: doc.$id,
             id: doc.id,
             userId: doc.userId,
-            qrId: doc.qrId,
+            qrId: doc.qrId || null,
+            bankAcId: doc.bankAcId || null,
             companyName: doc.companyName || null,
             holderName: doc.holderName,
             amount: doc.amount,
             preAmount: doc.preAmount || 0,
             commission: doc.commission || 0,
+            earlyReleaseCommission: Number(doc.earlyReleaseCommission || 0), // Rs — early-release fee, separate from commission
+            earlyReleasePortionPaise: Number(doc.earlyReleasePortionPaise || 0), // the slice priced at the early rate
             mode: doc.mode,
             upiId: doc.upiId,
             bankName: doc.bankName,
@@ -1101,13 +1211,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         };
 
         const amountPaise = toPaise(w.amount);
-        const qrId = w.qrId;
+        const source = sourceOf(w); // the ledger this withdrawal was raised against (QR or bank account)
+        if (source.error) return res.status(source.error.status).json({ error: source.error.message });
+        const qrId = source.id;
         if (!qrId || amountPaise <= 0) {
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
         }
 
         // Acquire per-QR lock — prevents two concurrent approvals both passing the balance check
-        const approveLockKey = `lock:qr:${qrId}`;
+        const approveLockKey = source.lock;
         const approveLockVal = w.id;
         let approveLockAcquired = false;
         try {
@@ -1118,18 +1230,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             approveLockAcquired = false; // fail safe
         }
         if (!approveLockAcquired) {
-            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
+            return res.status(409).json({ error: source.busy });
         }
         try {
 
-        // 2) Load QR document — fresh read under lock, no stale data
+        // 2) Load the source ledger doc (QR or bank account) — fresh read under lock, no stale data
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          [Query.equal('qrId', qrId), Query.limit(1)]
+          source.col,
+          [Query.equal(source.key, source.id), Query.limit(1)]
         ); // list and index 0 safely [19]
         if (!qrList.documents.length) {
-          return res.status(404).json({ error: 'QR not found for withdrawal' });
+          return res.status(404).json({ error: source.notFound });
         }
         const qr = qrList.documents[0];
 
@@ -1144,7 +1256,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // console.log(`Approving Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
 
         // Separate commission and withdrawal amounts
-        const commissionPaise = Math.round((w.commission || 0) * 100);
+        // payin commission + early-release fee: both were held in commissionOnHold at request time
+        const commissionPaise = Math.round((w.commission || 0) * 100) + Math.round((w.earlyReleaseCommission || 0) * 100);
         const withdrawalPaise = amountPaise - commissionPaise;
 
         // Validate that requested and commissionOnHold have enough funds
@@ -1173,10 +1286,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         }
 
         // Continue with database updates...
-        // 4) Update QR ledger first
+        // 4) Update the source ledger first
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          Qr_collectionId,
+          source.col,
           qr.$id,
           {
             withdrawalRequestedAmount: newRequested,
@@ -1212,8 +1325,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // Day-wise withdrawal report rollup (withdrawalSummary.js) — report-only, same posture as the
         // commission rollups below: the approval is committed regardless; a failure here is repaired by
         // re-running the backfill for that day (recompute-and-overwrite).
-        try { await withdrawalSummary.record({ ...w, processedAt: approvedAtIST }); }
-        catch (e) { const d = withdrawalSummary.istDay(approvedAtIST); console.error(`CRITICAL: daily withdrawal summary failed for ${w.id} (day ${d}). Run: node scripts/backfill-withdrawal-daily-summaries.js --from ${d} --to ${d} --write`, e); }
+        try { await source.summary.record({ ...w, processedAt: approvedAtIST }); }
+        catch (e) { const d = source.summary.istDay(approvedAtIST); console.error(`CRITICAL: daily withdrawal summary failed for ${w.id} (day ${d}). Run: ${source.backfill} --from ${d} --to ${d} --write`, e); }
 
         // NOTE: the payout-wallet credit runs AFTER the commission block below, not here. The QR has
         // already been debited principal + commission at this point, so the commission ledger must be
@@ -1314,6 +1427,36 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         }
 
+        // Early-release fee → its OWN commission rows (commissionType:'early_release'), counters and
+        // rollups, so it never blends into the payin figures. Same request-time-snapshot routing as payin:
+        // parent rate → admin; own rate → the live parent only if one exists and the parent rate > 0.
+        const earlyPortionPaise = Number(w.earlyReleasePortionPaise || 0);
+        const earlyFeePaise = Math.round((w.earlyReleaseCommission || 0) * 100);
+        if (user && earlyPortionPaise > 0 && earlyFeePaise > 0) {
+          const snapU = Number(w.earlyUserRate || 0), snapP = Number(w.earlyParentRate || 0);
+          const liveParentE = user.parentId ? await getUserMeta(user.parentId) : null;
+          const earlyTxs = [];
+          const at = new Date().toISOString();
+          if (liveParentE && snapP > 0) {
+            const subAmt = calculateCommissionPaise(earlyPortionPaise, snapU);
+            if (subAmt > 0) { earlyTxs.push({ userId: liveParentE.userId, sourceWithdrawalId: w.id, amount: subAmt, commissionRate: snapU, earningType: 'subadmin', commissionType: 'early_release', createdAt: at }); await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseMerchantProfit', subAmt).catch(console.error); }
+            if (admin) { const admAmt = calculateCommissionPaise(earlyPortionPaise, snapP); if (admAmt > 0) { earlyTxs.push({ userId: admin.userId, sourceWithdrawalId: w.id, amount: admAmt, commissionRate: snapP, earningType: 'admin', commissionType: 'early_release', createdAt: at }); await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', admAmt).catch(console.error); } }
+          } else if (admin) {
+            // one row = exactly the fee the ledger was debited (single ceil on the combined rate)
+            earlyTxs.push({ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: snapU + snapP, earningType: 'admin', commissionType: 'early_release', createdAt: at });
+            await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', earlyFeePaise).catch(console.error);
+          }
+          for (const tx of earlyTxs) await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, ID.unique(), tx);
+          try {
+            if (!earlyRelease?.daily) throw new Error('early-release rollup collections not configured');
+            await recordCommissionRollups(earlyTxs, earlyRelease);
+          } catch (rollupErr) {
+            console.error(`CRITICAL: Early-release commission rollup failed for withdrawal ${w.id}. Raw tx docs saved. Needs reconciliation.`, rollupErr);
+            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id, { commissionRollupFailed: true })
+              .catch(e => console.error(`CRITICAL: Could not mark commissionRollupFailed on withdrawal ${w.id}`, e));
+          }
+        }
+
         // Payout-wallet withdrawal: credit the wallet (idempotent on w.id). Runs last, after the QR
         // ledger, the withdrawal doc and the commission ledger are all committed.
         // Lock order: lock:qr → lock:payoutwallet. If the credit fails the withdrawal stays approved
@@ -1377,13 +1520,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         };
 
         const amountPaise = toPaise(w.amount);
-        const qrId = w.qrId;
+        const source = sourceOf(w); // the ledger this withdrawal was raised against (QR or bank account)
+        if (source.error) return res.status(source.error.status).json({ error: source.error.message });
+        const qrId = source.id;
         if (!qrId || amountPaise <= 0) {
           return res.status(400).json({ error: 'Invalid withdrawal document data' });
         }
 
         // Acquire per-QR lock — prevents two concurrent rejections both passing the balance check
-        const rejectLockKey = `lock:qr:${qrId}`;
+        const rejectLockKey = source.lock;
         const rejectLockVal = w.id;
         let rejectLockAcquired = false;
         try {
@@ -1394,18 +1539,18 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             rejectLockAcquired = false; // fail safe
         }
         if (!rejectLockAcquired) {
-            return res.status(409).json({ error: 'QR is currently being processed. Please try again in a moment.' });
+            return res.status(409).json({ error: source.busy });
         }
         try {
 
-        // 2) Load QR document — fresh read under lock
+        // 2) Load the source ledger doc (QR or bank account) — fresh read under lock
         const qrList = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
-          Qr_collectionId,
-          [Query.equal('qrId', qrId), Query.limit(1)]
+          source.col,
+          [Query.equal(source.key, source.id), Query.limit(1)]
         ); // list then index 0 [19]
         if (!qrList.documents.length) {
-          return res.status(404).json({ error: 'QR not found for withdrawal' });
+          return res.status(404).json({ error: source.notFound });
         }
         const qr = qrList.documents[0];
 
@@ -1420,7 +1565,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // console.log(`Rejecting Withdrawal - AmountPaise: ${amountPaise}, QR Requested: ${requested}, CommissionOnHold: ${commissionOnHold}`);
 
         // Convert commission from rupees to paise safely
-        const commissionPaise = Math.round((w.commission || 0) * 100);
+        // payin commission + early-release fee: both were held in commissionOnHold at request time
+        const commissionPaise = Math.round((w.commission || 0) * 100) + Math.round((w.earlyReleaseCommission || 0) * 100);
 
         // Withdrawal amount portion excluding commission
         const withdrawalPaise = amountPaise - commissionPaise;
@@ -1449,10 +1595,10 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           return res.status(409).json({ error: 'Ledger computation error: rejection would result in a negative balance field.' });
         }
 
-        // 4) Update QR ledger
+        // 4) Update the source ledger
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          Qr_collectionId,
+          source.col,
           qr.$id,
           {
             withdrawalRequestedAmount: newRequested,
@@ -1513,14 +1659,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // One entrypoint after computing commissionTxs in your approval route
-    async function recordCommissionRollups(commissionTxs) {
-      await upsertDailyCommissionFromTxs(commissionTxs); // daily JSON map [web:52]
-      await upsertMonthlyTotalsFromTxs(commissionTxs); // monthly per-user with composite unique [web:39][web:40]
-      await upsertAllTimeTotalsFromTxs(commissionTxs); // all-time per-user unique [web:40]
+    // `cols` = { daily, monthly, allTime } collection ids: the payin rollups by default, the
+    // early-release rollups when called for early-release fee rows. Same shapes, same locks per key.
+    async function recordCommissionRollups(commissionTxs, cols = PAYIN_ROLLUPS) {
+      await upsertDailyCommissionFromTxs(commissionTxs, cols); // daily JSON map [web:52]
+      await upsertMonthlyTotalsFromTxs(commissionTxs, cols); // monthly per-user with composite unique [web:39][web:40]
+      await upsertAllTimeTotalsFromTxs(commissionTxs, cols); // all-time per-user unique [web:40]
     }
 
     // 1) Daily JSON map merge (one doc per date)
-    async function upsertDailyCommissionFromTxs(commissionTxs) {
+    async function upsertDailyCommissionFromTxs(commissionTxs, cols = PAYIN_ROLLUPS) {
       const day = istDayString();
 
       // Per-day lock: serializes concurrent approvals updating the same day's JSON doc
@@ -1538,7 +1686,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       try {
         const existing = await databases.listDocuments(
           APPWRITE_DATABASE_ID,
-          APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+          cols.daily,
           [ Query.equal('date', day), Query.limit(1) ]
         );
 
@@ -1572,7 +1720,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         if (docId) {
           await databases.updateDocument(
             APPWRITE_DATABASE_ID,
-            APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+            cols.daily,
             docId,
             payload
           );
@@ -1580,7 +1728,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           try {
             await databases.createDocument(
               APPWRITE_DATABASE_ID,
-              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+              cols.daily,
               ID.unique(),
               payload
             );
@@ -1588,13 +1736,13 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             // race fallback: re-read then update
             const again = await databases.listDocuments(
               APPWRITE_DATABASE_ID,
-              APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+              cols.daily,
               [ Query.equal('date', day), Query.limit(1) ]
             );
             if (again.total > 0) {
               await databases.updateDocument(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID,
+                cols.daily,
                 again.documents[0].$id,
                 payload
               );
@@ -1609,7 +1757,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // 2) Monthly per-user totals (one row per userId+month)
-    async function upsertMonthlyTotalsFromTxs(commissionTxs) {
+    async function upsertMonthlyTotalsFromTxs(commissionTxs, cols = PAYIN_ROLLUPS) {
       const month = istMonthString();
 
       // collapse to per-user to minimize writes
@@ -1639,7 +1787,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
           const list = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
-            APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+            cols.monthly,
             [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
           );
 
@@ -1649,7 +1797,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (newTotal < 0) throw new Error(`Negative monthly total for ${userId}`);
             await databases.updateDocument(
               APPWRITE_DATABASE_ID,
-              APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+              cols.monthly,
               row.$id,
               { totalCommissionPaise: newTotal }
             );
@@ -1657,7 +1805,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             try {
               await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                cols.monthly,
                 ID.unique(),
                 { userId, month, totalCommissionPaise: delta }
               );
@@ -1665,7 +1813,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
               // retry path on unique collision
               const again = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                cols.monthly,
                 [ Query.equal('userId', userId), Query.equal('month', month), Query.limit(1) ]
               );
               if (again.total > 0) {
@@ -1673,7 +1821,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 const newTotal = Number(row.totalCommissionPaise || 0) + delta;
                 await databases.updateDocument(
                   APPWRITE_DATABASE_ID,
-                  APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID,
+                  cols.monthly,
                   row.$id,
                   { totalCommissionPaise: newTotal }
                 );
@@ -1689,7 +1837,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     }
 
     // 3) All-time per-user totals (one row per userId)
-    async function upsertAllTimeTotalsFromTxs(commissionTxs) {
+    async function upsertAllTimeTotalsFromTxs(commissionTxs, cols = PAYIN_ROLLUPS) {
 
       const perUser = {};
       for (const { userId, amount } of commissionTxs) {
@@ -1717,7 +1865,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         try {
           const list = await databases.listDocuments(
             APPWRITE_DATABASE_ID,
-            APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+            cols.allTime,
             [ Query.equal('userId', userId), Query.limit(1) ]
           );
 
@@ -1727,7 +1875,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             if (newTotal < 0) throw new Error(`Negative all-time total for ${userId}`);
             await databases.updateDocument(
               APPWRITE_DATABASE_ID,
-              APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+              cols.allTime,
               row.$id,
               { totalCommissionPaise: newTotal }
             );
@@ -1735,14 +1883,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             try {
               await databases.createDocument(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                cols.allTime,
                 ID.unique(),
                 { userId, totalCommissionPaise: delta }
               );
             } catch (e) {
               const again = await databases.listDocuments(
                 APPWRITE_DATABASE_ID,
-                APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                cols.allTime,
                 [ Query.equal('userId', userId), Query.limit(1) ]
               );
               if (again.total > 0) {
@@ -1750,7 +1898,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
                 const newTotal = Number(row.totalCommissionPaise || 0) + delta;
                 await databases.updateDocument(
                   APPWRITE_DATABASE_ID,
-                  APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID,
+                  cols.allTime,
                   row.$id,
                   { totalCommissionPaise: newTotal }
                 );
