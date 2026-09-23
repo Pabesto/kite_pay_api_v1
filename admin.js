@@ -5108,11 +5108,15 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     async function unregisteredQr() {
         if (Date.now() - _unregCache.at < 60000) return _unregCache;
         try {
-            const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => q.qrId));
-            const paid = {};   // id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
+            // Case-insensitive on purpose: Appwrite's equal() matches ids regardless of case, so a payment
+            // that arrived as "Q123" WAS credited to the QR stored as "q123" (only its daily-summary key
+            // differs). Treating it as unregistered would be wrong twice — it is not orphan money, and
+            // Query.equal('qrCodeId', 'Q123') would then pull every row of the registered QR into the list.
+            const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => String(q.qrId || '').toLowerCase()));
+            const paid = {};   // lower-cased id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
             for (const day of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
                 let obj; try { obj = JSON.parse(day.totalsJson || '{}'); } catch { continue; }
-                for (const [k, v] of Object.entries(obj)) if (k) paid[k] = (paid[k] || 0) + (parseInt(v || 0, 10) || 0);
+                for (const [k, v] of Object.entries(obj)) if (k) paid[String(k).toLowerCase()] = (paid[String(k).toLowerCase()] || 0) + (parseInt(v || 0, 10) || 0);
             }
             const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !known.has(id)));
             const ids = Object.keys(byId);
