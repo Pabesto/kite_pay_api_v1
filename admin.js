@@ -1128,6 +1128,18 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 }
             }
 
+            // ?unregisteredQr=true — only transactions whose qrCodeId has NO qr_codes doc right now (money
+            // that was counted but never landed on a ledger). Admin only: these rows have no owner. Appwrite
+            // has no cross-collection "not in", so the id set comes from unregisteredQrIds() (cached 60s).
+            if (req.query.unregisteredQr === 'true') {
+                if (!isAdmin) return res.status(403).json({ error: 'Only admin can list transactions of unregistered QR codes' });
+                if (qrId || userId) return res.status(400).json({ error: 'unregisteredQr cannot be combined with qrId or userId' });
+                const ids = await unregisteredQrIds();
+                if (!ids.length) return res.status(200).json({ transactions: [], nextCursor: null, unregisteredQrIds: [] });
+                const chunks = []; for (let i = 0; i < ids.length; i += 100) chunks.push(Query.equal('qrCodeId', ids.slice(i, i + 100)));
+                filters.push(chunks.length === 1 ? chunks[0] : Query.or(chunks));
+            }
+
             // Date filtering helper — timezone-safe, works on any server
             function toISTRange(dateStr) {
                 const start = moment.tz(dateStr, 'Asia/Kolkata').startOf('day').utc().toDate();
@@ -4404,6 +4416,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             ...deriveDashboardTotals(get),
             // WHERE netFlow sits — an exact decomposition from the live ledgers (see ledgerTotals)
             netBreakdown: await netBreakdown(get),
+            // Money received on QR ids that were never uploaded (no qr_codes doc): inside totalAmountReceived,
+            // on no ledger. Same source as GET /transactions?unregisteredQr=true (cached 60s).
+            unregisteredQrAmountReceived: (await unregisteredQr()).amountPaise,
+            unregisteredQrIdCount: (await unregisteredQr()).ids.length,
             };
 
             return res.status(200).json(payload);
@@ -5078,6 +5094,28 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         }
     });
 
+    // qrCodeIds that have received money (every key ever written into daily_qr_summaries) but have NO
+    // qr_codes doc today. That is the exact set of "unregistered QR" transactions: finalize credits the
+    // daily summary and the counters even when the ledger lookup fails, so the daily keys are a complete
+    // index of every id that was ever paid. A QR uploaded later drops out of this list (its doc now
+    // exists) even though the earlier rows were never credited — see reconcile-net.js for the money view.
+    // ponytail: parses every day doc; cached 60s so the admin list stays cheap.
+    let _unregCache = { at: 0, ids: [], amountPaise: 0, byId: {} };
+    async function unregisteredQr() {
+        if (Date.now() - _unregCache.at < 60000) return _unregCache;
+        const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => q.qrId));
+        const paid = {};   // id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
+        for (const day of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
+            let obj; try { obj = JSON.parse(day.totalsJson || '{}'); } catch { continue; }
+            for (const [k, v] of Object.entries(obj)) if (k) paid[k] = (paid[k] || 0) + (parseInt(v || 0, 10) || 0);
+        }
+        const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !known.has(id)));
+        const ids = Object.keys(byId);
+        _unregCache = { at: Date.now(), ids, byId, amountPaise: Object.values(byId).reduce((s, v) => s + v, 0) };
+        return _unregCache;
+    }
+    const unregisteredQrIds = async () => (await unregisteredQr()).ids;
+
     // Sum the seven ledger fields over every doc of a ledger collection (qr_codes or bank_accounts —
     // "_hold" archives included, they still hold real balances). `balancePaise` = merchant money still
     // sitting on the ledger: available + pending withdrawals + on-hold + commission-on-hold.
@@ -5105,8 +5143,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // between netFlow and that sum — normally 0 or a few paise of ceil rounding; a large value means a
     // counter and a ledger disagree (a failed counter increment, or a manual ledger edit) and is worth a look.
     async function netBreakdown(get) {
-        const [qr, bank] = await Promise.all([ledgerTotals(APPWRITE_QRCODE_COLLECTION_ID), ledgerTotals(APPWRITE_BANK_ACCOUNTS_COLLECTION_ID)]);
+        const [qr, bank, unreg] = await Promise.all([ledgerTotals(APPWRITE_QRCODE_COLLECTION_ID), ledgerTotals(APPWRITE_BANK_ACCOUNTS_COLLECTION_ID), unregisteredQr()]);
         const d = deriveDashboardTotals(get);
+        // Money received on QR ids that have no ledger doc: counted in totalAmountReceived, sitting on no
+        // ledger, so it is part of netFlow that no balance explains — shown on its own, not as "unexplained".
+        const unregisteredQr = { idCount: unreg.ids.length, amountPaise: unreg.amountPaise, amountRs: unreg.amountPaise / 100 };
         const commission = {
             payinAdminPaise: get('totalAdminProfit'), payinMerchantPaise: get('totalMerchantProfit'),
             payoutAdminPaise: get('totalPayoutAdminProfit'), payoutMerchantPaise: get('totalPayoutMerchantProfit'),
@@ -5114,10 +5155,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             adminTotalPaise: d.totalAdminProfitAll, merchantTotalPaise: d.totalMerchantProfitAll, totalPaise: d.totalPlatformProfit,
         };
         const payoutWallet = { balancePaise: get('totalPayoutWalletBalance'), customerPayoutPendingPaise: get('totalCustomerPayoutPendingAmount') };
-        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise;
+        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise + unregisteredQr.amountPaise;
         return {
             netFlowPaise: d.netFlow, netFlowRs: d.netFlow / 100,
-            qr, bank, payoutWallet, commission,
+            qr, bank, payoutWallet, commission, unregisteredQr,
             merchantBalancePaise: qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise,
             explainedPaise, explainedRs: explainedPaise / 100,
             unexplainedPaise: d.netFlow - explainedPaise,

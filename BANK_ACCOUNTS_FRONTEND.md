@@ -268,6 +268,7 @@ Withdrawals on bank accounts still emit the normal `withdrawal:update` (with `ba
 | `totalBankAcTxCount` | approved bank claims (live, Redis) |
 | `totalBankAcsUploaded`, `totalBankAcsAssignedToMerchant`, `bankAcsActive`, `bankAcsDisabled` | account counts |
 | `totalBankAcTxPendingCount`, `totalBankAcTxPendingAmount` | open claims |
+| `unregisteredQrAmountReceived`, `unregisteredQrIdCount` | money received on QR ids that were **never uploaded** (no QR doc exists), and how many such ids. Inside `totalAmountReceived`, on no ledger, so no merchant can withdraw it. Tile: "Received on unregistered QRs" — tap → the transactions list with `?unregisteredQr=true` |
 
 `avgTxAmount`, `netFlow` and the other derived roll-ups now include the bank channel.
 
@@ -290,11 +291,15 @@ paid. So `netFlow` is **everything still on the platform**: merchant balances *a
   "commission": { "payinAdminPaise": …, "payinMerchantPaise": …, "payoutAdminPaise": …, "payoutMerchantPaise": …,
                   "earlyReleaseAdminPaise": …, "earlyReleaseMerchantPaise": …,
                   "adminTotalPaise": …, "merchantTotalPaise": …, "totalPaise": … },
+  "unregisteredQr": { "idCount": 3, "amountPaise": …, "amountRs": … },   // received on QR ids with no QR doc
   "merchantBalancePaise": …,        // qr.balance + bank.balance + payoutWallet.balance
-  "explainedPaise": …, "explainedRs": …,   // merchantBalance + commission.total
+  "explainedPaise": …, "explainedRs": …,   // merchantBalance + commission.total + unregisteredQr.amount
   "unexplainedPaise": 0             // netFlow − explained
 }
 ```
+
+`unregisteredQr` is money that came in on QR ids nobody uploaded: it is inside `netFlow` but on no
+ledger, so it is shown as its own line rather than left in the unexplained gap.
 
 | Piece | Meaning |
 |---|---|

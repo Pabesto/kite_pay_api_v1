@@ -193,3 +193,21 @@ describe('hold-and-reset moves the later-added QR references', () => {
         expect(res.body.steps).toMatchObject({ pendingReviewTxnsAtStart: 0, pendingReviewTxnsMoved: 0 });
     });
 });
+
+describe('GET /transactions?unregisteredQr=true — payments whose QR id has no qr_codes doc', () => {
+    test('lists only rows of ids that were paid (daily summary keys) but are not registered; uploading the QR drops them', async () => {
+        const data = seed();
+        data[TXNS].push({ $id: 't_ghost', qrCodeId: 'ghost', amount: 700, status: 'normal', created_at: '2026-09-22T05:00:00.000Z' });
+        data[DAILY][0].totalsJson = JSON.stringify({ [SRC]: 5000, other: 1, ghost: 700 });
+        const res = await request(buildApp(makeDb(data))).get('/transactions?unregisteredQr=true');
+        expect(res.status).toBe(200);
+        const ids = res.body.transactions.map((t) => t.$id).sort();
+        expect(ids).toEqual(['t_ghost', 't_other_pending']);          // 'other' and 'ghost' have no QR doc
+        expect(ids).not.toContain('t_final');                          // SRC is registered
+
+        data[QRS].push({ $id: 'q_ghost', qrId: 'ghost', isActive: true });
+        const after = await request(buildApp(makeDb(data))).get('/transactions?unregisteredQr=true');
+        expect(after.body.transactions.map((t) => t.$id)).toEqual(['t_other_pending']);
+        expect((await request(buildApp(makeDb(data))).get('/transactions?unregisteredQr=true&qrId=ghost')).status).toBe(400);
+    });
+});
