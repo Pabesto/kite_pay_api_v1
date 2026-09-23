@@ -82,7 +82,7 @@ recompute it. `t1HoldApplies` is `false` while the admin switch `bank_account_in
 
 | Method & path | Who | Body / query | Response |
 |---|---|---|---|
-| `GET /` | admin, employee `view_bank_acs`, subadmin | `?limit≤100 &cursor &isActive=true|false &assignedUserId &bankAcId` | `{ bankAccounts: [Account], nextCursor }` |
+| `GET /` | admin, employee `view_bank_acs`, subadmin | `?limit≤100 &cursor &isActive=true|false &assignedUserId &bankAcId &accountType=savings|current|corporate` (400 on any other type; filters stack) | `{ bankAccounts: [Account], nextCursor }` |
 | `GET /user/:userId` | the user themselves, their subadmin, admin, employee | `?limit &cursor` | `{ bankAccounts, nextCursor }` |
 | `POST /` | admin | `{ bankAcId, bankName, accountHolderName, ifscCode, accountType: "savings"\|"current"\|"corporate", upiId?, notes?, perTxnLimit?, dailyLimit? }` (limits in rupees; accountType is case-insensitive, stored lower-case) | `201 { message, bankAccount }` · `409` duplicate number |
 | `PATCH /:bankAcId` | admin | any of `bankName, accountHolderName, ifscCode, accountType, upiId, notes, perTxnLimit, dailyLimit` — **not** `bankAcId` (400) | `{ message, bankAccount }` |

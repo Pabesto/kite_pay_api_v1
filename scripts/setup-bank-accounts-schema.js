@@ -112,6 +112,7 @@ async function main() {
     await idx(ACCOUNTS, 'idx_assignedUserId', 'key', ['assignedUserId']);
     await idx(ACCOUNTS, 'idx_managedByUserId', 'key', ['managedByUserId']);
     await idx(ACCOUNTS, 'idx_createdAt', 'key', ['createdAt']);
+    await idx(ACCOUNTS, 'idx_accountType', 'key', ['accountType']);   // GET /api/bank-acs?accountType=
     await idx(TXNS, 'idx_bankAcId', 'key', ['bankAcId']);
     await idx(TXNS, 'idx_referenceNumber', 'key', ['referenceNumber']);   // uniqueness is app-level: a rejected claim may be re-submitted
     await idx(TXNS, 'idx_status', 'key', ['status']);

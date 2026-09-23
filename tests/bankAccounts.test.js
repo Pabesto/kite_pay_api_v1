@@ -140,6 +140,15 @@ describe('accounts', () => {
         expect(mine.body.bankAccounts[0]).toMatchObject({ bankAcId: AC, canWithdrawTodayPaise: 0, todayTotalPayIn: 0 });
         expect((await request(app).get('/bank-acs/user/user1').set(as('user2'))).status).toBe(403);
     });
+
+    test('list filters by accountType (case-insensitive, 400 on an unknown type)', async () => {
+        const { app } = build({ [ACCOUNTS]: [account(), account({ $id: 'ac2', bankAcId: '999999999999', accountType: 'corporate' })], [TXNS]: [] });
+        const corp = await request(app).get('/bank-acs?accountType=Corporate').set(as('admin1'));
+        expect(corp.status).toBe(200);
+        expect(corp.body.bankAccounts.map((a) => a.bankAcId)).toEqual(['999999999999']);
+        expect((await request(app).get('/bank-acs?accountType=current').set(as('admin1'))).body.bankAccounts.map((a) => a.bankAcId)).toEqual([AC]);
+        expect((await request(app).get('/bank-acs?accountType=nre').set(as('admin1'))).status).toBe(400);
+    });
 });
 
 describe('claims', () => {

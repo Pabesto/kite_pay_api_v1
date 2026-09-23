@@ -339,6 +339,11 @@ module.exports = (databases, ID, Query, DB, USERS_META, ACCOUNTS, TXNS, DAILY, W
             if (req.query.isActive === 'true' || req.query.isActive === 'false') queries.push(Query.equal('isActive', req.query.isActive === 'true'));
             if (req.query.assignedUserId) queries.push(Query.equal('assignedUserId', String(req.query.assignedUserId)));
             if (req.query.bankAcId) queries.push(Query.equal('bankAcId', String(req.query.bankAcId).trim()));
+            if (req.query.accountType) {
+                const t = String(req.query.accountType).trim().toLowerCase();
+                if (!ACCOUNT_TYPES.includes(t)) throw fail(400, `Invalid accountType. Must be one of: ${ACCOUNT_TYPES.join(', ')}`);
+                queries.push(Query.equal('accountType', t));
+            }
             queries.push(Query.orderDesc('createdAt'), ...cursorQuery(req.query.cursor), Query.limit(limit));
             const r = await databases.listDocuments(DB, ACCOUNTS, queries);
             const bankAccounts = await withSettlement(r.documents);
