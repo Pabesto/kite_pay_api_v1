@@ -215,18 +215,22 @@ describe('GET /transactions?unregisteredQr=true — payments whose QR id has no 
 describe('GET /dashboard/counters — netBreakdown decomposes netFlow from the live ledgers', () => {
     test('returns numbers (never an error object) and counts unregistered pay-ins separately', async () => {
         const data = seed();
+        // 'late' was uploaded after ₹5 of its ₹6 had arrived: ledger holds 100 paise, the daily summary says 600.
+        data[QRS].push({ $id: 'q_late', qrId: 'LATE1', isActive: true, totalPayInAmount: 100, amountAvailableForWithdrawal: 100 });
+        data[DAILY][0].totalsJson = JSON.stringify({ [SRC]: 5000, other: 1, late1: 400, LATE1: 200 });   // case variants fold together
         data.dashboard_counters = [
-            { $id: 'c1', id: 'totalAmountReceived', totals: 5001 }, { $id: 'c2', id: 'totalAmountPaid', totals: 0 },
+            { $id: 'c1', id: 'totalAmountReceived', totals: 5601 }, { $id: 'c2', id: 'totalAmountPaid', totals: 0 },
             { $id: 'c3', id: 'totalAdminProfit', totals: 100 }, { $id: 'c4', id: 'totalPayoutWalletBalance', totals: 200 },
         ];
         const res = await request(buildApp(makeDb(data))).get('/dashboard/counters');
         expect(res.status).toBe(200);
         const nb = res.body.netBreakdown;
         expect(nb.error).toBeUndefined();
-        expect(nb.qr).toMatchObject({ count: 1, totalPayInPaise: 5000, availablePaise: 5000, balancePaise: 5000 });
+        expect(nb.qr).toMatchObject({ count: 2, totalPayInPaise: 5100, availablePaise: 5100, balancePaise: 5100 });
         expect(nb.bank).toMatchObject({ count: 0, balancePaise: 0 });
         expect(nb.unregisteredQr).toEqual({ idCount: 1, amountPaise: 1, amountRs: 0.01 });   // 'other' has no QR doc
-        expect(nb).toMatchObject({ netFlowPaise: 5001, merchantBalancePaise: 5200, explainedPaise: 5000 + 200 + 100 + 1, unexplainedPaise: 5001 - 5301 });
-        expect(res.body).toMatchObject({ unregisteredQrAmountReceived: 1, unregisteredQrIdCount: 1, totalAmountReceived: 5001, totalQrAmountReceived: 5001 });
+        expect(nb.preUploadPayments).toEqual({ qrCount: 1, amountPaise: 500, amountRs: 5, ledgerOverDailyPaise: 0 });   // late1: 600 received − 100 on ledger
+        expect(nb).toMatchObject({ netFlowPaise: 5601, merchantBalancePaise: 5300, explainedPaise: 5100 + 200 + 100 + 1 + 500, unexplainedPaise: 5601 - 5901 });
+        expect(res.body).toMatchObject({ unregisteredQrAmountReceived: 1, unregisteredQrIdCount: 1, preUploadQrAmountReceived: 500, preUploadQrCount: 1, totalAmountReceived: 5601, totalQrAmountReceived: 5601 });
     });
 });

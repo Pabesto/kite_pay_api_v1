@@ -269,6 +269,7 @@ Withdrawals on bank accounts still emit the normal `withdrawal:update` (with `ba
 | `totalBankAcsUploaded`, `totalBankAcsAssignedToMerchant`, `bankAcsActive`, `bankAcsDisabled` | account counts |
 | `totalBankAcTxPendingCount`, `totalBankAcTxPendingAmount` | open claims |
 | `unregisteredQrAmountReceived`, `unregisteredQrIdCount` | money received on QR ids that were **never uploaded** (no QR doc exists), and how many such ids. Inside `totalAmountReceived`, on no ledger, so no merchant can withdraw it. Tile: "Received on unregistered QRs" — tap → the transactions list with `?unregisteredQr=true` |
+| `preUploadQrAmountReceived`, `preUploadQrCount` | money that arrived on registered QRs **before they were uploaded** (the QR's ledger started at 0 afterwards and never picked those payments up), and how many QRs are affected. Also inside `totalAmountReceived`, also on no ledger. Tile: "Received before QR upload" |
 
 `avgTxAmount`, `netFlow` and the other derived roll-ups now include the bank channel.
 
@@ -292,14 +293,22 @@ paid. So `netFlow` is **everything still on the platform**: merchant balances *a
                   "earlyReleaseAdminPaise": …, "earlyReleaseMerchantPaise": …,
                   "adminTotalPaise": …, "merchantTotalPaise": …, "totalPaise": … },
   "unregisteredQr": { "idCount": 3, "amountPaise": …, "amountRs": … },   // received on QR ids with no QR doc
+  "preUploadPayments": { "qrCount": 67, "amountPaise": …, "amountRs": …, "ledgerOverDailyPaise": 0 },   // received before the QR was uploaded
   "merchantBalancePaise": …,        // qr.balance + bank.balance + payoutWallet.balance
-  "explainedPaise": …, "explainedRs": …,   // merchantBalance + commission.total + unregisteredQr.amount
+  "explainedPaise": …, "explainedRs": …,   // merchantBalance + commission.total + unregisteredQr.amount + preUploadPayments.amount
   "unexplainedPaise": 0             // netFlow − explained
 }
 ```
 
-`unregisteredQr` is money that came in on QR ids nobody uploaded: it is inside `netFlow` but on no
-ledger, so it is shown as its own line rather than left in the unexplained gap.
+Two lines are money that is inside `netFlow` but on no ledger, shown on their own rather than left in the
+unexplained gap:
+
+- `unregisteredQr` — came in on QR ids nobody uploaded.
+- `preUploadPayments` — came in on QRs that **were** uploaded, but after the payment; the ledger started at
+  zero and never picked it up. `ledgerOverDailyPaise` is the opposite case (a ledger above what the daily
+  summaries say it received) and should stay 0.
+
+Neither line is withdrawable by anyone until the backend credits it explicitly.
 
 | Piece | Meaning |
 |---|---|

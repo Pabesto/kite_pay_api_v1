@@ -4424,6 +4424,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // on no ledger. Same source as GET /transactions?unregisteredQr=true (cached 60s).
             unregisteredQrAmountReceived: (await unregisteredQr()).amountPaise,
             unregisteredQrIdCount: (await unregisteredQr()).ids.length,
+            // Payments that arrived BEFORE their QR was uploaded (registered QRs whose ledger is below their
+            // daily-summary total). Received, on no ledger — the twin of the unregistered figure.
+            preUploadQrAmountReceived: (await unregisteredQr()).preUploadPaise || 0,
+            preUploadQrCount: Object.keys((await unregisteredQr()).preUploadById || {}).length,
             };
 
             return res.status(200).json(payload);
@@ -5104,7 +5108,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // index of every id that was ever paid. A QR uploaded later drops out of this list (its doc now
     // exists) even though the earlier rows were never credited — see reconcile-net.js for the money view.
     // ponytail: parses every day doc; cached 60s so the admin list stays cheap.
-    let _unregCache = { at: 0, ids: [], amountPaise: 0, byId: {} };
+    let _unregCache = { at: 0, ids: [], amountPaise: 0, byId: {}, preUploadById: {}, preUploadPaise: 0, ledgerOverDailyPaise: 0, error: null };
     async function unregisteredQr() {
         if (Date.now() - _unregCache.at < 60000) return _unregCache;
         try {
@@ -5112,19 +5116,30 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // that arrived as "Q123" WAS credited to the QR stored as "q123" (only its daily-summary key
             // differs). Treating it as unregistered would be wrong twice — it is not orphan money, and
             // Query.equal('qrCodeId', 'Q123') would then pull every row of the registered QR into the list.
-            const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => String(q.qrId || '').toLowerCase()));
+            const ledgerById = {};   // lower-cased qrId → ledger totalPayInAmount
+            for (const q of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) if (q.qrId) ledgerById[String(q.qrId).toLowerCase()] = Number(q.totalPayInAmount || 0);
             const paid = {};   // lower-cased id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
             for (const day of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
                 let obj; try { obj = JSON.parse(day.totalsJson || '{}'); } catch { continue; }
                 for (const [k, v] of Object.entries(obj)) if (k) paid[String(k).toLowerCase()] = (paid[String(k).toLowerCase()] || 0) + (parseInt(v || 0, 10) || 0);
             }
-            const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !known.has(id)));
+            const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !(id in ledgerById)));
             const ids = Object.keys(byId);
-            _unregCache = { at: Date.now(), ids, byId, amountPaise: Object.values(byId).reduce((s, v) => s + v, 0), error: null };
+            // Registered QRs whose ledger holds LESS than the daily summaries say they received: the difference
+            // is payments that arrived before the QR was uploaded (the ledger started at 0 afterwards and never
+            // picked them up — verified exactly against row timestamps on 2026-09-23). Counted in received, on
+            // no ledger, so shown as its own line. A ledger ABOVE its daily total is reported separately.
+            const preUploadById = {}; let ledgerOverDailyPaise = 0;
+            for (const [id, ledgerTotal] of Object.entries(ledgerById)) {
+                const diff = (paid[id] || 0) - ledgerTotal;
+                if (diff > 0) preUploadById[id] = diff; else if (diff < 0) ledgerOverDailyPaise += -diff;
+            }
+            _unregCache = { at: Date.now(), ids, byId, amountPaise: Object.values(byId).reduce((s, v) => s + v, 0),
+                preUploadById, preUploadPaise: Object.values(preUploadById).reduce((s, v) => s + v, 0), ledgerOverDailyPaise, error: null };
         } catch (e) {
             // Report-only: never 500 the dashboard or the transactions list over this. Retry on the next call.
             console.error('unregisteredQr() failed:', e?.message || e);
-            _unregCache = { at: 0, ids: [], byId: {}, amountPaise: 0, error: e?.message || String(e) };
+            _unregCache = { at: 0, ids: [], byId: {}, amountPaise: 0, preUploadById: {}, preUploadPaise: 0, ledgerOverDailyPaise: 0, error: e?.message || String(e) };
         }
         return _unregCache;
     }
@@ -5166,6 +5181,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         // Money received on QR ids that have no ledger doc: counted in totalAmountReceived, sitting on no
         // ledger, so it is part of netFlow that no balance explains — shown on its own, not as "unexplained".
         const unregisteredQrView = { idCount: unreg.ids.length, amountPaise: unreg.amountPaise, amountRs: unreg.amountPaise / 100 }; // NOT named unregisteredQr — that is the function called above (TDZ)
+        // Registered QRs whose payments arrived before the QR was uploaded: received, but never on the ledger.
+        const preUploadView = { qrCount: Object.keys(unreg.preUploadById || {}).length, amountPaise: unreg.preUploadPaise || 0, amountRs: (unreg.preUploadPaise || 0) / 100, ledgerOverDailyPaise: unreg.ledgerOverDailyPaise || 0 };
         const commission = {
             payinAdminPaise: get('totalAdminProfit'), payinMerchantPaise: get('totalMerchantProfit'),
             payoutAdminPaise: get('totalPayoutAdminProfit'), payoutMerchantPaise: get('totalPayoutMerchantProfit'),
@@ -5173,10 +5190,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             adminTotalPaise: d.totalAdminProfitAll, merchantTotalPaise: d.totalMerchantProfitAll, totalPaise: d.totalPlatformProfit,
         };
         const payoutWallet = { balancePaise: get('totalPayoutWalletBalance'), customerPayoutPendingPaise: get('totalCustomerPayoutPendingAmount') };
-        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise + unregisteredQrView.amountPaise;
+        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise + unregisteredQrView.amountPaise + preUploadView.amountPaise;
         return {
             netFlowPaise: d.netFlow, netFlowRs: d.netFlow / 100,
-            qr, bank, payoutWallet, commission, unregisteredQr: unregisteredQrView,
+            qr, bank, payoutWallet, commission, unregisteredQr: unregisteredQrView, preUploadPayments: preUploadView,
             merchantBalancePaise: qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise,
             explainedPaise, explainedRs: explainedPaise / 100,
             unexplainedPaise: d.netFlow - explainedPaise,
