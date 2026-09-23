@@ -211,3 +211,22 @@ describe('GET /transactions?unregisteredQr=true — payments whose QR id has no 
         expect((await request(buildApp(makeDb(data))).get('/transactions?unregisteredQr=true&qrId=ghost')).status).toBe(400);
     });
 });
+
+describe('GET /dashboard/counters — netBreakdown decomposes netFlow from the live ledgers', () => {
+    test('returns numbers (never an error object) and counts unregistered pay-ins separately', async () => {
+        const data = seed();
+        data.dashboard_counters = [
+            { $id: 'c1', id: 'totalAmountReceived', totals: 5001 }, { $id: 'c2', id: 'totalAmountPaid', totals: 0 },
+            { $id: 'c3', id: 'totalAdminProfit', totals: 100 }, { $id: 'c4', id: 'totalPayoutWalletBalance', totals: 200 },
+        ];
+        const res = await request(buildApp(makeDb(data))).get('/dashboard/counters');
+        expect(res.status).toBe(200);
+        const nb = res.body.netBreakdown;
+        expect(nb.error).toBeUndefined();
+        expect(nb.qr).toMatchObject({ count: 1, totalPayInPaise: 5000, availablePaise: 5000, balancePaise: 5000 });
+        expect(nb.bank).toMatchObject({ count: 0, balancePaise: 0 });
+        expect(nb.unregisteredQr).toEqual({ idCount: 1, amountPaise: 1, amountRs: 0.01 });   // 'other' has no QR doc
+        expect(nb).toMatchObject({ netFlowPaise: 5001, merchantBalancePaise: 5200, explainedPaise: 5000 + 200 + 100 + 1, unexplainedPaise: 5001 - 5301 });
+        expect(res.body).toMatchObject({ unregisteredQrAmountReceived: 1, unregisteredQrIdCount: 1, totalAmountReceived: 5001, totalQrAmountReceived: 5001 });
+    });
+});

@@ -5165,7 +5165,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         const d = deriveDashboardTotals(get);
         // Money received on QR ids that have no ledger doc: counted in totalAmountReceived, sitting on no
         // ledger, so it is part of netFlow that no balance explains — shown on its own, not as "unexplained".
-        const unregisteredQr = { idCount: unreg.ids.length, amountPaise: unreg.amountPaise, amountRs: unreg.amountPaise / 100 };
+        const unregisteredQrView = { idCount: unreg.ids.length, amountPaise: unreg.amountPaise, amountRs: unreg.amountPaise / 100 }; // NOT named unregisteredQr — that is the function called above (TDZ)
         const commission = {
             payinAdminPaise: get('totalAdminProfit'), payinMerchantPaise: get('totalMerchantProfit'),
             payoutAdminPaise: get('totalPayoutAdminProfit'), payoutMerchantPaise: get('totalPayoutMerchantProfit'),
@@ -5173,10 +5173,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             adminTotalPaise: d.totalAdminProfitAll, merchantTotalPaise: d.totalMerchantProfitAll, totalPaise: d.totalPlatformProfit,
         };
         const payoutWallet = { balancePaise: get('totalPayoutWalletBalance'), customerPayoutPendingPaise: get('totalCustomerPayoutPendingAmount') };
-        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise + unregisteredQr.amountPaise;
+        const explainedPaise = qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise + commission.totalPaise + unregisteredQrView.amountPaise;
         return {
             netFlowPaise: d.netFlow, netFlowRs: d.netFlow / 100,
-            qr, bank, payoutWallet, commission, unregisteredQr,
+            qr, bank, payoutWallet, commission, unregisteredQr: unregisteredQrView,
             merchantBalancePaise: qr.balancePaise + bank.balancePaise + payoutWallet.balancePaise,
             explainedPaise, explainedRs: explainedPaise / 100,
             unexplainedPaise: d.netFlow - explainedPaise,
