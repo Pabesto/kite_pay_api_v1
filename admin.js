@@ -4415,7 +4415,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // Derived roll-ups (see deriveDashboardTotals at the top of this file)
             ...deriveDashboardTotals(get),
             // WHERE netFlow sits — an exact decomposition from the live ledgers (see ledgerTotals)
-            netBreakdown: await netBreakdown(get),
+            netBreakdown: await netBreakdown(get).catch((e) => { console.error('netBreakdown failed:', e?.message || e); return { error: e?.message || String(e) }; }),
             // Money received on QR ids that were never uploaded (no qr_codes doc): inside totalAmountReceived,
             // on no ledger. Same source as GET /transactions?unregisteredQr=true (cached 60s).
             unregisteredQrAmountReceived: (await unregisteredQr()).amountPaise,
@@ -5103,15 +5103,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     let _unregCache = { at: 0, ids: [], amountPaise: 0, byId: {} };
     async function unregisteredQr() {
         if (Date.now() - _unregCache.at < 60000) return _unregCache;
-        const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => q.qrId));
-        const paid = {};   // id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
-        for (const day of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
-            let obj; try { obj = JSON.parse(day.totalsJson || '{}'); } catch { continue; }
-            for (const [k, v] of Object.entries(obj)) if (k) paid[k] = (paid[k] || 0) + (parseInt(v || 0, 10) || 0);
+        try {
+            const known = new Set((await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])).map((q) => q.qrId));
+            const paid = {};   // id → paise received over every day (the daily map is kept in step with deletes, so this is net of deleted rows)
+            for (const day of await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')])) {
+                let obj; try { obj = JSON.parse(day.totalsJson || '{}'); } catch { continue; }
+                for (const [k, v] of Object.entries(obj)) if (k) paid[k] = (paid[k] || 0) + (parseInt(v || 0, 10) || 0);
+            }
+            const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !known.has(id)));
+            const ids = Object.keys(byId);
+            _unregCache = { at: Date.now(), ids, byId, amountPaise: Object.values(byId).reduce((s, v) => s + v, 0), error: null };
+        } catch (e) {
+            // Report-only: never 500 the dashboard or the transactions list over this. Retry on the next call.
+            console.error('unregisteredQr() failed:', e?.message || e);
+            _unregCache = { at: 0, ids: [], byId: {}, amountPaise: 0, error: e?.message || String(e) };
         }
-        const byId = Object.fromEntries(Object.entries(paid).filter(([id]) => !known.has(id)));
-        const ids = Object.keys(byId);
-        _unregCache = { at: Date.now(), ids, byId, amountPaise: Object.values(byId).reduce((s, v) => s + v, 0) };
         return _unregCache;
     }
     const unregisteredQrIds = async () => (await unregisteredQr()).ids;
@@ -5121,8 +5127,12 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // sitting on the ledger: available + pending withdrawals + on-hold + commission-on-hold.
     // ponytail: full scan per dashboard read, like reportGroups(); cache if the tables grow past a few thousand.
     async function ledgerTotals(colId) {
-        const docs = colId ? await listAllDocuments(APPWRITE_DATABASE_ID, colId, [Query.limit(100), Query.orderAsc('$id')]) : [];
-        const t = { count: docs.length, totalPayInPaise: 0, withdrawalApprovedPaise: 0, pendingWithdrawalPaise: 0, onHoldPaise: 0, commissionOnHoldPaise: 0, commissionPaidPaise: 0, availablePaise: 0 };
+        // Report-only: a missing collection (bank schema not run yet) or a read error must never 500 the
+        // dashboard — return zeros and say so in `error`.
+        let docs = [], error = null;
+        try { docs = colId ? await listAllDocuments(APPWRITE_DATABASE_ID, colId, [Query.limit(100), Query.orderAsc('$id')]) : []; }
+        catch (e) { error = e?.code === 404 ? `collection ${colId} not found` : (e?.message || String(e)); console.error(`ledgerTotals(${colId}) failed:`, error); }
+        const t = { count: docs.length, error, totalPayInPaise: 0, withdrawalApprovedPaise: 0, pendingWithdrawalPaise: 0, onHoldPaise: 0, commissionOnHoldPaise: 0, commissionPaidPaise: 0, availablePaise: 0 };
         for (const d of docs) {
             t.totalPayInPaise += Number(d.totalPayInAmount || 0);
             t.withdrawalApprovedPaise += Number(d.withdrawalApprovedAmount || 0);
