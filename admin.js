@@ -1131,11 +1131,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             // ?unregisteredQr=true — only transactions whose qrCodeId has NO qr_codes doc right now (money
             // that was counted but never landed on a ledger). Admin only: these rows have no owner. Appwrite
             // has no cross-collection "not in", so the id set comes from unregisteredQrIds() (cached 60s).
-            if (req.query.unregisteredQr === 'true') {
+            const unregisteredQrOn = ['true', '1', 'yes'].includes(String(req.query.unregisteredQr || '').toLowerCase());
+            if (unregisteredQrOn) {
                 if (!isAdmin) return res.status(403).json({ error: 'Only admin can list transactions of unregistered QR codes' });
                 if (qrId || userId) return res.status(400).json({ error: 'unregisteredQr cannot be combined with qrId or userId' });
-                const ids = await unregisteredQrIds();
-                if (!ids.length) return res.status(200).json({ transactions: [], nextCursor: null, unregisteredQrIds: [] });
+                const unreg = await unregisteredQr();
+                if (unreg.error) return res.status(500).json({ error: `Could not resolve unregistered QR ids: ${unreg.error}` });
+                const ids = unreg.ids;
+                if (!ids.length) return res.status(200).json({ transactions: [], nextCursor: null, unregisteredQr: { idCount: 0, amountPaise: 0 } });
                 const chunks = []; for (let i = 0; i < ids.length; i += 100) chunks.push(Query.equal('qrCodeId', ids.slice(i, i + 100)));
                 filters.push(chunks.length === 1 ? chunks[0] : Query.or(chunks));
             }
@@ -1329,7 +1332,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const docs = transactions.documents.map(pickTxn);
             const nextCursor = docs.length === limitNum ? docs[docs.length - 1].$id : null;
 
-            return res.status(200).json({ transactions: docs, nextCursor });
+            // With the unregistered filter on, echo the id set size + total so the client can verify the filter applied.
+            return res.status(200).json({ transactions: docs, nextCursor, ...(unregisteredQrOn ? { unregisteredQr: { idCount: _unregCache.ids.length, amountPaise: _unregCache.amountPaise } } : {}) });
         } catch (error) {
             if (isCursorError(error)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             console.error('Error fetching deleted transactions:', error);
