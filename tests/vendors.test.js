@@ -159,6 +159,7 @@ describe('assignment', () => {
         expect((await request(app).put('/v/admin/accounts/a1/assign-manager').set(as('admin1')).send({ managedByUserId: 'sub1' })).status).toBe(200);
         expect((await request(app).put('/v/accounts/a1/assign-user').set(as('sub2')).send({ assignedUserId: 'user2' })).status).toBe(404);
         expect((await request(app).put('/v/accounts/a1/assign-user').set(as('sub1')).send({ assignedUserId: 'user2' })).status).toBe(409);
+        expect((await request(app).put('/v/accounts/a1/assign-user').set(as('sub1')).send({ assignedUserId: 'sub1' })).status).toBe(409);   // merchants only: a subadmin could never withdraw
         expect((await request(app).put('/v/accounts/a1/assign-user').set(as('sub1')).send({ assignedUserId: 'user1' })).status).toBe(200);
         expect((await request(app).put('/v/admin/accounts/a1/assign-manager').set(as('admin1')).send({ managedByUserId: 'sub2' })).status).toBe(409);   // merchant not under sub2
         Object.assign(A(db), { totalPayInAmount: 500, amountAvailableForWithdrawal: 500 });

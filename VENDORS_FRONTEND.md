@@ -12,6 +12,9 @@ Base path: `/api/vendors`. Auth: the normal Appwrite JWT bearer. Request amounts
 amounts are **paise** with an `…Rs` twin for display. Lists: `?limit (≤100) &cursor` → `{ <items>, nextCursor }`.
 Errors: `{ error }` (sometimes with extra fields, listed below).
 
+Building the Flutter UI? Screen-by-screen guide with Dart models, action matrices and the full error
+catalogue: [`VENDORS_FLUTTER_UI.md`](VENDORS_FLUTTER_UI.md). Design overview: https://claude.ai/artifact/Ez7UokqRmrmtHiFGehXRHY
+
 ---
 
 ## 1. Roles
@@ -91,7 +94,7 @@ accounts). Limits: `0` = none. `minTxn` and `perTxnLimit` **block** a claim (422
 | `POST /admin/accounts/:id/delist` | admin | `{ reason? }` | `{ message, account }` · `409` balance / open withdrawals / pending claims |
 | `POST /admin/accounts/:id/end-rental` | admin | `{ reason? }` | `{ message, account }` (stops rent accruing) |
 | `PUT /admin/accounts/:id/assign-manager` | admin | `{ managedByUserId: subadminId \| null }` | `{ message, account }` · `400` not a subadmin · `409` merchant not under the new subadmin |
-| `PUT /accounts/:id/assign-user` | admin, the managing subadmin | `{ assignedUserId: id \| null }` | `{ message, account }` · `409` no subadmin yet / merchant not under it / **account still holds money or pending claims** |
+| `PUT /accounts/:id/assign-user` | admin, the managing subadmin | `{ assignedUserId: merchantId \| null }` — a merchant (`role: user`) under the account's subadmin; never the subadmin itself | `{ message, account }` · `409` no subadmin yet / not a merchant under it / **account still holds money or pending claims** |
 
 The ledger belongs to the account, so the merchant on a funded account can never be changed — settle
 (withdraw, or reverse) first.

@@ -266,6 +266,9 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
         createdAt: d.createdAt || null,
     }, role);
 
+    const pickEarning = (d) => ({ $id: d.$id, accountId: d.accountId, vendorId: d.vendorId, type: d.type, period: d.period,
+        amountPaise: Number(d.amountPaise || 0), amountRs: rs(d.amountPaise || 0), utr: d.utr || null, notes: d.notes || null, paidAt: d.paidAt || null });
+
     // ─── scoping ───────────────────────────────────────────────────────────────
     function scopeQueries(user, kind) {   // kind: 'account' | 'row' (claims and withdrawals)
         switch (user.role) {
@@ -631,7 +634,9 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 if ((d.assignedUserId || null) === assignedUserId) return d;
                 if (assignedUserId) {
                     const u = await userMetaCache.getUserMeta(assignedUserId).catch(() => null);
-                    if (!u || (assignedUserId !== d.managedByUserId && !(u.role === 'user' && u.parentId === d.managedByUserId))) throw fail(409, 'Merchant is not under this account’s subadmin.');
+                    // Merchants (role 'user') only: withdraw/confirm/cancel are merchant actions, so any other
+                    // assignee would leave the account's money with nobody able to withdraw it.
+                    if (!u || !(u.role === 'user' && u.parentId === d.managedByUserId)) throw fail(409, 'Merchant is not under this account’s subadmin.');
                 }
                 if (d.assignedUserId) await assertNoOpenMoney(d);
                 return databases.updateDocument(DB, cols.accounts, d.$id, { assignedUserId });
@@ -1013,7 +1018,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                     utr: text(req.body.utr, 64), notes: text(req.body.notes, 300), paidBy: req.user.userId, paidAt: nowIso(),
                 });
             }, 'This account is being updated. Please try again.');
-            return res.status(201).json({ success: true, earning: { ...created, amountRs: rs(created.amountPaise) } });
+            return res.status(201).json({ success: true, earning: pickEarning(created) });
         } catch (e) { return sendError(res, e, 'Failed to record payment'); }
     });
 
@@ -1024,9 +1029,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
             if (req.query.accountId) q.push(Query.equal('accountId', String(req.query.accountId)));
             q.push(Query.orderDesc('$createdAt'), ...cursorQuery(req.query.cursor), Query.limit(limit));
             const r = await databases.listDocuments(DB, cols.earnings, q);
-            const earnings = r.documents.map((d) => ({ $id: d.$id, accountId: d.accountId, vendorId: d.vendorId, type: d.type, period: d.period,
-                amountPaise: Number(d.amountPaise || 0), amountRs: rs(d.amountPaise || 0), utr: d.utr || null, notes: d.notes || null, paidAt: d.paidAt || null }));
-            return res.json({ earnings, nextCursor: page(r.documents, limit) });
+            return res.json({ earnings: r.documents.map(pickEarning), nextCursor: page(r.documents, limit) });
         } catch (e) { return sendError(res, e, 'Failed to fetch earnings'); }
     });
 
