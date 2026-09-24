@@ -232,6 +232,8 @@ class VendorAccount {
   final String? bankName, accountHolderName, ifscCode, upiId, notes;
   // Visible to: admin (all) · vendor (not merchant ids) · subadmin/merchant (not vendor, not split, not sale/rent)
   final String? vendorId, assignedUserId, managedByUserId;
+  // Display names for the ids above (null = unassigned / unknown). Same visibility as the ids.
+  final String? vendorName, managerName, assignedUserName;
   final int minTxnPaise, perTxnLimitPaise, dailyLimitPaise;      // 0 = no limit
   final num? adminPercent, vendorPercent;                          // admin + vendor
   final num? feePercent;                                           // commission accounts, every role
@@ -259,6 +261,9 @@ class VendorAccount {
         vendorId = j['vendorId'],
         assignedUserId = j['assignedUserId'],
         managedByUserId = j['managedByUserId'],
+        vendorName = j['vendorName'],
+        managerName = j['managerName'],
+        assignedUserName = j['assignedUserName'],
         minTxnPaise = paise(j['minTxnPaise']),
         perTxnLimitPaise = paise(j['perTxnLimitPaise']),
         dailyLimitPaise = paise(j['dailyLimitPaise']),
@@ -295,6 +300,10 @@ class RentSale {
         periodsDue = (j['periodsDue'] as List?)?.cast<String>();
 }
 ```
+
+**Names on an account:** `accountHolderName` is the name printed on the bank account. `vendorName`,
+`managerName` (subadmin) and `assignedUserName` (merchant) are the people in the system. Show each where the
+role receives it, and "Unassigned" when the id is null.
 
 **Two account fields to be careful with:**
 
@@ -515,7 +524,7 @@ same call works for everyone.
 | 2 | `GET /rate-cards` | admin, vendor | — | `{ rateCards: [RateCard] }` |
 | 3 | `PUT /admin/rate-cards/:accountType` | admin | `{ adminPercent?, vendorPercent?, salePrice?, rentPerMonth? }` | `{ message, rateCard }` |
 | 4 | `POST /accounts` | vendor | listing form (§8.4) | `201 { message, account }` |
-| 5 | `GET /accounts` | all, scoped | `?state &mode &accountType &vendorId(admin) &limit &cursor` | `{ accounts, nextCursor }` |
+| 5 | `GET /accounts` | all, scoped | `?state &mode &accountType &limit &cursor`; admin: `&vendorId &managedByUserId &assignedUserId`; subadmin: `&assignedUserId` (`none` = unassigned) | `{ accounts, nextCursor }` |
 | 6 | `GET /accounts/:id` | all, scoped | — | `{ account }` |
 | 7 | `PATCH /accounts/:id` | vendor (under review), admin | changed fields only | `{ message, account }` |
 | 8 | `POST /accounts/:id/delist-request` | vendor | — | `{ message }` |
@@ -562,11 +571,15 @@ class VendorApi {
 
   Future<Map<String, dynamic>> me() => _http.get('$_b/me');
 
-  Future<Page<VendorAccount>> accounts({String? state, String? mode, String? vendorId, String? cursor}) async {
+  Future<Page<VendorAccount>> accounts({String? state, String? mode, String? accountType, String? vendorId,
+      String? managedByUserId, String? assignedUserId, String? cursor}) async {
     final j = await _http.get('$_b/accounts', query: {
       if (state != null) 'state': state,
       if (mode != null) 'mode': mode,
-      if (vendorId != null) 'vendorId': vendorId,
+      if (accountType != null) 'accountType': accountType,
+      if (vendorId != null) 'vendorId': vendorId,                        // admin
+      if (managedByUserId != null) 'managedByUserId': managedByUserId,  // admin; 'none' = no subadmin
+      if (assignedUserId != null) 'assignedUserId': assignedUserId,     // admin + subadmin; 'none' = no merchant
       if (cursor != null) 'cursor': cursor,
       'limit': '25',
     });
@@ -682,7 +695,8 @@ the app bar.
 ### 8.2 Accounts: `GET /accounts` (scoped to the vendor)
 
 - Filter chips by state: All · Under review · Active · Inactive · Sold · Rented · Rejected.
-- **Card:** bank name + masked number (`•••• 5544`), type, mode badge, state chip.
+- **Card:** account holder name, bank name + masked number (`•••• 5544`), type, mode badge, state chip.
+  The vendor sees no subadmin or merchant names; only admin and the account's subadmin/merchant do.
   - Commission accounts also show available balance and pay-in.
   - Rent/sale accounts show the monthly rent or price.
 - **FAB:** "List an account" → §8.4.
@@ -842,7 +856,7 @@ so assigned merchant and subadmin are included):
 |---|---|
 | Account | bank + number |
 | Type · Mode · State | chips |
-| Merchant / Subadmin | `assignedUserId` / `managedByUserId` → resolve names from your cached user list |
+| Merchant / Subadmin | `assignedUserName` / `managerName` ("Unassigned" when null) |
 | Pay-in / Paid out / Available | ledger |
 | Admin % / Vendor % | rates |
 | Rent/Sale due · paid · outstanding | `rentSale` |
@@ -870,7 +884,23 @@ fields required when the card is empty.
 
 ### 9.5 Accounts: `GET /accounts` (admin sees all)
 
-Filters: state, mode, type, vendor (`vendorId`). Account detail (admin) shows everything in §8.3 plus the
+**List columns:** account holder (`accountHolderName`) + bank + masked number · **Vendor** (`vendorName`) ·
+**Subadmin** (`managerName`) · **Merchant** (`assignedUserName`) · type · mode · state · available · pay-in.
+Show "Unassigned" in grey when a name is null.
+
+**Filter bar** (filters stack; each change resets the cursor):
+
+| Filter | Query | Options source |
+|---|---|---|
+| Vendor | `vendorId=<id>` | `GET /api/vendors/admin/vendors` (name + userId) |
+| Subadmin | `managedByUserId=<id>` or `none` ("No subadmin") | your existing subadmin list |
+| Merchant | `assignedUserId=<id>` or `none` ("No merchant") | merchants of the chosen subadmin (your existing user list filtered by `parentId`) |
+| State · Mode · Type | `state` · `mode` · `accountType` | fixed enums |
+
+Useful presets: "Approved but not given to a subadmin" = `state=active&managedByUserId=none`; "With a
+subadmin, no merchant yet" = `managedByUserId=<sub>&assignedUserId=none`.
+
+ Account detail (admin) shows everything in §8.3 plus the
 assigned merchant and subadmin, `reviewedAt`, and the audit trail (`GET /admin/audit?entityId=<accountId>`).
 
 Admin actions per §7.2:
@@ -943,7 +973,7 @@ Menu item **Vendor accounts**.
 
 | Screen | Call | Notes |
 |---|---|---|
-| Accounts list | `GET /accounts` | Only accounts admin gave to this subadmin. Shows merchant (`assignedUserId`), balance, fee % (`feePercent`). No vendor identity, no split. |
+| Accounts list | `GET /accounts` | Only accounts admin gave to this subadmin. Columns: account holder, bank + number, merchant (`assignedUserName`, "Unassigned" when null), balance, fee % (`feePercent`). No vendor identity, no split. Filter: merchant (`assignedUserId=<id>` or `none`). |
 | Assign merchant | `PUT /accounts/:id/assign-user { assignedUserId }` | Picker = this subadmin's own merchants (`role: user`). "Remove merchant" sends `null`. 409 while the account holds money or pending claims: show the message. |
 | File claim for a merchant | `POST /accounts/:id/transactions` | Same form as the merchant (§11.3). |
 | Claims | `GET /transactions` | Claims on their accounts. Cancel only the ones they filed. |

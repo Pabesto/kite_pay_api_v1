@@ -31,7 +31,7 @@ Create a vendor with the existing `POST /api/admin/create-user { name, email, pa
 A vendor who still has live accounts (under review / active / inactive / rented) cannot be deleted (400).
 
 **Field visibility.** A vendor never sees merchant identities (`userId`, `assignedUserId`, `managedByUserId`,
-`ownerSubadminId`). A merchant or subadmin never sees the vendor (`vendorId`), the admin/vendor fee split, or
+`ownerSubadminId`, `managerName`, `assignedUserName`). A merchant or subadmin never sees the vendor (`vendorId`, `vendorName`), the admin/vendor fee split, or
 sale/rent terms — they get `feePercent` / `feePaise` / `feesPaidPaise` (the combined fee) instead.
 
 ---
@@ -59,6 +59,7 @@ Changing the card later never touches approved accounts.
   "$id": "va_1", "accountNumber": "998877665544", "bankName": "SBI", "accountHolderName": "Ven", "ifscCode": "SBIN0001234",
   "accountType": "savings", "upiId": null, "notes": null, "mode": "commission", "state": "active",
   "vendorId": "ven1", "assignedUserId": "user1", "managedByUserId": "sub1",
+  "vendorName": "Ravi Traders", "managerName": "Sub One", "assignedUserName": "Merchant One",
   "minTxnPaise": 10000, "minTxnRs": 100, "perTxnLimitPaise": 5000000, "perTxnLimitRs": 50000, "dailyLimitPaise": 0, "dailyLimitRs": 0,
   "adminPercent": 2, "vendorPercent": 1, "feePercent": 3,
   "salePricePaise": null, "salePriceRs": null, "rentPerMonthPaise": null, "rentPerMonthRs": null, "rentStartDate": null, "rentEndDate": null,
@@ -68,6 +69,8 @@ Changing the card later never touches approved accounts.
   "amountAvailableForWithdrawal": 397000, "amountAvailableForWithdrawalRs": 3970
 }
 ```
+
+`vendorName` / `managerName` / `assignedUserName` are display names (users_meta `name`, falling back to email; `null` when unassigned) with the same visibility as their ids: a vendor gets `vendorName` only, a merchant or subadmin gets `managerName` and `assignedUserName` only. `accountHolderName` is the name on the bank account itself.
 
 `amountAvailableForWithdrawal` is what the merchant can withdraw **right now** (no T+1 hold on vendor
 accounts). Limits: `0` = none. `minTxn` and `perTxnLimit` **block** a claim (422); `dailyLimit` only warns.
@@ -84,7 +87,7 @@ accounts). Limits: `0` = none. `minTxn` and `perTxnLimit` **block** a claim (422
 |---|---|---|---|
 | `GET /me` | anyone logged in | — | `{ userId, name, email, role, status }` |
 | `POST /accounts` | vendor | `{ accountNumber, bankName, accountHolderName, ifscCode, accountType, mode: "commission"\|"sell"\|"rent", upiId?, notes?, minTxn?, perTxnLimit?, dailyLimit? }` | `201 { message, account }` · `409` number already listed |
-| `GET /accounts` | all (scoped) | `?state &mode &accountType &vendorId (admin)` | `{ accounts, nextCursor }` |
+| `GET /accounts` | all (scoped) | `?state &mode &accountType`; admin also `&vendorId &managedByUserId &assignedUserId`; subadmin also `&assignedUserId`. `managedByUserId` / `assignedUserId` take `none` = not assigned. Filters stack. | `{ accounts, nextCursor }` |
 | `GET /accounts/:id` | all (scoped) | — | `{ account }` |
 | `PATCH /accounts/:id` | vendor while `under_review`; admin any time | vendor: listing fields; admin: also `adminPercent, vendorPercent, salePrice, rentPerMonth`. `accountNumber` is immutable (400). `mode`/`accountType` only while under review. | `{ message, account }` |
 | `POST /accounts/:id/delist-request` | vendor | — | `{ message }` (sets `delistRequested`) |

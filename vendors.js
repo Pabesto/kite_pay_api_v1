@@ -221,18 +221,19 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
     // ─── projections (who sees what) ───────────────────────────────────────────
     // A vendor never sees merchant identities; a merchant / subadmin never sees the vendor or the fee split.
     const HIDE = {
-        vendor: ['assignedUserId', 'managedByUserId', 'userId', 'ownerSubadminId', 'requestedBy', 'reviewedBy', 'resolvedBy'],
-        subadmin: ['vendorId', 'adminPercent', 'vendorPercent', 'adminCommissionEarned', 'vendorCommissionEarned', 'adminFeePaise', 'vendorFeePaise',
+        vendor: ['assignedUserId', 'managedByUserId', 'managerName', 'assignedUserName', 'userId', 'ownerSubadminId', 'requestedBy', 'reviewedBy', 'resolvedBy'],
+        subadmin: ['vendorId', 'vendorName', 'adminPercent', 'vendorPercent', 'adminCommissionEarned', 'vendorCommissionEarned', 'adminFeePaise', 'vendorFeePaise',
             'salePricePaise', 'salePriceRs', 'rentPerMonthPaise', 'rentPerMonthRs', 'rentStartDate', 'rentEndDate', 'reviewedBy', 'resolvedBy', 'delistRequested'],
     };
     HIDE.user = HIDE.subadmin;
     const view = (obj, role) => { for (const k of HIDE[role] || []) delete obj[k]; return obj; };
-    const pickAccount = (d, role) => {
+    const pickAccount = (d, role, names = {}) => {
         const l = ledgerOf(d);
         return view({
             $id: d.$id, accountNumber: d.accountNumber, bankName: d.bankName || null, accountHolderName: d.accountHolderName || null,
             ifscCode: d.ifscCode || null, accountType: d.accountType, upiId: d.upiId || null, notes: d.notes || null, mode: d.mode, state: d.state,
             vendorId: d.vendorId, assignedUserId: d.assignedUserId || null, managedByUserId: d.managedByUserId || null,
+            vendorName: names[d.vendorId] ?? null, managerName: names[d.managedByUserId] ?? null, assignedUserName: names[d.assignedUserId] ?? null,
             minTxnPaise: Number(d.minTxnPaise || 0), minTxnRs: rs(d.minTxnPaise || 0),
             perTxnLimitPaise: Number(d.perTxnLimitPaise || 0), perTxnLimitRs: rs(d.perTxnLimitPaise || 0),
             dailyLimitPaise: Number(d.dailyLimitPaise || 0), dailyLimitRs: rs(d.dailyLimitPaise || 0),
@@ -246,6 +247,15 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
             amountAvailableForWithdrawal: Number(d.amountAvailableForWithdrawal || 0), amountAvailableForWithdrawalRs: rs(d.amountAvailableForWithdrawal || 0),
         }, role);
     };
+    // Display names for the vendor / subadmin / merchant on each account (one cached lookup per distinct id;
+    // a missing user just shows null). Visibility follows the ids via HIDE above.
+    async function pickAccounts(docs, role) {
+        const ids = [...new Set(docs.flatMap((d) => [d.vendorId, d.managedByUserId, d.assignedUserId]).filter(Boolean))];
+        const metas = await Promise.all(ids.map((id) => userMetaCache.getUserMeta(id).catch(() => null)));
+        const names = Object.fromEntries(ids.map((id, i) => [id, metas[i] ? (metas[i].name || metas[i].email || null) : null]));
+        return docs.map((d) => pickAccount(d, role, names));
+    }
+    const pickOne = async (d, role) => (await pickAccounts([d], role))[0];
     const pickTxn = (d, role) => view({
         $id: d.$id, accountId: d.accountId, vendorId: d.vendorId, userId: d.userId, ownerSubadminId: d.ownerSubadminId || null, requestedBy: d.requestedBy || null,
         referenceNumber: d.referenceNumber, amountPaise: Number(d.amountPaise || 0), amountRs: rs(d.amountPaise || 0),
@@ -435,7 +445,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 assignedUserId: null, managedByUserId: null, delistRequested: false, createdAt: nowIso(),
                 ...Object.fromEntries(LEDGER.map((k) => [k, 0])), amountAvailableForWithdrawal: 0,
             });
-            return res.status(201).json({ message: 'Account submitted for review.', account: pickAccount(created, 'vendor') });
+            return res.status(201).json({ message: 'Account submitted for review.', account: await pickOne(created, 'vendor') });
         } catch (e) { return sendError(res, e, 'Failed to list account'); }
     });
 
@@ -448,9 +458,19 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 if (req.query[k]) { const v = String(req.query[k]).toLowerCase(); if (!list.includes(v)) throw fail(400, `Invalid ${k}. Must be one of: ${list.join(', ')}`); q.push(Query.equal(k, v)); }
             }
             if (req.query.vendorId && req.user.role === 'admin') q.push(Query.equal('vendorId', String(req.query.vendorId)));
+            // Assigned-to filters. Admin: both; subadmin: merchant only (they only ever see their own accounts).
+            // 'none' = not assigned. Other roles can't filter by people they aren't allowed to see.
+            const assignFilters = req.user.role === 'admin' ? ['managedByUserId', 'assignedUserId'] : req.user.role === 'subadmin' ? ['assignedUserId'] : [];
+            for (const k of assignFilters) {
+                const v = req.query[k] == null ? '' : String(req.query[k]).trim();
+                if (!v) continue;
+                if (v === 'none') q.push(Query.isNull(k));
+                else if (CURSOR_RE.test(v)) q.push(Query.equal(k, v));
+                else throw fail(400, `Invalid ${k}`);
+            }
             q.push(Query.orderDesc('createdAt'), ...cursorQuery(req.query.cursor), Query.limit(limit));
             const r = await databases.listDocuments(DB, cols.accounts, q);
-            return res.json({ accounts: r.documents.map((d) => pickAccount(d, req.user.role)), nextCursor: page(r.documents, limit) });
+            return res.json({ accounts: await pickAccounts(r.documents, req.user.role), nextCursor: page(r.documents, limit) });
         } catch (e) { return sendError(res, e, 'Failed to fetch vendor accounts'); }
     });
 
@@ -458,7 +478,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
         try {
             const d = await getAccount(req.params.id);
             if (!canSeeAccount(req.user, d)) throw fail(404, 'Vendor account not found.');
-            return res.json({ account: pickAccount(d, req.user.role) });
+            return res.json({ account: await pickOne(d, req.user.role) });
         } catch (e) { return sendError(res, e, 'Failed to fetch vendor account'); }
     });
 
@@ -482,7 +502,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 assertLimits({ ...d, ...fields });
                 return databases.updateDocument(DB, cols.accounts, d.$id, fields);
             });
-            return res.json({ message: 'Vendor account updated.', account: pickAccount(updated, req.user.role) });
+            return res.json({ message: 'Vendor account updated.', account: await pickOne(updated, req.user.role) });
         } catch (e) { return sendError(res, e, 'Failed to update vendor account'); }
     });
 
@@ -524,7 +544,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 return databases.updateDocument(DB, cols.accounts, d.$id, patch);
             });
             await audit('account', updated.$id, 'approve', req, null);
-            return res.json({ message: 'Account approved.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Account approved.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to approve account'); }
     });
 
@@ -538,7 +558,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 return databases.updateDocument(DB, cols.accounts, d.$id, { state: 'rejected', rejectReason: reason.slice(0, 300), reviewedBy: req.user.userId, reviewedAt: nowIso() });
             });
             await audit('account', updated.$id, 'reject', req, reason);
-            return res.json({ message: 'Account rejected.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Account rejected.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to reject account'); }
     });
 
@@ -552,7 +572,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 if (!['active', 'inactive'].includes(d.state)) throw fail(409, `Account is ${d.state}`);
                 return d.state === next ? d : databases.updateDocument(DB, cols.accounts, d.$id, { state: next });
             });
-            return res.json({ message: 'Account status updated.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Account status updated.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to update account status'); }
     });
 
@@ -569,7 +589,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 return databases.updateDocument(DB, cols.accounts, d.$id, { state: 'delisted', assignedUserId: null, managedByUserId: null, delistRequested: false });
             });
             await audit('account', updated.$id, 'delist', req, req.body?.reason);
-            return res.json({ message: 'Account delisted.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Account delisted.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to delist account'); }
     });
 
@@ -581,7 +601,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 return databases.updateDocument(DB, cols.accounts, d.$id, { state: 'rent_ended', rentEndDate: nowIso() });
             });
             await audit('account', updated.$id, 'end_rental', req, req.body?.reason);
-            return res.json({ message: 'Rental ended.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Rental ended.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to end rental'); }
     });
 
@@ -616,7 +636,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 return databases.updateDocument(DB, cols.accounts, d.$id, { managedByUserId });
             });
             await audit('account', updated.$id, managedByUserId ? 'assign_manager' : 'unassign_manager', req, managedByUserId);
-            return res.json({ message: 'Manager updated.', account: pickAccount(updated, 'admin') });
+            return res.json({ message: 'Manager updated.', account: await pickOne(updated, 'admin') });
         } catch (e) { return sendError(res, e, 'Failed to update manager'); }
     });
 
@@ -641,7 +661,7 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
                 if (d.assignedUserId) await assertNoOpenMoney(d);
                 return databases.updateDocument(DB, cols.accounts, d.$id, { assignedUserId });
             });
-            return res.json({ message: 'Merchant updated.', account: pickAccount(updated, req.user.role) });
+            return res.json({ message: 'Merchant updated.', account: await pickOne(updated, req.user.role) });
         } catch (e) { return sendError(res, e, 'Failed to update merchant'); }
     });
 
@@ -1066,8 +1086,9 @@ function vendorsRouter(databases, ID, Query, DB, USERS_META, cols, redisClient, 
 
     async function vendorDashboard(vendorId, role, q) {
         const { summary, accounts, earnings } = await buildSummary({ vendorId, from: q.from, to: q.to });
+        const picked = await pickAccounts(accounts, role);
         return { success: true, vendorId, ...summary,
-            accountsTable: accounts.map((a) => ({ ...pickAccount(a, role), rentSale: earnings.perAccount[a.$id] || null })) };
+            accountsTable: picked.map((a) => ({ ...a, rentSale: earnings.perAccount[a.$id] || null })) };
     }
     router.get('/admin/vendors/:vendorId', authenticateAdmin, async (req, res) => {
         try {

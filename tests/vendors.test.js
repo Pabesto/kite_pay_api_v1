@@ -39,6 +39,7 @@ function makeDb(seed = {}) {
                 if (!q) continue;
                 if (q.method === 'limit') limit = q.values[0];
                 else if (q.method === 'equal') docs = docs.filter((d) => q.values.includes(d[q.attribute]));
+                else if (q.method === 'isNull') docs = docs.filter((d) => d[q.attribute] == null);
             }
             return { documents: docs.slice(0, limit).map((d) => ({ ...d })), total: docs.length };
         }),
@@ -84,9 +85,9 @@ beforeEach(() => {
         admin1: { $id: 'admin1', userId: 'admin1', role: 'admin' },
         ven1: { $id: 'ven1', userId: 'ven1', role: 'vendor', name: 'Vendor One' },
         ven2: { $id: 'ven2', userId: 'ven2', role: 'vendor' },
-        sub1: { $id: 'sub1', userId: 'sub1', role: 'subadmin' },
+        sub1: { $id: 'sub1', userId: 'sub1', role: 'subadmin', name: 'Sub One' },
         sub2: { $id: 'sub2', userId: 'sub2', role: 'subadmin' },
-        user1: { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' },
+        user1: { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', name: 'Merchant One' },
         user2: { $id: 'user2', userId: 'user2', role: 'user', parentId: 'sub2' },
         emp1: { $id: 'emp1', userId: 'emp1', role: 'employee', labels: [] },
     });
@@ -147,6 +148,48 @@ describe('listing and approval', () => {
         expect(r.body.account.rentStartDate).toBeTruthy();
         expect((await request(app).get('/v/accounts').set(as('emp1'))).status).toBe(403);
         expect((await request(app).put('/v/admin/accounts/s1/assign-manager').set(as('admin1')).send({ managedByUserId: 'sub1' })).status).toBe(409);   // listing-only
+    });
+});
+
+describe('account list: names and filters', () => {
+    const seed = () => ({ [COLS.accounts]: [
+        acct(),                                                                                   // ven1 → sub1 → user1
+        acct({ $id: 'a2', vendorId: 'ven2', managedByUserId: 'sub2', assignedUserId: 'user2' }),
+        acct({ $id: 'a3', vendorId: 'ven1', managedByUserId: null, assignedUserId: null }),
+        acct({ $id: 'a4', vendorId: 'ven1', managedByUserId: 'sub1', assignedUserId: null }),
+    ] });
+    const ids = (res) => res.body.accounts.map((a) => a.$id).sort();
+
+    test('admin sees vendor, subadmin and merchant names and can filter by each (none = unassigned)', async () => {
+        const { app } = build(seed());
+        const all = await request(app).get('/v/accounts').set(as('admin1'));
+        expect(all.body.accounts.find((a) => a.$id === 'a1')).toMatchObject({ accountHolderName: 'Ven', vendorName: 'Vendor One', managerName: 'Sub One', assignedUserName: 'Merchant One' });
+        expect(all.body.accounts.find((a) => a.$id === 'a3')).toMatchObject({ managerName: null, assignedUserName: null });
+        expect(ids(await request(app).get('/v/accounts?vendorId=ven1').set(as('admin1')))).toEqual(['a1', 'a3', 'a4']);
+        expect(ids(await request(app).get('/v/accounts?managedByUserId=sub1').set(as('admin1')))).toEqual(['a1', 'a4']);
+        expect(ids(await request(app).get('/v/accounts?assignedUserId=user2').set(as('admin1')))).toEqual(['a2']);
+        expect(ids(await request(app).get('/v/accounts?managedByUserId=none').set(as('admin1')))).toEqual(['a3']);
+        expect(ids(await request(app).get('/v/accounts?vendorId=ven1&managedByUserId=sub1&assignedUserId=none').set(as('admin1')))).toEqual(['a4']);
+        expect((await request(app).get('/v/accounts?assignedUserId=bad%20id').set(as('admin1'))).status).toBe(400);
+    });
+
+    test('names follow visibility: vendor never sees merchant names, merchant/subadmin never see the vendor', async () => {
+        const { app } = build(seed());
+        const v = await request(app).get('/v/accounts').set(as('ven1'));
+        expect(ids(v)).toEqual(['a1', 'a3', 'a4']);
+        expect(v.body.accounts[0].vendorName).toBe('Vendor One');
+        for (const a of v.body.accounts) { expect(a.managerName).toBeUndefined(); expect(a.assignedUserName).toBeUndefined(); }
+        expect(ids(await request(app).get('/v/accounts?managedByUserId=sub2').set(as('ven1')))).toEqual(['a1', 'a3', 'a4']);   // vendors can't filter by people
+
+        const sub = await request(app).get('/v/accounts').set(as('sub1'));
+        expect(ids(sub)).toEqual(['a1', 'a4']);
+        expect(sub.body.accounts.find((a) => a.$id === 'a1')).toMatchObject({ managerName: 'Sub One', assignedUserName: 'Merchant One' });
+        expect(sub.body.accounts[0].vendorName).toBeUndefined();
+        expect(ids(await request(app).get('/v/accounts?assignedUserId=none').set(as('sub1')))).toEqual(['a4']);
+
+        const m = await request(app).get('/v/accounts/a1').set(as('user1'));
+        expect(m.body.account).toMatchObject({ assignedUserName: 'Merchant One' });
+        expect(m.body.account.vendorName).toBeUndefined();
     });
 });
 
