@@ -91,7 +91,7 @@ function deriveDashboardTotals(get) {
     };
 }
 
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, APPWRITE_VENDOR_ACCOUNTS_COLLECTION_ID) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -452,8 +452,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             }
             await userMetaCache.invalidate(userId);
 
-            // Update dashboard counters in parallel
-            const counterUpdates = [
+            // Update dashboard counters in parallel. Vendors live in their own dashboard (vendors.js) — never counted here.
+            const counterUpdates = role === 'vendor' ? [] : [
                 updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', 1),
             ];
             if (role === 'subadmin') counterUpdates.push(updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'merchantActive', 1));
@@ -901,6 +901,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     const under = await count(APPWRITE_USERS_META_COLLECTION_ID, [Query.equal('parentId', userIdofUserDeleting)]);
                     if (under > 0) return refuse(`Cannot delete this sub-admin: ${under} user(s) are assigned to them. Unassign or reassign those users first.`);
                 }
+                if (userMetaDoc.role === 'vendor') {   // 45th arg; undefined = check off (count() returns 0)
+                    const listed = await count(APPWRITE_VENDOR_ACCOUNTS_COLLECTION_ID, [Query.equal('vendorId', userIdofUserDeleting), Query.equal('state', ['under_review', 'active', 'inactive', 'rented'])]);
+                    if (listed > 0) return refuse(`Cannot delete this vendor: ${listed} vendor account(s) are still live. Delist them or end the rental first.`);
+                }
                 const pendingWithdrawals = await count(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, [Query.equal('userId', userIdofUserDeleting), Query.equal('status', 'pending')]);
                 if (pendingWithdrawals > 0) return refuse(`Cannot delete this user: ${pendingWithdrawals} pending withdrawal request(s). Approve or reject them first.`);
                 const pendingPayouts = await count(APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, [Query.equal('userId', userIdofUserDeleting), Query.equal('status', 'pending')]);
@@ -921,7 +925,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 // Update dashboard counters
                 const role = userMetaDoc.role;
                 const status = userMetaDoc.status;
-                const deleteCounterUpdates = [
+                const deleteCounterUpdates = role === 'vendor' ? [] : [
                     updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalUsers', -1),
                 ];
                 if (role === 'subadmin') {

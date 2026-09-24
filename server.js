@@ -51,6 +51,7 @@ const extensionCaptureRoutes = require('./extensionCapture'); // PhonePe/BharatP
 const extensionAlertsRoutes = require('./extensionAlerts'); // PhonePe/BharatPe extension health alerts + heartbeats — NOT a money path
 const payoutRoutes = require('./payout'); // Customer Payout: payout wallet + customer payouts + payout commission — LIVE money path
 const bankAccountsRoutes = require('./bankAccounts'); // Bank Account pay-ins (manual claims → admin approve) — LIVE money path, own tables
+const vendorsRoutes = require('./vendors'); // Vendor accounts — fully separate channel, own tables (VENDORS_FRONTEND.md)
 
 const fs = require('fs');
 const path = require('path');
@@ -135,6 +136,18 @@ const APPWRITE_BANK_TRANSACTIONS_COLLECTION_ID = process.env.APPWRITE_BANK_TRANS
 const APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID || 'daily_bankac_summaries';
 const APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID = process.env.APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID || 'bankac_daily_releases';
 const APPWRITE_DAILY_BANKAC_WITHDRAWAL_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_BANKAC_WITHDRAWAL_SUMMARIES_COLLECTION_ID || 'daily_bankac_withdrawal_summaries';
+// Vendor accounts (vendors.js) — a self-contained channel; nothing here touches the QR/bank/withdrawal tables.
+// Schema: scripts/setup-vendor-schema.js. Contract: VENDORS_FRONTEND.md.
+const VENDOR_COLLECTIONS = {
+    rateCards: process.env.APPWRITE_VENDOR_RATE_CARDS_COLLECTION_ID || 'vendor_rate_cards',
+    accounts: process.env.APPWRITE_VENDOR_ACCOUNTS_COLLECTION_ID || 'vendor_accounts',
+    txns: process.env.APPWRITE_VENDOR_TRANSACTIONS_COLLECTION_ID || 'vendor_transactions',
+    withdrawals: process.env.APPWRITE_VENDOR_WITHDRAWALS_COLLECTION_ID || 'vendor_withdrawals',
+    commissions: process.env.APPWRITE_VENDOR_COMMISSIONS_COLLECTION_ID || 'vendor_commissions',
+    earnings: process.env.APPWRITE_VENDOR_EARNINGS_COLLECTION_ID || 'vendor_earnings',
+    audit: process.env.APPWRITE_VENDOR_AUDIT_COLLECTION_ID || 'vendor_audit',
+    daily: process.env.APPWRITE_DAILY_VENDOR_SUMMARIES_COLLECTION_ID || 'daily_vendor_summaries',
+};
 // Early-release fee rollups (withdraw.js) — the third commission pot, same shapes as the payin rollups,
 // own tables so the earnings show separately. Schema: scripts/setup-early-release-commission-schema.js.
 const APPWRITE_DAILY_EARLY_RELEASE_COMMISSION_SUMMARIES_COLLECTION_ID = process.env.APPWRITE_DAILY_EARLY_RELEASE_COMMISSION_SUMMARIES_COLLECTION_ID || 'daily_early_release_commissions';
@@ -849,6 +862,13 @@ const authenticateToken = async (req, res, next) => {
             return res.status(404).json({ error: 'User metadata not found' });
         }
 
+        // A vendor login reaches /api/vendors only: every other route family was written for
+        // admin/subadmin/employee/user and treats an unknown role unpredictably. One gate here
+        // covers every middleware built on this one.
+        if (vendorsRoutes.isVendorBlocked(userMeta.role, req.originalUrl)) {
+            return res.status(403).json({ error: 'Vendor logins can only use the vendor portal.' });
+        }
+
         // Attach the users_meta document to req.user
         req.user = userMeta;
 
@@ -986,7 +1006,7 @@ const finalizeTransaction = require('./transactionFinalize')({
 app.use('/api', qrCodeRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee,roleAuth, requireRole));
 
 // Admin routes use the admin authentication middleware
-app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID));
+app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, VENDOR_COLLECTIONS.accounts));
 
 // Admin routes use the admin authentication middleware
 // Customer Payout module — built before the withdraw mount because /withdrawals/approve_new
@@ -1001,6 +1021,9 @@ app.use('/api/user', withdrawRoutes(databases, storage, users, ID, Query, APPWRI
 // Bank Account pay-ins — accounts, payment claims, approve/reject, reports, T+0 release, hold-and-reset.
 // 16 positional args (see the header of bankAccounts.js); tests/bankAccounts.test.js mirrors this call.
 app.use('/api/bank-acs', bankAccountsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, APPWRITE_BANK_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_BANKAC_SUMMARIES_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, redisClient, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, emitWithdrawalEvent, bankSettlement, bankWithdrawalSummary));
+
+// Vendor accounts — 9 positional args (see the header of vendors.js); tests/vendors.test.js mirrors this call.
+app.use('/api/vendors', vendorsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, VENDOR_COLLECTIONS, redisClient, authenticateToken, authenticateAdmin));
 
 // Merchant API routes
 app.use('/api/merchant', apiMerchantRoutes(databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_BUCKET_ID, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_API_MERCHANTS_COLLECTION_ID, APPWRITE_API_MERCHANTS_REQUESTS_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient));

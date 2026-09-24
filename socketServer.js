@@ -91,6 +91,7 @@ function initSocket(app, { appwriteEndpoint, appwriteProjectId, resolveStaffRoom
     socket.on('subscribe:qrs', async ({ qrIds }) => {
       // console.log('User subscribing to QR rooms:', qrIds);
       if (!Array.isArray(qrIds)) return;
+      if (socket.data.userMeta?.role === 'vendor') return; // vendors own no QRs (vendors.js is a separate channel)
       for (const qrId of qrIds) {
         // TODO: validate ownership: isQrAssignedToUser(qrId, userId)
         // Only join if the QR is assigned to this user
