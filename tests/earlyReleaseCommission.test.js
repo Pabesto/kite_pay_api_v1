@@ -178,15 +178,25 @@ describe('early-release fee on withdrawals', () => {
         expect(qr(db).commissionOnHold).toBe(3000);
     });
 
-    test('no rate on the user → config default (0 = fee off); the subadmin\'s own rate never matters', async () => {
-        delete META.user1.earlyReleaseCommission;            // sub1 still has 9% — must be ignored
-        const { app } = build(seedQr());
-        expect((await preview(app)).body.earlyReleaseCommissionPaise).toBe(0);
-        expect((await wd(app)).status).toBe(200);
+    test('rate resolution = user\'s own → parent subadmin\'s → config default; admin earns it in every case', async () => {
+        // user1 has no rate; sub1 has 9% → the user inherits 9% (same inheritance shape as payin)…
+        delete META.user1.earlyReleaseCommission;
+        const { app, db } = build({ ...seedQr(), [EARLY_DAILY]: [] });
+        expect((await preview(app)).body).toMatchObject({ earlyReleaseRate: 9, earlyReleaseCommissionPaise: 4770 });   // ceil(53000 × 9%)
+        const created = await wd(app, { earlyReleaseCommission: 47.7, amount: 1077.7 });
+        expect(created.status).toBe(200);
+        expect(created.body.data).toMatchObject({ earlyUserRate: 0, earlyParentRate: 9 });                    // snapshot says: inherited
+        expect((await approve(app, created.body.data.id)).status).toBe(200);
+        expect(rows(db).filter((r) => r.kind === 'early_release')).toEqual([{ userId: 'admin1', amount: 4770, rate: 9, type: 'admin', kind: 'early_release' }]); // …but admin gets ALL of it
+        expect(counters.find(([k]) => k === 'totalEarlyReleaseMerchantProfit')).toBeUndefined();
 
-        mockConfig.default_early_release_commission = 1;     // admin sets 1% platform-wide → ceil(53000 × 1%) = 530
+        // …no rate anywhere → config default (0 = off)
+        delete META.sub1.earlyReleaseCommission;
         const { app: app2 } = build(seedQr());
-        expect((await preview(app2)).body).toMatchObject({ earlyReleaseCommissionPaise: 530, earlyReleaseRate: 1 });
+        expect((await preview(app2)).body.earlyReleaseCommissionPaise).toBe(0);
+        mockConfig.default_early_release_commission = 1;     // admin sets 1% platform-wide → ceil(53000 × 1%) = 530
+        const { app: app3 } = build(seedQr());
+        expect((await preview(app3)).body).toMatchObject({ earlyReleaseCommissionPaise: 530, earlyReleaseRate: 1 });
     });
 
     test('a request fully covered without the release pays nothing; one that dips into it pays only on the dip', async () => {

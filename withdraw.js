@@ -81,9 +81,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
   // until tomorrow. Priced at request time from the live settlement row, held in commissionOnHold with
   // the payin commission, and earned at approve. The release row's `chargeCommission` (admin's choice
   // per release) and a rate of 0 both make it free. UNLIKE payin, the fee is ADMIN's alone: a subadmin
-  // never earns a share of it, whoever the user hangs under. The rate is the user's own
-  // users_meta.earlyReleaseCommission (admin-set, = admin's rate for that user) or, when missing, the
-  // config default `default_early_release_commission` (fallback 0 = feature off until admin sets it).
+  // never earns a share of it, whoever the user hangs under. The RATE is inherited the way the payin
+  // rate is: the user's own users_meta.earlyReleaseCommission, else the parent subadmin's (one setting
+  // covers all their users), else config `default_early_release_commission` (fallback 0 = feature off).
   const PAYIN_ROLLUPS = { daily: APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, monthly: APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, allTime: APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID };
   function defaultEarlyRate() {
     const v = Number(ConfigManager.get('default_early_release_commission', 0));
@@ -99,11 +99,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
     const portionPaise = Math.min(Number(settle.releasedPaise), Math.max(0, requestedTotalPaise - withoutRelease));
     if (portionPaise <= 0) return none;
-    // One rate, admin's: the user's own value (admin-set) or the platform default. No parent lookup —
-    // the subadmin's share is always 0 by design.
-    const rate = Number(usrDet?.earlyReleaseCommission ?? defaultEarlyRate());
+    // One rate, ADMIN's, resolved like the payin/payout rates are inherited: the user's own value if set,
+    // else the parent subadmin's value (so one setting on a subadmin covers every user under them), else
+    // the platform default. Unlike payin the parent earns nothing — the whole fee is admin's whichever
+    // document supplied the rate. `parentRate` in the snapshot = the inherited rate (0 when not inherited).
+    let rate = usrDet?.earlyReleaseCommission, inherited = false;
+    if (rate == null && usrDet?.parentId) { rate = (await getUserMeta(usrDet.parentId).catch(() => null))?.earlyReleaseCommission; inherited = rate != null; }
+    if (rate == null) rate = defaultEarlyRate();
+    rate = Number(rate);
     if (!isFinite(rate) || rate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };
-    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate: rate, parentRate: 0, rate };
+    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate: inherited ? 0 : rate, parentRate: inherited ? rate : 0, rate };
   }
 
   function generateWithdrawalId() {
@@ -1436,7 +1441,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const earlyPortionPaise = Number(w.earlyReleasePortionPaise || 0);
         const earlyFeePaise = Math.round((w.earlyReleaseCommission || 0) * 100);
         if (admin && earlyPortionPaise > 0 && earlyFeePaise > 0) {
-          const earlyTxs = [{ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: Number(w.earlyUserRate || 0), earningType: 'admin', commissionType: 'early_release', createdAt: new Date().toISOString() }];
+          const earlyTxs = [{ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: Number(w.earlyUserRate || 0) + Number(w.earlyParentRate || 0), earningType: 'admin', commissionType: 'early_release', createdAt: new Date().toISOString() }];
           await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', earlyFeePaise).catch(console.error);
           for (const tx of earlyTxs) await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, ID.unique(), tx);
           try {

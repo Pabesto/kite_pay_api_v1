@@ -281,12 +281,13 @@ fee            = ceil(earlySlice × (userRate + parentRate) / 100)   // paise, r
 ```
 
 So a withdrawal fully covered by older money pays nothing, and one that dips into today's released
-money pays only on the dip. **The fee is admin's alone.** Unlike the payin rate there is no subadmin
-markup: a subadmin never earns a share of it, whoever the user hangs under. The `rate` is one percentage,
-the user's own `earlyReleaseCommission` (set by admin = admin's rate for that user), or, when the user
-has none, the platform default `default_early_release_commission` (**0 until admin sets it — the fee is
-off by default**). A subadmin's own `earlyReleaseCommission` only matters for the subadmin's own
-withdrawals, never for their users'.
+money pays only on the dip. **The fee is admin's alone** — a subadmin never earns a share of it, whoever
+the user hangs under. The **rate** is inherited the same way the payin and payout rates are, so it is
+tracked the same: the user's own `earlyReleaseCommission` if set, else the **parent subadmin's**
+`earlyReleaseCommission` (one setting on a subadmin covers every user under them), else the platform
+default `default_early_release_commission` (**0 until admin sets it — the fee is off by default**). The
+withdrawal snapshot records which applied: `earlyUserRate` (own) or `earlyParentRate` (inherited); the
+money goes to admin either way.
 
 **Admin controls**
 - Platform default rate: `PATCH /api/payout/admin/settings { "defaultEarlyReleaseCommission": 1 }`; shown at
