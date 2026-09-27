@@ -10,6 +10,13 @@ state allows, validation, error handling and Dart models. It is the only documen
 |---|---|
 | [Design overview (artifact)](https://claude.ai/artifact/Ez7UokqRmrmtHiFGehXRHY) | The why: roles, lifecycles and state diagrams on one page. Read it once before starting. |
 | [`VENDORS_FRONTEND.md`](VENDORS_FRONTEND.md) | The compact API contract. If it and this guide ever disagree, `VENDORS_FRONTEND.md` wins. |
+| [`VENDORS_FLUTTER_CHANGES.md`](VENDORS_FLUTTER_CHANGES.md) | **Change requests** against the already-built app, with exact file-by-file edits. Apply them in order. |
+
+### Changelog
+
+| # | Change | Where |
+|---|---|---|
+| 1 | Accounts carry `vendorName` / `managerName` / `assignedUserName`; `GET /accounts` gains `managedByUserId` + `assignedUserId` filters (`none` = unassigned) | §5.1, §6 row 5, §9.5, §10 · edits in `VENDORS_FLUTTER_CHANGES.md` #1 |
 
 ---
 
