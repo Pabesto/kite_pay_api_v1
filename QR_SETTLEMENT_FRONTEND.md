@@ -292,7 +292,10 @@ QR.commissionPaid += fee;  QR.amountAvailableForWithdrawal −= fee
 
 ```jsonc
 { "success": true, "message": "Release updated", "availablePaise": 198000, "releasedPaise": 100000, "heldPaise": 50000, "withdrawablePaise": 148000, …,
-  "release": { …, "chargeCommission": true, "feePaise": 2000, "feeRs": 20, "feeRate": 2, "feePayerUserId": "u1" },   // fee on this row so far (running total)
+  "release": { …, "chargeCommission": true, "feePaise": 2000, "feeRs": 20, "feeRate": 2,            // fee on this row so far (running total)
+               "feePayerUserId": "u1", "feePayerName": "Ravi Shop",                                  // who pays (the QR's user at release time)
+               "payerSubadminId": "sub1", "payerSubadminName": "Sub One",                            // their subadmin, null when direct under admin
+               "releasedBy": "admin1", "releasedByName": "Head Admin" },                             // who released
   "fee": { "feePaise": 2000, "feeRs": 20, "rate": 2, "rateFrom": "subadmin", "payerUserId": "u1", "skipped": null } } // what THIS call charged
 ```
 
@@ -317,7 +320,10 @@ release` (the `chargeCommission:false` checkbox), `QR is not assigned to any use
 - Commission ledger: `GET /api/admin/commissions?commissionType=early_release`; rows carry
   `sourceWithdrawalId: "release:<releaseRowId>"` and `earningType: "admin"`.
 - Early-release rollups: daily / monthly / all-time per admin (written on every charge).
-- Release rows: `feePaise`, `feeRs`, `feeRate`, `feePayerUserId` (`GET …/qr-settlement/:qrId`, `GET …/qr-releases`).
+- Release rows (`GET …/qr-settlement/:qrId`, `GET …/qr-releases`): `feePaise`, `feeRs`, `feeRate`, plus the people
+  as of release time — `feePayerUserId`/`feePayerName`, `payerSubadminId`/`payerSubadminName`, `releasedBy`/`releasedByName`.
+  Build the early-release list from `GET …/qr-releases?date=` with columns: QR, payer, subadmin, released ₹, fee ₹,
+  rate, released by, reason, time. Names are stamped even when the fee was 0.
 - Subadmin dashboard: `totalEarlyReleaseMerchantProfit`, always 0 (the fee is admin's).
 - Withdrawal rows and the withdrawal summaries no longer carry a fee (their `earlyReleaseCommission*` fields
   are legacy zeros).

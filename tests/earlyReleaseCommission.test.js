@@ -62,7 +62,7 @@ function makeDb(seed = {}) {
     };
 }
 const makeRedis = () => ({ set: jest.fn().mockResolvedValue('OK'), get: jest.fn().mockResolvedValue(null), eval: jest.fn().mockResolvedValue(1), incrBy: jest.fn().mockResolvedValue(1), scan: jest.fn().mockResolvedValue({ cursor: '0', keys: [] }) });
-const asUser = (req, res, next) => { const u = META[req.headers['x-user'] || 'admin1']; if (!u) return res.status(401).json({ error: 'nope' }); req.user = { $id: u.$id, userId: u.userId, role: u.role, labels: u.labels || [], parentId: u.parentId || null }; next(); };
+const asUser = (req, res, next) => { const u = META[req.headers['x-user'] || 'admin1']; if (!u) return res.status(401).json({ error: 'nope' }); req.user = { $id: u.$id, userId: u.userId, role: u.role, labels: u.labels || [], parentId: u.parentId || null, name: u.name || null }; next(); };
 const asAdminOrLabel = (label, { isSubadminAllowed = false } = {}) => (req, res, next) => asUser(req, res, () => {
     const { role, labels } = req.user;
     if (role === 'admin' || (isSubadminAllowed && role === 'subadmin') || (role === 'employee' && labels.includes(label))) return next();
@@ -118,10 +118,10 @@ beforeEach(() => {
     counters.length = 0;
     mockConfig.max_withdrawal_requests = 99;
     mockConfig.qr_daily_release_max_percent = 100;
-    META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin' };
+    META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin', name: 'Head Admin' };
     // user1 is under sub1 → pays sub1's early-release rate (2%); user1's own 7 is ignored. Admin earns it.
-    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 2 };
-    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 7 };
+    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 2, name: 'Sub One' };
+    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 7, name: 'Ravi Shop' };
 });
 
 describe('early-release fee is charged when admin releases', () => {
@@ -130,7 +130,12 @@ describe('early-release fee is charged when admin releases', () => {
         const res = await release(app, { amount: 1000 });
         expect(res.status).toBe(200);
         expect(res.body.fee).toMatchObject({ feePaise: 2000, feeRs: 20, rate: 2, rateFrom: 'subadmin', payerUserId: 'user1', skipped: null });
-        expect(res.body.release).toMatchObject({ releasedPaise: 100000, feePaise: 2000, feeRs: 20, feeRate: 2, feePayerUserId: 'user1', chargeCommission: true });
+        expect(res.body.release).toMatchObject({ releasedPaise: 100000, feePaise: 2000, feeRs: 20, feeRate: 2, chargeCommission: true,
+            feePayerUserId: 'user1', feePayerName: 'Ravi Shop', payerSubadminId: 'sub1', payerSubadminName: 'Sub One', releasedBy: 'admin1', releasedByName: 'Head Admin' });
+        // the audit list carries the same details, no lookups needed
+        const list = await request(app).get('/admin/qr-releases').set(as('admin1'));
+        expect(list.status).toBe(200);
+        expect(list.body.releases[0]).toMatchObject({ qrId: 'qr1', releasedPaise: 100000, feePaise: 2000, feePayerName: 'Ravi Shop', payerSubadminName: 'Sub One', releasedByName: 'Head Admin' });
         // ledger: fee taken now; withdrawable = available − held = (200000−2000) − (150000−100000)
         expect(qr(db)).toMatchObject({ commissionPaid: 2000, amountAvailableForWithdrawal: 198000, totalPayInAmount: 200000 });
         expect(res.body).toMatchObject({ availablePaise: 198000, releasedPaise: 100000, heldPaise: 50000, withdrawablePaise: 148000 });
@@ -162,7 +167,9 @@ describe('early-release fee is charged when admin releases', () => {
 
     test('chargeCommission:false, an unassigned QR, or a 0 rate → release works, no fee', async () => {
         const { app, db } = build(seedQr());
-        expect((await release(app, { amount: 1000, chargeCommission: false })).body.fee).toMatchObject({ feePaise: 0, skipped: 'fee disabled for this release' });
+        const off = await release(app, { amount: 1000, chargeCommission: false });
+        expect(off.body.fee).toMatchObject({ feePaise: 0, skipped: 'fee disabled for this release' });
+        expect(off.body.release).toMatchObject({ feePaise: 0, feePayerName: 'Ravi Shop', releasedByName: 'Head Admin' });   // names stamped even with no fee
         expect(qr(db).commissionPaid).toBe(0);
 
         const { app: app2, db: db2 } = build({ ...seedQr(), [QRS]: [{ ...seedQr()[QRS][0], assignedUserId: null }] });

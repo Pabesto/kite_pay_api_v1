@@ -359,13 +359,17 @@ function build() {
         return { scanned, moved, merged };
     }
 
-    /** Add a charged early-release fee to the release row (running total across top-ups; last rate/payer). */
-    async function recordFee(releaseDocId, { feePaise, rate, payerUserId }) {
-        if (!_db || !_releasesCol || !releaseDocId || !(feePaise > 0)) return null;
+    /**
+     * Stamp the release row with who was involved and what it cost, so the list needs no lookups:
+     * the payer (the QR's assigned user), their subadmin, the admin who released, and the fee — a running
+     * total across top-ups, with the last rate. Names are written even when no fee was charged.
+     */
+    async function recordFee(releaseDocId, { feePaise = 0, rate = null, payerUserId = null, payerName = null, subadminId = null, subadminName = null, releasedByName = null } = {}) {
+        if (!_db || !_releasesCol || !releaseDocId) return null;
         const cur = await _db.getDocument(_dbId, _releasesCol, releaseDocId);
-        return _db.updateDocument(_dbId, _releasesCol, releaseDocId, {
-            feePaise: Number(cur.feePaise || 0) + feePaise, feeRate: Number(rate) || 0, feePayerUserId: payerUserId || null,
-        });
+        const patch = { feePayerUserId: payerUserId, feePayerName: payerName, payerSubadminId: subadminId, payerSubadminName: subadminName, releasedByName };
+        if (feePaise > 0) { patch.feePaise = Number(cur.feePaise || 0) + feePaise; patch.feeRate = Number(rate) || 0; }
+        return _db.updateDocument(_dbId, _releasesCol, releaseDocId, patch);
     }
 
     /** Releases for one day, newest first. Cursor-paginated like every other list endpoint. */
@@ -388,7 +392,10 @@ function build() {
         percentAtSet: d.percentAtSet == null ? null : Number(d.percentAtSet),
         changeCount: Number(d.changeCount || 0),
         chargeCommission: d.chargeCommission !== false,   // early-release fee applies unless the admin switched it off
-        feePaise: Number(d.feePaise || 0), feeRs: Number(d.feePaise || 0) / 100, feeRate: d.feeRate == null ? null : Number(d.feeRate), feePayerUserId: d.feePayerUserId || null, // fee charged on this row so far
+        feePaise: Number(d.feePaise || 0), feeRs: Number(d.feePaise || 0) / 100, feeRate: d.feeRate == null ? null : Number(d.feeRate), // fee charged on this row so far
+        feePayerUserId: d.feePayerUserId || null, feePayerName: d.feePayerName || null,           // who pays (the QR's assigned user at release time)
+        payerSubadminId: d.payerSubadminId || null, payerSubadminName: d.payerSubadminName || null, // their subadmin, if any
+        releasedByName: d.releasedByName || null,                                                     // the admin who released (id is releasedBy)
         history: (() => { try { return JSON.parse(d.historyJson || '[]') || []; } catch { return []; } })(),
         reason: d.reason || null, releasedBy: d.releasedBy || null,
         createdAt: d.createdAt || d.$createdAt || null, updatedAt: d.updatedAt || null,

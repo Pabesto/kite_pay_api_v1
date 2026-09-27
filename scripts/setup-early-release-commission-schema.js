@@ -78,6 +78,7 @@ async function main() {
         await bool(col, 'chargeCommission').catch((e) => console.warn(`  ⚠️  ${col}: ${e?.message || e} (skip if this collection does not exist yet)`));
         // fee charged on the row (QR releases only; the bank collection gets the columns but never a value)
         await int(col, 'feePaise').catch(() => {}); await dbl(col, 'feeRate').catch(() => {}); await str(col, 'feePayerUserId', 64).catch(() => {});
+        for (const [k, n] of [['feePayerName', 120], ['payerSubadminId', 64], ['payerSubadminName', 120], ['releasedByName', 120]]) await str(col, k, n).catch(() => {});
     }
 
     console.log(`\n${DAILY}:`);

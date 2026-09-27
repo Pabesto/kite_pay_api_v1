@@ -5325,13 +5325,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 else if (deltaPaise > 0 && typeof chargeEarlyReleaseFee === 'function') {
                     try {
                         fee = await chargeEarlyReleaseFee({ qrId: qr.qrId, deltaPaise, releaseDocId: saved.$id, byUserId: req.user.userId });
-                        if (fee.feePaise > 0) saved = (await qrSettlement.recordFee(saved.$id, { feePaise: fee.feePaise, rate: fee.rate, payerUserId: fee.payerUserId })) || saved;
                     } catch (feeErr) {
                         if (feeErr?.status) throw feeErr; // e.g. 409 negative ledger — the release row is already written; the admin sees why
                         console.error(`CRITICAL: early-release fee failed for release ${saved.$id} (QR ${qr.qrId}, +${deltaPaise} paise) — release stands, fee NOT charged:`, feeErr);
                         fee = { feePaise: 0, rate: 0, skipped: 'fee charge failed — see server log' };
                     }
                 }
+                // Stamp who was involved (names as of now) + the fee on the row, so the release list shows everything.
+                try {
+                    const payer = qr.assignedUserId ? await userMetaCache.getUserMeta(qr.assignedUserId).catch(() => null) : null;
+                    const sub = payer?.parentId ? await userMetaCache.getUserMeta(payer.parentId).catch(() => null) : null;
+                    saved = (await qrSettlement.recordFee(saved.$id, {
+                        feePaise: fee.feePaise, rate: fee.rate, payerUserId: qr.assignedUserId || null, payerName: payer?.name || null,
+                        subadminId: payer?.parentId || null, subadminName: sub?.name || null, releasedByName: req.user.name || null,
+                    })) || saved;
+                } catch (e) { console.error(`early release ${saved.$id}: could not stamp payer/fee details:`, e?.message || e); }
             } finally { await releaseLock(lockKey, lockVal); }
             const settle = await qrSettlement.forQrDocs([await qrByBusinessId(qr.qrId)], day); // fresh: the fee changed available
             return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved),
