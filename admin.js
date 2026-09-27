@@ -4410,6 +4410,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // Early-release fee (withdraw.js) — the third commission pot, shown on its own
             totalEarlyReleaseAdminProfit: get('totalEarlyReleaseAdminProfit'),
+            totalEarlyReleasedAmount: get('totalEarlyReleasedAmount'),          // paise released early (T+0) across all QRs, lifetime
             totalEarlyReleaseMerchantProfit: get('totalEarlyReleaseMerchantProfit'),
 
             // Users/Merchants
@@ -5330,6 +5331,14 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                         console.error(`CRITICAL: early-release fee failed for release ${saved.$id} (QR ${qr.qrId}, +${deltaPaise} paise) — release stands, fee NOT charged:`, feeErr);
                         fee = { feePaise: 0, rate: 0, skipped: 'fee charge failed — see server log' };
                     }
+                }
+                // Per-QR lifetime "released early" total + the platform counter (report figures, never ledger math).
+                if (deltaPaise > 0) {
+                    try {
+                        const fresh = await qrByBusinessId(qr.qrId);
+                        await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, fresh.$id, { earlyReleasedTotalPaise: Number(fresh.earlyReleasedTotalPaise || 0) + deltaPaise });
+                        await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleasedAmount', deltaPaise).catch(console.error);
+                    } catch (e) { console.error(`early release ${saved.$id}: could not bump earlyReleasedTotalPaise:`, e?.message || e); }
                 }
                 // Stamp who was involved (names as of now) + the fee on the row, so the release list shows everything.
                 try {

@@ -290,6 +290,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 amountOnHold : doc.amountOnHold || 0,
                 commissionOnHold : doc.commissionOnHold || 0,
                 commissionPaid : doc.commissionPaid || 0,
+                earlyReleasedTotalPaise : doc.earlyReleasedTotalPaise || 0, // lifetime ₹ released early (T+0) on this QR
+                earlyReleaseFeePaidPaise : doc.earlyReleaseFeePaidPaise || 0, // lifetime early-release fee paid by this QR
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
@@ -913,6 +915,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 amountOnHold : doc.amountOnHold || 0,
                 commissionOnHold : doc.commissionOnHold || 0,
                 commissionPaid : doc.commissionPaid || 0,
+                earlyReleasedTotalPaise : doc.earlyReleasedTotalPaise || 0, // lifetime ₹ released early (T+0) on this QR
+                earlyReleaseFeePaidPaise : doc.earlyReleaseFeePaidPaise || 0, // lifetime early-release fee paid by this QR
             }));
 
             const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });

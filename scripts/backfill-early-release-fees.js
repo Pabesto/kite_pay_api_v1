@@ -2,11 +2,11 @@
 // BEFORE the fee existed (or failed to charge): same money rules as the live path
 // (withdraw.js chargeEarlyReleaseFee), applied once per release row.
 //
-// For every `qr_daily_releases` row with releasedPaise > 0, no fee yet (feePaise empty/0) and
-// chargeCommission !== false:
+// For every `qr_daily_releases` row with releasedPaise > 0 and chargeCommission !== false whose fee is
+// SHORT of what the whole released amount should carry (no fee at all, or only a later top-up's fee):
 //   1. rate  = the QR's assigned user's rate, resolved like live: a user under a subadmin → the SUBADMIN's
 //              earlyReleaseCommission; a parentless user → their own; else --rate / config default (1%)
-//   2. fee   = ceil(releasedPaise × rate)             (the row's total released amount)
+//   2. fee   = ceil(releasedPaise × rate) − feePaise already on the row   (the shortfall)
 //   3. under lock:qr:<qrId> (Redis, fails closed): QR.commissionPaid += fee, available recomputed
 //              (skipped, never written, if that would go negative)
 //   4. one commission_transactions row to ADMIN (commissionType 'early_release',
@@ -14,9 +14,11 @@
 //   5. the release row is stamped: feePaise, feeRate, payer / subadmin / releasedBy names
 // Then, once, recompute-and-overwrite (the sanctioned backfill style, so re-runs never double count):
 //   6. the three early-release rollups (daily map, monthly per admin, all-time per admin) from ALL
-//      early_release commission rows, and the dashboard counter totalEarlyReleaseAdminProfit.
+//      early_release commission rows, the dashboard counter totalEarlyReleaseAdminProfit, and — from the
+//      release rows — each QR's lifetime earlyReleasedTotalPaise / earlyReleaseFeePaidPaise plus the
+//      counter totalEarlyReleasedAmount.
 //
-// Idempotent: a row that already carries feePaise > 0 is skipped. Dry-run by default; --write to apply.
+// Idempotent: a row whose fee is already complete is skipped. Dry-run by default; --write to apply.
 //
 //   node scripts/backfill-early-release-fees.js                      # plan only
 //   node scripts/backfill-early-release-fees.js --write              # apply
@@ -101,28 +103,33 @@ async function main() {
     const rows = (await scan(COL.releases, filters)).sort((a, b) => String(a.date).localeCompare(String(b.date)));
     console.log(`release rows scanned: ${rows.length}\n`);
 
-    const plan = []; const skipped = {};
+    const plan = []; const skipped = {}; const plannedFeeByQr = {};
     const skip = (why, r) => { (skipped[why] = skipped[why] || []).push(`${r.date} ${r.qrId}`); };
     for (const r of rows) {
         const released = Number(r.releasedPaise || 0);
         if (!(released > 0)) { skip('released 0', r); continue; }
-        if (Number(r.feePaise || 0) > 0) { skip('fee already charged', r); continue; }
         if (r.chargeCommission === false) { skip('chargeCommission:false', r); continue; }
         const qr = await one(COL.qr, [Query.equal('qrId', r.qrId)]);
         if (!qr) { skip('QR doc not found', r); continue; }
         if (!qr.assignedUserId) { skip('QR unassigned (nobody to charge)', r); continue; }
         const { rate, from } = rateFor(qr.assignedUserId);
-        const fee = ceilPct(released, rate);
-        if (fee <= 0) { skip(`rate 0 (${from})`, r); continue; }
+        // A row released partly before the fee existed and topped up after carries only the top-up's fee
+        // (the live route charges per increment). Charge the SHORTFALL against the whole released amount.
+        const already = Number(r.feePaise || 0);
+        const fee = ceilPct(released, rate) - already;
+        if (fee <= 0) { skip(already > 0 ? 'fee already charged in full' : `rate 0 (${from})`, r); continue; }
+        // Several rows can hit one QR: accumulate their fees so the plan predicts what the locked write will find.
         const l = (k) => Number(qr[k] || 0);
-        const newAvailable = l('totalPayInAmount') - l('withdrawalApprovedAmount') - l('withdrawalRequestedAmount') - l('amountOnHold') - l('commissionOnHold') - (l('commissionPaid') + fee);
-        if (newAvailable < 0) { skip(`would make QR balance negative (available ${rs(l('amountAvailableForWithdrawal'))} < fee ${rs(fee)})`, r); continue; }
+        const plannedSoFar = plannedFeeByQr[r.qrId] || 0;
+        const newAvailable = l('totalPayInAmount') - l('withdrawalApprovedAmount') - l('withdrawalRequestedAmount') - l('amountOnHold') - l('commissionOnHold') - (l('commissionPaid') + plannedSoFar + fee);
+        if (newAvailable < 0) { skip(`would make QR balance negative (available ${rs(l('amountAvailableForWithdrawal') - plannedSoFar)} < fee ${rs(fee)}) — re-run once the QR receives money`, r); continue; }
+        plannedFeeByQr[r.qrId] = plannedSoFar + fee;
         const payer = U[qr.assignedUserId], sub = payer?.parentId ? U[payer.parentId] : null;
         plan.push({ r, qr, fee, rate, from, payer, sub });
     }
 
-    console.log('date        qrId                        released         rate   fee          payer                 subadmin');
-    for (const p of plan) console.log(`${p.r.date}  ${String(p.r.qrId).padEnd(26)} ${rs(p.r.releasedPaise).padStart(14)}  ${String(p.rate + '%').padStart(5)} ${rs(p.fee).padStart(12)}  ${String(p.payer?.name || p.qr.assignedUserId).slice(0, 20).padEnd(20)}  ${String(p.sub?.name || '-').slice(0, 20)}`);
+    console.log('date        qrId                        released         rate   to charge    (already)     payer                 subadmin');
+    for (const p of plan) console.log(`${p.r.date}  ${String(p.r.qrId).padEnd(26)} ${rs(p.r.releasedPaise).padStart(14)}  ${String(p.rate + '%').padStart(5)} ${rs(p.fee).padStart(12)} ${(Number(p.r.feePaise || 0) ? rs(p.r.feePaise) : '').padStart(12)}  ${String(p.payer?.name || p.qr.assignedUserId).slice(0, 20).padEnd(20)}  ${String(p.sub?.name || '-').slice(0, 20)}`);
     const totalFee = plan.reduce((s, p) => s + p.fee, 0);
     console.log(`\nto charge: ${plan.length} rows, ${rs(totalFee)} → all to admin ${admin.userId}`);
     for (const [why, list] of Object.entries(skipped)) console.log(`skipped (${why}): ${list.length}${list.length <= 6 ? '  ' + list.join(', ') : ''}`);
@@ -140,7 +147,9 @@ async function main() {
             await withQrLock(p.r.qrId, async () => {
                 const qr = await one(COL.qr, [Query.equal('qrId', p.r.qrId)]);        // fresh under lock
                 const rel = await db.getDocument(DB, COL.releases, p.r.$id);
-                if (Number(rel.feePaise || 0) > 0) { console.log(`  ↩︎  ${p.r.date} ${p.r.qrId}: fee appeared meanwhile, skipped`); return; }
+                const due = ceilPct(Number(rel.releasedPaise || 0), p.rate) - Number(rel.feePaise || 0);   // recomputed under lock
+                if (due <= 0) { console.log(`  ↩︎  ${p.r.date} ${p.r.qrId}: fee already complete, skipped`); return; }
+                p.fee = due;
                 const l = (k) => Number(qr[k] || 0);
                 const commissionPaid = l('commissionPaid') + p.fee;
                 const newAvailable = l('totalPayInAmount') - l('withdrawalApprovedAmount') - l('withdrawalRequestedAmount') - l('amountOnHold') - l('commissionOnHold') - commissionPaid;
@@ -149,7 +158,7 @@ async function main() {
                 // 1. commission row FIRST (the durable record), 2. ledger, 3. stamp the release row
                 await db.createDocument(DB, COL.comm, ID.unique(), { userId: admin.userId, sourceWithdrawalId: `release:${rel.$id}`, amount: p.fee, commissionRate: p.rate, earningType: 'admin', commissionType: 'early_release', createdAt: at });
                 await db.updateDocument(DB, COL.qr, qr.$id, { commissionPaid, amountAvailableForWithdrawal: newAvailable });
-                await db.updateDocument(DB, COL.releases, rel.$id, { feePaise: p.fee, feeRate: p.rate, feePayerUserId: qr.assignedUserId, feePayerName: p.payer?.name || null, payerSubadminId: p.payer?.parentId || null, payerSubadminName: p.sub?.name || null, releasedByName: U[rel.releasedBy]?.name || null });
+                await db.updateDocument(DB, COL.releases, rel.$id, { feePaise: Number(rel.feePaise || 0) + p.fee, feeRate: p.rate, feePayerUserId: qr.assignedUserId, feePayerName: p.payer?.name || null, payerSubadminId: p.payer?.parentId || null, payerSubadminName: p.sub?.name || null, releasedByName: U[rel.releasedBy]?.name || null });
                 charged++; console.log(`  ✅ ${p.r.date} ${p.r.qrId}: ${rs(p.fee)} (${p.rate}% ${p.from})`);
             });
         } catch (e) { failed++; console.error(`  ❌ ${p.r.date} ${p.r.qrId}: ${e.message}`); }
@@ -164,6 +173,21 @@ async function main() {
     for (const [userId, v] of Object.entries(allTime)) { const d = await one(COL.allTime, [Query.equal('userId', userId)]); if (d) await db.updateDocument(DB, COL.allTime, d.$id, { totalCommissionPaise: v }); else await db.createDocument(DB, COL.allTime, ID.unique(), { userId, totalCommissionPaise: v }); }
     const cdoc = await one(COL.counters, [Query.equal('id', 'totalEarlyReleaseAdminProfit')]);
     if (cdoc) await db.updateDocument(DB, COL.counters, cdoc.$id, { totals: grand }); else await db.createDocument(DB, COL.counters, ID.unique(), { id: 'totalEarlyReleaseAdminProfit', totals: grand });
+
+    // ── per-QR lifetime figures + platform "released early" counter: recompute-and-overwrite from the rows ──
+    const allRel = await scan(COL.releases);
+    const perQr = {};
+    for (const r of allRel) { const q = (perQr[r.qrId] = perQr[r.qrId] || { released: 0, fee: 0 }); q.released += Number(r.releasedPaise || 0); q.fee += Number(r.feePaise || 0); }
+    let qrsStamped = 0, releasedGrand = 0;
+    for (const [qrId, v] of Object.entries(perQr)) {
+        releasedGrand += v.released;
+        const qrDoc = await one(COL.qr, [Query.equal('qrId', qrId)]);
+        if (!qrDoc) continue;
+        await db.updateDocument(DB, COL.qr, qrDoc.$id, { earlyReleasedTotalPaise: v.released, earlyReleaseFeePaidPaise: v.fee }); qrsStamped++;
+    }
+    const rdoc = await one(COL.counters, [Query.equal('id', 'totalEarlyReleasedAmount')]);
+    if (rdoc) await db.updateDocument(DB, COL.counters, rdoc.$id, { totals: releasedGrand }); else await db.createDocument(DB, COL.counters, ID.unique(), { id: 'totalEarlyReleasedAmount', totals: releasedGrand });
+    console.log(`per-QR lifetime figures stamped on ${qrsStamped} QRs; counter totalEarlyReleasedAmount = ${rs(releasedGrand)}.`);
 
     await redis.quit().catch(() => {});
     console.log(`\ncharged ${charged}, failed ${failed}. Rollups rebuilt from ${all.length} early-release rows: ${Object.keys(daily).length} days, ${Object.keys(monthly).length} month rows, counter totalEarlyReleaseAdminProfit = ${rs(grand)}.\n`);

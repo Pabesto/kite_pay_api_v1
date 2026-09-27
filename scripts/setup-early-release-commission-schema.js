@@ -4,6 +4,7 @@
 //
 // Adds:
 //   users_meta.earlyReleaseCommission (double, %)              per-user rate; null = config default
+//   qr_codes.earlyReleasedTotalPaise / earlyReleaseFeePaidPaise (int)   lifetime released-early ₹ and fee paid, per QR
 //   withdrawal_requests: earlyReleaseCommission (double, Rs), earlyReleasePortionPaise (int),
 //                        earlyUserRate (double), earlyParentRate (double)      request-time snapshot
 //   commission_transactions.commissionType (string)            'early_release' on the fee rows
@@ -27,6 +28,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { Client } = require('node-appwrite');
 
+const E = process.env;
 const {
     APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY, APPWRITE_DATABASE_ID,
     APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID,
@@ -69,6 +71,10 @@ async function main() {
     await int(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'earlyReleasePortionPaise');
     await dbl(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'earlyUserRate');
     await dbl(APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, 'earlyParentRate');
+
+    console.log(`\n${E.APPWRITE_QRCODE_COLLECTION_ID || 'qr_codes'} (lifetime early-release figures per QR):`);
+    await int(E.APPWRITE_QRCODE_COLLECTION_ID, 'earlyReleasedTotalPaise').catch(() => {});
+    await int(E.APPWRITE_QRCODE_COLLECTION_ID, 'earlyReleaseFeePaidPaise').catch(() => {});
 
     console.log(`\n${APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID}:`);
     await str(APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, 'commissionType', 30);

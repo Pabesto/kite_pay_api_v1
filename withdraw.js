@@ -115,7 +115,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const onHold = Number(qr.amountOnHold || 0), commissionOnHold = Number(qr.commissionOnHold || 0), commissionPaid = Number(qr.commissionPaid || 0) + feePaise;
     const newAvailable = total - approved - requested - onHold - commissionOnHold - commissionPaid;
     if (newAvailable < 0) throw Object.assign(new Error('Early release fee would make the QR balance negative; reduce the release amount.'), { status: 409 });
-    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, { commissionPaid, amountAvailableForWithdrawal: newAvailable });
+    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, { commissionPaid, amountAvailableForWithdrawal: newAvailable, earlyReleaseFeePaidPaise: Number(qr.earlyReleaseFeePaidPaise || 0) + feePaise }); // lifetime fee paid by this QR (report figure, not ledger math)
     // Commission row + counter + rollups — the same three places the payin commission lands, own pots.
     const admin = await getadminMeta();
     let txId = null;

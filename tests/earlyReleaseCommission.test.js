@@ -137,7 +137,8 @@ describe('early-release fee is charged when admin releases', () => {
         expect(list.status).toBe(200);
         expect(list.body.releases[0]).toMatchObject({ qrId: 'qr1', releasedPaise: 100000, feePaise: 2000, feePayerName: 'Ravi Shop', payerSubadminName: 'Sub One', releasedByName: 'Head Admin' });
         // ledger: fee taken now; withdrawable = available − held = (200000−2000) − (150000−100000)
-        expect(qr(db)).toMatchObject({ commissionPaid: 2000, amountAvailableForWithdrawal: 198000, totalPayInAmount: 200000 });
+        expect(qr(db)).toMatchObject({ commissionPaid: 2000, amountAvailableForWithdrawal: 198000, totalPayInAmount: 200000, earlyReleasedTotalPaise: 100000, earlyReleaseFeePaidPaise: 2000 });
+        expect(counters).toEqual(expect.arrayContaining([['totalEarlyReleasedAmount', 100000]]));
         expect(res.body).toMatchObject({ availablePaise: 198000, releasedPaise: 100000, heldPaise: 50000, withdrawablePaise: 148000 });
         expect(earlyRows(db)).toEqual([{ userId: 'admin1', amount: 2000, rate: 2, type: 'admin', src: `release:${res.body.release.$id}` }]);
         expect(counters).toEqual(expect.arrayContaining([['totalEarlyReleaseAdminProfit', 2000]]));
@@ -156,12 +157,12 @@ describe('early-release fee is charged when admin releases', () => {
         const up = await release(app, { addAmount: 500, expectedReleasedPaise: 100000 });     // +₹500 → +₹10
         expect(up.body.fee.feePaise).toBe(1000);
         expect(up.body.release).toMatchObject({ releasedPaise: 150000, feePaise: 3000 });       // running total on the row
-        expect(qr(db).commissionPaid).toBe(3000);
+        expect(qr(db)).toMatchObject({ commissionPaid: 3000, earlyReleasedTotalPaise: 150000, earlyReleaseFeePaidPaise: 3000 });
         const down = await release(app, { amount: 200 });                                       // reduction
         expect(down.status).toBe(200); expect(down.body.fee).toMatchObject({ feePaise: 0, skipped: 'no newly released amount' });
         const revoke = await request(app).delete('/admin/qr-settlement/qr1/release').set(as('admin1')).send({});
         expect(revoke.status).toBe(200);
-        expect(qr(db).commissionPaid).toBe(3000);                                               // nothing given back
+        expect(qr(db)).toMatchObject({ commissionPaid: 3000, earlyReleasedTotalPaise: 150000 }); // nothing given back, lifetime total untouched by a reduction
         expect(earlyRows(db)).toHaveLength(2);
     });
 

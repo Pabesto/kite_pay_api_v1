@@ -320,6 +320,11 @@ release` (the `chargeCommission:false` checkbox), `QR is not assigned to any use
 - Commission ledger: `GET /api/admin/commissions?commissionType=early_release`; rows carry
   `sourceWithdrawalId: "release:<releaseRowId>"` and `earningType: "admin"`.
 - Early-release rollups: daily / monthly / all-time per admin (written on every charge).
+- Every QR row (`GET /api/qr-codes`, `GET /api/qr-codes/user/:userId`, …): `earlyReleasedTotalPaise` (lifetime ₹
+  released early on this QR) and `earlyReleaseFeePaidPaise` (lifetime fee this QR paid). Show them as two small
+  figures under the QR's balances, e.g. "Released early ₹1,20,000 · fee paid ₹1,200"; they only ever grow.
+- Dashboard: `totalEarlyReleasedAmount` (lifetime ₹ released early across all QRs) beside
+  `totalEarlyReleaseAdminProfit` (fee earned). Tile pair: "Released early" / "Early-release fee earned".
 - Release rows (`GET …/qr-settlement/:qrId`, `GET …/qr-releases`): `feePaise`, `feeRs`, `feeRate`, plus the people
   as of release time — `feePayerUserId`/`feePayerName`, `payerSubadminId`/`payerSubadminName`, `releasedBy`/`releasedByName`.
   Build the early-release list from `GET …/qr-releases?date=` with columns: QR, payer, subadmin, released ₹, fee ₹,
