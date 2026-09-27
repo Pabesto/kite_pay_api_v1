@@ -7,7 +7,7 @@
 //   withdrawal_requests: earlyReleaseCommission (double, Rs), earlyReleasePortionPaise (int),
 //                        earlyUserRate (double), earlyParentRate (double)      request-time snapshot
 //   commission_transactions.commissionType (string)            'early_release' on the fee rows
-//   qr_daily_releases.chargeCommission / bankac_daily_releases.chargeCommission (boolean)   admin's per-release switch
+//   qr_daily_releases.chargeCommission (boolean) admin's per-release switch; feePaise (int), feeRate (double), feePayerUserId — the fee charged on that release
 //   daily_early_release_commissions   { date, commissionsJson }        (unique date)
 //   monthly_early_release_totals    { userId, month, totalCommissionPaise } (unique userId+month)
 //   all_time_early_release_totals   { userId, totalCommissionPaise }        (unique userId)
@@ -76,6 +76,8 @@ async function main() {
     for (const col of [APPWRITE_QR_DAILY_RELEASES_COLLECTION_ID, APPWRITE_BANKAC_DAILY_RELEASES_COLLECTION_ID]) {
         console.log(`\n${col}:`);
         await bool(col, 'chargeCommission').catch((e) => console.warn(`  ⚠️  ${col}: ${e?.message || e} (skip if this collection does not exist yet)`));
+        // fee charged on the row (QR releases only; the bank collection gets the columns but never a value)
+        await int(col, 'feePaise').catch(() => {}); await dbl(col, 'feeRate').catch(() => {}); await str(col, 'feePayerUserId', 64).catch(() => {});
     }
 
     console.log(`\n${DAILY}:`);

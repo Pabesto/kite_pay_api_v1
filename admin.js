@@ -91,7 +91,7 @@ function deriveDashboardTotals(get) {
     };
 }
 
-module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, APPWRITE_VENDOR_ACCOUNTS_COLLECTION_ID) => {
+module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, APPWRITE_QRCODE_COLLECTION_ID, webhook_collectionId, bucketId, APPWRITE_DAILY_QR_SUMMARIES_COLLECTION_ID, APPWRITE_DAILY_DELETED_SUMMARY_COLLECTION_ID, APPWRITE_DAILY_FLAGGED_SUMMARY_COLLECTION_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID, APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_DASHBOARD_COUNTERS_COLLECTION_ID, APPWRITE_MANUAL_HOLD_COLLECTION_ID, APPWRITE_CONFIG_COLLECTION_ID, updateDailyQrTotal, emitTxnNew, authenticateToken, authenticateAdminOrLabel, authenticateAdmin, authenticateAdminOrSubAdmin, authenticateAdminOrSubAdminOrEmployee, InputFile, roleAuth, requireRole, redisClient, emitTxnStatusNew, APPWRITE_WITHDRAWAL_REQUEST_COLLECTION_ID, finalizeTransaction, APPWRITE_REJECTED_TRANSACTIONS_COLLECTION_ID, APPWRITE_DAILY_REJECTED_SUMMARY_COLLECTION_ID, emitReviewResolved, APPWRITE_ALL_TIME_PAYOUT_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_PAYOUT_WALLETS_COLLECTION_ID, APPWRITE_CUSTOMER_PAYOUTS_COLLECTION_ID, APPWRITE_ALL_TIME_EARLY_RELEASE_COMMISSION_TOTALS_COLLECTION_ID, APPWRITE_BANK_ACCOUNTS_COLLECTION_ID, APPWRITE_VENDOR_ACCOUNTS_COLLECTION_ID, chargeEarlyReleaseFee) => {
     // router.use(roleAuth); // All routes will now have req.userMeta
 
     function getISTDateTime() {
@@ -5305,15 +5305,37 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const releasedPaise = given(req.body.amount) ? toPaise(req.body.amount, 'amount') : null;
             const addPaise = given(req.body.addAmount) ? toPaise(req.body.addAmount, 'addAmount') : null;
 
-            const saved = await qrSettlement.setRelease({
-                ID, qrId: qr.qrId, releasedPaise, addPaise, percent: req.body.percent,
-                expectedTodayPayInPaise: req.body.expectedTodayPayInPaise,
-                expectedReleasedPaise: req.body.expectedReleasedPaise,
-                reason: req.body.reason, byUserId: req.user.userId, day,
-                chargeCommission: req.body.chargeCommission, // optional: false = no early-release fee on this release
-            });
-            const settle = await qrSettlement.forQrDocs([qr], day);
-            return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved) });
+            // The fee for making money withdrawable before T+1 is charged HERE, on what this call newly
+            // releases, and debited from the QR ledger — so the release row write and the ledger RMW run under
+            // lock:qr (fails closed, like every other admin ledger write). Reductions/revokes charge nothing.
+            const lockKey = `lock:qr:${qr.qrId}`, lockVal = `release:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+            if (!await acquireLock(lockKey, lockVal, 20)) return res.status(423).json({ error: `QR ${qr.qrId} is busy (locked) — try again shortly.` });
+            let saved, fee = { feePaise: 0, rate: 0, skipped: 'no newly released amount' };
+            try {
+                const prevPaise = Number((await qrSettlement.getRelease(qr.qrId, day))?.releasedPaise || 0);
+                saved = await qrSettlement.setRelease({
+                    ID, qrId: qr.qrId, releasedPaise, addPaise, percent: req.body.percent,
+                    expectedTodayPayInPaise: req.body.expectedTodayPayInPaise,
+                    expectedReleasedPaise: req.body.expectedReleasedPaise,
+                    reason: req.body.reason, byUserId: req.user.userId, day,
+                    chargeCommission: req.body.chargeCommission, // optional: false = no early-release fee on this release
+                });
+                const deltaPaise = Number(saved.releasedPaise || 0) - prevPaise;
+                if (saved.chargeCommission === false) fee.skipped = 'fee disabled for this release';
+                else if (deltaPaise > 0 && typeof chargeEarlyReleaseFee === 'function') {
+                    try {
+                        fee = await chargeEarlyReleaseFee({ qrId: qr.qrId, deltaPaise, releaseDocId: saved.$id, byUserId: req.user.userId });
+                        if (fee.feePaise > 0) saved = (await qrSettlement.recordFee(saved.$id, { feePaise: fee.feePaise, rate: fee.rate, payerUserId: fee.payerUserId })) || saved;
+                    } catch (feeErr) {
+                        if (feeErr?.status) throw feeErr; // e.g. 409 negative ledger — the release row is already written; the admin sees why
+                        console.error(`CRITICAL: early-release fee failed for release ${saved.$id} (QR ${qr.qrId}, +${deltaPaise} paise) — release stands, fee NOT charged:`, feeErr);
+                        fee = { feePaise: 0, rate: 0, skipped: 'fee charge failed — see server log' };
+                    }
+                }
+            } finally { await releaseLock(lockKey, lockVal); }
+            const settle = await qrSettlement.forQrDocs([await qrByBusinessId(qr.qrId)], day); // fresh: the fee changed available
+            return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: qrSettlement.pickRelease(saved),
+                fee: { feePaise: fee.feePaise, feeRs: fee.feePaise / 100, rate: fee.rate, rateFrom: fee.rateFrom || null, payerUserId: fee.payerUserId || null, skipped: fee.skipped || null } });
         } catch (e) { return settlementError(res, e, 'Failed to update QR release'); }
     });
 
@@ -5630,7 +5652,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     date: dateStr,
                     totalPaise: dayAgg.paidPaise, totalRs: dayAgg.paidPaise / 100,
                     commissionPaise: dayAgg.commissionPaise, commissionRs: dayAgg.commissionPaise / 100,
-                    earlyReleaseCommissionPaise: dayAgg.earlyReleaseCommissionPaise || 0, earlyReleaseCommissionRs: (dayAgg.earlyReleaseCommissionPaise || 0) / 100,
                     count: dayAgg.count, direct: dayAgg.direct, wallet: dayAgg.wallet,
                     qrs, companies: dayCompanies, integrations: dayIntegrations,
                 });
@@ -5642,7 +5663,6 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 days,
                 grandTotalPaise: grand.paidPaise, grandTotalRs: grand.paidPaise / 100,
                 grandCommissionPaise: grand.commissionPaise, grandCommissionRs: grand.commissionPaise / 100,
-                grandEarlyReleaseCommissionPaise: grand.earlyReleaseCommissionPaise || 0, grandEarlyReleaseCommissionRs: (grand.earlyReleaseCommissionPaise || 0) / 100,
                 grandCount: grand.count, direct: grand.direct, wallet: grand.wallet,
                 todayPaise, todayRs: todayPaise / 100,
                 yesterdayPaise, yesterdayRs: yesterdayPaise / 100,

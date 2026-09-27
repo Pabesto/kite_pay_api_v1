@@ -76,41 +76,59 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
   }
 
   // ─── early-release fee ──────────────────────────────────────────────────────
-  // A separate commission (its own rate, counters and rollups) charged ONLY on the slice of a withdrawal
-  // that an admin's T+0 release made withdrawable — money that without the release would still be held
-  // until tomorrow. Priced at request time from the live settlement row, held in commissionOnHold with
-  // the payin commission, and earned at approve. The release row's `chargeCommission` (admin's choice
-  // per release) and a rate of 0 both make it free. UNLIKE payin, the fee is ADMIN's alone: a subadmin
-  // never earns a share of it, whoever the user hangs under. The RATE is inherited the way the payin
-  // rate is: the user's own users_meta.earlyReleaseCommission, else the parent subadmin's (one setting
-  // covers all their users), else config `default_early_release_commission` (fallback 0 = feature off).
+  // A separate commission (its own rate, counter and rollups) charged AT RELEASE TIME: when an admin
+  // makes part of today's pay-in withdrawable before T+1, the fee is `ceil(newlyReleased × rate)` and is
+  // debited from the QR ledger right then (commissionPaid += fee, available recomputed) — it is the
+  // price of instant availability, not of a later withdrawal. Top-ups pay only on the increment; a
+  // reduction or revoke charges nothing and refunds nothing. ADMIN earns all of it. The rate is resolved
+  // like the payin/payout rates: a user under a subadmin pays the SUBADMIN's users_meta.earlyReleaseCommission
+  // (the user's own value is ignored, even 0); a parentless account pays its own; either falls back to
+  // config `default_early_release_commission` (0 = feature off). QR ONLY — bank releases never call this.
+  // Called by admin.js PUT /qr-settlement/:qrId/release while it holds lock:qr:<qrId>.
   const PAYIN_ROLLUPS = { daily: APPWRITE_DAILY_COMMISSION_SUMMARIES_COLLECTION_ID, monthly: APPWRITE_MONTHLY_COMMISSION_TOTALS_COLLECTION_ID, allTime: APPWRITE_ALL_TIME_COMMISSION_TOTAL_COLLECTION_ID };
   function defaultEarlyRate() {
     const v = Number(ConfigManager.get('default_early_release_commission', 0));
     return isFinite(v) && v >= 0 && v <= 100 ? v : 0;
   }
-  // QR ONLY: a bank-account withdrawal never carries the fee, whatever release row exists for the account
-  // (bank early release stays a free gate). `source` is the sourceOf() result of the withdrawal.
-  async function earlyFeeFor(usrDet, settle, requestedTotalPaise, source) {
-    const none = { portionPaise: 0, feePaise: 0, userRate: 0, parentRate: 0, rate: 0 };
-    if (source && source.kind !== 'qr') return none;
-    if (!settle || settle.chargeCommission === false || !(settle.releasedPaise > 0)) return none;
-    // What could be withdrawn with NO release = available − today's pay-in (may be negative → nothing).
-    const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
-    const portionPaise = Math.min(Number(settle.releasedPaise), Math.max(0, requestedTotalPaise - withoutRelease));
-    if (portionPaise <= 0) return none;
-    // One rate, ADMIN's. A user UNDER A SUBADMIN always pays the subadmin's rate — the user's own value
-    // (even an explicit 0) is ignored, so one setting on a subadmin covers every user under them with no
-    // per-user exceptions. A user with no parent pays their own rate. Either falls back to the platform
-    // default when unset. Unlike payin the parent earns nothing — the whole fee is admin's.
-    // `parentRate` in the snapshot = the subadmin's rate (inherited), `userRate` = the user's own.
-    let rate, inherited = false;
-    if (usrDet?.parentId) { rate = (await getUserMeta(usrDet.parentId).catch(() => null))?.earlyReleaseCommission; inherited = rate != null; }
-    else rate = usrDet?.earlyReleaseCommission;
-    if (rate == null) rate = defaultEarlyRate();
+  async function earlyRateFor(userId) {
+    const usr = userId ? await getUserMeta(userId).catch(() => null) : null;
+    if (!usr) return { rate: defaultEarlyRate(), from: 'default' };
+    let rate, from;
+    if (usr.parentId) { rate = (await getUserMeta(usr.parentId).catch(() => null))?.earlyReleaseCommission; from = 'subadmin'; }
+    else { rate = usr.earlyReleaseCommission; from = 'own'; }
+    if (rate == null) { rate = defaultEarlyRate(); from = 'default'; }
     rate = Number(rate);
-    if (!isFinite(rate) || rate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };
-    return { portionPaise, feePaise: calculateCommissionPaise(portionPaise, rate), userRate: inherited ? 0 : rate, parentRate: inherited ? rate : 0, rate };
+    if (!isFinite(rate) || rate < 0 || rate > 100) throw Object.assign(new Error('Early release commission rate is invalid. Please contact support.'), { status: 422 });
+    return { rate, from };
+  }
+  async function chargeEarlyReleaseFee({ qrId, deltaPaise, releaseDocId, byUserId }) {
+    const none = (skipped) => ({ feePaise: 0, rate: 0, skipped });
+    if (!(deltaPaise > 0)) return none('no newly released amount');
+    const qr = (await databases.listDocuments(APPWRITE_DATABASE_ID, Qr_collectionId, [Query.equal('qrId', qrId), Query.limit(1)])).documents[0];
+    if (!qr) return none('QR not found');
+    if (!qr.assignedUserId) return none('QR is not assigned to any user');
+    const { rate, from } = await earlyRateFor(qr.assignedUserId);
+    const feePaise = calculateCommissionPaise(deltaPaise, rate);
+    if (feePaise <= 0) return none(rate === 0 ? 'rate is 0' : 'fee rounds to 0');
+    // Ledger debit (caller holds lock:qr). Recompute available from fresh components; never go negative.
+    const total = Number(qr.totalPayInAmount || 0), approved = Number(qr.withdrawalApprovedAmount || 0), requested = Number(qr.withdrawalRequestedAmount || 0);
+    const onHold = Number(qr.amountOnHold || 0), commissionOnHold = Number(qr.commissionOnHold || 0), commissionPaid = Number(qr.commissionPaid || 0) + feePaise;
+    const newAvailable = total - approved - requested - onHold - commissionOnHold - commissionPaid;
+    if (newAvailable < 0) throw Object.assign(new Error('Early release fee would make the QR balance negative; reduce the release amount.'), { status: 409 });
+    await databases.updateDocument(APPWRITE_DATABASE_ID, Qr_collectionId, qr.$id, { commissionPaid, amountAvailableForWithdrawal: newAvailable });
+    // Commission row + counter + rollups — the same three places the payin commission lands, own pots.
+    const admin = await getadminMeta();
+    let txId = null;
+    if (admin) {
+      const tx = { userId: admin.userId, sourceWithdrawalId: `release:${releaseDocId || qrId}`, amount: feePaise, commissionRate: rate, earningType: 'admin', commissionType: 'early_release', createdAt: new Date().toISOString() };
+      txId = (await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, ID.unique(), tx)).$id;
+      await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', feePaise).catch(console.error);
+      try {
+        if (!earlyRelease?.daily) throw new Error('early-release rollup collections not configured');
+        await recordCommissionRollups([tx], earlyRelease);
+      } catch (e) { console.error(`CRITICAL: early-release commission rollup failed for release ${releaseDocId} (QR ${qrId}, ${feePaise} paise). Raw row ${txId} saved.`, e); }
+    } else console.error(`CRITICAL: no admin users_meta — early-release fee ${feePaise} paise on QR ${qrId} debited but booked to nobody`);
+    return { feePaise, rate, rateFrom: from, payerUserId: qr.assignedUserId, adminUserId: admin?.userId || null, txId, byUserId };
   }
 
   function generateWithdrawalId() {
@@ -259,12 +277,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
       const qr = qrList.documents[0];
       const amountAvailableForWithdrawal = Number(qr.amountAvailableForWithdrawal || 0);
-      // Early-release fee quote: same rule as /withdraw_new, priced from the live settlement row.
-      const previewSettle = await source.settlement.forQr(source.id, amountAvailableForWithdrawal);
-      const early = await earlyFeeFor(usrDet, previewSettle, preAmountPaise + Math.round(commissionRs * 100), source);
-      if (early.error) return res.status(422).json({ error: early.error });
-      const earlyReleaseCommissionRs = early.feePaise / 100;
-      const totalAmountWithEarly = Number(preAmount) + Number(commissionRs) + earlyReleaseCommissionRs;
+      // The early-release fee is charged at RELEASE time (admin.js), never on a withdrawal. The zero
+      // fields below stay for clients built against the earlier contract.
 
       // console.log(`Preview Withdrawal - PreAmountPaise: ${preAmountPaise}, CommissionRs: ${commissionRs}, Available: ${amountAvailableForWithdrawal}`);
 
@@ -304,17 +318,12 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       }
 
       // Return breakdown
-      // totalAmount includes the early-release fee (0 when no release applies). Clients send exactly
-      // these three figures back on /withdraw_new: commission, earlyReleaseCommission, amount.
       return res.json({
         commissionRs,
         commissionRate,
         preAmount,
-        totalAmount: totalAmountWithEarly,
-        earlyReleaseCommissionRs,
-        earlyReleaseCommissionPaise: early.feePaise,
-        earlyReleaseRate: early.rate,
-        earlyReleasePortionPaise: early.portionPaise,
+        totalAmount,
+        earlyReleaseCommissionRs: 0, earlyReleaseCommissionPaise: 0, earlyReleaseRate: 0, earlyReleasePortionPaise: 0, // legacy: fee is charged at release, not here
       });
     });
 
@@ -538,9 +547,15 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           const recalculatedCommissionRs = recalculatedCommissionPaise / 100;
           const recalculatedTotalPaise = preAmountPaise + recalculatedCommissionPaise;
 
-          // The total-amount check (amount === preAmount + commission + earlyReleaseCommission) runs under
-          // the source lock below, because the early-release fee is priced from the live settlement row.
-          // Integer paise throughout (100.1 + 0.3 !== 100.4 in IEEE 754, but 10010 + 30 === 10040 always).
+          // Validation check — compare in integer paise to avoid floating-point drift
+          // (e.g. 100.1 + 0.3 !== 100.4 in IEEE 754, but 10010 + 30 === 10040 always)
+          if (Math.round(Number(amount) * 100) !== recalculatedTotalPaise) {
+            return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.' });
+          }
+          // The early-release fee is charged when admin releases, never on a withdrawal (see chargeEarlyReleaseFee).
+          if (Math.round(Number(earlyReleaseCommission || 0) * 100) !== 0) {
+            return res.status(400).json({ error: 'Early release fee is charged at release time, not on withdrawals. Send earlyReleaseCommission 0 or omit it.' });
+          }
 
           if (Math.round(Number(commission) * 100) !== recalculatedCommissionPaise) {
             return res.status(400).json({ error: 'Commission mismatch. Please check the commission and try again.' });
@@ -594,18 +609,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // preAmountPaise = withdrawal amount in paise (e.g. ₹10 = 1000 paise)
         // Commission already computed in paise — no conversion needed
         const commissionPaiseRequired = recalculatedCommissionPaise;
-
-        // Early-release fee on the slice only today's release makes withdrawable (0 when none applies).
-        const early = await earlyFeeFor(usrDet, settlement, preAmountPaise + commissionPaiseRequired, source);
-        if (early.error) return res.status(422).json({ error: early.error });
-        const earlyPaise = early.feePaise;
-        if (Math.round(Number(earlyReleaseCommission || 0) * 100) !== earlyPaise) {
-          return res.status(400).json({ error: 'Early release commission mismatch. Re-run the commission preview and try again.', earlyReleaseCommissionPaise: earlyPaise, earlyReleaseRate: early.rate, earlyReleasePortionPaise: early.portionPaise });
-        }
-        if (Math.round(Number(amount) * 100) !== recalculatedTotalPaise + earlyPaise) {
-          return res.status(400).json({ error: 'Amount mismatch. Please check the amount and try again.', ...(earlyPaise > 0 ? { earlyReleaseCommissionPaise: earlyPaise, hint: 'amount must equal preAmount + commission + earlyReleaseCommission' } : {}) });
-        }
-        if ((preAmountPaise + commissionPaiseRequired + earlyPaise) > todayWithdrawAmount) {
+        if ((preAmountPaise + commissionPaiseRequired) > todayWithdrawAmount) {
           return res.status(400).json({ error: 'Requested amount including commission exceeds available balance' });
         }
 
@@ -614,7 +618,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         // }
 
         const newRequested = requested + preAmountPaise;                        // paise
-        const newCommissionOnHold = commissionOnHold + commissionPaiseRequired + earlyPaise; // paise — payin + early-release fee held together
+        const newCommissionOnHold = commissionOnHold + commissionPaiseRequired; // paise
         // recompute available after deducting this request
         const newAvailable = total - approved - newRequested - onHold - newCommissionOnHold - commissionPaid; // paise
 
@@ -635,14 +639,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             amount: amount, // Rs
             preAmount: preAmount, // Rs
             commission: recalculatedCommissionRs, // Rs
-            // Early-release fee snapshot (Rs + the priced slice + the rates at request time). Written only
-            // when a fee applies so a schema without these attributes still accepts plain withdrawals.
-            ...(earlyPaise > 0 || early.portionPaise > 0 ? {
-              earlyReleaseCommission: earlyPaise / 100, // Rs
-              earlyReleasePortionPaise: early.portionPaise,
-              earlyUserRate: early.userRate,
-              earlyParentRate: early.parentRate,
-            } : {}),
             userCommissionRate: userCommissionRate,
             parentCommissionRate: parentCommissionRate,
             totalCommissionRate: totalCommissionRate,
@@ -1437,25 +1433,6 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
         }
 
-        // Early-release fee → its OWN commission row (commissionType:'early_release'), counter and
-        // rollups, so it never blends into the payin figures. ADMIN earns all of it, whoever the user
-        // hangs under (no subadmin split, by design): one row = exactly the fee the ledger was debited.
-        const earlyPortionPaise = Number(w.earlyReleasePortionPaise || 0);
-        const earlyFeePaise = Math.round((w.earlyReleaseCommission || 0) * 100);
-        if (admin && earlyPortionPaise > 0 && earlyFeePaise > 0) {
-          const earlyTxs = [{ userId: admin.userId, sourceWithdrawalId: w.id, amount: earlyFeePaise, commissionRate: Number(w.earlyUserRate || 0) + Number(w.earlyParentRate || 0), earningType: 'admin', commissionType: 'early_release', createdAt: new Date().toISOString() }];
-          await updateDashboardCounter(databases, APPWRITE_DATABASE_ID, 'totalEarlyReleaseAdminProfit', earlyFeePaise).catch(console.error);
-          for (const tx of earlyTxs) await databases.createDocument(APPWRITE_DATABASE_ID, APPWRITE_COMMISSION_TRANSACTIONS_COLLECTION_ID, ID.unique(), tx);
-          try {
-            if (!earlyRelease?.daily) throw new Error('early-release rollup collections not configured');
-            await recordCommissionRollups(earlyTxs, earlyRelease);
-          } catch (rollupErr) {
-            console.error(`CRITICAL: Early-release commission rollup failed for withdrawal ${w.id}. Raw tx docs saved. Needs reconciliation.`, rollupErr);
-            await databases.updateDocument(APPWRITE_DATABASE_ID, Withdrawal_request_collectionId, w.$id, { commissionRollupFailed: true })
-              .catch(e => console.error(`CRITICAL: Could not mark commissionRollupFailed on withdrawal ${w.id}`, e));
-          }
-        }
-
         // Payout-wallet withdrawal: credit the wallet (idempotent on w.id). Runs last, after the QR
         // ledger, the withdrawal doc and the commission ledger are all committed.
         // Lock order: lock:qr → lock:payoutwallet. If the credit fails the withdrawal stays approved
@@ -1926,6 +1903,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
 
     });
 
+    router.chargeEarlyReleaseFee = chargeEarlyReleaseFee; // used by admin.js PUT /qr-settlement/:qrId/release (46th admin arg)
     return router;
     
 };

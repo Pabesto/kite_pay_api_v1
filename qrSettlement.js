@@ -11,10 +11,12 @@
 //     heldPaise         = max(0, todayPayInPaise − releasedPaise)
 //     withdrawablePaise = amountAvailableForWithdrawal − heldPaise
 //
-// A release is a GATE, never money. It changes what may be withdrawn, never a stored balance, so it
-// takes no lock, touches no ledger and cannot corrupt a total. It can never raise
-// `amountAvailableForWithdrawal`, so the most any release can unlock is today's own pay-in, and the
-// available balance is still the hard ceiling above it.
+// The release itself is a GATE, never money: it changes what may be withdrawn, never a stored balance,
+// so this module takes no lock and touches no ledger. It can never raise `amountAvailableForWithdrawal`,
+// so the most any release can unlock is today's own pay-in, and the available balance is still the hard
+// ceiling above it. The EARLY-RELEASE FEE charged for a QR release is separate money, debited by the
+// admin route under lock:qr right after setRelease (withdraw.js chargeEarlyReleaseFee) and recorded on
+// the release row via recordFee() — QR only, never bank.
 //
 // With no release the formula is byte-identical to the previous behaviour (released = 0 →
 // held = todayPayIn), so every existing figure is unchanged until an admin acts.
@@ -357,6 +359,15 @@ function build() {
         return { scanned, moved, merged };
     }
 
+    /** Add a charged early-release fee to the release row (running total across top-ups; last rate/payer). */
+    async function recordFee(releaseDocId, { feePaise, rate, payerUserId }) {
+        if (!_db || !_releasesCol || !releaseDocId || !(feePaise > 0)) return null;
+        const cur = await _db.getDocument(_dbId, _releasesCol, releaseDocId);
+        return _db.updateDocument(_dbId, _releasesCol, releaseDocId, {
+            feePaise: Number(cur.feePaise || 0) + feePaise, feeRate: Number(rate) || 0, feePayerUserId: payerUserId || null,
+        });
+    }
+
     /** Releases for one day, newest first. Cursor-paginated like every other list endpoint. */
     async function listReleases({ day = istDay(), qrId = null, id = null, limit = 25, cursor = null } = {}) {
         if (!_db || !_releasesCol) return { total: 0, documents: [] };
@@ -377,6 +388,7 @@ function build() {
         percentAtSet: d.percentAtSet == null ? null : Number(d.percentAtSet),
         changeCount: Number(d.changeCount || 0),
         chargeCommission: d.chargeCommission !== false,   // early-release fee applies unless the admin switched it off
+        feePaise: Number(d.feePaise || 0), feeRs: Number(d.feePaise || 0) / 100, feeRate: d.feeRate == null ? null : Number(d.feeRate), feePayerUserId: d.feePayerUserId || null, // fee charged on this row so far
         history: (() => { try { return JSON.parse(d.historyJson || '[]') || []; } catch { return []; } })(),
         reason: d.reason || null, releasedBy: d.releasedBy || null,
         createdAt: d.createdAt || d.$createdAt || null, updatedAt: d.updatedAt || null,
@@ -386,7 +398,7 @@ function build() {
         init, istDay, maxPercent, maxReleasablePaise,
         heldPaise, withdrawablePaise, todayPayIns, releasesFor,
         forQr, forQrDocs, row, totalsOf,
-        getRelease, setRelease, listReleases, pickRelease, repointReleases,
+        getRelease, setRelease, listReleases, pickRelease, repointReleases, recordFee,
         keyField: () => _key, holdEnabled,
     };
 }

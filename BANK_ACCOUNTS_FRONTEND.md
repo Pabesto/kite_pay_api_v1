@@ -161,10 +161,9 @@ Withdrawal rows and `withdrawal:update` payloads now carry both `qrId` and `bank
 bank account ledger (response and `payout:update` carry `bankAcId`). Sending both `qrId` and `bankAcId`
 is a 400 (`Send either qrId or bankAcId, not both`).
 
-The **early-release fee is QR-only.** A bank withdrawal never carries it: the preview always returns
-`earlyReleaseCommissionRs: 0` for a `bankAcId`, and `/withdraw_new` keeps the plain contract
-`amount = preAmount + commission` (sending `earlyReleaseCommission: 0` is accepted). A bank early
-release (§7) is a free gate.
+The **early-release fee is QR-only** and is charged when admin releases (see `QR_SETTLEMENT_FRONTEND.md`
+§6.5), never on any withdrawal. A bank early release (§7) is a free gate: the bank release response has no
+`fee` block and the account ledger is not debited.
 
 ---
 
