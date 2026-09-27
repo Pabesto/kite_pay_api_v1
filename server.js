@@ -1025,7 +1025,6 @@ app.use('/api/admin', adminRoutes(APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databa
 // Admin routes use the admin authentication middleware
 // Customer Payout module — built before the withdraw mount because /withdrawals/approve_new
 // credits mode:'wallet' withdrawals through payout.creditWalletFromWithdrawal.
-c
 
 // Vendor accounts — 9 positional args (see the header of vendors.js); tests/vendors.test.js mirrors this call.
 app.use('/api/vendors', vendorsRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, VENDOR_COLLECTIONS, redisClient, authenticateToken, authenticateAdmin));
