@@ -161,11 +161,10 @@ Withdrawal rows and `withdrawal:update` payloads now carry both `qrId` and `bank
 bank account ledger (response and `payout:update` carry `bankAcId`). Sending both `qrId` and `bankAcId`
 is a 400 (`Send either qrId or bankAcId, not both`).
 
-The **early-release fee** applies to bank withdrawals exactly as to QR ones: the preview returns
-`earlyReleaseCommissionRs` and `totalAmount` including it, and `/withdraw_new` needs
-`earlyReleaseCommission` echoed with `amount = preAmount + commission + earlyReleaseCommission`. Full
-rules, rates and where it shows: `QR_SETTLEMENT_FRONTEND.md` §6.5. With `bank_account_insta_credit` on
-there is never a release on a bank account, so the fee is always 0 there.
+The **early-release fee is QR-only.** A bank withdrawal never carries it: the preview always returns
+`earlyReleaseCommissionRs: 0` for a `bankAcId`, and `/withdraw_new` keeps the plain contract
+`amount = preAmount + commission` (sending `earlyReleaseCommission: 0` is accepted). A bank early
+release (§7) is a free gate.
 
 ---
 
@@ -197,14 +196,14 @@ range ≤ 366 days; dates are IST days.
 default **false**):
 
 - **false** — an approved bank pay-in is held T+1 exactly like a QR pay-in, and the admin may release it
-  early with the endpoints below (with the early-release fee, §5).
+  early with the endpoints below (always free of the early-release fee — that fee is QR-only).
 - **true** — an approved claim is withdrawable the moment it is approved. Nothing is held, every account
   reports `t1HoldApplies: false`, and the release endpoints answer
   `400 Early release is not applicable: bank_account_insta_credit is on…`. QR codes are unaffected.
 
 The switch is read live: flipping it changes every bank account's `canWithdrawTodayPaise` at once,
 with no restart and no data change. Same dialog and rules as QR early release
-(`QR_SETTLEMENT_FRONTEND.md`, including `chargeCommission` and the fee in §6.5), same config cap
+(`QR_SETTLEMENT_FRONTEND.md`, minus `chargeCommission` — bank releases carry no fee), same config cap
 `qr_daily_release_max_percent`, own rows keyed by `bankAcId`:
 
 | Method & path | Notes |
@@ -333,4 +332,4 @@ wallet float, commission, and the unexplained gap.
 | `bankac_realtime_enabled` | boolean | true | `bankac:*` socket events |
 | `qr_daily_release_max_percent` | integer | 50 | shared with QR: cap on T+0 release; 0 = nothing may be released |
 | `bank_account_insta_credit` | boolean | false | true = approved bank pay-ins withdrawable at once, no T+1, release endpoints refused (§7). Set via `PATCH /api/payout/admin/settings { bankAccountInstaCredit }` |
-| `default_early_release_commission` | double (%) | 0 | early-release fee rate for users without their own `earlyReleaseCommission` (QR and bank alike); 0 = fee off. Set via `PATCH /api/payout/admin/settings { defaultEarlyReleaseCommission }` |
+| `default_early_release_commission` | double (%) | 0 | early-release fee rate for QR withdrawals (never bank) for users without their own `earlyReleaseCommission`; 0 = fee off. Set via `PATCH /api/payout/admin/settings { defaultEarlyReleaseCommission }` |

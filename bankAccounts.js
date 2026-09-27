@@ -801,8 +801,8 @@ module.exports = (databases, ID, Query, DB, USERS_META, ACCOUNTS, TXNS, DAILY, W
             const rsToPaise = (v, label) => { const n = Number(v); if (!isFinite(n) || n < 0) throw fail(400, `Invalid ${label}`); return Math.round(n * 100); };
             const saved = await settlement.setRelease({ ID, id: ac.bankAcId, releasedPaise: given(req.body.amount) ? rsToPaise(req.body.amount, 'amount') : null,
                 addPaise: given(req.body.addAmount) ? rsToPaise(req.body.addAmount, 'addAmount') : null, percent: req.body.percent,
-                expectedTodayPayInPaise: req.body.expectedTodayPayInPaise, expectedReleasedPaise: req.body.expectedReleasedPaise, reason: req.body.reason, byUserId: req.user.userId, day,
-                chargeCommission: req.body.chargeCommission }); // optional: false = no early-release fee on this release
+                expectedTodayPayInPaise: req.body.expectedTodayPayInPaise, expectedReleasedPaise: req.body.expectedReleasedPaise, reason: req.body.reason, byUserId: req.user.userId, day });
+                // No `chargeCommission` here: the early-release fee is a QR-only feature; a bank release is always free (withdraw.js earlyFeeFor).
             const settle = await settlement.forQrDocs([ac], day);
             return res.json({ success: true, message: 'Release updated', ...settle.rows[0], maxPercent: settle.maxPercent, release: settlement.pickRelease(saved) });
         } catch (e) { return sendError(res, e, 'Failed to update bank account release'); }

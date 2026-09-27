@@ -333,9 +333,9 @@ fee, and `/withdraw_new` requires you to echo it:
   `totalEarlyReleaseMerchantProfit`.
 - Commission ledger: `GET /api/admin/commissions?commissionType=early_release` (or `payin`) filters the rows;
   early rows carry `commissionType: "early_release"`.
-- Bank accounts: identical rules on `/api/bank-acs/:bankAcId/release` and on bank withdrawals — unless
-  `bank_account_insta_credit` is on, in which case bank accounts hold nothing, so there is no release and no
-  fee (see `BANK_ACCOUNTS_FRONTEND.md`).
+- **QR only.** Bank-account withdrawals never carry the fee (the preview returns 0 for a `bankAcId`) and the
+  bank release endpoint takes no `chargeCommission`; a bank early release is a free gate
+  (see `BANK_ACCOUNTS_FRONTEND.md`).
 
 ## 7. The cap, and one gotcha
 

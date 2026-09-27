@@ -89,8 +89,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const v = Number(ConfigManager.get('default_early_release_commission', 0));
     return isFinite(v) && v >= 0 && v <= 100 ? v : 0;
   }
-  async function earlyFeeFor(usrDet, settle, requestedTotalPaise) {
+  // QR ONLY: a bank-account withdrawal never carries the fee, whatever release row exists for the account
+  // (bank early release stays a free gate). `source` is the sourceOf() result of the withdrawal.
+  async function earlyFeeFor(usrDet, settle, requestedTotalPaise, source) {
     const none = { portionPaise: 0, feePaise: 0, userRate: 0, parentRate: 0, rate: 0 };
+    if (source && source.kind !== 'qr') return none;
     if (!settle || settle.chargeCommission === false || !(settle.releasedPaise > 0)) return none;
     // What could be withdrawn with NO release = available − today's pay-in (may be negative → nothing).
     const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
@@ -251,7 +254,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
       const amountAvailableForWithdrawal = Number(qr.amountAvailableForWithdrawal || 0);
       // Early-release fee quote: same rule as /withdraw_new, priced from the live settlement row.
       const previewSettle = await source.settlement.forQr(source.id, amountAvailableForWithdrawal);
-      const early = await earlyFeeFor(usrDet, previewSettle, preAmountPaise + Math.round(commissionRs * 100));
+      const early = await earlyFeeFor(usrDet, previewSettle, preAmountPaise + Math.round(commissionRs * 100), source);
       if (early.error) return res.status(422).json({ error: early.error });
       const earlyReleaseCommissionRs = early.feePaise / 100;
       const totalAmountWithEarly = Number(preAmount) + Number(commissionRs) + earlyReleaseCommissionRs;
@@ -586,7 +589,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         const commissionPaiseRequired = recalculatedCommissionPaise;
 
         // Early-release fee on the slice only today's release makes withdrawable (0 when none applies).
-        const early = await earlyFeeFor(usrDet, settlement, preAmountPaise + commissionPaiseRequired);
+        const early = await earlyFeeFor(usrDet, settlement, preAmountPaise + commissionPaiseRequired, source);
         if (early.error) return res.status(422).json({ error: early.error });
         const earlyPaise = early.feePaise;
         if (Math.round(Number(earlyReleaseCommission || 0) * 100) !== earlyPaise) {

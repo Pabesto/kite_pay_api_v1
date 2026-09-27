@@ -204,11 +204,16 @@ describe('bank_account_insta_credit', () => {
     const seed = () => ({ [ACCOUNTS]: [account()], [DAILY_BANK]: [{ $id: 'bd1', date: today(), totalsJson: JSON.stringify({ [AC]: 100000 }) }], [BANK_RELEASES]: [] });
     const bankWd = (app) => request(app).post('/user/withdraw_new').set(as('user1')).send({ userId: 'user1', bankAcId: AC, mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: 500, commission: 15, amount: 515 });
 
-    test('OFF (default): today\'s bank pay-in is held like a QR', async () => {
-        const { app } = build(seed());
-        const list = await request(app).get('/bank-acs/user/user1').set(as('user1'));
+    test('OFF (default): today\'s bank pay-in is held like a QR, and a bank release never charges the fee (QR-only)', async () => {
+        const { app } = build({ ...seed(), [BANK_RELEASES]: [{ $id: 'br1', bankAcId: AC, date: today(), releasedPaise: 100000, changeCount: 1, historyJson: '[]' }] });
+        const p = await request(app).post('/user/withdraw_commission_preview').set(as('user1')).send({ userId: 'user1', bankAcId: AC, preAmount: 500 });
+        expect(p.status).toBe(200);
+        expect(p.body).toMatchObject({ earlyReleaseCommissionPaise: 0, earlyReleaseRate: 0, totalAmount: 515 });   // released, rate 2% on user1, still no fee
+        expect((await bankWd(app)).status).toBe(200);                                                              // fully released → passes T+1, old contract
+        const { app: held } = build(seed());
+        const list = await request(held).get('/bank-acs/user/user1').set(as('user1'));
         expect(list.body.bankAccounts[0]).toMatchObject({ todayTotalPayIn: 100000, heldTodayPaise: 100000, canWithdrawTodayPaise: 0, t1HoldApplies: true });
-        expect((await bankWd(app)).status).toBe(400);
+        expect((await bankWd(held)).status).toBe(400);
     });
 
     test('ON: withdrawable at once, nothing held, early release refused; QRs are unaffected', async () => {

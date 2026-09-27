@@ -5626,6 +5626,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                     date: dateStr,
                     totalPaise: dayAgg.paidPaise, totalRs: dayAgg.paidPaise / 100,
                     commissionPaise: dayAgg.commissionPaise, commissionRs: dayAgg.commissionPaise / 100,
+                    earlyReleaseCommissionPaise: dayAgg.earlyReleaseCommissionPaise || 0, earlyReleaseCommissionRs: (dayAgg.earlyReleaseCommissionPaise || 0) / 100,
                     count: dayAgg.count, direct: dayAgg.direct, wallet: dayAgg.wallet,
                     qrs, companies: dayCompanies, integrations: dayIntegrations,
                 });
@@ -5637,6 +5638,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 days,
                 grandTotalPaise: grand.paidPaise, grandTotalRs: grand.paidPaise / 100,
                 grandCommissionPaise: grand.commissionPaise, grandCommissionRs: grand.commissionPaise / 100,
+                grandEarlyReleaseCommissionPaise: grand.earlyReleaseCommissionPaise || 0, grandEarlyReleaseCommissionRs: (grand.earlyReleaseCommissionPaise || 0) / 100,
                 grandCount: grand.count, direct: grand.direct, wallet: grand.wallet,
                 todayPaise, todayRs: todayPaise / 100,
                 yesterdayPaise, yesterdayRs: yesterdayPaise / 100,
