@@ -26,7 +26,8 @@
 // --write (the QR ledger lock); a Redis outage refuses to write rather than write unlocked.
 
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+// DOTENV_CONFIG_PATH=.env.v3 picks another env file; on Render the dashboard variables already win.
+require('dotenv').config({ path: process.env.DOTENV_CONFIG_PATH ? path.resolve(process.env.DOTENV_CONFIG_PATH) : path.join(__dirname, '..', '.env') });
 const { Client, Query } = require('node-appwrite');
 const moment = require('moment-timezone');
 
@@ -78,7 +79,8 @@ async function withQrLock(qrId, fn) {
 }
 
 async function main() {
-    console.log(`\n=== early-release fee backfill (${WRITE ? 'WRITE' : 'dry run'}) ===\n`);
+    console.log(`\n=== early-release fee backfill (${WRITE ? 'WRITE' : 'dry run'}) ===`);
+    console.log(`target: ${new URL(E.APPWRITE_ENDPOINT).host} project ${String(E.APPWRITE_PROJECT_ID).slice(0, 4)}…${String(E.APPWRITE_PROJECT_ID).slice(-3)} | redis: ${E.REDIS_URL ? new URL(E.REDIS_URL).host : '(none)'}\n`);
     const cfg = await one(COL.config, [Query.equal('key', 'default_early_release_commission')]);
     const defaultRate = RATE_OVERRIDE != null ? Number(RATE_OVERRIDE) : Number(cfg?.val ?? 0);
     if (!isFinite(defaultRate) || defaultRate < 0 || defaultRate > 100) { console.error('❌ bad fallback rate', defaultRate); process.exit(1); }
