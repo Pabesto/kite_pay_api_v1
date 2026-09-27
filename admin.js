@@ -582,6 +582,10 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (hadParent !== willHaveParent) {
                 update.commission = willHaveParent ? 0 : defaultRate('default_payin_commission', 2.2);
                 update.payoutCommission = willHaveParent ? 0 : defaultRate('default_payout_commission', 1.5);
+                // Early-release fee: clear any per-user override so the moved user inherits — under a subadmin,
+                // the subadmin's rate; unassigned, the platform default (withdraw.js earlyFeeFor). NOT 0: a stored
+                // 0 is a real "free" rate and would stop the subadmin's rate from ever applying. Admin earns it either way.
+                update.earlyReleaseCommission = null;
             }
             await databases.updateDocument(APPWRITE_DATABASE_ID, APPWRITE_USERS_META_COLLECTION_ID, current.$id, update);
             await userMetaCache.invalidate(userId);

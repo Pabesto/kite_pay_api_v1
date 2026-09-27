@@ -101,7 +101,7 @@ const seedQr = (release = { releasedPaise: 100000 }) => ({
     [QR_RELEASES]: release ? [{ $id: 'r1', qrId: 'qr1', date: today(), changeCount: 1, historyJson: '[]', ...release }] : [],
 });
 // ₹1,000 out; payin 3% (user 1 + parent 2) = ₹30. The early slice = min(₹1,000 released, ₹1,030 − ₹500) = ₹530;
-// admin's early-release rate for user1 is 2% → ceil(53000 × 2%) = 1060 paise = ₹10.60, all of it admin's.
+// sub1's early-release rate (2%) applies to user1 → ceil(53000 × 2%) = 1060 paise = ₹10.60, all of it admin's.
 const preview = (app) => request(app).post('/user/withdraw_commission_preview').set(as('user1')).send({ userId: 'user1', qrId: 'qr1', preAmount: 1000 });
 const wd = (app, over = {}) => request(app).post('/user/withdraw_new').set(as('user1')).send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: 1000, commission: 30, amount: 1030, ...over });
 const approve = (app, id) => request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id, utrNumber: 'UTR123456' });
@@ -113,9 +113,9 @@ beforeEach(() => {
     counters.length = 0;
     mockConfig.max_withdrawal_requests = 99;
     META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin' };
-    // sub1's own earlyReleaseCommission is irrelevant to user1's fee — it is admin's rate for user1 (2%).
-    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 9 };
-    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 2 };
+    // user1 is under sub1, so user1 pays sub1's early-release rate (2%) — user1's own 7 is ignored. Admin earns it.
+    META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2, earlyReleaseCommission: 2 };
+    META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1, earlyReleaseCommission: 7 };
 });
 
 describe('early-release fee on withdrawals', () => {
@@ -136,7 +136,7 @@ describe('early-release fee on withdrawals', () => {
 
         const ok = await wd(app, { earlyReleaseCommission: 10.6, amount: 1040.6 });
         expect(ok.status).toBe(200);
-        expect(ok.body.data).toMatchObject({ commission: 30, earlyReleaseCommission: 10.6, earlyReleasePortionPaise: 53000, earlyUserRate: 2, earlyParentRate: 0 });
+        expect(ok.body.data).toMatchObject({ commission: 30, earlyReleaseCommission: 10.6, earlyReleasePortionPaise: 53000, earlyUserRate: 0, earlyParentRate: 2 });
         expect(qr(db)).toMatchObject({ withdrawalRequestedAmount: 100000, commissionOnHold: 4060, amountAvailableForWithdrawal: 95940 });
     });
 
@@ -178,25 +178,29 @@ describe('early-release fee on withdrawals', () => {
         expect(qr(db).commissionOnHold).toBe(3000);
     });
 
-    test('rate resolution = user\'s own → parent subadmin\'s → config default; admin earns it in every case', async () => {
-        // user1 has no rate; sub1 has 9% → the user inherits 9% (same inheritance shape as payin)…
-        delete META.user1.earlyReleaseCommission;
+    test('a user under a subadmin ALWAYS pays the subadmin\'s rate (own value, even 0, ignored); no parent → own → default; admin earns it', async () => {
+        // user1 has an explicit 0; sub1 has 9% → the user still pays 9% (the subadmin's rate wins outright)…
+        META.user1.earlyReleaseCommission = 0; META.sub1.earlyReleaseCommission = 9;
         const { app, db } = build({ ...seedQr(), [EARLY_DAILY]: [] });
         expect((await preview(app)).body).toMatchObject({ earlyReleaseRate: 9, earlyReleaseCommissionPaise: 4770 });   // ceil(53000 × 9%)
         const created = await wd(app, { earlyReleaseCommission: 47.7, amount: 1077.7 });
         expect(created.status).toBe(200);
-        expect(created.body.data).toMatchObject({ earlyUserRate: 0, earlyParentRate: 9 });                    // snapshot says: inherited
+        expect(created.body.data).toMatchObject({ earlyUserRate: 0, earlyParentRate: 9 });                    // snapshot says: the subadmin's rate
         expect((await approve(app, created.body.data.id)).status).toBe(200);
         expect(rows(db).filter((r) => r.kind === 'early_release')).toEqual([{ userId: 'admin1', amount: 4770, rate: 9, type: 'admin', kind: 'early_release' }]); // …but admin gets ALL of it
         expect(counters.find(([k]) => k === 'totalEarlyReleaseMerchantProfit')).toBeUndefined();
 
-        // …no rate anywhere → config default (0 = off)
-        delete META.sub1.earlyReleaseCommission;
+        // …subadmin has no rate → config default (0 = off), whatever the user's own value says
+        delete META.sub1.earlyReleaseCommission; META.user1.earlyReleaseCommission = 5;
         const { app: app2 } = build(seedQr());
         expect((await preview(app2)).body.earlyReleaseCommissionPaise).toBe(0);
         mockConfig.default_early_release_commission = 1;     // admin sets 1% platform-wide → ceil(53000 × 1%) = 530
         const { app: app3 } = build(seedQr());
         expect((await preview(app3)).body).toMatchObject({ earlyReleaseCommissionPaise: 530, earlyReleaseRate: 1 });
+        // …a user with NO parent pays their own rate
+        META.user1.parentId = null; META.user1.earlyReleaseCommission = 3;
+        const { app: app4 } = build(seedQr());
+        expect((await preview(app4)).body).toMatchObject({ earlyReleaseRate: 3, earlyReleaseCommissionPaise: 1530, earlyReleasePortionPaise: 51000 });   // no parent → payin 1% → slice ₹510 → ceil(51000 × 3%)
     });
 
     test('a request fully covered without the release pays nothing; one that dips into it pays only on the dip', async () => {

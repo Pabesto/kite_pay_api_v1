@@ -99,12 +99,14 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     const withoutRelease = Math.max(0, Number(settle.availablePaise || 0) - Number(settle.todayPayInPaise || 0));
     const portionPaise = Math.min(Number(settle.releasedPaise), Math.max(0, requestedTotalPaise - withoutRelease));
     if (portionPaise <= 0) return none;
-    // One rate, ADMIN's, resolved like the payin/payout rates are inherited: the user's own value if set,
-    // else the parent subadmin's value (so one setting on a subadmin covers every user under them), else
-    // the platform default. Unlike payin the parent earns nothing — the whole fee is admin's whichever
-    // document supplied the rate. `parentRate` in the snapshot = the inherited rate (0 when not inherited).
-    let rate = usrDet?.earlyReleaseCommission, inherited = false;
-    if (rate == null && usrDet?.parentId) { rate = (await getUserMeta(usrDet.parentId).catch(() => null))?.earlyReleaseCommission; inherited = rate != null; }
+    // One rate, ADMIN's. A user UNDER A SUBADMIN always pays the subadmin's rate — the user's own value
+    // (even an explicit 0) is ignored, so one setting on a subadmin covers every user under them with no
+    // per-user exceptions. A user with no parent pays their own rate. Either falls back to the platform
+    // default when unset. Unlike payin the parent earns nothing — the whole fee is admin's.
+    // `parentRate` in the snapshot = the subadmin's rate (inherited), `userRate` = the user's own.
+    let rate, inherited = false;
+    if (usrDet?.parentId) { rate = (await getUserMeta(usrDet.parentId).catch(() => null))?.earlyReleaseCommission; inherited = rate != null; }
+    else rate = usrDet?.earlyReleaseCommission;
     if (rate == null) rate = defaultEarlyRate();
     rate = Number(rate);
     if (!isFinite(rate) || rate < 0 || rate > 100) return { ...none, error: 'Early release commission rate is invalid. Please contact support.' };

@@ -797,7 +797,7 @@ describe('create-user commission defaults', () => {
         const db = assignDb(null);
         const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1' });
         expect(res.status).toBe(200);
-        expect(updated(db)).toEqual({ parentId: 'sub1', commission: 0, payoutCommission: 0 }); // earlyReleaseCommission is admin's fee — never re-stamped
+        expect(updated(db)).toEqual({ parentId: 'sub1', commission: 0, payoutCommission: 0, earlyReleaseCommission: null }); // early-release: cleared to INHERIT the subadmin's rate (never 0 — that would be a real free rate)
         expect(res.body).toMatchObject({ parentId: 'sub1', commission: 0, payoutCommission: 0, ratesReset: true });
     });
 
@@ -805,7 +805,7 @@ describe('create-user commission defaults', () => {
         const db = assignDb('sub1');
         const res = await request(buildAdminApp(db, makeRedis(), asAdmin)).put('/assign-user/sub1').send({ userId: 'u1', unassign: true });
         expect(res.status).toBe(200);
-        expect(updated(db)).toEqual({ parentId: null, commission: 2.2, payoutCommission: 1.5 });
+        expect(updated(db)).toEqual({ parentId: null, commission: 2.2, payoutCommission: 1.5, earlyReleaseCommission: null }); // early-release: cleared → platform default
         expect(res.body.ratesReset).toBe(true);
     });
 

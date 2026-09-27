@@ -283,11 +283,12 @@ fee            = ceil(earlySlice × (userRate + parentRate) / 100)   // paise, r
 So a withdrawal fully covered by older money pays nothing, and one that dips into today's released
 money pays only on the dip. **The fee is admin's alone** — a subadmin never earns a share of it, whoever
 the user hangs under. The **rate** is inherited the same way the payin and payout rates are, so it is
-tracked the same: the user's own `earlyReleaseCommission` if set, else the **parent subadmin's**
-`earlyReleaseCommission` (one setting on a subadmin covers every user under them), else the platform
-default `default_early_release_commission` (**0 until admin sets it — the fee is off by default**). The
-withdrawal snapshot records which applied: `earlyUserRate` (own) or `earlyParentRate` (inherited); the
-money goes to admin either way.
+tracked the same: a user **under a subadmin always pays the subadmin's** `earlyReleaseCommission` (the
+user's own value is ignored, even 0 — one setting on a subadmin covers every user under them, no
+per-user exceptions); a user with **no parent** pays their own; either falls back to the platform default
+`default_early_release_commission` when unset (**0 until admin sets it — the fee is off by default**).
+The withdrawal snapshot records which applied: `earlyParentRate` (subadmin's) or `earlyUserRate` (own);
+the money goes to admin either way.
 
 **Admin controls**
 - Platform default rate: `PATCH /api/payout/admin/settings { "defaultEarlyReleaseCommission": 1 }`; shown at
@@ -295,9 +296,10 @@ money goes to admin either way.
 - Per-user rate: `PUT /api/admin/edit-user/:id { "earlyReleaseCommission": 0.5 }` — **admin only** (a
   subadmin sending it gets `403 Only admin can set the early release commission`, since it is admin's own
   earning). Every user list/profile returns `earlyReleaseCommission` next to `commission` and
-  `payoutCommission` (the platform default when the user has none). It is never re-stamped on create-user
-  or on assign/unassign: the value means the same thing wherever the user sits. Show it on the edit-user
-  screen as a read-only field for subadmins.
+  `payoutCommission` (the effective value: the subadmin's when the user has one, else own, else the default). Assigning
+  a user to a subadmin, or unassigning them, **clears** the user's own value so they inherit (the subadmin's
+  rate, or the default) — the same reset moment as the payin/payout rates. Show it on the edit-user screen
+  as a read-only field for subadmins.
 - Per release: the `chargeCommission` flag on `PUT …/release` (§6.2). Show it as a checkbox in the release
   dialog, default on. `GET …/qr-settlement/:qrId` returns it inside `release.chargeCommission`.
 
