@@ -136,6 +136,17 @@ describe('early-release fee is charged when admin releases', () => {
         const list = await request(app).get('/admin/qr-releases').set(as('admin1'));
         expect(list.status).toBe(200);
         expect(list.body.releases[0]).toMatchObject({ qrId: 'qr1', releasedPaise: 100000, feePaise: 2000, feePayerName: 'Ravi Shop', payerSubadminName: 'Sub One', releasedByName: 'Head Admin' });
+        expect(list.body).toMatchObject({ totalReleasedPaise: 100000, totalFeePaise: 2000 });
+        // range list + per-day summary with range totals
+        expect((await request(app).get(`/admin/qr-releases?from=${today()}&to=${today()}`).set(as('admin1'))).body.releases).toHaveLength(1);
+        expect((await request(app).get(`/admin/qr-releases?from=${today()}`).set(as('admin1'))).status).toBe(400);
+        const sum = await request(app).get(`/admin/early-release-summary?from=${today()}&to=${today()}`).set(as('admin1'));
+        expect(sum.status).toBe(200);
+        expect(sum.body).toMatchObject({ from: today(), to: today(), grandReleasedPaise: 100000, grandReleasedRs: 1000, grandFeePaise: 2000, grandFeeRs: 20, grandCount: 1, todayReleasedPaise: 100000, todayFeePaise: 2000 });
+        expect(sum.body.days).toHaveLength(1);
+        expect(sum.body.days[0]).toMatchObject({ date: today(), releasedPaise: 100000, feePaise: 2000, count: 1, qrs: { qr1: { releasedPaise: 100000, feePaise: 2000 } } });
+        expect(sum.body.days[0].releases[0]).toMatchObject({ qrId: 'qr1', feePayerName: 'Ravi Shop' });
+        expect(sum.body.qrs).toEqual([expect.objectContaining({ qrId: 'qr1', releasedPaise: 100000, feePaise: 2000, count: 1, payerName: 'Ravi Shop' })]);
         // ledger: fee taken now; withdrawable = available − held = (200000−2000) − (150000−100000)
         expect(qr(db)).toMatchObject({ commissionPaid: 2000, amountAvailableForWithdrawal: 198000, totalPayInAmount: 200000, earlyReleasedTotalPaise: 100000, earlyReleaseFeePaidPaise: 2000 });
         expect(counters).toEqual(expect.arrayContaining([['totalEarlyReleasedAmount', 100000]]));

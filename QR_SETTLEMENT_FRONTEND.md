@@ -255,15 +255,35 @@ Optional `?date=`. Identical to setting the amount to zero, and returns the same
 Revoking does **not** claw back money the merchant already withdrew. It only re-holds whatever is
 still sitting in the QR. Say so in the confirmation dialog, because admins will assume otherwise.
 
-### 6.4 Audit list — `GET /api/admin/qr-releases?date=&qrId=&limit=&cursor=`
+### 6.4 Audit list — `GET /api/admin/qr-releases?date=&qrId=&limit=&cursor=` (or `?from=&to=`)
 ```jsonc
-{ "success": true, "date": "2026-09-07", "maxPercent": 50, "total": 3,
-  "releases": [ /* the release shape from §6.1 */ ],
-  "totalReleasedPaise": 450000,
+{ "success": true, "date": "2026-09-07", "from": "2026-09-07", "to": "2026-09-07", "maxPercent": 50, "total": 3,
+  "releases": [ /* the release shape from §6.1, incl. fee* and the payer/subadmin/releasedBy names (§6.5) */ ],
+  "totalReleasedPaise": 450000, "totalFeePaise": 4500,   // THIS PAGE only
   "nextCursor": null }
 ```
-Cursor pagination, default 25 and max 100 per page, same as every other list. Use it for a "released
-today" screen so there is one place to review the day's decisions.
+One day (`date`, default today) or an inclusive range (`from` + `to`, both required together; `date` is
+then `null`). Cursor pagination, default 25 and max 100 per page. The two totals cover the page, not the
+range — for whole-range figures use §6.4a.
+
+### 6.4a Early-release summary — `GET /api/admin/early-release-summary?from=&to=&qrId=`
+Per-day released amount and fee across a date range (≤ 366 days, default today), every release row grouped
+under its day, and range totals — the early-release twin of `/api/admin/payin-summary`.
+```jsonc
+{ "success": true, "from": "2026-09-21", "to": "2026-09-27",
+  "days": [ { "date": "2026-09-21", "releasedPaise": 23381050, "releasedRs": 233810.5, "feePaise": 233811, "feeRs": 2338.11, "count": 4,
+              "qrs": { "bharatpe.908j…": { "releasedPaise": 6858200, "feePaise": 68582 }, … },
+              "releases": [ /* full release rows for that day, §6.1 shape */ ] },
+            { "date": "2026-09-22", … }, … ],                       // every day in the range, zero days included
+  "grandReleasedPaise": 345162733, "grandReleasedRs": 3451627.33,  // whole range
+  "grandFeePaise": 3148059, "grandFeeRs": 31480.59, "grandCount": 59,
+  "todayReleasedPaise": 0, "todayFeePaise": 0,
+  "qrs": [ { "qrId": "q211108399", "releasedPaise": …, "feePaise": …, "count": 6, "payerName": "Niceold", "releasedRs": …, "feeRs": … }, … ] } // desc by released
+```
+Screen: a date-range picker, two headline tiles ("Released early" = `grandReleasedRs`, "Fee earned" =
+`grandFeeRs`), a per-day table or bar chart from `days` (released vs fee), each day expandable to its
+`releases` rows (QR, payer, subadmin, released ₹, fee ₹, rate, released by, reason, time), and a
+"by QR" tab from `qrs`. All amounts paise unless the key ends in `Rs`.
 
 ---
 

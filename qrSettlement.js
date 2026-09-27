@@ -373,15 +373,33 @@ function build() {
     }
 
     /** Releases for one day, newest first. Cursor-paginated like every other list endpoint. */
-    async function listReleases({ day = istDay(), qrId = null, id = null, limit = 25, cursor = null } = {}) {
+    async function listReleases({ day = istDay(), from = null, to = null, qrId = null, id = null, limit = 25, cursor = null } = {}) {
         if (!_db || !_releasesCol) return { total: 0, documents: [] };
         const rowId = id ?? qrId;
-        const q = [_Query.equal('date', day)];
+        // from/to (inclusive IST days) win over the single day; the `date` field is a YYYY-MM-DD string, so between() sorts correctly.
+        const q = from && to ? [_Query.between('date', from, to)] : [_Query.equal('date', day)];
         if (rowId) q.push(_Query.equal(_key, rowId));
         q.push(_Query.orderDesc('$createdAt'));
         if (cursor) q.push(_Query.cursorAfter(cursor));
         q.push(_Query.limit(limit));
         return _db.listDocuments(_dbId, _releasesCol, q);
+    }
+
+    /** Every release row in an inclusive IST day range (optionally one QR), oldest day first — bounded by the caller's range cap. */
+    async function listReleasesBetween(from, to, id = null) {
+        if (!_db || !_releasesCol) return [];
+        const out = []; let cursor = null;
+        for (let page = 0; page < 500; page++) {
+            const q = [_Query.between('date', from, to)];
+            if (id) q.push(_Query.equal(_key, id));
+            q.push(_Query.orderAsc('$id'), _Query.limit(100));
+            if (cursor) q.push(_Query.cursorAfter(cursor));
+            const r = await _db.listDocuments(_dbId, _releasesCol, q);
+            out.push(...r.documents);
+            if (r.documents.length < 100) break;
+            cursor = r.documents[r.documents.length - 1].$id;
+        }
+        return out;
     }
 
     /** Response shape for a release row. */
@@ -405,7 +423,7 @@ function build() {
         init, istDay, maxPercent, maxReleasablePaise,
         heldPaise, withdrawablePaise, todayPayIns, releasesFor,
         forQr, forQrDocs, row, totalsOf,
-        getRelease, setRelease, listReleases, pickRelease, repointReleases, recordFee,
+        getRelease, setRelease, listReleases, listReleasesBetween, pickRelease, repointReleases, recordFee,
         keyField: () => _key, holdEnabled,
     };
 }

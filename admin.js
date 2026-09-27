@@ -5375,22 +5375,67 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     // Every release for a day (audit view). ?date=YYYY-MM-DD&qrId=&limit=&cursor=
     router.get('/qr-releases', authenticateAdmin, async (req, res) => {
         try {
-            const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : qrSettlement.istDay();
+            const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+            const day = isDay(req.query.date) ? String(req.query.date) : qrSettlement.istDay();
+            // ?from=&to= (inclusive IST days) lists a range instead of one day; pageTotals cover the PAGE only —
+            // use /early-release-summary for whole-range figures.
+            const from = isDay(req.query.from) ? String(req.query.from) : null, to = isDay(req.query.to) ? String(req.query.to) : null;
+            if ((from && !to) || (!from && to)) return res.status(400).json({ error: 'from and to must be given together (YYYY-MM-DD)' });
+            if (from && to && to < from) return res.status(400).json({ error: 'Invalid date range' });
             const limit = Math.min(Math.max(parseInt(req.query.limit ?? 25, 10) || 25, 1), 100);
             const cursor = req.query.cursor;
             if (cursor && !/^[a-zA-Z0-9_:-]{1,255}$/.test(cursor)) return res.status(400).json({ error: 'Invalid cursor format' });
-            const r = await qrSettlement.listReleases({ day, qrId: req.query.qrId || null, limit, cursor });
+            const r = await qrSettlement.listReleases({ day, from, to, qrId: req.query.qrId || null, limit, cursor });
             const docs = r.documents || [];
             return res.json({
-                success: true, date: day, maxPercent: qrSettlement.maxPercent(), total: r.total,
+                success: true, date: from ? null : day, from: from || day, to: to || day, maxPercent: qrSettlement.maxPercent(), total: r.total,
                 releases: docs.map(qrSettlement.pickRelease),
-                totalReleasedPaise: docs.reduce((s, d) => s + Number(d.releasedPaise || 0), 0),
+                totalReleasedPaise: docs.reduce((s, d) => s + Number(d.releasedPaise || 0), 0),   // this page
+                totalFeePaise: docs.reduce((s, d) => s + Number(d.feePaise || 0), 0),             // this page
                 nextCursor: docs.length === limit ? docs[docs.length - 1].$id : null,
             });
         } catch (e) {
             if (isCursorError(e)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
             return settlementError(res, e, 'Failed to fetch QR releases');
         }
+    });
+
+    // GET /early-release-summary?from&to&qrId — the early-release twin of /payin-summary: one row per IST day
+    // in the range with what was released and what fee it earned, every release row grouped under its day,
+    // and range totals. Read straight from qr_daily_releases (one row per QR per day, so a range is small).
+    router.get('/early-release-summary', authenticateAdmin, async (req, res) => {
+        try {
+            const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+            const todayStr = qrSettlement.istDay();
+            const from = isDay(req.query.from) ? String(req.query.from) : todayStr, to = isDay(req.query.to) ? String(req.query.to) : from;
+            if (to < from) return res.status(400).json({ error: 'Invalid date range' });
+            if (moment(to).diff(moment(from), 'days') > 366) return res.status(400).json({ error: 'Range too large (max 366 days)' });
+            const rows = await qrSettlement.listReleasesBetween(from, to, req.query.qrId ? String(req.query.qrId) : null);
+            const byDay = {};
+            for (const d of rows) {
+                const day = (byDay[d.date] = byDay[d.date] || { date: d.date, releasedPaise: 0, feePaise: 0, count: 0, qrs: {}, releases: [] });
+                const rel = Number(d.releasedPaise || 0), fee = Number(d.feePaise || 0);
+                day.releasedPaise += rel; day.feePaise += fee; day.count += 1;
+                day.qrs[d.qrId] = { releasedPaise: rel, feePaise: fee };
+                day.releases.push(qrSettlement.pickRelease(d));
+            }
+            // every day in the range appears, zero rows included, so charts have no gaps
+            const days = [];
+            for (const c = moment.tz(from, 'Asia/Kolkata'); c.format('YYYY-MM-DD') <= to; c.add(1, 'day')) {
+                const key = c.format('YYYY-MM-DD');
+                const d = byDay[key] || { date: key, releasedPaise: 0, feePaise: 0, count: 0, qrs: {}, releases: [] };
+                days.push({ ...d, releasedRs: d.releasedPaise / 100, feeRs: d.feePaise / 100 });
+            }
+            const grandReleasedPaise = days.reduce((s, d) => s + d.releasedPaise, 0), grandFeePaise = days.reduce((s, d) => s + d.feePaise, 0);
+            const byQr = {};
+            for (const d of rows) { const q = (byQr[d.qrId] = byQr[d.qrId] || { qrId: d.qrId, releasedPaise: 0, feePaise: 0, count: 0, payerName: null }); q.releasedPaise += Number(d.releasedPaise || 0); q.feePaise += Number(d.feePaise || 0); q.count += 1; q.payerName = d.feePayerName || q.payerName; }
+            return res.json({
+                success: true, from, to, days,
+                grandReleasedPaise, grandReleasedRs: grandReleasedPaise / 100, grandFeePaise, grandFeeRs: grandFeePaise / 100, grandCount: rows.length,
+                todayReleasedPaise: byDay[todayStr]?.releasedPaise || 0, todayFeePaise: byDay[todayStr]?.feePaise || 0,
+                qrs: Object.values(byQr).sort((a, b) => b.releasedPaise - a.releasedPaise).map((q) => ({ ...q, releasedRs: q.releasedPaise / 100, feeRs: q.feePaise / 100 })),
+            });
+        } catch (e) { return settlementError(res, e, 'Failed to fetch early-release summary'); }
     });
 
     // Which QR ids the caller may see in a QR-keyed report (payin / withdrawal summaries).
