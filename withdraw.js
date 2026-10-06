@@ -466,9 +466,9 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifscCode.trim().toUpperCase())) {
           return res.status(400).json({ error: 'Invalid IFSC code format (e.g. SBIN0001234)' });
         }
-        // Account number: 8–18 digits only
-        if (!/^\d{8,18}$/.test(accountNumber.toString().trim())) {
-          return res.status(400).json({ error: 'Invalid account number (must be 8–18 digits)' });
+        // Account number: 8–18 letters or digits (some banks issue alphanumeric numbers) — same rule as payout.js
+        if (!/^[A-Za-z0-9]{8,18}$/.test(accountNumber.toString().trim())) {
+          return res.status(400).json({ error: 'Invalid account number (must be 8–18 letters or digits)' });
         }
       }
 

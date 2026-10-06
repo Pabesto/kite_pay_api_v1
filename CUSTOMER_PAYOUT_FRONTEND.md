@@ -331,9 +331,12 @@ paginated with `limit`/`cursor`; accepts the row filters of §5.4 (`status`, `mo
 account number already exists for this user (it is reused, never duplicated — but a missing `upiId`
 is filled in if you send one).
 Validation (400 with message): name 2–100 chars; bank 2–100; IFSC `AAAA0XXXXXX`; account number
-8–18 digits; `accountNumber !== confirmAccountNumber` → `Account numbers do not match`; `upiId`
-must look like `handle@provider` → `Invalid UPI ID format…`.
-Client-side: uppercase the IFSC, digits-only keyboard for account number, paste-blocked confirm field.
+8–18 **letters or digits** (some banks issue alphanumeric numbers; no spaces, dashes or symbols) →
+`Invalid account number (must be 8–18 letters or digits)`; `accountNumber !== confirmAccountNumber` →
+`Account numbers do not match`; `upiId` must look like `handle@provider` → `Invalid UPI ID format…`.
+Client-side: uppercase the IFSC, alphanumeric keyboard (not digits-only) for account number, paste-blocked
+confirm field. Note: the queue's bare `search` treats an all-digit term as an account-number prefix; for an
+alphanumeric account number use `searchField=accountNumber` explicitly.
 
 `DELETE /api/payout/accounts/:accountId` — remove a saved account (`:accountId` = its `$id`).
 `200 { success, message }`. `404` if it is not yours; `409 Account has a pending payout request` —
@@ -516,7 +519,8 @@ account number.
 `POST /api/payout/admin/requests/:id/paid` — `:id` is the business id `cpo_…`.
 ```jsonc
 { "referenceNumber": "UTR1234567890",        // required, 5–100 chars — the bank/payout reference (the user sees this)
-  "paidVia": "HDFC current a/c ****4321" }   // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
+  "paidVia": "HDFC current a/c ****4321",    // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
+  "remark": "Customer confirmed on call" }   // optional, ≤500 chars — free-text remark by the resolver; stored as `adminRemark`, visible to the user too
 ```
 `paidVia` is optional on the server, but **make it a required field in the Paid dialog** — it is the
 internal record of the source account. Build the field as a **type-to-search dropdown backed by the
@@ -547,9 +551,16 @@ Errors: `400` short reference / not pending (`Cannot mark a paid request as paid
 
 `POST /api/payout/admin/requests/:id/reject`
 ```jsonc
-{ "reason": "IFSC does not match the bank" }   // required, 4–500 chars; the user sees this text
+{ "reason": "IFSC does not match the bank",     // required, 4–500 chars; the user sees this text
+  "remark": "Asked merchant to re-add the account" }   // optional, ≤500 chars — extra remark by the resolver; stored as `adminRemark`
 ```
 `200 { success, message: "Payout rejected", payout }`. Effect: hold released, no money moves.
+
+**Remark field (both dialogs).** Add an optional multi-line "Remark" input to the Paid and Reject dialogs
+(admin and labelled employees). It lands on the request as `adminRemark` (every payout row and the
+`request_paid` / `request_rejected` socket payloads carry it) — show it under the status on the request
+detail and as a "Remark" column in the queue. It is distinct from `rejectionReason` (the one-line why the
+user must see) and from `paidVia` (the source account, staff-only).
 
 Both are exactly-once on the server; a double tap returns 400/409, never a double debit.
 

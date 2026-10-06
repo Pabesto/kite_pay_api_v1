@@ -36,7 +36,7 @@ const defaultPayoutCommission = () => defaultRate('default_payout_commission', D
 
 const CURSOR_RE = /^[a-zA-Z0-9_:-]{1,255}$/;
 const IFSC_RE = /^[A-Z]{4}0[A-Z0-9]{6}$/;
-const ACCT_RE = /^\d{8,18}$/;
+const ACCT_RE = /^[A-Za-z0-9]{8,18}$/;   // some banks issue alphanumeric account numbers
 const UPI_RE = /^[a-zA-Z0-9.\-_+]+@[a-zA-Z0-9]+$/;
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^\d{4}-\d{2}$/;
@@ -600,6 +600,7 @@ module.exports = (
     amountRs: Number(d.amountPaise || 0) / 100, commissionRs: Number(d.commissionPaise || 0) / 100, totalRs: Number(d.totalPaise || 0) / 100,
     commissionRate: d.commissionRate, notes: d.notes || null, status: d.status,
     referenceNumber: d.referenceNumber || null, rejectionReason: d.rejectionReason || null,
+    adminRemark: d.adminRemark || null,   // free-text remark the resolving admin/employee attached on paid or reject
     createdAt: d.createdAt, processedAt: d.processedAt || null, processedBy: d.processedBy || null,
     accountBankingStatus: d.accountBankingStatus || null,
     accountVerificationStatus: d.accountVerificationStatus || null,
@@ -886,7 +887,7 @@ module.exports = (
     if (name.length < 2 || name.length > 100) throw fail(400, 'Customer name is required (2–100 characters)');
     if (bank.length < 2 || bank.length > 100) throw fail(400, 'Bank name is required (2–100 characters)');
     if (!IFSC_RE.test(ifsc)) throw fail(400, 'Invalid IFSC code format (e.g. SBIN0001234)');
-    if (!ACCT_RE.test(acct)) throw fail(400, 'Invalid account number (must be 8–18 digits)');
+    if (!ACCT_RE.test(acct)) throw fail(400, 'Invalid account number (must be 8–18 letters or digits)');
     if (acct !== confirm) throw fail(400, 'Account numbers do not match');
     return { customerName: name, bankName: bank, ifscCode: ifsc, accountNumber: acct, upiId: validateUpiId(upiId) };
   }
@@ -2061,9 +2062,19 @@ module.exports = (
   // reference number, then records payout commission. Exactly-once via wallet lock + re-read +
   // idempotent ledger row.
   // Body: { referenceNumber (required), paidVia? (staff-only note: which of our accounts paid it, ≤100) }
+  // Optional free-text remark on paid/reject (≤500) — kept on the request as `adminRemark`, separate from
+  // `rejectionReason` (the user-facing why) and `paidVia` (the source account). 400 when too long.
+  const remarkOf = (body) => {
+    if (body.remark === undefined || body.remark === null) return null;
+    const r = String(body.remark).trim();
+    if (r.length > 500) throw fail(400, 'remark must be at most 500 characters');
+    return r || null;
+  };
+
   router.post('/admin/requests/:id/paid', adminEdit, async (req, res) => {
     try {
       const referenceNumber = String(req.body.referenceNumber || '').trim();
+      const adminRemark = remarkOf(req.body);
       if (referenceNumber.length < 5 || referenceNumber.length > 100) throw fail(400, 'Payout reference number is required (5–100 characters)');
       const paidVia = String(req.body.paidVia || '').trim().slice(0, 100) || null;
       const found = await loadPayoutByBusinessId(req.params.id);
@@ -2087,7 +2098,7 @@ module.exports = (
         }
         const at = nowIso();
         const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'paid', referenceNumber, paidVia, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
+          status: 'paid', referenceNumber, paidVia, adminRemark, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
         });
         await bumpAccountStats(p.accountId, { paidCount: 1, totalPaidPaise: Number(p.amountPaise || 0), totalCommissionPaise: Number(p.commissionPaise || 0) }, { lastPaidAt: at });
         return doc;
@@ -2107,7 +2118,7 @@ module.exports = (
       try { await upsertDailyPayoutSummary(updated); }
       catch (e) { console.error(`CRITICAL: daily payout summary failed for ${updated.id} (day ${istDay(updated.paidAt)}). Run: node scripts/backfill-payout-daily-summaries.js --from ${istDay(updated.paidAt)} --to ${istDay(updated.paidAt)} --write`, e); }
       await touchSource(paidVia, paidAmount, req.user.userId);
-      await notify(updated.userId, { type: 'request_paid', userId: updated.userId, payoutId: updated.id, status: 'paid', amountPaise: paidAmount, referenceNumber });
+      await notify(updated.userId, { type: 'request_paid', userId: updated.userId, payoutId: updated.id, status: 'paid', amountPaise: paidAmount, referenceNumber, adminRemark });
 
       res.json({ success: true, message: 'Payout marked as paid', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to mark payout as paid'); }
@@ -2117,6 +2128,7 @@ module.exports = (
     try {
       const reason = String(req.body.reason || '').trim();
       if (reason.length < 4 || reason.length > 500) throw fail(400, 'Rejection reason is required (4–500 characters)');
+      const adminRemark = remarkOf(req.body);
       const found = await loadPayoutByBusinessId(req.params.id);
       await assertCanAct(req, found.userId);
       if (found.status !== 'pending') throw fail(400, `Cannot reject a ${found.status} request`);
@@ -2127,14 +2139,14 @@ module.exports = (
         await moveWallet(p.userId, { deltaHold: -Number(p.totalPaise) }); // release the hold, balance untouched
         const at = nowIso();
         const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'rejected', rejectionReason: reason, referenceNumber: null, processedAt: at, rejectedAt: at, processedBy: req.user.userId,
+          status: 'rejected', rejectionReason: reason, adminRemark, referenceNumber: null, processedAt: at, rejectedAt: at, processedBy: req.user.userId,
         });
         await bumpAccountStats(p.accountId, { rejectedCount: 1 });
         return doc;
       });
       await inc('totalCustomerPayoutPendingAmount', -Number(updated.amountPaise || 0));
       await inc('totalCustomerPayoutPendingCount', -1);
-      await notify(updated.userId, { type: 'request_rejected', userId: updated.userId, payoutId: updated.id, status: 'rejected', reason });
+      await notify(updated.userId, { type: 'request_rejected', userId: updated.userId, payoutId: updated.id, status: 'rejected', reason, adminRemark });
       res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to reject payout'); }
   });

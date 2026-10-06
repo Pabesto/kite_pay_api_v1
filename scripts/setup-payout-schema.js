@@ -189,6 +189,7 @@ async function main() {
     await str(PAYOUTS, 'notes', 500);
     await str(PAYOUTS, 'status', 16, true);        // pending | paid | rejected
     await str(PAYOUTS, 'referenceNumber', 100);
+    await str(PAYOUTS, 'adminRemark', 500);   // staff remark attached on paid/reject (optional)
     await str(PAYOUTS, 'paidVia', 100);            // staff-only: which of OUR accounts paid it
     await str(PAYOUTS, 'rejectionReason', 500);
     await str(PAYOUTS, 'createdAt', 40, true);

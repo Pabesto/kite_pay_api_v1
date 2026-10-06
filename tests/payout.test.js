@@ -362,6 +362,25 @@ describe('admin paid / reject', () => {
         [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
     });
 
+    test('paid / reject accept an optional staff remark, stored as adminRemark and returned; >500 chars → 400', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', remark: 'x'.repeat(501) })).status).toBe(400);
+        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', remark: '  Paid from HDFC, customer confirmed on call  ' });
+        expect(paid.status).toBe(200);
+        expect(paid.body.payout).toMatchObject({ status: 'paid', adminRemark: 'Paid from HDFC, customer confirmed on call' });
+        expect(db.store[COLS.PAYOUTS][0].adminRemark).toBe('Paid from HDFC, customer confirmed on call');
+
+        const db2 = makeDb(seed());
+        const { app: app2 } = buildPayout(db2, makeRedis(), asUser('admin1', 'admin'));
+        const rej = await request(app2).post('/admin/requests/cpo_1/reject').send({ reason: 'IFSC mismatch', remark: 'asked merchant to re-add the account' });
+        expect(rej.status).toBe(200);
+        expect(rej.body.payout).toMatchObject({ status: 'rejected', rejectionReason: 'IFSC mismatch', adminRemark: 'asked merchant to re-add the account' });
+        const noRemark = makeDb(seed());
+        const { app: app3 } = buildPayout(noRemark, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app3).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).body.payout.adminRemark).toBeNull();
+    });
+
     test('paid: debits balance+hold, writes ledger row, records split commission + daily rollup', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
@@ -1363,6 +1382,16 @@ describe('realtime staff routing + new event types', () => {
         expect(e.platform).toBe(true);
         expect(e.userId).toBeNull();
         expect(e.payload.changed).toEqual(expect.arrayContaining(['payout_max_pending']));
+    });
+
+    test('account numbers may be alphanumeric (8–18 letters/digits); symbols or wrong length → 400', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        const ok = await request(app).post('/accounts').send({ ...ACCOUNT, accountNumber: 'AB12CD345678', confirmAccountNumber: 'AB12CD345678' });
+        expect(ok.status).toBe(201);
+        expect(ok.body.account.accountNumber).toBe('AB12CD345678');
+        expect((await request(app).post('/accounts').send({ ...ACCOUNT, accountNumber: '1234-5678-90', confirmAccountNumber: '1234-5678-90' })).status).toBe(400);
+        expect((await request(app).post('/accounts').send({ ...ACCOUNT, accountNumber: 'ABC1234', confirmAccountNumber: 'ABC1234' })).status).toBe(400);
     });
 
     test('adding a beneficiary emits account_created; deleting emits account_deleted', async () => {
