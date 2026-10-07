@@ -522,11 +522,46 @@ account number.
   "paidVia": "HDFC current a/c ****4321",    // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
   "remark": "Customer confirmed on call" }   // optional, ≤500 chars — free-text remark by the resolver; stored as `adminRemark`, visible to the user too
 ```
+**Reference numbers are unique platform-wide.** A UTR already stamped on another *paid* payout is refused:
+`409 { error: "Reference number already used on payout cpo_…", conflictPayoutId: "cpo_…" }` (compared
+case-insensitively, trimmed). Show the message with a link to that payout; nothing was debited. Two admins
+stamping the same UTR at the same moment get `409 This reference number is being processed on another payout…`
+→ retry once. Rejected/cancelled rows never hold a reference, so a UTR from a rejected attempt can be reused.
+
 `paidVia` is optional on the server, but **make it a required field in the Paid dialog** — it is the
 internal record of the source account. Build the field as a **type-to-search dropdown backed by the
 source-account list (§6.2a)**: as the admin types, call `GET /admin/source-accounts?search=<text>`
 and offer matches; picking one fills the field; typing a new value is allowed and is saved to the
 list automatically the moment the payout is marked paid.
+
+#### 6.2z Duplicate reference numbers — `GET /api/payout/admin/requests/duplicate-references?from=&to=`
+Paid payouts whose bank reference (UTR) is shared with another paid payout — a UTR typed twice, or one
+bank transfer recorded against two requests (a double debit of the merchant). Compared case-insensitively
+and trimmed. Same scoping as the queue: staff see every merchant, a subadmin only their own users.
+`from`/`to` (IST days, on `paidAt`) narrow the scan; default = all time.
+```jsonc
+{ "success": true, "scanned": 2352, "duplicateReferences": 3,
+  "duplicates": [
+    { "referenceNumber": "983678661", "count": 2, "totalPaise": 10000000, "totalRs": 100000,
+      "sameAccountAndAmount": true,                 // ⚠ same beneficiary account AND amount → most likely ONE transfer, two payouts
+      "payouts": [ /* full §5.4 payout rows (staff shape), oldest paidAt first */ ] },
+    … ] }                                           // flagged groups first, then by totalPaise desc
+```
+Screen: an "Audit → Duplicate UTRs" page with a date range, one card per group showing the reference,
+count, total, and a red badge when `sameAccountAndAmount` is true; expand to the payouts (id, customer,
+account, amount, merchant, paid at, paid by, paidVia, adminRemark). Tap a payout → its detail (§6.2). A
+group with different beneficiaries is usually a copy-paste typo; a flagged group needs the bank statement.
+
+#### 6.2y Reference length audit — `GET /api/payout/admin/requests/reference-audit?minLength=&maxLength=&from=&to=`
+Paid payouts whose bank reference (trimmed) is shorter or longer than the bounds — e.g. `minLength=10` for
+"longer than 9 characters". NEFT/IMPS/UPI UTRs are 12 digits, RTGS 16–22; anything else is worth a look. At
+least one bound is required (400 otherwise). Same scoping and `from`/`to` window (on `paidAt`) as 6.2z.
+```jsonc
+{ "success": true, "scanned": 2352, "matched": 41, "minLength": 10, "maxLength": null, "totalPaise": 1234500, "totalRs": 12345,
+  "payouts": [ { /* §5.4 payout row (staff shape) */ "referenceLength": 13 }, … ] }   // oldest paidAt first
+```
+Screen: on the same "Audit" page as 6.2z, a "Reference length" tab with two number fields (min / max) and a
+date range; list the rows with the reference, its length, customer, amount, merchant, paid at, paid by.
 
 #### 6.2a Source accounts (the "paid via" list) — staff
 `GET /api/payout/admin/source-accounts?search&sort&includeInactive&limit&cursor`

@@ -68,7 +68,7 @@ module.exports = (
   if (!DAILY_PAYOUT_SUMMARIES) console.warn('⚠️  payout.js: DAILY_PAYOUT_SUMMARIES collection id not injected — the day-wise payout rollup is OFF and GET /admin/payout-summary will 500.');
 
   // ─── helpers ───────────────────────────────────────────────────────────────
-  function fail(status, message) { const e = new Error(message); e.status = status; return e; }
+  function fail(status, message, extra) { const e = new Error(message); e.status = status; if (extra) Object.assign(e, extra); return e; }
   // The ledger a withdrawal was raised against: a QR (qrId) or a bank account (bankAcId). Mirrors
   // withdraw.js sourceOf() — same seven ledger fields, different collection/key/lock family.
   function ledgerSourceOf(w) {
@@ -98,7 +98,7 @@ module.exports = (
     return err?.code === 400 && (msg.includes('cursor') || msg.includes('document with the requested id could not be found'));
   }
   function sendError(res, err, fallback) {
-    if (err?.status) return res.status(err.status).json({ error: err.message });
+    if (err?.status) return res.status(err.status).json({ error: err.message, ...(err.conflictPayoutId ? { conflictPayoutId: err.conflictPayoutId } : {}) });
     if (isCursorError(err)) return res.status(400).json({ error: 'Invalid or expired pagination cursor' });
     console.error(`❌ payout: ${fallback}:`, err);
     return res.status(500).json({ error: fallback });
@@ -2048,6 +2048,62 @@ module.exports = (
     catch (e) { sendError(res, e, 'Failed to fetch customer payout requests'); }
   });
 
+  // GET /admin/requests/duplicate-references — paid payouts whose bank reference (UTR) is shared with
+  // another paid payout: a UTR typed twice, or one transfer recorded against two requests. Compared
+  // case-insensitively and trimmed. Tenant-scoped like the queue (staff see every merchant, a subadmin
+  // only their own users). Registered BEFORE /admin/requests/:id so the path is not read as an id.
+  // Optional ?from&to (IST days, on paidAt) narrow the scan; default = all time.
+  router.get('/admin/requests/duplicate-references', adminView, async (req, res) => {
+    try {
+      const allowed = await visibleUserIds(req);
+      if (allowed && !allowed.length) return res.json({ success: true, scanned: 0, duplicateReferences: 0, duplicates: [] });
+      const queries = [Query.equal('status', 'paid'), ...(req.query.from || req.query.to ? dateQueries(req.query.from, req.query.to).map((q) => q.replace('"createdAt"', '"paidAt"')) : [])];
+      const { docs } = await pageAll(PAYOUTS, queries, 50000);
+      const groups = {};
+      for (const p of docs) {
+        if (allowed && !allowed.includes(p.userId)) continue;
+        const ref = String(p.referenceNumber || '').trim().toUpperCase();
+        if (!ref) continue;
+        (groups[ref] = groups[ref] || []).push(p);
+      }
+      const staff = isStaff(req);
+      const duplicates = Object.entries(groups).filter(([, rows]) => rows.length > 1).map(([referenceNumber, rows]) => {
+        const payouts = rows.sort((a, b) => String(a.paidAt || '').localeCompare(String(b.paidAt || ''))).map((r) => pickPayout(r, staff));
+        const totalPaise = rows.reduce((t, r) => t + Number(r.amountPaise || 0), 0);
+        return {
+          referenceNumber, count: rows.length, totalPaise, totalRs: totalPaise / 100,
+          // same beneficiary account AND same amount → most likely ONE bank transfer recorded twice (a double debit of the merchant)
+          sameAccountAndAmount: new Set(rows.map((r) => `${r.accountNumber}|${r.amountPaise}`)).size === 1,
+          payouts,
+        };
+      }).sort((a, b) => Number(b.sameAccountAndAmount) - Number(a.sameAccountAndAmount) || b.totalPaise - a.totalPaise);
+      res.json({ success: true, scanned: docs.length, duplicateReferences: duplicates.length, duplicates });
+    } catch (e) { sendError(res, e, 'Failed to find duplicate payout references'); }
+  });
+
+  // GET /admin/requests/reference-audit?minLength&maxLength&from&to — paid payouts whose bank reference
+  // (trimmed) is shorter/longer than expected (NEFT/IMPS/UPI UTRs are 12 digits, RTGS 16–22). At least one
+  // bound is required. Same scan, scoping and date window as duplicate-references; registered before :id.
+  router.get('/admin/requests/reference-audit', adminView, async (req, res) => {
+    try {
+      const bound = (k) => { if (req.query[k] === undefined || req.query[k] === '') return null; const n = Number(req.query[k]); if (!Number.isInteger(n) || n < 0) throw fail(400, `${k} must be a non-negative integer`); return n; };
+      const minLength = bound('minLength'), maxLength = bound('maxLength');
+      if (minLength == null && maxLength == null) throw fail(400, 'Give minLength and/or maxLength');
+      const allowed = await visibleUserIds(req);
+      if (allowed && !allowed.length) return res.json({ success: true, scanned: 0, matched: 0, minLength, maxLength, totalPaise: 0, totalRs: 0, payouts: [] });
+      const queries = [Query.equal('status', 'paid'), ...(req.query.from || req.query.to ? dateQueries(req.query.from, req.query.to).map((q) => q.replace('"createdAt"', '"paidAt"')) : [])];
+      const { docs } = await pageAll(PAYOUTS, queries, 50000);
+      const staff = isStaff(req);
+      const rows = docs.filter((p) => (!allowed || allowed.includes(p.userId)) && String(p.referenceNumber || '').trim())
+        .map((p) => ({ p, len: String(p.referenceNumber).trim().length }))
+        .filter(({ len }) => (minLength == null || len >= minLength) && (maxLength == null || len <= maxLength))
+        .sort((a, b) => String(a.p.paidAt || '').localeCompare(String(b.p.paidAt || '')));
+      const totalPaise = rows.reduce((t, { p }) => t + Number(p.amountPaise || 0), 0);
+      res.json({ success: true, scanned: docs.filter((p) => !allowed || allowed.includes(p.userId)).length, matched: rows.length, minLength, maxLength, totalPaise, totalRs: totalPaise / 100,
+        payouts: rows.map(({ p, len }) => ({ ...pickPayout(p, staff), referenceLength: len })) });
+    } catch (e) { sendError(res, e, 'Failed to audit payout references'); }
+  });
+
   // Single request by unique id (cpo_…). Subadmins: only their users' requests (404 otherwise).
   router.get('/admin/requests/:id', adminView, async (req, res) => {
     try {
@@ -2081,7 +2137,22 @@ module.exports = (
       await assertCanAct(req, found.userId); // employees: only their assigned subadmins' users
       if (found.status !== 'pending') throw fail(400, `Cannot mark a ${found.status} request as paid`);
 
-      const updated = await withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+      // A bank reference (UTR) identifies ONE transfer, so it may be used on ONE paid payout, platform-wide.
+      // Checked under lock:payoutref:<REF> (outer; the per-user wallet lock would not serialize two
+      // different merchants' payouts) so two admins cannot stamp the same UTR at the same instant.
+      // Stored values are trimmed; the typed, UPPER and lower forms are all checked so "utr1" vs "UTR1 " collide
+      // whatever the database's own case rule (Appwrite's equal() happens to be case-insensitive, but we
+      // do not depend on it).
+      const refKey = referenceNumber.toUpperCase();
+      const refForms = [...new Set([referenceNumber, refKey, referenceNumber.toLowerCase()])];
+      const assertReferenceUnused = async () => {
+        const clash = (await databases.listDocuments(DB, PAYOUTS, [Query.equal('referenceNumber', refForms), Query.equal('status', 'paid'), Query.limit(1)])).documents[0];
+        if (clash && clash.$id !== found.$id) throw fail(409, `Reference number already used on payout ${clash.id}`, { conflictPayoutId: clash.id });
+      };
+      await assertReferenceUnused();
+
+      const updated = await withLock(`lock:payoutref:${refKey}`, LOCK_TTL_REQUEST, () => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+        await assertReferenceUnused(); // re-check under the reference lock
         const p = await databases.getDocument(DB, PAYOUTS, found.$id); // fresh read under lock
         if (p.status !== 'pending') throw fail(409, 'Request was already resolved');
         const total = Number(p.totalPaise);
@@ -2102,7 +2173,7 @@ module.exports = (
         });
         await bumpAccountStats(p.accountId, { paidCount: 1, totalPaidPaise: Number(p.amountPaise || 0), totalCommissionPaise: Number(p.commissionPaise || 0) }, { lastPaidAt: at });
         return doc;
-      });
+      }), 'This reference number is being processed on another payout. Please try again.');
 
       const paidAmount = Number(updated.amountPaise || 0);
       await inc('totalCustomerPayoutPendingAmount', -paidAmount);

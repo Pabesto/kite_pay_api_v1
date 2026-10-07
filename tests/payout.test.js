@@ -362,6 +362,72 @@ describe('admin paid / reject', () => {
         [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
     });
 
+    test('duplicate-references: groups paid payouts sharing a UTR (case/space-insensitive), flags same account+amount, scoped per tenant', async () => {
+        const base = pending();
+        const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [
+            { ...base, $id: 'p1', id: 'cpo_1', status: 'paid', referenceNumber: 'UTR999', paidAt: '2026-10-01T05:00:00.000Z', amountPaise: 50000, accountNumber: '41180568083' },
+            { ...base, $id: 'p2', id: 'cpo_2', status: 'paid', referenceNumber: ' utr999', paidAt: '2026-10-01T05:01:00.000Z', amountPaise: 50000, accountNumber: '41180568083' },
+            { ...base, $id: 'p3', id: 'cpo_3', status: 'paid', referenceNumber: 'UTR777', paidAt: '2026-10-02T05:00:00.000Z', amountPaise: 1000, accountNumber: '111' },
+            { ...base, $id: 'p4', id: 'cpo_4', status: 'paid', referenceNumber: 'UTR777', paidAt: '2026-10-02T06:00:00.000Z', amountPaise: 2000, accountNumber: '222', userId: 'user2' },
+            { ...base, $id: 'p5', id: 'cpo_5', status: 'paid', referenceNumber: 'UTR555', paidAt: '2026-10-03T05:00:00.000Z' },
+            { ...base, $id: 'p6', id: 'cpo_6', status: 'rejected', referenceNumber: null },
+        ] });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/requests/duplicate-references');
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ success: true, scanned: 5, duplicateReferences: 2 });
+        expect(res.body.duplicates[0]).toMatchObject({ referenceNumber: 'UTR999', count: 2, totalPaise: 100000, totalRs: 1000, sameAccountAndAmount: true });
+        expect(res.body.duplicates[0].payouts.map((p) => p.id)).toEqual(['cpo_1', 'cpo_2']);
+        expect(res.body.duplicates[1]).toMatchObject({ referenceNumber: 'UTR777', count: 2, totalPaise: 3000, sameAccountAndAmount: false });
+        expect(res.body.duplicates[1].payouts[0].paidVia).toBeDefined();   // staff projection
+        // a subadmin sees only groups formed by their own users: user2's row drops out, so UTR777 is no longer a duplicate
+        const { app: sub } = buildPayout(makeDb({ ...seed(), [COLS.PAYOUTS]: db.store[COLS.PAYOUTS], [COLS.USERS]: [{ $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' }] }), makeRedis(), asUser('sub1', 'subadmin'), () => asUser('sub1', 'subadmin'));
+        const r2 = await request(sub).get('/admin/requests/duplicate-references');
+        expect(r2.status).toBe(200);
+        expect(r2.body.duplicates.map((d) => d.referenceNumber)).toEqual(['UTR999']);
+        // the literal path must not be swallowed by /admin/requests/:id
+        expect((await request(app).get('/admin/requests/cpo_1')).body.payout.id).toBe('cpo_1');
+    });
+
+    test('reference-audit: paid payouts whose reference length is outside the given bounds (e.g. longer than 9)', async () => {
+        const base = pending();
+        const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [
+            { ...base, $id: 'p1', id: 'cpo_1', status: 'paid', referenceNumber: '983678661', paidAt: '2026-10-01T05:00:00.000Z' },            // 9
+            { ...base, $id: 'p2', id: 'cpo_2', status: 'paid', referenceNumber: ' 6260373003070 ', paidAt: '2026-10-02T05:00:00.000Z' },      // 13 (trimmed)
+            { ...base, $id: 'p3', id: 'cpo_3', status: 'paid', referenceNumber: 'N2609281234567890123456', paidAt: '2026-10-03T05:00:00.000Z' }, // 23
+            { ...base, $id: 'p4', id: 'cpo_4', status: 'paid', referenceNumber: 'UTR12', paidAt: '2026-10-03T06:00:00.000Z' },               // 5
+            { ...base, $id: 'p5', id: 'cpo_5', status: 'rejected', referenceNumber: null },
+        ] });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const gt9 = await request(app).get('/admin/requests/reference-audit?minLength=10');
+        expect(gt9.status).toBe(200);
+        expect(gt9.body).toMatchObject({ success: true, scanned: 4, matched: 2, minLength: 10, maxLength: null });
+        expect(gt9.body.payouts.map((p) => [p.id, p.referenceLength])).toEqual([['cpo_2', 13], ['cpo_3', 23]]);
+        const short = await request(app).get('/admin/requests/reference-audit?maxLength=8');
+        expect(short.body.payouts.map((p) => p.id)).toEqual(['cpo_4']);
+        expect((await request(app).get('/admin/requests/reference-audit?minLength=12&maxLength=12')).body.matched).toBe(0);
+        expect((await request(app).get('/admin/requests/reference-audit')).status).toBe(400);              // need at least one bound
+        expect((await request(app).get('/admin/requests/reference-audit?minLength=x')).status).toBe(400);
+    });
+
+    test('paid: a reference number already on another paid payout is refused (409, case-insensitive, trimmed) and nothing moves', async () => {
+        const base = pending();
+        const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [base, { ...base, $id: 'p9', id: 'cpo_9', status: 'paid', referenceNumber: 'UTR12345', paidAt: '2026-10-01T05:00:00.000Z' }] });
+        const { app, mod } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: '  utr12345 ' });
+        expect(res.status).toBe(409);
+        expect(res.body).toEqual({ error: 'Reference number already used on payout cpo_9', conflictPayoutId: 'cpo_9' });
+        expect(db.store[COLS.PAYOUTS][0].status).toBe('pending');
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 50000, holdPaise: 10300 });
+        expect(db.store[COLS.TXNS] || []).toHaveLength(0);
+        // a fresh reference goes through, under lock:payoutref:<REF>
+        const redis = makeRedis();
+        const { app: app2 } = buildPayout(makeDb({ ...seed(), [COLS.PAYOUTS]: [pending(), { ...base, $id: 'p9', id: 'cpo_9', status: 'paid', referenceNumber: 'UTR12345' }] }), redis, asUser('admin1', 'admin'));
+        expect((await request(app2).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR99999' })).status).toBe(200);
+        expect(redis.set).toHaveBeenCalledWith('lock:payoutref:UTR99999', expect.any(String), { NX: true, EX: 15 });
+        void mod;
+    });
+
     test('paid / reject accept an optional staff remark, stored as adminRemark and returned; >500 chars → 400', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
