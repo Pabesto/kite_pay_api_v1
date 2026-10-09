@@ -559,10 +559,17 @@ Auth: `view_payouts` or admin; subadmins get their own users only. Non-admins ar
 `exports_enabled` kill switch and export time window as the transaction export (`403 Exports are currently
 disabled` / `403 Export is only allowed during permitted time windows`).
 
-**Flutter: "Download" button on the Customer Payout queue screen.** Opens a sheet with: date range
+**Flutter: "Download" button on the Customer Payout queue screen.** Opens a sheet with: a format toggle
+(**Excel** default, PDF), date range
 (from/to, default the queue's current range), merchant picker (All / one user, subadmin picker for admin),
 status chips (All / Paid / Rejected / Cancelled / Pending), and a row-limit selector (100 / 500 / 1000 /
-2500 / 5000, default 500). On confirm call this endpoint with the chosen params and build the PDF exactly
+2500 / 5000, default 500). On confirm call this endpoint once and build the chosen file **on the device** from the JSON (the server
+sends data only, never files). Excel: one sheet "Payouts" with one row per payout and every column listed
+above in that order (write `id`, `accountNumber`, `referenceNumber`, `upiId`, `ifscCode` as **text cells** so
+Excel never rewrites a 12-digit UTR as 9.8E+08; write the `*Rs` amounts as numbers so they sum; timestamps
+in IST `YYYY-MM-DD HH:mm:ss`), plus a sheet "Summary" with count / amount / commission / total per status and
+the grand line, the filters used, `generatedAt` and `generatedBy.name`; file name
+`customer-payouts-<from>-<to>-<status>.xlsx`, saved with the platform share/save flow. PDF: build it exactly
 like the transactions PDF: a header block from `filters` + `generatedAt` + `generatedBy`, a summary table
 from `summary.byStatus` (count, amount ₹, commission ₹, total ₹ per status, then the grand line), then one
 row per payout with the maximum columns: `id`, `requestedAt`, `status`, `customerName`, `bankName`,
