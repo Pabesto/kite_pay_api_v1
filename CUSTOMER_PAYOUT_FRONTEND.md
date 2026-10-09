@@ -534,6 +534,45 @@ source-account list (§6.2a)**: as the admin types, call `GET /admin/source-acco
 and offer matches; picking one fills the field; typing a new value is allowed and is saved to the
 list automatically the moment the payout is marked paid.
 
+#### 6.2x Download / PDF export — `GET /api/payout/admin/requests/export`
+The queue with the **same filters**, un-paginated up to a chosen cap, every column, names resolved, and a
+status summary — the app renders the PDF (as it does for `/user/transactions/export`). Query params:
+
+| param | values | notes |
+|---|---|---|
+| `from`, `to` | `YYYY-MM-DD` (IST) | on `createdAt`; omit both for all time |
+| `userId` / `subadminId` | id | one merchant / one subadmin's merchants; omit = all the caller may see |
+| `status` | `paid` \| `rejected` \| `cancelled` \| `pending` \| `ALL` | default `ALL` |
+| `limit` | **100, 500, 1000, 2500, 5000** | default 500; any other value → 400 |
+| `mode`, `accountId`, `processedBy`, `minAmount`, `maxAmount`, `search`… | as §6.1 | optional |
+
+```jsonc
+{ "success": true, "generatedAt": "2026-10-09T06:00:00.000Z", "generatedBy": { "userId": "admin1", "name": "Head Admin", "role": "admin" },
+  "filters": { "from": "2026-10-01", "to": "2026-10-09", "userId": null, "subadminId": null, "status": "ALL", "mode": null, "limit": 500 },
+  "total": 312, "truncated": false,                     // truncated:true = more rows matched than `limit`; raise the limit or narrow the dates
+  "summary": { "count": 312, "amountPaise": …, "amountRs": …, "commissionPaise": …, "commissionRs": …, "totalPaise": …, "totalRs": …,
+               "byStatus": { "paid": { "count": 280, "amountPaise": …, "amountRs": …, "commissionPaise": …, "commissionRs": …, "totalPaise": …, "totalRs": … }, "rejected": { … }, "cancelled": { … }, "pending": { … } } },
+  "payouts": [ { /* every §5.4 field (staff shape incl. paidVia, adminRemark) */
+                 "merchantName": "Ravi Shop", "merchantEmail": "ravi@x.in", "subadminId": "sub1", "subadminName": "Sub One", "processedByName": "Head Admin" }, … ] }
+```
+Auth: `view_payouts` or admin; subadmins get their own users only. Non-admins are subject to the same
+`exports_enabled` kill switch and export time window as the transaction export (`403 Exports are currently
+disabled` / `403 Export is only allowed during permitted time windows`).
+
+**Flutter: "Download" button on the Customer Payout queue screen.** Opens a sheet with: date range
+(from/to, default the queue's current range), merchant picker (All / one user, subadmin picker for admin),
+status chips (All / Paid / Rejected / Cancelled / Pending), and a row-limit selector (100 / 500 / 1000 /
+2500 / 5000, default 500). On confirm call this endpoint with the chosen params and build the PDF exactly
+like the transactions PDF: a header block from `filters` + `generatedAt` + `generatedBy`, a summary table
+from `summary.byStatus` (count, amount ₹, commission ₹, total ₹ per status, then the grand line), then one
+row per payout with the maximum columns: `id`, `requestedAt`, `status`, `customerName`, `bankName`,
+`ifscCode`, `accountNumber`, `upiId`, `mode`, `amountRs`, `commissionRs`, `totalRs`, `commissionRate`,
+`merchantName`, `subadminName`, `referenceNumber`, `paidVia`, `paidAt` / `rejectedAt` / `cancelledAt`,
+`processedByName`, `rejectionReason`, `adminRemark`, `notes`, `accountBankingStatus`,
+`accountVerificationStatus`, `paidInMinutes`. Landscape page. If `truncated` is true show a banner
+"Showing first N of more — raise the limit or narrow the dates" before rendering. File name
+`customer-payouts-<from>-<to>-<status>.pdf`. Use the platform share/save-file flow.
+
 #### 6.2z Duplicate reference numbers — `GET /api/payout/admin/requests/duplicate-references?from=&to=`
 Paid payouts whose bank reference (UTR) is shared with another paid payout — a UTR typed twice, or one
 bank transfer recorded against two requests (a double debit of the merchant). Compared case-insensitively

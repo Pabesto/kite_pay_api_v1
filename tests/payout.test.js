@@ -362,6 +362,25 @@ describe('admin paid / reject', () => {
         [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
     });
 
+    test('export: same filters as the queue, fixed limit choices, names + status summary, truncated flag', async () => {
+        const base = pending();
+        const rows = [];
+        for (let i = 1; i <= 120; i++) rows.push({ ...base, $id: `p${i}`, id: `cpo_${i}`, status: i % 3 === 0 ? 'rejected' : 'paid', referenceNumber: i % 3 === 0 ? null : `UTR${i}`, createdAt: `2026-10-0${1 + (i % 5)}T05:00:00.000Z`, amountPaise: 1000, commissionPaise: 30, totalPaise: 1030, processedBy: 'admin1' });
+        const db = makeDb({ ...seed(), [COLS.PAYOUTS]: rows, [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin', name: 'Head Admin' }, { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', name: 'Ravi Shop', email: 'ravi@x.in' }, { $id: 'sub1', userId: 'sub1', role: 'subadmin', name: 'Sub One' }] });
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await request(app).get('/admin/requests/export?limit=700')).status).toBe(400);
+        const all = await request(app).get('/admin/requests/export?status=ALL&limit=100');
+        expect(all.status).toBe(200);
+        expect(all.body).toMatchObject({ total: 100, truncated: true, filters: { status: 'ALL', limit: 100 } });
+        expect(all.body.payouts[0]).toMatchObject({ merchantName: 'Ravi Shop', merchantEmail: 'ravi@x.in', subadminId: 'sub1', subadminName: 'Sub One', processedByName: 'Head Admin' });
+        expect(all.body.payouts[0]).toHaveProperty('paidVia');   // staff shape
+        const paid = await request(app).get('/admin/requests/export?status=paid&limit=500');
+        expect(paid.body).toMatchObject({ total: 80, truncated: false });
+        expect(paid.body.summary).toMatchObject({ count: 80, amountPaise: 80000, amountRs: 800, commissionPaise: 2400, totalPaise: 82400, byStatus: { paid: { count: 80, amountPaise: 80000 } } });
+        expect(paid.body.payouts.every((p) => p.status === 'paid')).toBe(true);
+        expect((await request(app).get('/admin/requests/export?status=bogus')).status).toBe(400);
+    });
+
     test('duplicate-references: groups paid payouts sharing a UTR (case/space-insensitive), flags same account+amount, scoped per tenant', async () => {
         const base = pending();
         const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [

@@ -2048,6 +2048,67 @@ module.exports = (
     catch (e) { sendError(res, e, 'Failed to fetch customer payout requests'); }
   });
 
+  // GET /admin/requests/export — the queue with the same filters, un-paginated up to a chosen cap, every
+  // detail column, plus names (merchant, subadmin, resolver) and a status summary. The app renders the PDF
+  // (same split as /user/transactions/export in admin.js). Non-admins honour the export kill switch and the
+  // export time window exactly like the transaction export. Registered before /admin/requests/:id.
+  const EXPORT_LIMITS = [100, 500, 1000, 2500, 5000];
+  const exportWindowOpen = () => {
+    const now = moment().tz('Asia/Kolkata'), mins = now.hours() * 60 + now.minutes();
+    return [{ from: 9 * 60, to: 10 * 60 }].some((w) => mins >= w.from && mins < w.to);   // mirrors admin.js isExportTimeAllowed
+  };
+  router.get('/admin/requests/export', adminView, async (req, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        await ConfigManager.refresh();
+        if (!parseBool(ConfigManager.get('exports_enabled', false), false)) throw fail(403, 'Exports are currently disabled');
+        if (parseBool(ConfigManager.get('export_time_windows_enabled', false), false) && !exportWindowOpen()) throw fail(403, 'Export is only allowed during permitted time windows');
+      }
+      const limit = req.query.limit === undefined ? 500 : Number(req.query.limit);
+      if (!EXPORT_LIMITS.includes(limit)) throw fail(400, `limit must be one of ${EXPORT_LIMITS.join(', ')}`);
+      const q = { ...req.query };
+      if (!q.status || String(q.status).toUpperCase() === 'ALL') delete q.status;
+      const scope = await userScope(req, q);
+      const staff = isStaff(req);
+      const rows = [];
+      let cursor = null, truncated = false;
+      if (scope !== null) {
+        for (let page = 0; page < limit / 100; page++) {
+          const r = await listPayouts({ ...q, limit: 100, cursor }, scope, staff);
+          rows.push(...r.payouts);
+          cursor = r.nextCursor;
+          if (!cursor) break;
+        }
+        truncated = !!cursor;
+      }
+      // Names, once per distinct id — merchant, their subadmin, the resolver — so the PDF needs no lookups.
+      const ids = [...new Set(rows.flatMap((p) => [p.userId, p.processedBy]).filter(Boolean))];
+      const meta = {};
+      for (let i = 0; i < ids.length; i += 100) for (const u of (await databases.listDocuments(DB, USERS_META, [Query.equal('userId', ids.slice(i, i + 100)), Query.limit(100)])).documents) meta[u.userId] = u;
+      const parentIds = [...new Set(Object.values(meta).map((u) => u.parentId).filter((id) => id && !meta[id]))];
+      for (let i = 0; i < parentIds.length; i += 100) for (const u of (await databases.listDocuments(DB, USERS_META, [Query.equal('userId', parentIds.slice(i, i + 100)), Query.limit(100)])).documents) meta[u.userId] = u;
+      const nameOf = (id) => (id && meta[id] ? (meta[id].name || meta[id].email || id) : id || null);
+      const payouts = rows.map((p) => ({
+        ...p,
+        merchantName: nameOf(p.userId), merchantEmail: meta[p.userId]?.email || null,
+        subadminId: meta[p.userId]?.parentId || null, subadminName: nameOf(meta[p.userId]?.parentId || null),
+        processedByName: nameOf(p.processedBy),
+      }));
+      const summary = { count: payouts.length, amountPaise: 0, commissionPaise: 0, totalPaise: 0, byStatus: {} };
+      for (const p of payouts) {
+        summary.amountPaise += Number(p.amountPaise || 0); summary.commissionPaise += Number(p.commissionPaise || 0); summary.totalPaise += Number(p.totalPaise || 0);
+        const b = (summary.byStatus[p.status] = summary.byStatus[p.status] || { count: 0, amountPaise: 0, commissionPaise: 0, totalPaise: 0 });
+        b.count += 1; b.amountPaise += Number(p.amountPaise || 0); b.commissionPaise += Number(p.commissionPaise || 0); b.totalPaise += Number(p.totalPaise || 0);
+      }
+      for (const b of [summary, ...Object.values(summary.byStatus)]) { b.amountRs = b.amountPaise / 100; b.commissionRs = b.commissionPaise / 100; b.totalRs = b.totalPaise / 100; }
+      res.json({
+        success: true, generatedAt: nowIso(), generatedBy: { userId: req.user.userId, name: req.user.name || null, role: req.user.role },
+        filters: { from: q.from || null, to: q.to || null, userId: q.userId || null, subadminId: q.subadminId || null, status: q.status || 'ALL', mode: q.mode || null, limit },
+        total: payouts.length, truncated, summary, payouts,
+      });
+    } catch (e) { sendError(res, e, 'Failed to export customer payouts'); }
+  });
+
   // GET /admin/requests/duplicate-references — paid payouts whose bank reference (UTR) is shared with
   // another paid payout: a UTR typed twice, or one transfer recorded against two requests. Compared
   // case-insensitively and trimmed. Tenant-scoped like the queue (staff see every merchant, a subadmin

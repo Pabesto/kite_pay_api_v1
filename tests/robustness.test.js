@@ -502,14 +502,19 @@ describe('POST /withdraw_new — input validation', () => {
         expect(res.body.error).toMatch(/account number/i);
     });
 
-    test('Bank mode with account number containing letters returns 400', async () => {
-        const res = await request(app).post('/withdraw_new').send({
+    test('Bank mode: account number may contain letters (8–18 letters/digits); symbols or wrong length return 400', async () => {
+        const send = (accountNumber) => request(app).post('/withdraw_new').send({
             userId: 'user1', qrId: 'qr1', holderName: 'Alice', mode: 'bank',
-            bankName: 'SBI', accountNumber: '1234abc67890', ifscCode: 'SBIN0001234',
+            bankName: 'SBI', accountNumber, ifscCode: 'SBIN0001234',
             amount: 100, preAmount: 100, commission: 0,
         });
-        expect(res.status).toBe(400);
-        expect(res.body.error).toMatch(/account number/i);
+        const letters = await send('1234abc67890');            // alphanumeric is valid now — fails later for an unrelated reason, never on the account number
+        expect(letters.body.error || '').not.toMatch(/account number/i);
+        for (const bad of ['1234-5678-90', '12 345 678', 'ABC1234']) {
+            const res = await send(bad);
+            expect(res.status).toBe(400);
+            expect(res.body.error).toMatch(/account number/i);
+        }
     });
 
     test('Negative or zero amount returns 400', async () => {
