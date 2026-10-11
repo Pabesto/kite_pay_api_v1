@@ -582,7 +582,7 @@ module.exports = (
   // shown to users or subadmins.
   const pickPayout = (d, staff = false) => ({
     $id: d.$id, id: d.id, userId: d.userId, accountId: d.accountId,
-    ...(staff ? { paidVia: d.paidVia || null } : {}),
+    ...(staff ? { paidVia: d.paidVia || null, fromCompany: d.fromCompany || null, paidBy: d.paidBy || null } : {}),
     // Service timeline (UTC ISO) + derived durations for "added in X min / paid in Y min" badges
     requestedAt: d.createdAt,
     addedToBankingAt: d.addedToBankingAt || null,
@@ -1199,6 +1199,8 @@ module.exports = (
     if (scopeQueries === null) return empty;
     const queries = [...scopeQueries];
     if (staff && q.paidVia) queries.push(Query.equal('paidVia', String(q.paidVia).trim()));
+    if (staff && q.fromCompany) queries.push(Query.equal('fromCompany', String(q.fromCompany).trim()));
+    if (staff && q.paidBy) queries.push(Query.equal('paidBy', String(q.paidBy).trim()));
     if (q.status) {
       if (!['pending', 'paid', 'rejected', 'cancelled'].includes(q.status)) throw fail(400, 'Invalid status');
       queries.push(Query.equal('status', q.status));
@@ -2103,7 +2105,7 @@ module.exports = (
       for (const b of [summary, ...Object.values(summary.byStatus)]) { b.amountRs = b.amountPaise / 100; b.commissionRs = b.commissionPaise / 100; b.totalRs = b.totalPaise / 100; }
       res.json({
         success: true, generatedAt: nowIso(), generatedBy: { userId: req.user.userId, name: req.user.name || null, role: req.user.role },
-        filters: { from: q.from || null, to: q.to || null, userId: q.userId || null, subadminId: q.subadminId || null, status: q.status || 'ALL', mode: q.mode || null, limit },
+        filters: { from: q.from || null, to: q.to || null, userId: q.userId || null, subadminId: q.subadminId || null, status: q.status || 'ALL', mode: q.mode || null, fromCompany: q.fromCompany || null, paidBy: q.paidBy || null, limit },
         total: payouts.length, truncated, summary, payouts,
       });
     } catch (e) { sendError(res, e, 'Failed to export customer payouts'); }
@@ -2181,6 +2183,31 @@ module.exports = (
   // Body: { referenceNumber (required), paidVia? (staff-only note: which of our accounts paid it, ≤100) }
   // Optional free-text remark on paid/reject (≤500) — kept on the request as `adminRemark`, separate from
   // `rejectionReason` (the user-facing why) and `paidVia` (the source account). 400 when too long.
+  // Accounting stamps on a paid payout (staff-only, optional on the server, required in the Paid dialog).
+  // Both are picked from admin-maintained config lists and stored in the config spelling (matched
+  // trimmed / case-insensitively; a value not in the list is a 400 before anything moves):
+  //   fromCompany — config `company_names` ({name: email} map or legacy array; the list the QR reports group by)
+  //   paidBy      — config `employee_names` (array of names): who actually made the bank transfer. Free text
+  //                 from config, NOT a users_meta id — it may differ from `processedBy`, the login that pressed Paid.
+  const cfgNames = (key) => { const cfg = ConfigManager.get(key, []); return (Array.isArray(cfg) ? cfg : Object.keys(cfg || {})).map((c) => String(c).trim()).filter(Boolean); };
+  const pickFromConfig = (body, field, key, what) => {
+    const raw = String(body[field] || '').trim();
+    if (!raw) return null;
+    const hit = cfgNames(key).find((c) => c.toLowerCase() === raw.toLowerCase());
+    if (!hit) throw fail(400, `${field} must be one of the configured ${what}`);
+    return hit;
+  };
+  const companyOf = (body) => pickFromConfig(body, 'fromCompany', 'company_names', 'company names');
+  const paidByOf = (body) => pickFromConfig(body, 'paidBy', 'employee_names', 'employee names');
+  // GET /admin/payment-options — the two pick lists for the Paid dialog (staff only), straight from config.
+  router.get('/admin/payment-options', adminView, async (req, res) => {
+    try {
+      staffOnly(req);
+      await ConfigManager.refresh();
+      res.json({ success: true, companies: cfgNames('company_names'), employees: cfgNames('employee_names'), me: { userId: req.user.userId, name: req.user.name || null, role: req.user.role } });
+    } catch (e) { sendError(res, e, 'Failed to load payment options'); }
+  });
+
   const remarkOf = (body) => {
     if (body.remark === undefined || body.remark === null) return null;
     const r = String(body.remark).trim();
@@ -2194,6 +2221,8 @@ module.exports = (
       const adminRemark = remarkOf(req.body);
       if (referenceNumber.length < 5 || referenceNumber.length > 100) throw fail(400, 'Payout reference number is required (5–100 characters)');
       const paidVia = String(req.body.paidVia || '').trim().slice(0, 100) || null;
+      const fromCompany = companyOf(req.body);
+      const paidBy = paidByOf(req.body);
       const found = await loadPayoutByBusinessId(req.params.id);
       await assertCanAct(req, found.userId); // employees: only their assigned subadmins' users
       if (found.status !== 'pending') throw fail(400, `Cannot mark a ${found.status} request as paid`);
@@ -2230,7 +2259,7 @@ module.exports = (
         }
         const at = nowIso();
         const doc = await databases.updateDocument(DB, PAYOUTS, p.$id, {
-          status: 'paid', referenceNumber, paidVia, adminRemark, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
+          status: 'paid', referenceNumber, paidVia, fromCompany, paidBy, adminRemark, rejectionReason: null, processedAt: at, paidAt: at, processedBy: req.user.userId,
         });
         await bumpAccountStats(p.accountId, { paidCount: 1, totalPaidPaise: Number(p.amountPaise || 0), totalCommissionPaise: Number(p.commissionPaise || 0) }, { lastPaidAt: at });
         return doc;

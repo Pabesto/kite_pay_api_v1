@@ -502,6 +502,8 @@ bottom (server returns newest first). All filters combine (AND). Build a filter 
 | `processedBy` | admin/employee user id | who marked it paid/rejected |
 | `search` (+ `searchField`) | text | `searchField` ∈ `customerName` (default; word search), `accountNumber` (prefix), `upiId`, `referenceNumber`, `id` (exact). Digits-only `search` without a field = account-number prefix |
 | `paidVia` | text (exact) | admin / labelled employee only — which of our accounts paid it; silently ignored for subadmins |
+| `fromCompany` | text (exact, config spelling) | staff only — which of **our companies** paid it (§6.2b); silently ignored for subadmins |
+| `paidBy` | text (exact, config spelling) | staff only — the employee name who actually made the bank transfer (§6.2b); silently ignored for subadmins |
 | `minAmount` / `maxAmount` | **rupees** | on the payout amount (excl. commission) |
 | `from` / `to` | `YYYY-MM-DD` (IST) | on request time |
 | `sort` / `order` | `createdAt` (default) `processedAt` `amount` / `desc` (default) `asc` | `processedAt` sorts pending rows last |
@@ -520,8 +522,13 @@ account number.
 ```jsonc
 { "referenceNumber": "UTR1234567890",        // required, 5–100 chars — the bank/payout reference (the user sees this)
   "paidVia": "HDFC current a/c ****4321",    // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
+  "fromCompany": "Sky Traders",              // one of the §6.2b `companies` — which of OUR companies paid it. STAFF-ONLY.
+  "paidBy": "Priya",                         // one of the §6.2b `employees` — who actually made the transfer. STAFF-ONLY.
   "remark": "Customer confirmed on call" }   // optional, ≤500 chars — free-text remark by the resolver; stored as `adminRemark`, visible to the user too
 ```
+`fromCompany` and `paidBy` are optional on the server but **required in the Paid dialog** (see §6.2b).
+A value not in the pick lists is refused before anything moves: `400 fromCompany must be one of the
+configured company names` / `400 paidBy must be one of the configured employee names`.
 **Reference numbers are unique platform-wide.** A UTR already stamped on another *paid* payout is refused:
 `409 { error: "Reference number already used on payout cpo_…", conflictPayoutId: "cpo_…" }` (compared
 case-insensitively, trimmed). Show the message with a link to that payout; nothing was debited. Two admins
@@ -553,7 +560,9 @@ status summary — the app renders the PDF (as it does for `/user/transactions/e
   "summary": { "count": 312, "amountPaise": …, "amountRs": …, "commissionPaise": …, "commissionRs": …, "totalPaise": …, "totalRs": …,
                "byStatus": { "paid": { "count": 280, "amountPaise": …, "amountRs": …, "commissionPaise": …, "commissionRs": …, "totalPaise": …, "totalRs": … }, "rejected": { … }, "cancelled": { … }, "pending": { … } } },
   "payouts": [ { /* every §5.4 field (staff shape incl. paidVia, adminRemark) */
-                 "merchantName": "Ravi Shop", "merchantEmail": "ravi@x.in", "subadminId": "sub1", "subadminName": "Sub One", "processedByName": "Head Admin" }, … ] }
+                 "merchantName": "Ravi Shop", "merchantEmail": "ravi@x.in", "subadminId": "sub1", "subadminName": "Sub One", "processedByName": "Head Admin",
+                 "fromCompany": "Sky Traders", "paidBy": "Priya" }, … ] }
+The export also accepts `fromCompany` and `paidBy` as filters (echoed back under `filters`).
 ```
 Auth: `view_payouts` or admin; subadmins get their own users only. Non-admins are subject to the same
 `exports_enabled` kill switch and export time window as the transaction export (`403 Exports are currently
@@ -574,7 +583,7 @@ like the transactions PDF: a header block from `filters` + `generatedAt` + `gene
 from `summary.byStatus` (count, amount ₹, commission ₹, total ₹ per status, then the grand line), then one
 row per payout with the maximum columns: `id`, `requestedAt`, `status`, `customerName`, `bankName`,
 `ifscCode`, `accountNumber`, `upiId`, `mode`, `amountRs`, `commissionRs`, `totalRs`, `commissionRate`,
-`merchantName`, `subadminName`, `referenceNumber`, `paidVia`, `paidAt` / `rejectedAt` / `cancelledAt`,
+`merchantName`, `subadminName`, `referenceNumber`, `paidVia`, `fromCompany`, `paidBy`, `paidAt` / `rejectedAt` / `cancelledAt`,
 `processedByName`, `rejectionReason`, `adminRemark`, `notes`, `accountBankingStatus`,
 `accountVerificationStatus`, `paidInMinutes`. Landscape page. If `truncated` is true show a banner
 "Showing first N of more — raise the limit or narrow the dates" before rendering. File name
@@ -608,6 +617,25 @@ least one bound is required (400 otherwise). Same scoping and `from`/`to` window
 ```
 Screen: on the same "Audit" page as 6.2z, a "Reference length" tab with two number fields (min / max) and a
 date range; list the rows with the reference, its length, customer, amount, merchant, paid at, paid by.
+
+#### 6.2b "From company" + "Paid by" — the two accounting pick lists (staff)
+`GET /api/payout/admin/payment-options`
+→ `{ success, companies: ["Kite Pay Pvt Ltd", "Sky Traders", …], employees: ["Priya", "Rahul", …], me: { userId, name, role } }`
+Both lists come straight from app config, exactly like the company dropdown the app already builds
+from config: `companies` = config key `company_names` (the list the QR reports group by), `employees`
+= config key **`employee_names`** (an array of names the admin maintains under config). Values are
+exact — send one back unchanged. Subadmins get 403; call it once when the Paid dialog opens (or read
+the two config keys the way the company dropdown already does — same data).
+
+**Paid dialog (admin and `edit_payouts` employees):** two new required dropdowns above the remark —
+**From company** (`companies` → `fromCompany`) and **Paid by** (`employees` → `paidBy`; pre-select the
+entry equal to `me.name` when present, the user may change it, e.g. an admin recording a transfer an
+employee made). Every paid row then carries `fromCompany` and `paidBy` (staff shape only — users and
+subadmins never receive these keys, like `paidVia`). Show them as two columns in the queue ("From
+company", "Paid by"), on the request detail, and offer both as filters (§6.1 `fromCompany`, `paidBy`,
+dropdowns from the same lists) and as columns in the export (§6.2x). `processedBy` / `processedByName`
+stay what they were: the login that pressed Paid, which can differ from `paidBy`. Rows paid before this
+change have both `null` — render "—".
 
 #### 6.2a Source accounts (the "paid via" list) — staff
 `GET /api/payout/admin/source-accounts?search&sort&includeInactive&limit&cursor`

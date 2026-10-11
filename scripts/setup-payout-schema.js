@@ -191,6 +191,8 @@ async function main() {
     await str(PAYOUTS, 'referenceNumber', 100);
     await str(PAYOUTS, 'adminRemark', 500);   // staff remark attached on paid/reject (optional)
     await str(PAYOUTS, 'paidVia', 100);            // staff-only: which of OUR accounts paid it
+    await str(PAYOUTS, 'fromCompany', 100);        // staff-only: which of our companies paid it (config company_names)
+    await str(PAYOUTS, 'paidBy', 100);             // staff-only: who made the transfer (config employee_names)
     await str(PAYOUTS, 'rejectionReason', 500);
     await str(PAYOUTS, 'createdAt', 40, true);
     await str(PAYOUTS, 'processedAt', 40);
@@ -215,6 +217,8 @@ async function main() {
     await idx(PAYOUTS, 'idx_processedBy', 'key', ['processedBy']);
     await idx(PAYOUTS, 'idx_referenceNumber', 'key', ['referenceNumber']);
     await idx(PAYOUTS, 'idx_paidVia', 'key', ['paidVia']);
+    await idx(PAYOUTS, 'idx_fromCompany', 'key', ['fromCompany']);
+    await idx(PAYOUTS, 'idx_paidBy', 'key', ['paidBy']);
 
     // 5. payout_commission_transactions (mirrors commission_transactions)
     const COMM = APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID;

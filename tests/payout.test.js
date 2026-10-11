@@ -725,6 +725,72 @@ describe('dashboard counters', () => {
     });
 });
 
+describe('fromCompany + paidBy (accounting stamps on mark-paid)', () => {
+    const seed = () => ({
+        [COLS.USERS]: [
+            { $id: 'admin1', userId: 'admin1', role: 'admin', name: 'Head Admin' },
+            { $id: 'emp1', userId: 'emp1', role: 'employee', name: 'Priya', labels: ['edit_payouts'] },
+            { $id: 'emp2', userId: 'emp2', role: 'employee', name: 'Viewer', labels: ['view_payouts'] },
+            { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', name: 'Merchant' },
+        ],
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 20600 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', bankingStatus: 'added' }],
+        [COLS.PAYOUTS]: [
+            { $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'Ravi', accountNumber: '1', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: '2026-09-01T00:00:00.000Z' },
+            { $id: 'p2', id: 'cpo_2', userId: 'user1', accountId: 'acc1', customerName: 'Sita', accountNumber: '2', mode: 'IMPS', amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending', createdAt: '2026-09-01T00:00:00.000Z' },
+        ],
+    });
+    beforeEach(() => { mockConfig.company_names = { 'Kite Pay Pvt Ltd': 'a@x.in', 'Sky Traders': 'b@x.in' }; mockConfig.employee_names = ['Priya', 'Rahul']; });
+    afterEach(() => { delete mockConfig.company_names; delete mockConfig.employee_names; });
+
+    test('paid stores the config-spelled company and employee; both filter the queue and reach the export', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', fromCompany: '  sky traders ', paidBy: 'priya ' });
+        expect(paid.status).toBe(200);
+        expect(paid.body.payout).toMatchObject({ fromCompany: 'Sky Traders', paidBy: 'Priya', processedBy: 'admin1' });
+        expect(db.store[COLS.PAYOUTS][0]).toMatchObject({ fromCompany: 'Sky Traders', paidBy: 'Priya' });
+        // optional: a plain paid leaves them null
+        expect((await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890' })).body.payout).toMatchObject({ fromCompany: null, paidBy: null });
+
+        expect((await request(app).get('/admin/requests?status=paid&fromCompany=Sky Traders')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        expect((await request(app).get('/admin/requests?status=paid&paidBy=Priya')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        const ex = await request(app).get('/admin/requests/export?status=paid&limit=100&paidBy=Priya');
+        expect(ex.body.filters).toMatchObject({ fromCompany: null, paidBy: 'Priya' });
+        expect(ex.body.payouts).toHaveLength(1);
+        expect(ex.body.payouts[0]).toMatchObject({ fromCompany: 'Sky Traders', paidBy: 'Priya', processedByName: 'Head Admin' });
+
+        // users never see the staff keys
+        const { app: userApp } = buildPayout(db, makeRedis(), asUser('user1'));
+        const own = (await request(userApp).get('/requests/cpo_1')).body.payout;
+        for (const k of ['fromCompany', 'paidBy']) expect(own).not.toHaveProperty(k);
+    });
+
+    test('unknown company → 400; name not in employee_names → 400; nothing debited', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const bad = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', fromCompany: 'Nope Ltd' });
+        expect(bad.status).toBe(400); expect(bad.body.error).toMatch(/fromCompany/);
+        const bad2 = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidBy: 'Head Admin' });
+        expect(bad2.status).toBe(400); expect(bad2.body.error).toMatch(/paidBy must be one of the configured employee names/);
+        expect(db.store[COLS.PAYOUTS][0].status).toBe('pending');
+        expect(db.store[COLS.WALLETS][0].balancePaise).toBe(50000);
+    });
+
+    test('payment-options returns the two config lists; subadmin 403', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const r = await request(app).get('/admin/payment-options');
+        expect(r.status).toBe(200);
+        expect(r.body.companies).toEqual(['Kite Pay Pvt Ltd', 'Sky Traders']);
+        expect(r.body.employees).toEqual(['Priya', 'Rahul']);
+        expect(r.body.me).toMatchObject({ userId: 'admin1', role: 'admin' });
+        const sub = asUser('sub1', 'subadmin');
+        const { app: subApp } = buildPayout(db, makeRedis(), sub, () => sub);
+        expect((await request(subApp).get('/admin/payment-options')).status).toBe(403);
+    });
+});
+
 describe('paidVia (staff-only) + lookup by unique id', () => {
     const seed = () => ({
         [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }, { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' }],
