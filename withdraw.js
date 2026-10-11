@@ -47,6 +47,20 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     return v == null ? def : !['false', '0', 'no', ''].includes(String(v).toLowerCase());
   }
 
+  // Accounting stamps on an approved withdrawal — same two config pick lists as customer payouts
+  // (payout.js): `fromCompany` ∈ config `company_names`, `paidBy` ∈ config `employee_names`. REQUIRED for
+  // direct (upi/bank) approvals — a mode:'wallet' withdrawal is an internal transfer to the payout wallet,
+  // no company account pays it, so there they are optional. Matched trimmed / case-insensitively, stored
+  // in the config spelling; missing/unknown is a 400 before any lock. Staff-only on read.
+  const cfgNames = (key) => { const cfg = ConfigManager.get(key, []); return (Array.isArray(cfg) ? cfg : Object.keys(cfg || {})).map((c) => String(c).trim()).filter(Boolean); };
+  const pickFromConfig = (body, field, key, what, required) => {
+    const raw = String(body[field] || '').trim();
+    if (!raw) { if (required) throw new Error(`${field} is required`); return null; }
+    const hit = cfgNames(key).find((c) => c.toLowerCase() === raw.toLowerCase());
+    if (!hit) throw new Error(`${field} must be one of the configured ${what}`);
+    return hit;
+  };
+
   // The ledger a withdrawal draws on: a QR (qrId) or a bank account (bankAcId). Same seven ledger
   // fields, same formula, same lock choreography — only the collection, the key field, the lock
   // family and the settlement/report instances differ. Every route that reads a QR by qrId goes
@@ -747,7 +761,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     // GET /withdrawals?status=pending&limit=20&cursor=docId
     router.get('/withdrawals_paginated', authenticateAdminOrSubAdminOrEmployee, async (req, res) => {
       try {
-        const {userId, qrId, bankAcId, status, from, to, limit: limitStr, cursor } = req.query;
+        const {userId, qrId, bankAcId, status, from, to, limit: limitStr, cursor, fromCompany, paidBy } = req.query;
+        const staff = req.user.role !== 'subadmin'; // admin / employee: see the accounting stamps
 
         // 1) Parse limit with sane default + cap
         const DEFAULT_LIMIT = 25;
@@ -857,6 +872,8 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             }
         // Bank-account withdrawals (bankAccounts.js): exact key, stacks with the filters above.
         if (bankAcId) queries.push(Query.equal('bankAcId', String(bankAcId).trim()));
+        if (staff && fromCompany) queries.push(Query.equal('fromCompany', String(fromCompany).trim()));
+        if (staff && paidBy) queries.push(Query.equal('paidBy', String(paidBy).trim()));
 
         if (status) {
           queries.push(Query.equal('status', status));
@@ -933,6 +950,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
             processedAt: doc.processedAt || null,
             utrNumber: doc.utrNumber || null,
             rejectionReason: doc.rejectionReason || null,
+            ...(staff ? { fromCompany: doc.fromCompany || null, paidBy: doc.paidBy || null } : {}), // accounting stamps, staff-only
             walletCreditFailed: doc.walletCreditFailed === true, // mode:wallet only — payout wallet credit needs retry-credit
             walletRevertedPaise: Number(doc.walletRevertedPaise || 0), // mode:wallet only — already reverted back to the QR (paise)
             // Include other metadata if needed
@@ -1165,6 +1183,16 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
     //   }
     // });
 
+    // GET /withdrawals/payment-options — the two config pick lists for the Approve dialog (same data
+    // as /api/payout/admin/payment-options, gated by the withdrawal label so a withdrawals-only
+    // employee can load it).
+    router.get('/withdrawals/payment-options', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
+      try {
+        await ConfigManager.refresh();
+        res.json({ success: true, companies: cfgNames('company_names'), employees: cfgNames('employee_names'), me: { userId: req.user.userId, name: req.user.name || null, role: req.user.role } });
+      } catch (e) { console.error('payment-options failed', e); res.status(500).json({ error: 'Failed to load payment options' }); }
+    });
+
     // POST /withdrawals/approve_new (with balance and ledger updates)
     router.post('/withdrawals/approve_new', authenticateAdminOrLabel('edit_withdrawals'), async (req, res) => {
       const { id, utrNumber } = req.body;
@@ -1208,6 +1236,11 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
         if (isWalletWithdrawal && typeof creditPayoutWallet !== 'function') {
           return res.status(500).json({ error: 'Payout wallet is not configured on this server' });
         }
+        let fromCompany, paidBy;
+        try {
+          fromCompany = pickFromConfig(req.body, 'fromCompany', 'company_names', 'company names', !isWalletWithdrawal);
+          paidBy = pickFromConfig(req.body, 'paidBy', 'employee_names', 'employee names', !isWalletWithdrawal);
+        } catch (e) { return res.status(400).json({ error: e.message }); }
 
         // normalize money to paise
         const toPaise = (val) => {
@@ -1314,6 +1347,7 @@ module.exports = (databases, storage, users, ID, Query, APPWRITE_DATABASE_ID, AP
           {
             status: 'approved',
             utrNumber: isWalletWithdrawal ? 'PAYOUT_WALLET' : utrNumber.trim(),
+            fromCompany, paidBy,
             processedAt: approvedAtIST,
             rejectionReason: null,
           }

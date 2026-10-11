@@ -2183,7 +2183,7 @@ module.exports = (
   // Body: { referenceNumber (required), paidVia? (staff-only note: which of our accounts paid it, ≤100) }
   // Optional free-text remark on paid/reject (≤500) — kept on the request as `adminRemark`, separate from
   // `rejectionReason` (the user-facing why) and `paidVia` (the source account). 400 when too long.
-  // Accounting stamps on a paid payout (staff-only, optional on the server, required in the Paid dialog).
+  // Accounting stamps on a paid payout (staff-only, REQUIRED — a paid payout always names its company and payer).
   // Both are picked from admin-maintained config lists and stored in the config spelling (matched
   // trimmed / case-insensitively; a value not in the list is a 400 before anything moves):
   //   fromCompany — config `company_names` ({name: email} map or legacy array; the list the QR reports group by)
@@ -2192,7 +2192,7 @@ module.exports = (
   const cfgNames = (key) => { const cfg = ConfigManager.get(key, []); return (Array.isArray(cfg) ? cfg : Object.keys(cfg || {})).map((c) => String(c).trim()).filter(Boolean); };
   const pickFromConfig = (body, field, key, what) => {
     const raw = String(body[field] || '').trim();
-    if (!raw) return null;
+    if (!raw) throw fail(400, `${field} is required`);
     const hit = cfgNames(key).find((c) => c.toLowerCase() === raw.toLowerCase());
     if (!hit) throw fail(400, `${field} must be one of the configured ${what}`);
     return hit;

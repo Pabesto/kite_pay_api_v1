@@ -8,7 +8,7 @@ const request = require('supertest');
 const express = require('express');
 const { Query } = require('node-appwrite');
 
-const mockConfig = {};
+const mockConfig = { company_names: { 'Kite Co': 'a@x.in' }, employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}),
@@ -75,7 +75,7 @@ function build(emit) {
 const ask = (app, rs = 1000) => request(app).post('/withdraw_new')
     .send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'ramesh@ybl', holderName: 'Ramesh', preAmount: rs, amount: rs * 1.02, commission: rs * 0.02 });
 
-beforeEach(() => { for (const k of Object.keys(mockConfig)) delete mockConfig[k]; });
+beforeEach(() => { for (const k of Object.keys(mockConfig)) delete mockConfig[k]; mockConfig.company_names = { 'Kite Co': 'a@x.in' }; mockConfig.employee_names = ['Priya']; });
 
 describe('withdrawal:update', () => {
     test('requested → one event to the user + tenant staff, full sanitized row, no bank/UPI details', async () => {
@@ -104,7 +104,7 @@ describe('withdrawal:update', () => {
         let statusAtEmit = null;
         const { app, db } = build(jest.fn(() => { statusAtEmit = db.store[WD][0].status; }));
         const created = await ask(app);
-        const res = await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, utrNumber: 'UTR123456' });
+        const res = await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' });
         expect(res.status).toBe(200);
         expect(statusAtEmit).toBe('approved'); // the last emit (approved) saw the committed doc
     });
@@ -113,7 +113,7 @@ describe('withdrawal:update', () => {
         const emit = jest.fn();
         const { app } = build(emit);
         const created = await ask(app);
-        await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, utrNumber: 'UTR123456' });
+        await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' });
         const approved = emit.mock.calls.find((c) => c[0].payload.type === 'approved')[0];
         expect(approved).toMatchObject({ userId: 'user1', staffRooms: ['sub1', 'user1'] });
         expect(approved.payload.withdrawal).toMatchObject({ withdrawalId: created.body.data.id, status: 'approved', utrNumber: 'UTR123456', rejectionReason: null, preAmountPaise: 100000 });
@@ -137,7 +137,7 @@ describe('withdrawal:update', () => {
         const { app } = build(emit);
         const created = await ask(app);
         expect(created.status).toBe(200);
-        expect((await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, utrNumber: 'UTR123456' })).status).toBe(200);
+        expect((await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' })).status).toBe(200);
         expect(emit).not.toHaveBeenCalled();
     });
 
@@ -146,7 +146,7 @@ describe('withdrawal:update', () => {
         const created = await ask(app);
         expect(created.status).toBe(200);
         expect(db.store[WD]).toHaveLength(1);
-        expect((await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, utrNumber: 'UTR123456' })).status).toBe(200);
+        expect((await request(app).post('/withdrawals/approve_new').send({ id: created.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' })).status).toBe(200);
         expect(db.store[WD][0].status).toBe('approved');
     });
 

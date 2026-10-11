@@ -24,7 +24,7 @@ const mockEmit = jest.fn();
 const emitted = () => mockEmit.mock.calls.map((c) => c[0]);
 
 // withdraw.js reads max_withdrawal_requests via ConfigManager (uninitialised here → known TDZ).
-const mockConfig = { max_withdrawal_requests: 2 };
+const mockConfig = { max_withdrawal_requests: 2, company_names: { 'Kite Co': 'a@x.in' }, employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}),
@@ -433,7 +433,7 @@ describe('admin paid / reject', () => {
         const base = pending();
         const db = makeDb({ ...seed(), [COLS.PAYOUTS]: [base, { ...base, $id: 'p9', id: 'cpo_9', status: 'paid', referenceNumber: 'UTR12345', paidAt: '2026-10-01T05:00:00.000Z' }] });
         const { app, mod } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: '  utr12345 ' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: '  utr12345 ' });
         expect(res.status).toBe(409);
         expect(res.body).toEqual({ error: 'Reference number already used on payout cpo_9', conflictPayoutId: 'cpo_9' });
         expect(db.store[COLS.PAYOUTS][0].status).toBe('pending');
@@ -442,7 +442,7 @@ describe('admin paid / reject', () => {
         // a fresh reference goes through, under lock:payoutref:<REF>
         const redis = makeRedis();
         const { app: app2 } = buildPayout(makeDb({ ...seed(), [COLS.PAYOUTS]: [pending(), { ...base, $id: 'p9', id: 'cpo_9', status: 'paid', referenceNumber: 'UTR12345' }] }), redis, asUser('admin1', 'admin'));
-        expect((await request(app2).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR99999' })).status).toBe(200);
+        expect((await request(app2).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR99999' })).status).toBe(200);
         expect(redis.set).toHaveBeenCalledWith('lock:payoutref:UTR99999', expect.any(String), { NX: true, EX: 15 });
         void mod;
     });
@@ -450,8 +450,8 @@ describe('admin paid / reject', () => {
     test('paid / reject accept an optional staff remark, stored as adminRemark and returned; >500 chars → 400', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', remark: 'x'.repeat(501) })).status).toBe(400);
-        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', remark: '  Paid from HDFC, customer confirmed on call  ' });
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345', remark: 'x'.repeat(501) })).status).toBe(400);
+        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345', remark: '  Paid from HDFC, customer confirmed on call  ' });
         expect(paid.status).toBe(200);
         expect(paid.body.payout).toMatchObject({ status: 'paid', adminRemark: 'Paid from HDFC, customer confirmed on call' });
         expect(db.store[COLS.PAYOUTS][0].adminRemark).toBe('Paid from HDFC, customer confirmed on call');
@@ -463,13 +463,13 @@ describe('admin paid / reject', () => {
         expect(rej.body.payout).toMatchObject({ status: 'rejected', rejectionReason: 'IFSC mismatch', adminRemark: 'asked merchant to re-add the account' });
         const noRemark = makeDb(seed());
         const { app: app3 } = buildPayout(noRemark, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(app3).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).body.payout.adminRemark).toBeNull();
+        expect((await request(app3).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).body.payout.adminRemark).toBeNull();
     });
 
     test('paid: debits balance+hold, writes ledger row, records split commission + daily rollup', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(res.body.payout).toMatchObject({ status: 'paid', referenceNumber: 'UTR12345', processedBy: 'admin1' });
         expect(res.body.payout.processedAt).toBeTruthy();
@@ -496,8 +496,8 @@ describe('admin paid / reject', () => {
         s[COLS.WALLETS][0].holdPaise = 20600;
         const db = makeDb(s);
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
-        await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890' });
+        await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
+        await request(app).post('/admin/requests/cpo_2/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR67890' });
         expect(db.store[COLS.MONTHLY]).toHaveLength(2);
         expect(db.store[COLS.ALLTIME].find((r) => r.userId === 'sub1').totalCommissionPaise).toBe(400);
         expect(db.store[COLS.MONTHLY].find((r) => r.userId === 'admin1').totalCommissionPaise).toBe(200);
@@ -515,7 +515,7 @@ describe('admin paid / reject', () => {
             return origCreate(d, c, id, data);
         });
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[COLS.PAYOUTS][0]).toMatchObject({ status: 'paid', commissionRollupFailed: true });
         expect(db.store[COLS.COMM]).toHaveLength(2); // raw txns (source of truth) still written
@@ -528,7 +528,7 @@ describe('admin paid / reject', () => {
         })[id] || null);
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(200);
         expect(db.store[COLS.COMM].map((c) => [c.userId, c.amount])).toEqual([['admin1', 300]]); // 2% + 1% of 10000
     });
 
@@ -537,15 +537,15 @@ describe('admin paid / reject', () => {
         s[COLS.PAYOUTS][0] = { ...pending(), mode: 'UPI', upiId: 'ravi@okaxis' };
         const db = makeDb(s);
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(db.store[COLS.TXNS][0].notes).toBe('UPI payout to Ravi (ravi@okaxis)');
     });
 
     test('paid is exactly-once: second call → 400, wallet untouched', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR99999' });
+        await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR99999' });
         expect(res.status).toBe(400);
         expect(res.body.error).toMatch(/paid/i);
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(39700);
@@ -556,7 +556,7 @@ describe('admin paid / reject', () => {
         const db = makeDb(seed());
         db.getDocument.mockImplementationOnce(async () => ({ ...pending(), status: 'paid' }));
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(409);
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(50000);
     });
@@ -567,7 +567,7 @@ describe('admin paid / reject', () => {
         s[COLS.TXNS] = [{ $id: 't1', type: 'payout_paid', refId: 'cpo_1', userId: 'user1' }];
         const db = makeDb(s);
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(39700);
         expect(db.store[COLS.TXNS]).toHaveLength(1);
@@ -577,7 +577,7 @@ describe('admin paid / reject', () => {
     test('paid: short reference number → 400 before any write', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: '12' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: '12' });
         expect(res.status).toBe(400);
         expect(db.updateDocument).not.toHaveBeenCalled();
     });
@@ -590,7 +590,7 @@ describe('admin paid / reject', () => {
             return origCreate(d, c, id, data);
         });
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[COLS.PAYOUTS][0].status).toBe('paid');
     });
@@ -610,7 +610,7 @@ describe('admin paid / reject', () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
         await request(app).post('/admin/requests/cpo_1/reject').send({ reason: 'Wrong IFSC' });
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(400);
     });
 });
@@ -635,7 +635,7 @@ describe('service timeline', () => {
             expect(tag.body.stampedRequests).toBe(1);
 
             jest.setSystemTime(new Date('2026-09-06T10:30:30.000Z'));
-            const paid = await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' });
+            const paid = await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
             expect(paid.body.payout).toMatchObject({
                 addedToBankingAt: '2026-09-06T10:12:00.000Z', addedInMinutes: 12,
                 paidAt: '2026-09-06T10:30:30.000Z', paidInMinutes: 31, rejectedAt: null, rejectedInMinutes: null,
@@ -674,7 +674,7 @@ describe('dashboard counters', () => {
         updateDashboardCounter.mockClear();
 
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect((await request(adminApp).post(`/admin/requests/${created.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(200);
         expect(counterDeltas()).toEqual([
             ['totalPayoutWalletBalance', -10300],
             ['totalCustomerPayoutPendingAmount', -10000], ['totalCustomerPayoutPendingCount', -1],
@@ -706,7 +706,7 @@ describe('dashboard counters', () => {
         await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 10, notes: 'fix' });      // -1000
         db.store[COLS.PAYOUTS] = [{ $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'a', customerName: 'R', accountNumber: '1', mode: 'NEFT', amountPaise: 20000, commissionPaise: 600, totalPaise: 20600, userCommissionRate: 3, parentCommissionRate: 0, status: 'pending' }];
         db.store[COLS.WALLETS][0].holdPaise = 20600;
-        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(200);
         expect(db.store[COLS.WALLETS][0]).toMatchObject({
             balancePaise: 100000 + 5000 - 1000 - 20600, holdPaise: 0,
             totalCreditedPaise: 105000, totalAdminDebitPaise: 1000, totalPaidOutPaise: 20000, totalPayoutCommissionPaise: 600, paidCount: 1,
@@ -741,7 +741,7 @@ describe('fromCompany + paidBy (accounting stamps on mark-paid)', () => {
         ],
     });
     beforeEach(() => { mockConfig.company_names = { 'Kite Pay Pvt Ltd': 'a@x.in', 'Sky Traders': 'b@x.in' }; mockConfig.employee_names = ['Priya', 'Rahul']; });
-    afterEach(() => { delete mockConfig.company_names; delete mockConfig.employee_names; });
+    afterEach(() => { mockConfig.company_names = { 'Kite Co': 'a@x.in' }; mockConfig.employee_names = ['Priya']; });
 
     test('paid stores the config-spelled company and employee; both filter the queue and reach the export', async () => {
         const db = makeDb(seed());
@@ -750,8 +750,12 @@ describe('fromCompany + paidBy (accounting stamps on mark-paid)', () => {
         expect(paid.status).toBe(200);
         expect(paid.body.payout).toMatchObject({ fromCompany: 'Sky Traders', paidBy: 'Priya', processedBy: 'admin1' });
         expect(db.store[COLS.PAYOUTS][0]).toMatchObject({ fromCompany: 'Sky Traders', paidBy: 'Priya' });
-        // optional: a plain paid leaves them null
-        expect((await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890' })).body.payout).toMatchObject({ fromCompany: null, paidBy: null });
+        // mandatory: a paid without them is refused, nothing moves
+        const missing = await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890' });
+        expect(missing.status).toBe(400); expect(missing.body.error).toBe('fromCompany is required');
+        expect((await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890', fromCompany: 'Sky Traders' })).body.error).toBe('paidBy is required');
+        expect(db.store[COLS.PAYOUTS][1].status).toBe('pending');
+        expect((await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR67890', fromCompany: 'Kite Pay Pvt Ltd', paidBy: 'Rahul' })).status).toBe(200);
 
         expect((await request(app).get('/admin/requests?status=paid&fromCompany=Sky Traders')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
         expect((await request(app).get('/admin/requests?status=paid&paidBy=Priya')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
@@ -769,9 +773,9 @@ describe('fromCompany + paidBy (accounting stamps on mark-paid)', () => {
     test('unknown company → 400; name not in employee_names → 400; nothing debited', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const bad = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', fromCompany: 'Nope Ltd' });
+        const bad = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', fromCompany: 'Nope Ltd', paidBy: 'Priya' });
         expect(bad.status).toBe(400); expect(bad.body.error).toMatch(/fromCompany/);
-        const bad2 = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidBy: 'Head Admin' });
+        const bad2 = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', fromCompany: 'Sky Traders', paidBy: 'Head Admin' });
         expect(bad2.status).toBe(400); expect(bad2.body.error).toMatch(/paidBy must be one of the configured employee names/);
         expect(db.store[COLS.PAYOUTS][0].status).toBe('pending');
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(50000);
@@ -802,7 +806,7 @@ describe('paidVia (staff-only) + lookup by unique id', () => {
     test('paid stores paidVia; admin sees it everywhere, user and subadmin never do', async () => {
         const db = makeDb(seed());
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidVia: 'HDFC current a/c ****4321' });
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345', paidVia: 'HDFC current a/c ****4321' });
         expect(paid.status).toBe(200);
         expect(paid.body.payout.paidVia).toBe('HDFC current a/c ****4321');
         expect(db.store[COLS.PAYOUTS][0].paidVia).toBe('HDFC current a/c ****4321');
@@ -834,7 +838,7 @@ describe('paidVia (staff-only) + lookup by unique id', () => {
     test('paidVia is optional; lookups: unknown id → 404, foreign user → 404, subadmin foreign → 404, bad id → 400', async () => {
         const db = makeDb(seed());
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(paid.status).toBe(200);
         expect(paid.body.payout.paidVia).toBeNull();
         expect((await request(adminApp).get('/admin/requests/cpo_404')).status).toBe(404);
@@ -1085,9 +1089,9 @@ describe('employee scoping (assigned subadmins → their users)', () => {
         expect((await request(app).get('/admin/wallets')).body.wallets.map((w) => w.userId)).toEqual(['user1']);
         expect((await request(app).patch('/admin/accounts/accX/banking-status').send({ bankingStatus: 'added' })).status).toBe(403);
         expect((await request(app).patch('/admin/accounts/acc1/banking-status').send({ bankingStatus: 'added' })).status).toBe(200);
-        expect((await request(app).post('/admin/requests/cpo_X/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(403);
+        expect((await request(app).post('/admin/requests/cpo_X/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(403);
         expect((await request(app).post('/admin/requests/cpo_X/reject').send({ reason: 'nope' })).status).toBe(403);
-        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345', paidVia: 'HDFC ****1' });
+        const paid = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345', paidVia: 'HDFC ****1' });
         expect(paid.status).toBe(200);
         expect(paid.body.payout.paidVia).toBe('HDFC ****1'); // employees are staff: they see paidVia
         expect(db.store[COLS.WALLETS][0].balancePaise).toBe(39700);
@@ -1106,7 +1110,7 @@ describe('employee scoping (assigned subadmins → their users)', () => {
         const lonely = asUser('emp9', 'employee');
         const { app: lonelyApp } = buildPayout(db, makeRedis(), lonely, () => lonely);
         expect((await request(lonelyApp).get('/admin/requests')).body.payouts).toEqual([]);
-        expect((await request(lonelyApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' })).status).toBe(403);
+        expect((await request(lonelyApp).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(403);
     });
 });
 
@@ -1195,7 +1199,7 @@ describe('user self-cancel', () => {
         expect(emitted().at(-1)).toMatchObject({ userId: 'user1', event: 'payout:update', payload: { type: 'request_cancelled', payoutId: 'cpo_1' } });
         expect((await request(app).post('/requests/cpo_1/cancel')).status).toBe(400);
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const paid = await request(adminApp).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(paid.status).toBe(400); expect(paid.body.error).toMatch(/cancelled/);
         expect((await request(app).get('/requests?status=cancelled')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
         expect((await request(adminApp).get('/admin/accounts')).body.accounts[0]).toMatchObject({ cancelledCount: 1, pendingCount: 0 });
@@ -1220,9 +1224,9 @@ describe('"paid via" source accounts', () => {
     test('paid with paidVia upserts the source (case-insensitive) and bumps use/total; list, search, sort, create, deactivate', async () => {
         const db = makeDb(seed());
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR00001', paidVia: 'HDFC Current ****4321' });
-        await request(app).post('/admin/requests/cpo_2/paid').send({ referenceNumber: 'UTR00002', paidVia: 'hdfc current ****4321' });
-        await request(app).post('/admin/requests/cpo_3/paid').send({ referenceNumber: 'UTR00003', paidVia: 'ICICI ****9' });
+        await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00001', paidVia: 'HDFC Current ****4321' });
+        await request(app).post('/admin/requests/cpo_2/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00002', paidVia: 'hdfc current ****4321' });
+        await request(app).post('/admin/requests/cpo_3/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00003', paidVia: 'ICICI ****9' });
         expect(db.store[COLS.SOURCES]).toHaveLength(2);
         const list = await request(app).get('/admin/source-accounts');
         expect(list.body.sourceAccounts.map((s) => [s.label, s.useCount, s.totalPaidPaise])).toEqual([['HDFC Current ****4321', 2, 20000], ['ICICI ****9', 1, 10000]]);
@@ -1247,7 +1251,7 @@ describe('"paid via" source accounts', () => {
         const origCreate = db.createDocument.getMockImplementation();
         db.createDocument.mockImplementation(async (d, c, id, data) => { if (c === COLS.SOURCES) throw new Error('down'); return origCreate(d, c, id, data); });
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR00001', paidVia: 'HDFC' })).status).toBe(200);
+        expect((await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00001', paidVia: 'HDFC' })).status).toBe(200);
         expect(db.store[COLS.PAYOUTS][0].status).toBe('paid');
     });
 });
@@ -1341,7 +1345,7 @@ describe('day-wise payout report (GET /admin/payout-summary, from the rollup)', 
         const realList = db.listDocuments.getMockImplementation();
         db.listDocuments.mockImplementation(async (d, c, q) => { if (c === COLS.DAILY_PAYOUTS) throw new Error('appwrite down'); return realList(d, c, q); });
         const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+        const res = await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[COLS.PAYOUTS][0].status).toBe('paid');
         expect(db.store[COLS.DAILY_PAYOUTS] || []).toHaveLength(0);
@@ -1419,7 +1423,7 @@ describe('alerts (admin toggle)', () => {
             expect(al.body.stalePending[0].waitingMinutes).toBeGreaterThanOrEqual(179);
             mockEmit.mockClear();
             // paid does NOT move available (hold was taken at request time): no alert
-            await request(app).post('/admin/requests/cpo_1/paid').send({ referenceNumber: 'UTR12345' });
+            await request(app).post('/admin/requests/cpo_1/paid').send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
             expect(emitted().filter((e) => e.event === 'payout:alert')).toHaveLength(0);
             // user1 available 49700 → admin debit ₹50 → 44700: crosses 45000 → one alert to user + admins
             await request(app).post('/admin/wallet/adjust').send({ userId: 'user1', direction: 'debit', amount: 50, notes: 'crossing' });
@@ -1602,7 +1606,7 @@ describe('realtime events (platform toggle + user opt-out)', () => {
         expect(emitted().at(-1)).toMatchObject({ userId: 'user1', event: 'payout:update', toAdmins: true, payload: { type: 'request_created', payoutId: r.body.payout.id, status: 'pending', amountPaise: 10000 } });
         mockEmit.mockClear();
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' });
+        await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' });
         expect(emitted().map((e) => e.payload.type)).toEqual(['request_paid']);
         expect(emitted()[0].payload).toMatchObject({ userId: 'user1', status: 'paid', referenceNumber: 'UTR12345', amountPaise: 10000 });
         expect(emitted()[0].payload.at).toBeTruthy();
@@ -1845,7 +1849,7 @@ describe('payin commission on wallet transfers + refund on revert', () => {
         // now the same money leaves directly: charged the payin rate, once
         const direct = await request(ctx.wdApp).post('/withdraw_new').send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: TRANSFER_RS, amount: TRANSFER_RS + COMMISSION_PAISE / 100, commission: COMMISSION_PAISE / 100 });
         expect(direct.status).toBe(200);
-        await request(ctx.wdApp).post('/withdrawals/approve_new').send({ id: direct.body.data.id, utrNumber: 'UTR12345' });
+        await request(ctx.wdApp).post('/withdrawals/approve_new').send({ id: direct.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR12345' });
         expect(qr(ctx.db)).toMatchObject({ withdrawalApprovedAmount: TRANSFER_PAISE, commissionPaid: COMMISSION_PAISE });
         expect(commissionNet(ctx.db)).toBe(COMMISSION_PAISE);        // exactly one payin cut, total
     });
@@ -1895,7 +1899,7 @@ describe('payin commission on wallet transfers + refund on revert', () => {
         const { app: userApp } = buildPayout(ctx.db, makeRedis(), asUser('user1'));
         const req1 = await userApp && await request(userApp).post('/requests').send({ ...ACCOUNT, mode: 'NEFT', amount: 400 });
         expect(req1.status).toBe(201);
-        expect((await request(ctx.payoutApp).post(`/admin/requests/${req1.body.payout.id}/paid`).send({ referenceNumber: 'UTR12345' })).status).toBe(200);
+        expect((await request(ctx.payoutApp).post(`/admin/requests/${req1.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR12345' })).status).toBe(200);
         expect(ctx.db.store[COLS.WALLETS][0].balancePaise).toBe(59600);
 
         const rv = await request(ctx.payoutApp).post('/admin/wallet/revert-to-qr').send({ withdrawalId: ctx.db.store[COLS.WD][0].id, amount: 596, notes: 'return the rest' });
@@ -2351,8 +2355,8 @@ describe('customer account stats + detail', () => {
         expect(db.store[COLS.ACCOUNTS][0]).toMatchObject({ requestCount: 3, lastRequestedAt: r3.body.payout.createdAt });
 
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        await request(adminApp).post(`/admin/requests/${r1.body.payout.id}/paid`).send({ referenceNumber: 'UTR00001' });
-        await request(adminApp).post(`/admin/requests/${r2.body.payout.id}/paid`).send({ referenceNumber: 'UTR00002' });
+        await request(adminApp).post(`/admin/requests/${r1.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00001' });
+        await request(adminApp).post(`/admin/requests/${r2.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00002' });
         await request(adminApp).post(`/admin/requests/${r3.body.payout.id}/reject`).send({ reason: 'Wrong IFSC' });
         expect(db.store[COLS.ACCOUNTS][0]).toMatchObject({ requestCount: 3, paidCount: 2, rejectedCount: 1, totalPaidPaise: 15000, totalCommissionPaise: 450 });
         expect(db.store[COLS.ACCOUNTS][0].lastPaidAt).toBeTruthy();
@@ -2384,7 +2388,7 @@ describe('customer account stats + detail', () => {
         expect(r.status).toBe(201);
         expect(db.store[COLS.ACCOUNTS][0].requestCount).toBeUndefined();
         const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
-        expect((await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ referenceNumber: 'UTR00001' })).status).toBe(200);
+        expect((await request(adminApp).post(`/admin/requests/${r.body.payout.id}/paid`).send({ fromCompany: 'Kite Co', paidBy: 'Priya', referenceNumber: 'UTR00001' })).status).toBe(200);
         db.updateDocument.mockImplementation(origUpdate);
         const fixed = await request(adminApp).post(`/admin/accounts/${r.body.payout.accountId}/recompute-stats`);
         expect(fixed.status).toBe(200);

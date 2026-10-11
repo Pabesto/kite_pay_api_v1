@@ -176,6 +176,30 @@ calls `POST /api/payout/admin/wallet/retry-credit` (§6.4). For `upi`/`bank` row
 
 `POST /withdrawals/reject_new` works unchanged for wallet rows.
 
+### 3.3a "From company" + "Paid by" on withdrawal approve (staff)
+The same two accounting stamps as customer payouts (§6.2b) apply to **every** withdrawal approval:
+```jsonc
+POST /api/user/withdrawals/approve_new
+{ "id": "wdh_…", "utrNumber": "UTR1234567890",
+  "fromCompany": "Sky Traders",   // one of `companies` — which of OUR companies' accounts paid it
+  "paidBy": "Priya" }             // one of `employees` — who actually made the transfer
+```
+- Pick lists: `GET /api/user/withdrawals/payment-options` → `{ success, companies: [string], employees:
+  [string], me: { userId, name, role } }` — identical data to `/api/payout/admin/payment-options`
+  (config `company_names` / `employee_names`) but gated by `edit_withdrawals`, so a withdrawals-only
+  employee can load it. Or read the two config keys the way the company dropdown already does.
+- Both are **mandatory for `upi` / `bank` withdrawals** — the server refuses an approve without them
+  (`400 fromCompany is required` / `400 paidBy is required`) and a value not in the list
+  (`400 fromCompany must be one of the configured company names` / `400 paidBy must be one of the
+  configured employee names`), all before anything moves. Pre-select "Paid by" to `me.name` when present.
+  For a `mode: "wallet"` row (internal transfer to the payout wallet, no bank transfer) they are optional —
+  the dialog may hide them.
+- `GET /withdrawals_paginated` rows carry `fromCompany` and `paidBy` for admins and employees
+  (**subadmins never receive the keys** — hide the columns/filters for them; the user's own list and the
+  `withdrawal:update` socket event never include them). Filter with `?fromCompany=` / `?paidBy=` (exact,
+  config spelling, dropdowns from the same lists). Rows approved before this change are `null` → "—".
+- Show them as two columns in the withdrawal queue and on the withdrawal detail, next to the UTR.
+
 ---
 
 ## 4. User — Payout Wallet
@@ -522,13 +546,14 @@ account number.
 ```jsonc
 { "referenceNumber": "UTR1234567890",        // required, 5–100 chars — the bank/payout reference (the user sees this)
   "paidVia": "HDFC current a/c ****4321",    // ≤100 chars — which of OUR accounts paid it. STAFF-ONLY.
-  "fromCompany": "Sky Traders",              // one of the §6.2b `companies` — which of OUR companies paid it. STAFF-ONLY.
-  "paidBy": "Priya",                         // one of the §6.2b `employees` — who actually made the transfer. STAFF-ONLY.
+  "fromCompany": "Sky Traders",              // REQUIRED — one of the §6.2b `companies`: which of OUR companies paid it. STAFF-ONLY.
+  "paidBy": "Priya",                         // REQUIRED — one of the §6.2b `employees`: who actually made the transfer. STAFF-ONLY.
   "remark": "Customer confirmed on call" }   // optional, ≤500 chars — free-text remark by the resolver; stored as `adminRemark`, visible to the user too
 ```
-`fromCompany` and `paidBy` are optional on the server but **required in the Paid dialog** (see §6.2b).
-A value not in the pick lists is refused before anything moves: `400 fromCompany must be one of the
-configured company names` / `400 paidBy must be one of the configured employee names`.
+`fromCompany` and `paidBy` are **mandatory** (see §6.2b): a Paid call without either is refused before
+anything moves — `400 fromCompany is required` / `400 paidBy is required` — and a value not in the pick
+lists likewise: `400 fromCompany must be one of the configured company names` / `400 paidBy must be one of
+the configured employee names`.
 **Reference numbers are unique platform-wide.** A UTR already stamped on another *paid* payout is refused:
 `409 { error: "Reference number already used on payout cpo_…", conflictPayoutId: "cpo_…" }` (compared
 case-insensitively, trimmed). Show the message with a link to that payout; nothing was debited. Two admins
@@ -627,7 +652,8 @@ from config: `companies` = config key `company_names` (the list the QR reports g
 exact — send one back unchanged. Subadmins get 403; call it once when the Paid dialog opens (or read
 the two config keys the way the company dropdown already does — same data).
 
-**Paid dialog (admin and `edit_payouts` employees):** two new required dropdowns above the remark —
+**Paid dialog (admin and `edit_payouts` employees):** two new **mandatory** dropdowns above the remark (the
+server refuses a Paid without them) —
 **From company** (`companies` → `fromCompany`) and **Paid by** (`employees` → `paidBy`; pre-select the
 entry equal to `me.name` when present, the user may change it, e.g. an admin recording a transfer an
 employee made). Every paid row then carries `fromCompany` and `paidBy` (staff shape only — users and

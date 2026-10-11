@@ -17,7 +17,7 @@ const express = require('express');
 const { Query } = require('node-appwrite');
 const moment = require('moment-timezone');
 
-const mockConfig = {};
+const mockConfig = { company_names: { 'Kite Co': 'a@x.in' }, employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}), getConfig: jest.fn().mockResolvedValue({}), set: jest.fn().mockResolvedValue(),
@@ -117,6 +117,7 @@ beforeEach(() => {
     for (const k of Object.keys(mockConfig)) delete mockConfig[k];
     counters.length = 0;
     mockConfig.max_withdrawal_requests = 99;
+    mockConfig.company_names = { 'Kite Co': 'a@x.in' }; mockConfig.employee_names = ['Priya'];
     mockConfig.qr_daily_release_max_percent = 100;
     META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin', name: 'Head Admin' };
     // user1 is under sub1 → pays sub1's early-release rate (2%); user1's own 7 is ignored. Admin earns it.
@@ -228,7 +229,7 @@ describe('early-release fee is charged when admin releases', () => {
         expect(ok.status).toBe(200);
         expect(ok.body.data.earlyReleaseCommission).toBeUndefined();
         expect(qr(db)).toMatchObject({ withdrawalRequestedAmount: 100000, commissionOnHold: 3000, commissionPaid: 2000, amountAvailableForWithdrawal: 95000 });
-        const approve = await request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id: ok.body.data.id, utrNumber: 'UTR123456' });
+        const approve = await request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id: ok.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' });
         expect(approve.status).toBe(200);
         expect(qr(db)).toMatchObject({ commissionOnHold: 0, commissionPaid: 5000, withdrawalApprovedAmount: 100000 });
         expect(earlyRows(db)).toHaveLength(1);                                                   // approve adds no early row

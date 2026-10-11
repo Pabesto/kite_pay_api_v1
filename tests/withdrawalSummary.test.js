@@ -16,7 +16,7 @@ jest.mock('../scripts/transactionStatusMailer', () => ({ sendMerchantHoldEmail: 
 jest.mock('../dashboardCounters', () => ({ updateDashboardCounter: jest.fn().mockResolvedValue() }));
 jest.mock('../userMetaCache', () => ({ getUserMeta: jest.fn(async () => null), invalidate: jest.fn() }));
 jest.mock('../qrOwnerCache', () => ({ reload: jest.fn().mockResolvedValue(null), invalidateQr: jest.fn(), resolve: jest.fn().mockResolvedValue(null), get: jest.fn() }));
-const mockConfig = { max_withdrawal_requests: 2, company_names: { 'SCANSERVE AI PRIVATE LIMITED': 'x@y.z', 'PABESTO TECH PVT. LTD.': '' }, integrations: ['Razorpay', 'Paytm'] };
+const mockConfig = { max_withdrawal_requests: 2, company_names: { 'SCANSERVE AI PRIVATE LIMITED': 'x@y.z', 'PABESTO TECH PVT. LTD.': '' }, integrations: ['Razorpay', 'Paytm'], employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}), getConfig: jest.fn().mockResolvedValue({}), set: jest.fn().mockResolvedValue(),
@@ -147,7 +147,7 @@ describe('approve_new writes the rollup', () => {
     test('approved direct withdrawal lands in today\'s direct bucket (rupees → paise once)', async () => {
         const db = makeDb(seed());
         const { withdraw } = build(db, makeRedis(), { withdraw: true });
-        const res = await request(withdraw).post('/withdrawals/approve_new').send({ id: 'wdh_1', utrNumber: 'UTR12345' });
+        const res = await request(withdraw).post('/withdrawals/approve_new').send({ id: 'wdh_1', fromCompany: 'PABESTO TECH PVT. LTD.', paidBy: 'Priya', utrNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[WD][0]).toMatchObject({ status: 'approved' });
         expect(dailyDoc(db).date).toBe(today());
@@ -159,7 +159,7 @@ describe('approve_new writes the rollup', () => {
         db.createDocument.mockImplementation(async (_d, c) => { if (c === DAILY_WD) throw new Error('appwrite down'); return { $id: 'x' }; });
         const err = jest.spyOn(console, 'error').mockImplementation(() => {});
         const { withdraw } = build(db, makeRedis(), { withdraw: true });
-        const res = await request(withdraw).post('/withdrawals/approve_new').send({ id: 'wdh_1', utrNumber: 'UTR12345' });
+        const res = await request(withdraw).post('/withdrawals/approve_new').send({ id: 'wdh_1', fromCompany: 'PABESTO TECH PVT. LTD.', paidBy: 'Priya', utrNumber: 'UTR12345' });
         expect(res.status).toBe(200);
         expect(db.store[WD][0]).toMatchObject({ status: 'approved' });
         expect(err.mock.calls.some((c) => String(c[0]).includes('CRITICAL: daily withdrawal summary failed for wdh_1'))).toBe(true);

@@ -301,6 +301,8 @@ async function main() {
     await int(WD, 'walletRevertedPaise');          // paise already reverted from the payout wallet back to the QR
     await int(WD, 'walletRevertedCommissionPaise'); // payin commission already refunded to the QR for those reverts
     await bool(WD, 'commissionRefundFailed');      // QR was credited but the commission ledger reversal failed
+    await str(WD, 'fromCompany', 100);             // staff-only: which of our companies paid it (config company_names)
+    await str(WD, 'paidBy', 100);                  // staff-only: who made the transfer (config employee_names)
 
     console.log('\n✅ Customer Payout schema setup complete.\n');
     console.log('Optional .env overrides (defaults shown are what server.js uses):');

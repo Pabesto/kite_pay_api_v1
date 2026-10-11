@@ -9,7 +9,7 @@ const request = require('supertest');
 const express = require('express');
 const { Query } = require('node-appwrite');
 
-const mockConfig = {};
+const mockConfig = { company_names: { 'Kite Co': 'a@x.in' }, employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}),
@@ -74,7 +74,7 @@ function build() {
 // ₹1,000 request; commission body must match what the server recomputes from the CURRENT rates
 const requestAt = (app, ratePct) => request(app).post('/withdraw_new')
     .send({ userId: 'user1', qrId: 'qr1', mode: 'upi', upiId: 'a@ybl', holderName: 'A', preAmount: 1000, amount: 1000 * (1 + ratePct / 100), commission: 1000 * ratePct / 100 });
-const approve = (app, id) => request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456' });
+const approve = (app, id) => request(app).post('/withdrawals/approve_new').send({ id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' });
 const rows = (db) => (db.store[COMM] || []).map((c) => ({ userId: c.userId, amount: c.amount, rate: c.commissionRate, type: c.earningType }));
 
 beforeEach(() => {
@@ -82,6 +82,38 @@ beforeEach(() => {
     counters.length = 0;
     META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin' };
     META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2 };
+});
+
+describe('approve stamps fromCompany / paidBy from config (staff-only)', () => {
+    beforeEach(() => { mockConfig.company_names = { 'Sky Traders': 'a@x.in' }; mockConfig.employee_names = ['Priya']; });
+    afterEach(() => { mockConfig.company_names = { 'Kite Co': 'a@x.in' }; mockConfig.employee_names = ['Priya']; });
+
+    test('stored in config spelling, filterable, hidden from subadmins; bad values 400 before any ledger change', async () => {
+        META.user1 = { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1', commission: 1 };
+        const { db, app } = build();
+        const id = (await requestAt(app, 3)).body.data.id;
+        const opts = await request(app).get('/withdrawals/payment-options');
+        expect(opts.body).toMatchObject({ companies: ['Sky Traders'], employees: ['Priya'], me: { userId: 'admin1' } });
+
+        const bad = await request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456', fromCompany: 'Nope', paidBy: 'Priya' });
+        expect(bad.status).toBe(400); expect(bad.body.error).toMatch(/fromCompany must be one of the configured company names/);
+        const bad2 = await request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456', fromCompany: 'Sky Traders', paidBy: 'Bob' });
+        expect(bad2.status).toBe(400); expect(bad2.body.error).toMatch(/paidBy must be one of the configured employee names/);
+        // mandatory for a direct (upi/bank) withdrawal
+        const missing = await request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456' });
+        expect(missing.status).toBe(400); expect(missing.body.error).toBe('fromCompany is required');
+        expect((await request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456', fromCompany: 'Sky Traders' })).body.error).toBe('paidBy is required');
+        expect(db.store[WD][0].status).toBe('pending');
+        expect(db.store[QRS][0].withdrawalApprovedAmount).toBe(0);
+
+        const ok = await request(app).post('/withdrawals/approve_new').send({ id, utrNumber: 'UTR123456', fromCompany: ' sky traders', paidBy: 'PRIYA' });
+        expect(ok.status).toBe(200);
+        expect(db.store[WD][0]).toMatchObject({ status: 'approved', fromCompany: 'Sky Traders', paidBy: 'Priya' });
+
+        const list = await request(app).get('/withdrawals_paginated?paidBy=Priya');
+        expect(list.body.withdrawals.map((w) => [w.id, w.fromCompany, w.paidBy])).toEqual([[id, 'Sky Traders', 'Priya']]);
+        expect((await request(app).get('/withdrawals_paginated?fromCompany=Other')).body.withdrawals).toEqual([]);
+    });
 });
 
 describe('approve-time commission routing', () => {

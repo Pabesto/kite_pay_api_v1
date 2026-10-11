@@ -16,7 +16,7 @@ const express = require('express');
 const { Query } = require('node-appwrite');
 const moment = require('moment-timezone');
 
-const mockConfig = {};
+const mockConfig = { company_names: { 'Kite Co': 'a@x.in' }, employee_names: ['Priya'] };
 jest.mock('../configManager', () => ({
     get: jest.fn((key, def = null) => (key in mockConfig ? mockConfig[key] : def)),
     refresh: jest.fn().mockResolvedValue({}), getConfig: jest.fn().mockResolvedValue({}), set: jest.fn().mockResolvedValue(),
@@ -108,6 +108,7 @@ beforeEach(() => {
     for (const k of Object.keys(mockConfig)) delete mockConfig[k];
     counters.length = 0;
     mockConfig.max_withdrawal_requests = 99;
+    mockConfig.company_names = { 'Kite Co': 'a@x.in' }; mockConfig.employee_names = ['Priya'];
     META.admin1 = { $id: 'admin1', userId: 'admin1', role: 'admin' };
     META.sub1 = { $id: 'sub1', userId: 'sub1', role: 'subadmin', parentId: null, commission: 2 };
     META.sub2 = { $id: 'sub2', userId: 'sub2', role: 'subadmin', parentId: null, commission: 2 };
@@ -281,7 +282,7 @@ describe('withdrawals against a bank account (withdraw.js source = bankAcId)', (
         expect(redis.set).toHaveBeenCalledWith(`lock:bankac:${AC}`, expect.any(String), expect.objectContaining({ NX: true }));
         expect(redis.set).not.toHaveBeenCalledWith(expect.stringMatching(/^lock:qr:/), expect.anything(), expect.anything());
 
-        const approve = await request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id: res.body.data.id, utrNumber: 'UTR123456' });
+        const approve = await request(app).post('/user/withdrawals/approve_new').set(as('admin1')).send({ id: res.body.data.id, fromCompany: 'Kite Co', paidBy: 'Priya', utrNumber: 'UTR123456' });
         expect(approve.status).toBe(200);
         expect(ac(db)).toMatchObject({ withdrawalRequestedAmount: 0, withdrawalApprovedAmount: 100000, commissionOnHold: 0, commissionPaid: 3000, amountAvailableForWithdrawal: 397000 });
         expect(JSON.parse(db.store[DAILY_WD][0].totalsJson)).toEqual({ [AC]: { direct: { paidPaise: 100000, commissionPaise: 3000, count: 1 } } });
