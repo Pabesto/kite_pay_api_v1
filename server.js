@@ -1060,16 +1060,24 @@ app.use('/pinelabs', digiqrRoutes);
 // same as updateDailyQrTotal, which is passed to the mounts above from line 1782. Do not "fix".
 app.use('/uat',  uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
-// Axis Worldline. The URL handed to Worldline is /prod/axis-worldline-webhook.
+// Axis Worldline. One URL + one AES key per Worldline merchant account, same factory:
+//   /prod/axis-worldline-webhook             ← AXIS_WL_AES_KEY            (first account)
+//   /prod/axis-worldline-webhook-scan-serve  ← AXIS_WL_AES_KEY_SCAN_SERVE (SCANSERVE account)
+//   /prod/axis-worldline-webhook-settle-flow ← AXIS_WL_AES_KEY_SETTLE_FLOW (SETTLE FLOW account)
 //   /prod → LIVE ingest (axisWorldline.js): credits money via the same lock → dedup → review
 //           gate → finalizeTransaction sequence as the webhooks above; encrypted envelope only.
-//           AXIS_WORLDLINE_LIVE=false swaps the capture-only UAT router back in at /prod.
+//           AXIS_WORLDLINE_LIVE=false swaps the capture-only UAT router back in at /prod (the
+//           scan-serve path is then not mounted at all).
 //   /uat  → capture-only UAT router (axisWorldlineUat.js) + admin GET …/captures read-back.
 const AXIS_WORLDLINE_LIVE = process.env.AXIS_WORLDLINE_LIVE !== 'false';
 if (AXIS_WORLDLINE_LIVE) {
   app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview));
+  app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview,
+    { path: '/axis-worldline-webhook-scan-serve', aesKeyEnv: 'AXIS_WL_AES_KEY_SCAN_SERVE' }));
+  app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview,
+    { path: '/axis-worldline-webhook-settle-flow', aesKeyEnv: 'AXIS_WL_AES_KEY_SETTLE_FLOW' }));
 } else {
-  console.warn('⚠️  AXIS_WORLDLINE_LIVE=false — /prod/axis-worldline-webhook is capture-only; Worldline payments will NOT be credited.');
+  console.warn('⚠️  AXIS_WORLDLINE_LIVE=false — /prod/axis-worldline-webhook is capture-only (and the scan-serve / settle-flow paths are not mounted); Worldline payments will NOT be credited.');
   app.use('/prod', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 }
 app.use('/uat', axisWorldlineUatRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));

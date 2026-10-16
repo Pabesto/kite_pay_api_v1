@@ -11,6 +11,16 @@
 // ONLY the encrypted envelope `{ "data": "<IV||ciphertext||tag>" }`; a plaintext body is
 // rejected with 400 (send those to the UAT router instead).
 //
+// ONE FACTORY, ONE MOUNT PER WORLDLINE MERCHANT ACCOUNT. Each account Worldline onboards gets
+// its own AES key and its own URL, so server.js mounts this factory once per account with the
+// trailing `opts` — `{ path, aesKeyEnv }` (default: '/axis-worldline-webhook' + AXIS_WL_AES_KEY;
+// second account: '/axis-worldline-webhook-scan-serve' + AXIS_WL_AES_KEY_SCAN_SERVE; third:
+// '/axis-worldline-webhook-settle-flow' + AXIS_WL_AES_KEY_SETTLE_FLOW). Keys are
+// never shared across mounts: a payload for one account does not decrypt on the other's URL,
+// and a mount whose key is unset answers 503 FAILED (fails closed), never falls back to the
+// other key. Everything after decrypt (provider, mapping, dedup on ref_no, lock, finalize) is
+// identical — the `mid` → qrId identifies the merchant, not the URL.
+//
 // MAPPING (decrypted §1.1.1 → webhook_data):
 //   mid → qrCodeId  (the QR doc must be registered with qrId = mid, else the txn is stored but
 //                    never credited — same as every provider; see updateQrTotalAtomic)
@@ -55,11 +65,14 @@ module.exports = (
     reviewMode,
     ConfigManager,
     finalizeTransaction,
-    emitPendingReview
+    emitPendingReview,
+    opts = {}
 ) => {
     const router = express.Router();
-    const AES_KEY = loadAesKey();
-    if (!AES_KEY) console.warn('⚠️  AXIS_WL_AES_KEY is not set — POST /axis-worldline-webhook (LIVE) will answer 503 FAILED to every notification.');
+    const ROUTE_PATH = opts.path || '/axis-worldline-webhook';
+    const AES_KEY_ENV = opts.aesKeyEnv || 'AXIS_WL_AES_KEY';
+    const AES_KEY = loadAesKey(console.warn, AES_KEY_ENV);
+    if (!AES_KEY) console.warn(`⚠️  ${AES_KEY_ENV} is not set — POST ${ROUTE_PATH} (LIVE) will answer 503 FAILED to every notification.`);
 
     // Best-effort raw capture of a notification we could not ingest. Never throws.
     async function captureRaw(req, warnings) {
@@ -71,7 +84,7 @@ module.exports = (
                     provider: PROVIDER,
                     created_at: new Date().toISOString(),
                     status: 'normal',
-                    warningsJson: JSON.stringify(['LIVE route rejected', ...warnings]).slice(0, 4096),
+                    warningsJson: JSON.stringify([`LIVE route rejected (${ROUTE_PATH})`, ...warnings]).slice(0, 4096),
                     sourceIp: String(req.ip || '').slice(0, 64),
                 }
             );
@@ -81,18 +94,18 @@ module.exports = (
     }
 
     router.post(
-        '/axis-worldline-webhook',
+        ROUTE_PATH,
         express.json({ type: '*/*', limit: '1mb' }),
         async (req, res) => {
             const body = req.body;
-            wlLog('📩 Axis Worldline LIVE webhook received from', req.ip);
+            wlLog(`📩 Axis Worldline LIVE webhook received at ${ROUTE_PATH} from`, req.ip);
 
             // 1. Validate — encrypted envelope only (see AUTH above).
             if (!body || typeof body !== 'object' || typeof body.data !== 'string' || !body.data) {
                 return failed(res, 400, 'Expected encrypted { data } envelope');
             }
             if (!AES_KEY) {
-                await captureRaw(req, ['AXIS_WL_AES_KEY not configured']);
+                await captureRaw(req, [`${AES_KEY_ENV} not configured`]);
                 return failed(res, 503, 'Decryption key not configured');
             }
             let decrypted;
@@ -100,7 +113,7 @@ module.exports = (
                 decrypted = decryptWorldlineData(body.data, AES_KEY);
             } catch (e) {
                 console.error('🔐 Axis Worldline LIVE DECRYPTION FAILED', JSON.stringify({
-                    error: e?.message || String(e), sourceIp: req.ip, rawData: body.data, rawLength: body.data.length, keyBytes: AES_KEY.length,
+                    route: ROUTE_PATH, keyEnv: AES_KEY_ENV, error: e?.message || String(e), sourceIp: req.ip, rawData: body.data, rawLength: body.data.length, keyBytes: AES_KEY.length,
                 }));
                 await captureRaw(req, [`decryption failed: ${e?.message || e}`]);
                 return failed(res, 400, 'Unable to decrypt notification');

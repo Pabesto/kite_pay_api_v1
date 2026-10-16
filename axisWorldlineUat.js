@@ -74,10 +74,11 @@ const wlLog = process.env.AXIS_WL_LOG === 'false' ? () => {} : (...a) => console
 const IV_LEN = 16;
 const TAG_LEN = 16; // Java's AES/GCM/NoPadding appends the 128-bit tag to the ciphertext
 
-// AXIS_WL_AES_KEY as 64 hex chars, base64, or 32 raw chars. Returns null when unset;
-// throws nothing — a bad key must not stop the server booting.
-function loadAesKey(log = console.warn) {
-    const raw = (process.env.AXIS_WL_AES_KEY || '').trim();
+// AXIS_WL_AES_KEY (or another env var, e.g. AXIS_WL_AES_KEY_SCAN_SERVE for the second live
+// merchant) as 64 hex chars, base64, or 32 raw chars. Returns null when unset; throws nothing —
+// a bad key must not stop the server booting.
+function loadAesKey(log = console.warn, envName = 'AXIS_WL_AES_KEY') {
+    const raw = (process.env[envName] || '').trim();
     if (!raw) return null;
     const candidates = [
         /^[0-9a-fA-F]{64}$/.test(raw) ? Buffer.from(raw, 'hex') : null,
@@ -85,7 +86,7 @@ function loadAesKey(log = console.warn) {
         Buffer.from(raw, 'utf8'),
     ];
     const key = candidates.find((b) => b && b.length === 32);
-    if (!key) log('⚠️  AXIS_WL_AES_KEY is set but does not decode to 32 bytes — Worldline payloads will be captured encrypted.');
+    if (!key) log(`⚠️  ${envName} is set but does not decode to 32 bytes — Worldline payloads will be captured encrypted.`);
     return key || null;
 }
 

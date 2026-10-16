@@ -36,7 +36,7 @@ const LIVE_SAMPLE = {
     primary_id: 'T2609111602372587513907',
 };
 
-function build({ db = {}, manual = false, lockOk = true, key = KEY.toString('hex') } = {}) {
+function build({ db = {}, manual = false, lockOk = true, key = KEY.toString('hex'), opts } = {}) {
     if (key === null) delete process.env.AXIS_WL_AES_KEY; else process.env.AXIS_WL_AES_KEY = key;
     const databases = {
         listDocuments: jest.fn().mockResolvedValue({ documents: [], total: 0 }),
@@ -59,7 +59,8 @@ function build({ db = {}, manual = false, lockOk = true, key = KEY.toString('hex
     jest.isolateModules(() => {
         const factory = require('../axisWorldline.js');
         const router = factory(databases, { unique: () => 'newId' }, Query, 'db1', WEBHOOK_COL, UAT_COL, rupeesToPaiseStrict,
-            deps.acquireLock, deps.releaseLock, deps.resolveReviewOwners, deps.reviewMode, deps.ConfigManager, deps.finalizeTransaction, deps.emitPendingReview);
+            deps.acquireLock, deps.releaseLock, deps.resolveReviewOwners, deps.reviewMode, deps.ConfigManager, deps.finalizeTransaction, deps.emitPendingReview,
+            ...(opts ? [opts] : []));
         app = express();
         app.use('/prod', router);
     });
@@ -70,7 +71,50 @@ const post = (app, body) => request(app).post('/prod/axis-worldline-webhook').se
 const webhookWrites = (db) => db.createDocument.mock.calls.filter((c) => c[1] === WEBHOOK_COL);
 const uatWrites = (db) => db.createDocument.mock.calls.filter((c) => c[1] === UAT_COL);
 
-afterEach(() => { delete process.env.AXIS_WL_AES_KEY; });
+afterEach(() => { delete process.env.AXIS_WL_AES_KEY; delete process.env.AXIS_WL_AES_KEY_SCAN_SERVE; });
+
+describe('second merchant account: /axis-worldline-webhook-scan-serve with its own key', () => {
+    const KEY2 = Buffer.alloc(32, 9);
+    const SCAN = { path: '/axis-worldline-webhook-scan-serve', aesKeyEnv: 'AXIS_WL_AES_KEY_SCAN_SERVE' };
+    const postScan = (app, body) => request(app).post('/prod/axis-worldline-webhook-scan-serve').set('Content-Type', 'application/json').send(body);
+
+    test('decrypts with AXIS_WL_AES_KEY_SCAN_SERVE only; the first account\'s key is refused; same mapping + finalize', async () => {
+        process.env.AXIS_WL_AES_KEY_SCAN_SERVE = KEY2.toString('hex');
+        const { app, deps } = build({ opts: SCAN });                       // AXIS_WL_AES_KEY is also set — must be ignored here
+        const ok = await postScan(app, { data: encrypt(LIVE_SAMPLE, KEY2) });
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ status: 'SUCCESS', errorMsg: '' });
+        expect(webhookWrites(deps.databases)[0][3]).toMatchObject({ qrCodeId: '037216061150011', paymentId: '758103148736', amount: 100, provider: 'axis_worldline' });
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(1);
+        expect(deps.acquireLock).toHaveBeenCalledWith('lock:qr:037216061150011', '758103148736', 15);
+
+        const wrongKey = await postScan(app, { data: encrypt(LIVE_SAMPLE, KEY) });
+        expect(wrongKey.status).toBe(400);
+        expect(wrongKey.body).toEqual({ status: 'FAILED', errorMsg: 'Unable to decrypt notification' });
+        expect(uatWrites(deps.databases)).toHaveLength(1);                 // captured raw, tagged with the route
+        expect(JSON.parse(uatWrites(deps.databases)[0][3].warningsJson)[0]).toBe('LIVE route rejected (/axis-worldline-webhook-scan-serve)');
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(1);
+
+        // the old path does not exist on this mount
+        expect((await post(app, { data: encrypt(LIVE_SAMPLE, KEY2) })).status).toBe(404);
+    });
+
+    test('scan-serve key unset → 503 FAILED, never falls back to AXIS_WL_AES_KEY', async () => {
+        const { app, deps } = build({ opts: SCAN });                       // only AXIS_WL_AES_KEY set
+        const res = await postScan(app, { data: encrypt(LIVE_SAMPLE, KEY) });
+        expect(res.status).toBe(503);
+        expect(res.body).toEqual({ status: 'FAILED', errorMsg: 'Decryption key not configured' });
+        expect(JSON.parse(uatWrites(deps.databases)[0][3].warningsJson)).toContain('AXIS_WL_AES_KEY_SCAN_SERVE not configured');
+        expect(deps.finalizeTransaction).not.toHaveBeenCalled();
+    });
+
+    test('the first account\'s mount ignores the scan-serve key', async () => {
+        process.env.AXIS_WL_AES_KEY_SCAN_SERVE = KEY2.toString('hex');
+        const { app } = build();
+        expect((await post(app, { data: encrypt(LIVE_SAMPLE, KEY2) })).status).toBe(400);
+        expect((await post(app, { data: encrypt(LIVE_SAMPLE, KEY) })).status).toBe(200);
+    });
+});
 
 describe('happy path', () => {
     test('encrypted notification → webhook_data row mapped per spec, finalized once, 200 SUCCESS', async () => {
