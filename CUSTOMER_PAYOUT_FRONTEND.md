@@ -943,7 +943,7 @@ etc.) now include `payoutDisabled` and `payoutDisabledReason` — show a "Payout
 toggle in the user detail. Both switches return `403` for labelled employees; only role `admin` may
 pause. Pausing never touches money or existing requests — admin can still pay/reject the queue.
 
-### 6.5b-1 Day-wise payout report — `GET /api/payout/admin/payout-summary?from&to&userId&subadminId`
+### 6.5b-1 Day-wise payout report — `GET /api/payout/admin/payout-summary?from&to&userId&subadminId&fromCompany&paidBy`
 
 **This is the report to build the "daily payout" screen from** — the customer-payout twin of the
 pay-in report (`GET /api/admin/payin-summary`) with the **same response shape** and one
@@ -991,8 +991,16 @@ never the platform's. There is nothing to filter client-side for security.
 | `to` | `from` | last day, inclusive |
 | `userId` | — | one merchant only (403 if outside your scope) |
 | `subadminId` | — | one subadmin's merchants only (admin/employee use; 403 if outside your scope) |
+| `fromCompany` | — | **staff only** — only payouts paid from this company (exact value from the §6.2b `companies` list) |
+| `paidBy` | — | **staff only** — only payouts made by this employee (exact value from the §6.2b `employees` list) |
 
-Both filters may be combined; they intersect.
+All filters may be combined; they intersect. The two stamp filters are silently ignored for subadmins
+(the stamps are staff-only). Build them as the same two dropdowns the queue uses, with an "All
+companies" / "All employees" default. With either set, the response additionally carries
+`filters: { fromCompany, paidBy }` (echo) and `truncated` (true only past 10,000 paid rows in the
+range — narrow the dates). Payouts paid **before the stamps existed** have no company and never appear
+in a filtered view, so a company-filtered total for an old range is lower than the unfiltered one;
+show the hint "Company/employee filters cover payouts paid after <go-live date>".
 
 ##### Validation (400)
 
@@ -1118,6 +1126,7 @@ the source rows. So:
 |---|---|
 | Per-mode split (UPI / IMPS / NEFT / RTGS) | not in the rollup |
 | Per-source-account ("paid via") split | not in the rollup |
+| Per-company / per-employee split in ONE response | not in the rollup — filter with `fromCompany` / `paidBy` and call once per value you want to compare |
 | Requested / rejected / cancelled per day | use `/api/payout/admin/stats/daily` (§6.5b-2) |
 | Email / phone in the response | by design — join on `userId` |
 | Hourly resolution | days only, IST |

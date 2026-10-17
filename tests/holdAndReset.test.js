@@ -212,6 +212,47 @@ describe('GET /transactions?unregisteredQr=true — payments whose QR id has no 
     });
 });
 
+describe('manual hold: dashboard total + history filters', () => {
+    const withHolds = () => {
+        const data = seed();
+        data[QRS][0].amountOnHold = 1500;                                                                      // SRC, company 'Shop', user u1
+        data[QRS].push({ $id: 'q2', qrId: 'Q2', companyName: 'Other Co', assignedUserId: 'u2', amountOnHold: 250, isActive: true });
+        data[QRS].push({ $id: 'q3', qrId: 'Q3', companyName: ' shop ', assignedUserId: 'u3', amountOnHold: 0, isActive: true });   // same company, spelling variant
+        data[HOLDS] = [
+            { $id: 'h1', qrId: SRC, assignedUserId: 'u1', action: 'hold', amountPaise: 1500, previousHold: 0, newHold: 1500, newAvailable: 3500, reason: 'policy', adminId: 'admin1', adminName: 'Admin', createdAt: '2026-10-01T05:00:00.000Z' },
+            { $id: 'h2', qrId: 'Q2', assignedUserId: 'u2', action: 'hold', amountPaise: 250, previousHold: 0, newHold: 250, newAvailable: 0, reason: null, adminId: 'admin1', adminName: 'Admin', createdAt: '2026-10-02T05:00:00.000Z' },
+            { $id: 'h3', qrId: 'Q3', assignedUserId: 'u3', action: 'release', amountPaise: 100, previousHold: 100, newHold: 0, newAvailable: 100, reason: null, adminId: 'admin1', adminName: 'Admin', createdAt: '2026-10-03T05:00:00.000Z' },
+        ];
+        return data;
+    };
+
+    test('dashboard: totalQrManualHold is the live Σ amountOnHold over every QR doc, with the count of QRs holding money', async () => {
+        const res = await request(buildApp(makeDb(withHolds()))).get('/dashboard/counters');
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ totalQrManualHold: 1750, totalQrManualHoldRs: 17.5, qrsOnHoldCount: 2 });
+        expect(res.body.netBreakdown.qr).toMatchObject({ onHoldPaise: 1750, onHoldCount: 2 });
+    });
+
+    test('history: ?companyName narrows rows to that company\'s QRs (trimmed, case-insensitive), every row carries companyName, totals are the live on-hold for the filtered QRs', async () => {
+        const app = buildApp(makeDb(withHolds()));
+        const all = await request(app).get('/manual-hold-on-qr');
+        expect(all.status).toBe(200);
+        expect(all.body.records.map((r) => [r.$id, r.companyName])).toEqual(expect.arrayContaining([['h1', 'Shop'], ['h2', 'Other Co'], ['h3', 'shop']]));   // no config list in this harness → each QR's own trimmed spelling; config spelling wins in prod
+        expect(all.body).toMatchObject({ total: 3, totalOnHoldPaise: 1750, totalOnHoldRs: 17.5, qrsOnHoldCount: 2, filters: { qrId: null, companyName: null } });
+
+        const shop = await request(app).get('/manual-hold-on-qr?companyName=SHOP');
+        expect(shop.body.records.map((r) => r.$id).sort()).toEqual(['h1', 'h3']);
+        expect(shop.body).toMatchObject({ total: 2, totalOnHoldPaise: 1500, qrsOnHoldCount: 1, filters: { companyName: 'Shop' } });
+
+        const one = await request(app).get('/manual-hold-on-qr?qrId=Q2');
+        expect(one.body.records.map((r) => r.$id)).toEqual(['h2']);
+        expect(one.body).toMatchObject({ totalOnHoldPaise: 250, qrsOnHoldCount: 1, filters: { qrId: 'Q2' } });
+
+        const none = await request(app).get('/manual-hold-on-qr?companyName=Nobody');
+        expect(none.body).toMatchObject({ records: [], total: 0, nextCursor: null, totalOnHoldPaise: 0, qrsOnHoldCount: 0 });
+    });
+});
+
 describe('GET /dashboard/counters — netBreakdown decomposes netFlow from the live ledgers', () => {
     test('returns numbers (never an error object) and counts unregistered pay-ins separately', async () => {
         const data = seed();

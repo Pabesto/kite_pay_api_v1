@@ -1560,9 +1560,13 @@ module.exports = (
   });
 
   // ─── day-wise payout report (from the rollup: O(days), never a row scan) ─────
-  // GET /admin/payout-summary?from&to&userId&subadminId — the customer-payout twin of
-  // /api/admin/payin-summary: per IST day, paid amount + commission + count, split per merchant.
-  // Scoped like the queue: a subadmin's `users` map only ever holds their own merchants.
+  // GET /admin/payout-summary?from&to&userId&subadminId&fromCompany&paidBy — the customer-payout
+  // twin of /api/admin/payin-summary: per IST day, paid amount + commission + count, split per
+  // merchant. Scoped like the queue: a subadmin's `users` map only ever holds their own merchants.
+  // `fromCompany` / `paidBy` (staff-only, exact config spelling): the rollup is keyed by merchant
+  // only, so a filtered read is computed from the paid rows themselves — a bounded scan on
+  // paidAt, bucketed by the SAME IST day key the rollup uses, same response shape. Rows paid
+  // before the stamps existed carry null and are therefore never in a filtered view.
   router.get('/admin/payout-summary', adminView, async (req, res) => {
     try {
       if (!DAILY_PAYOUT_SUMMARIES) throw fail(500, 'Daily payout summaries are not configured');
@@ -1573,15 +1577,43 @@ module.exports = (
       if (!start.isValid() || !end.isValid() || end.isBefore(start)) throw fail(400, 'Invalid date range');
       if (end.diff(start, 'days') > 366) throw fail(400, 'Range too large (max 366 days)');
       const allowed = await scopeIdSet(req, { userId: req.query.userId, subadminId: req.query.subadminId }); // null = everyone
+      const fromCompany = isStaff(req) ? String(req.query.fromCompany || '').trim() : '';
+      const paidBy = isStaff(req) ? String(req.query.paidBy || '').trim() : '';
+      let filteredByDay = null; // { [date]: { [userId]: row } } — only when a stamp filter is on
+      let truncated = false;
+      if (fromCompany || paidBy) {
+        filteredByDay = {};
+        if (allowed === null || allowed.length) {
+          const bounds = dateQueries(from, to).map((q) => q.replace('"createdAt"', '"paidAt"'));
+          const base = [...(allowed ? [idsQuery('userId', allowed)] : []), Query.equal('status', 'paid'),
+            ...(fromCompany ? [Query.equal('fromCompany', fromCompany)] : []), ...(paidBy ? [Query.equal('paidBy', paidBy)] : []),
+            ...bounds, Query.orderAsc('$id'), Query.limit(100)];
+          let cursor = null;
+          for (let page = 0; page < 100; page++) { // ponytail: 10k paid rows per call, same cap as /stats/daily
+            const r = await databases.listDocuments(DB, PAYOUTS, cursor ? [...base, Query.cursorAfter(cursor)] : base);
+            for (const p of r.documents) {
+              const day = istDay(p.paidAt || p.processedAt);
+              const row = ((filteredByDay[day] = filteredByDay[day] || {})[p.userId] = filteredByDay[day][p.userId] || emptyDayRow());
+              row.paidPaise += Number(p.amountPaise || 0); row.commissionPaise += Number(p.commissionPaise || 0); row.count += 1;
+            }
+            if (r.documents.length < 100) break;
+            cursor = r.documents[r.documents.length - 1].$id;
+            if (page === 99) truncated = true;
+          }
+        }
+      }
 
       const days = [];
       const userIds = new Set();
       let grandTotalPaise = 0, grandCommissionPaise = 0, grandCount = 0, todayPaise = 0, yesterdayPaise = 0;
       for (let d = start.clone(); !d.isAfter(end); d.add(1, 'day')) {
         const date = d.format('YYYY-MM-DD');
-        const doc = (await databases.listDocuments(DB, DAILY_PAYOUT_SUMMARIES, [Query.equal('date', date), Query.limit(1)])).documents[0];
         let obj = {};
-        try { obj = doc ? (JSON.parse(doc.totalsJson || '{}') || {}) : {}; } catch (e) { console.error('WARNING: corrupted totalsJson for payout day', date, '—', e.message); }
+        if (filteredByDay) obj = filteredByDay[date] || {};
+        else {
+          const doc = (await databases.listDocuments(DB, DAILY_PAYOUT_SUMMARIES, [Query.equal('date', date), Query.limit(1)])).documents[0];
+          try { obj = doc ? (JSON.parse(doc.totalsJson || '{}') || {}) : {}; } catch (e) { console.error('WARNING: corrupted totalsJson for payout day', date, '—', e.message); }
+        }
         const users = {};
         let totalPaise = 0, commissionPaise = 0, count = 0;
         for (const [uid, raw] of Object.entries(obj)) {
@@ -1603,6 +1635,7 @@ module.exports = (
         grandCommissionPaise, grandCommissionRs: grandCommissionPaise / 100, grandCount,
         todayPaise, todayRs: todayPaise / 100, yesterdayPaise, yesterdayRs: yesterdayPaise / 100,
         userNames,
+        filters: { fromCompany: fromCompany || null, paidBy: paidBy || null }, truncated,
       });
     } catch (e) { sendError(res, e, 'Failed to fetch payout summary'); }
   });

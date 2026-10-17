@@ -114,6 +114,18 @@ has no idea why.
   "releasedTodayPaise": 200000 }   // released early across this user's QRs
 ```
 
+`GET /api/admin/dashboard/counters` (admin) now also returns the **manual hold across all QR codes**:
+
+```jsonc
+{ "totalQrManualHold": 1750,      // paise — Σ amountOnHold over EVERY QR ledger (archived "_hold" generations included)
+  "totalQrManualHoldRs": 17.5,    // display mirror
+  "qrsOnHoldCount": 2 }           // how many QRs currently hold money
+```
+Tile: "Manual hold on QRs" = `totalQrManualHoldRs` with the subtitle "<qrsOnHoldCount> QRs". This is
+the live ledger figure (what the merchants cannot withdraw right now), not a count of hold actions —
+ignore the older `manualHoldAmount` / `manualHoldCount` counters if you see them in the same payload.
+Tapping the tile should open the QR Hold History page (§10).
+
 `GET /api/admin/dashboard/subadmin/:merchantId` adds the same three-way split it already uses:
 `totalHeldToday` / `totalReleasedToday`, `selfHeldToday` / `selfReleasedToday`, and
 `userHeldToday` / `userReleasedToday`. The existing `withdrawableAmount`, `selfWithdrawableAmount`
@@ -425,3 +437,37 @@ the new, larger ceiling.
   day the two amounts are added, with a `hold-reset-merge` entry in `history`. The dialog for the
   fresh id will therefore show `releasedPaise: 0` right after a reset — that is correct, not a loss;
   open `<qrId>_hold` to see the carried-over release.
+
+---
+
+## 10. QR Hold History page — company / QR filters and the on-hold total
+
+`GET /api/admin/manual-hold-on-qr?qrId=&companyName=&userId=&limit=&cursor=` (any logged-in role; the
+server scopes rows to the QRs the caller may see — admin all, subadmin/employee their tenants, user
+their own).
+
+| Query param | Meaning |
+|---|---|
+| `qrId` | one QR code (exact) |
+| `companyName` | one company — the QR's `companyName`, matched trimmed and case-insensitively, config spelling canonical; `(no company)` selects QRs with a blank company. Build it as the same company dropdown the pay-in report uses (config `company_names`), default "All companies" |
+| `userId` | admin only — QRs assigned to one user |
+| `limit` / `cursor` | pagination as everywhere (default 25, max 100) |
+
+Filters stack (AND). Response:
+
+```jsonc
+{ "success": true,
+  "records": [ { "$id": "…", "qrId": "193893", "companyName": "Shop",   // NEW per row — show it as a column
+                 "action": "hold" | "release", "amountPaise": 1500, "previousHold": 0, "newHold": 1500, "newAvailable": 3500,
+                 "reason": "policy", "adminId": "…", "adminName": "Admin", "createdAt": "…", "assignedUserId": "u1" }, … ],
+  "total": 2, "nextCursor": null,
+  "totalOnHoldPaise": 1500, "totalOnHoldRs": 15,   // NEW — money CURRENTLY on hold across the QRs matching the filters
+  "qrsOnHoldCount": 1,                             // NEW — how many of those QRs hold money right now
+  "filters": { "qrId": null, "companyName": "Shop" } }
+```
+
+Show a header card "Total QR manual hold: ₹<totalOnHoldRs> on <qrsOnHoldCount> QRs" above the list
+and re-read it from every page response (it is the same on every page of one filter set). It is the
+live ledger sum for the filtered QRs — **not** the sum of the rows below (a hold followed by a
+release nets to zero on the ledger but shows as two rows). With no filters it equals the dashboard
+tile `totalQrManualHold` (§5). Amounts are paise; `*Rs` is for display.

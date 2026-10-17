@@ -3836,16 +3836,21 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
     });
 
     // ✅ GET /manual-hold-on-qr — role-based hold history
-    // admin: all records (optional ?qrId, ?userId filters)
+    // admin: all records (optional ?qrId, ?userId, ?companyName filters)
     // subadmin: only QRs assigned/managed by them or their users
     // employee: only QRs of subadmins/users assigned to them
     // user: only their own QRs
+    // ?companyName= narrows to the QRs of one company (qr_codes.companyName, matched like the reports:
+    // trimmed, case-insensitive, config spelling canonical, "(no company)" for blanks). Every response
+    // also carries the money CURRENTLY on hold across the QRs in scope (role scope ∩ qrId ∩ company):
+    // totalOnHoldPaise = Σ qr_codes.amountOnHold — the live ledger, not a sum of the history rows.
     router.get('/manual-hold-on-qr', authenticateToken, async (req, res) => {
         try {
-            const { qrId, cursor, limit } = req.query;
+            const { qrId, cursor, limit, companyName } = req.query;
             const limitNum = Math.min(Number(limit) || 25, 100);
             const role = req.user.role;
             const requestorId = req.user.userId;
+            let scopeUserIds = null; // null = every QR (admin); else only QRs assigned to these users
 
             const queries = [Query.orderDesc('$createdAt'), Query.limit(limitNum)];
             if (cursor) queries.push(Query.cursorAfter(cursor));
@@ -3853,7 +3858,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             if (role === 'admin') {
                 // Admin sees all — optional filters
                 if (qrId) queries.unshift(Query.equal('qrId', qrId));
-                if (req.query.userId) queries.unshift(Query.equal('assignedUserId', req.query.userId));
+                if (req.query.userId) { queries.unshift(Query.equal('assignedUserId', req.query.userId)); scopeUserIds = [String(req.query.userId)]; }
 
             } else if (role === 'subadmin') {
                 // Subadmin sees holds on QRs assigned to them or their users
@@ -3863,6 +3868,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 );
                 const userIds = usersRes.documents.map(d => d.userId);
                 const allIds = [requestorId, ...userIds];
+                scopeUserIds = allIds;
                 queries.unshift(Query.equal('assignedUserId', allIds));
                 if (qrId) queries.unshift(Query.equal('qrId', qrId));
 
@@ -3885,15 +3891,37 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
                 }
 
                 if (allIds.length === 0)
-                    return res.status(200).json({ success: true, records: [], total: 0, nextCursor: null });
+                    return res.status(200).json({ success: true, records: [], total: 0, nextCursor: null, totalOnHoldPaise: 0, totalOnHoldRs: 0, qrsOnHoldCount: 0, filters: { qrId: qrId || null, companyName: null } });
 
+                scopeUserIds = allIds;
                 queries.unshift(Query.equal('assignedUserId', allIds));
                 if (qrId) queries.unshift(Query.equal('qrId', qrId));
 
             } else {
                 // Regular user — only their own QRs
+                scopeUserIds = [requestorId];
                 queries.unshift(Query.equal('assignedUserId', requestorId));
                 if (qrId) queries.unshift(Query.equal('qrId', qrId));
+            }
+
+            // The company filter and the live on-hold total both need the QR docs — one scan per call,
+            // like reportGroups(). ponytail: cache this if qr_codes grows past a few thousand.
+            const qrDocs = await listAllDocuments(APPWRITE_DATABASE_ID, APPWRITE_QRCODE_COLLECTION_ID, [Query.limit(100), Query.orderAsc('$id')]);
+            const companies = groupMap(qrDocs, 'companyName', ConfigManager.get('company_names', {}), NO_COMPANY);
+            const companyFilter = String(companyName || '').trim().toLowerCase();
+            const scopedQrs = qrDocs.filter(q =>
+                (!scopeUserIds || scopeUserIds.includes(q.assignedUserId)) &&
+                (!qrId || q.qrId === qrId) &&
+                (!companyFilter || companies.of(q.qrId).toLowerCase() === companyFilter));
+            const totalOnHoldPaise = scopedQrs.reduce((s, q) => s + Number(q.amountOnHold || 0), 0);
+            const qrsOnHoldCount = scopedQrs.filter(q => Number(q.amountOnHold || 0) > 0).length;
+            const companyEcho = companyFilter ? (scopedQrs[0] ? companies.of(scopedQrs[0].qrId) : String(companyName).trim()) : null;
+            const totals = { totalOnHoldPaise, totalOnHoldRs: totalOnHoldPaise / 100, qrsOnHoldCount, filters: { qrId: qrId || null, companyName: companyEcho } };
+            if (companyFilter) {
+                const ids = scopedQrs.map(q => q.qrId);
+                if (!ids.length) return res.status(200).json({ success: true, records: [], total: 0, nextCursor: null, ...totals });
+                const chunks = []; for (let i = 0; i < ids.length; i += 100) chunks.push(Query.equal('qrId', ids.slice(i, i + 100)));
+                queries.unshift(chunks.length === 1 ? chunks[0] : Query.or(chunks));
             }
 
             const result = await databases.listDocuments(
@@ -3903,6 +3931,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
             const records = result.documents.map(doc => ({
                 $id: doc.$id,
                 qrId: doc.qrId,
+                companyName: companies.of(doc.qrId),
                 assignedUserId: doc.assignedUserId,
                 action: doc.action,
                 amountPaise: doc.amountPaise,
@@ -3917,7 +3946,7 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             const nextCursor = records.length === limitNum ? result.documents[records.length - 1].$id : null;
 
-            return res.status(200).json({ success: true, records, total: result.total, nextCursor });
+            return res.status(200).json({ success: true, records, total: result.total, nextCursor, ...totals });
         } catch (err) {
             console.error('❌ List hold records error:', err);
             return res.status(500).json({ error: 'Failed to fetch hold records' });
@@ -4325,6 +4354,8 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // Helper to get value or 0
             const get = (k) => (map.has(k) ? map.get(k) : 0);
+            // WHERE netFlow sits — an exact decomposition from the live ledgers (see ledgerTotals)
+            const nb = await netBreakdown(get).catch((e) => { console.error('netBreakdown failed:', e?.message || e); return { error: e?.message || String(e) }; });
 
             // Override the 3 counters that are now maintained atomically in Redis.
             // Appwrite values lag up to 5 minutes behind due to the periodic flush.
@@ -4427,8 +4458,11 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
 
             // Derived roll-ups (see deriveDashboardTotals at the top of this file)
             ...deriveDashboardTotals(get),
-            // WHERE netFlow sits — an exact decomposition from the live ledgers (see ledgerTotals)
-            netBreakdown: await netBreakdown(get).catch((e) => { console.error('netBreakdown failed:', e?.message || e); return { error: e?.message || String(e) }; }),
+            netBreakdown: nb,
+            // Manual hold across EVERY QR ledger (archived _hold generations included — they still hold money):
+            // the live sum of qr_codes.amountOnHold. NOT the incremental manualHoldAmount counter, which only
+            // sees the manual-hold route and drifts whenever a status edit / delete moves money on or off hold.
+            totalQrManualHold: nb.qr?.onHoldPaise ?? 0, totalQrManualHoldRs: (nb.qr?.onHoldPaise ?? 0) / 100, qrsOnHoldCount: nb.qr?.onHoldCount ?? 0,
             // Money received on QR ids that were never uploaded (no qr_codes doc): inside totalAmountReceived,
             // on no ledger. Same source as GET /transactions?unregisteredQr=true (cached 60s).
             unregisteredQrAmountReceived: (await unregisteredQr()).amountPaise,
@@ -5164,12 +5198,13 @@ module.exports = (APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, databases, storage, us
         let docs = [], error = null;
         try { docs = colId ? await listAllDocuments(APPWRITE_DATABASE_ID, colId, [Query.limit(100), Query.orderAsc('$id')]) : []; }
         catch (e) { error = e?.code === 404 ? `collection ${colId} not found` : (e?.message || String(e)); console.error(`ledgerTotals(${colId}) failed:`, error); }
-        const t = { count: docs.length, error, totalPayInPaise: 0, withdrawalApprovedPaise: 0, pendingWithdrawalPaise: 0, onHoldPaise: 0, commissionOnHoldPaise: 0, commissionPaidPaise: 0, availablePaise: 0 };
+        const t = { count: docs.length, error, totalPayInPaise: 0, withdrawalApprovedPaise: 0, pendingWithdrawalPaise: 0, onHoldPaise: 0, onHoldCount: 0, commissionOnHoldPaise: 0, commissionPaidPaise: 0, availablePaise: 0 };
         for (const d of docs) {
             t.totalPayInPaise += Number(d.totalPayInAmount || 0);
             t.withdrawalApprovedPaise += Number(d.withdrawalApprovedAmount || 0);
             t.pendingWithdrawalPaise += Number(d.withdrawalRequestedAmount || 0);
             t.onHoldPaise += Number(d.amountOnHold || 0);
+            if (Number(d.amountOnHold || 0) > 0) t.onHoldCount += 1;
             t.commissionOnHoldPaise += Number(d.commissionOnHold || 0);
             t.commissionPaidPaise += Number(d.commissionPaid || 0);
             t.availablePaise += Number(d.amountAvailableForWithdrawal || 0);

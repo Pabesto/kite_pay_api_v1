@@ -1336,6 +1336,38 @@ describe('day-wise payout report (GET /admin/payout-summary, from the rollup)', 
         expect((await request(app).get('/admin/payout-summary?from=2025-01-01&to=2026-09-01')).status).toBe(400);
     });
 
+    test('?fromCompany / ?paidBy: computed from the paid rows (same shape, same day key), rollup ignored; unstamped rows excluded; subadmin ignores the filter', async () => {
+        const db = seed();
+        const P = (id, userId, paidAt, amountPaise, commissionPaise, stamps) => ({ $id: id, id, userId, status: 'paid', paidAt, processedAt: paidAt, createdAt: paidAt, amountPaise, commissionPaise, ...stamps });
+        db.store[COLS.PAYOUTS] = [
+            P('a', 'user1', '2026-09-02T05:00:00.000Z', 4000, 120, { fromCompany: 'Sky Traders', paidBy: 'Priya' }),
+            P('b', 'user1', '2026-09-02T18:40:00.000Z', 6000, 180, { fromCompany: 'Sky Traders', paidBy: 'Rahul' }),   // 00:10 IST on the 3rd → day 2026-09-03
+            P('c', 'userX', '2026-09-02T06:00:00.000Z', 99000, 1, { fromCompany: 'Kite Co', paidBy: 'Priya' }),
+            P('d', 'userX', '2026-09-02T07:00:00.000Z', 500, 5, {}),                                                 // paid before the stamps existed
+            { $id: 'e', id: 'e', userId: 'user1', status: 'rejected', processedAt: '2026-09-02T08:00:00.000Z', createdAt: '2026-09-02T08:00:00.000Z', amountPaise: 1, commissionPaise: 0, fromCompany: 'Sky Traders' },
+        ];
+        const { app } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&fromCompany=Sky Traders');
+        expect(res.status).toBe(200);
+        expect(res.body.days).toEqual([
+            { date: '2026-09-02', totalPaise: 4000, totalRs: 40, commissionPaise: 120, commissionRs: 1.2, count: 1, users: { user1: { paidPaise: 4000, commissionPaise: 120, count: 1 } } },
+            { date: '2026-09-03', totalPaise: 6000, totalRs: 60, commissionPaise: 180, commissionRs: 1.8, count: 1, users: { user1: { paidPaise: 6000, commissionPaise: 180, count: 1 } } },
+        ]);
+        expect(res.body).toMatchObject({ grandTotalPaise: 10000, grandCount: 2, filters: { fromCompany: 'Sky Traders', paidBy: null }, truncated: false, userNames: { user1: 'Ramesh Stores' } });
+        // both stamps stack; ?userId still intersects
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&fromCompany=Sky Traders&paidBy=Rahul')).body.grandTotalPaise).toBe(6000);
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&paidBy=Priya')).body.grandTotalPaise).toBe(103000);
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&paidBy=Priya&userId=userX')).body.grandTotalPaise).toBe(99000);
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-03&fromCompany=Nobody')).body.grandTotalPaise).toBe(0);
+        // no filter → still the rollup, untouched
+        expect((await request(app).get('/admin/payout-summary?from=2026-09-02&to=2026-09-02')).body.grandTotalPaise).toBe(109000);
+        // subadmin: the stamps are staff-only, so the filter is ignored and the rollup answers
+        const sub = asUser('sub1', 'subadmin');
+        const { app: subApp } = buildPayout(db, makeRedis(), sub, () => sub);
+        const subRes = await request(subApp).get('/admin/payout-summary?from=2026-09-02&to=2026-09-02&fromCompany=Kite Co');
+        expect(subRes.body).toMatchObject({ grandTotalPaise: 10000, filters: { fromCompany: null, paidBy: null } });
+    });
+
     test('a rollup write failure at mark-paid never fails the payment', async () => {
         const db = makeDb({
             [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 50000, holdPaise: 10300 }],
