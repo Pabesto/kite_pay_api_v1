@@ -203,6 +203,18 @@ async function main() {
     await str(PAYOUTS, 'rejectedAt', 40);
     await str(PAYOUTS, 'cancelledAt', 40);         // user self-cancel (status 'cancelled')
     await bool(PAYOUTS, 'commissionRollupFailed');
+    // objection on a PAID row ("customer did not receive it") — status stays 'paid', this is a sub-state
+    await str(PAYOUTS, 'objectionStatus', 16);     // open | resolved
+    await str(PAYOUTS, 'objectionRemark', 500);    // merchant's remark when raising
+    await str(PAYOUTS, 'objectionAt', 40);
+    await str(PAYOUTS, 'objectionBy', 64);
+    await str(PAYOUTS, 'objectionOutcome', 16);    // cleared | repaid
+    await str(PAYOUTS, 'objectionResolveRemark', 500);
+    await str(PAYOUTS, 'objectionResolvedAt', 40);
+    await str(PAYOUTS, 'objectionResolvedBy', 64);
+    await int(PAYOUTS, 'objectionCount');
+    await str(PAYOUTS, 'originalReferenceNumber', 100); // first UTR, kept when a 'repaid' resolve overwrites referenceNumber
+    await str(PAYOUTS, 'repaidAt', 40);
     await sleep(4000);
     await idx(PAYOUTS, 'idx_id', 'unique', ['id']);
     await idx(PAYOUTS, 'idx_user_createdAt', 'key', ['userId', 'createdAt']);
@@ -219,6 +231,7 @@ async function main() {
     await idx(PAYOUTS, 'idx_paidVia', 'key', ['paidVia']);
     await idx(PAYOUTS, 'idx_fromCompany', 'key', ['fromCompany']);
     await idx(PAYOUTS, 'idx_paidBy', 'key', ['paidBy']);
+    await idx(PAYOUTS, 'idx_objectionStatus', 'key', ['objectionStatus']);
 
     // 5. payout_commission_transactions (mirrors commission_transactions)
     const COMM = APPWRITE_PAYOUT_COMMISSION_TRANSACTIONS_COLLECTION_ID;

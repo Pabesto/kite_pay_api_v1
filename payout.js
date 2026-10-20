@@ -578,6 +578,8 @@ module.exports = (
     if (!isFinite(a) || !isFinite(b)) return null;
     return Math.max(0, Math.round((b - a) / 60000));
   }
+  const OBJECTION_OUTCOMES = ['cleared', 'repaid'];
+  const displayStatusOf = (d) => (d.status !== 'paid' ? d.status : d.objectionStatus === 'open' ? 'objection_received' : d.objectionStatus === 'resolved' ? (d.objectionOutcome || 'paid') : 'paid');
   // `staff` = admin / labelled employee view: adds paidVia (which of OUR accounts paid it) — never
   // shown to users or subadmins.
   const pickPayout = (d, staff = false) => ({
@@ -593,6 +595,18 @@ module.exports = (
     paidInMinutes: minutesBetween(d.createdAt, d.paidAt),
     rejectedInMinutes: minutesBetween(d.createdAt, d.rejectedAt),
     cancelledInMinutes: minutesBetween(d.createdAt, d.cancelledAt),
+    // Objection on a PAID row (merchant: "customer did not receive it"). `status` stays 'paid';
+    // `displayStatus` is what the screen shows: paid → objection_received → cleared | repaid.
+    displayStatus: displayStatusOf(d),
+    objection: d.objectionStatus ? {
+      status: d.objectionStatus, remark: d.objectionRemark || null, raisedAt: d.objectionAt || null, raisedBy: d.objectionBy || null,
+      outcome: d.objectionOutcome || null, resolveRemark: d.objectionResolveRemark || null, resolvedAt: d.objectionResolvedAt || null, resolvedBy: d.objectionResolvedBy || null,
+      count: Number(d.objectionCount || 0),
+    } : null,
+    objectionInMinutes: minutesBetween(d.paidAt, d.objectionAt),                      // paid → objection raised
+    objectionResolvedInMinutes: minutesBetween(d.objectionAt, d.objectionResolvedAt), // raised → resolved
+    repaidAt: d.repaidAt || null,
+    originalReferenceNumber: d.originalReferenceNumber || null, // first UTR, kept when a repaid objection overwrote referenceNumber
     // pending only: server-clock wait so far (device clocks drift); null once resolved
     waitingMinutes: d.status === 'pending' ? minutesBetween(d.createdAt, nowIso()) : null,
     customerName: d.customerName, bankName: d.bankName, ifscCode: d.ifscCode, accountNumber: d.accountNumber, upiId: d.upiId || null,
@@ -1186,6 +1200,38 @@ module.exports = (
     } catch (e) { sendError(res, e, 'Failed to cancel payout request'); }
   });
 
+  // ─── Objection on a PAID payout ────────────────────────────────────────────
+  // The merchant says the customer did not receive the money. `status` stays 'paid' — the wallet was
+  // debited once and commission, the day report, counters, account stats and UTR uniqueness all key
+  // on it — so the objection is a sub-state on the row: objectionStatus 'open' → 'resolved' with
+  // objectionOutcome 'cleared' (the transfer was fine) or 'repaid' (we sent it again under a NEW
+  // reference; no wallet movement, no ledger row — the merchant already paid for it). A bank refund
+  // is handled manually for now (no outcome for it). A user may object again after a resolve; the
+  // row keeps the latest objection + objectionCount. No money moves here, but the flip runs under the
+  // wallet lock with a re-read so a double-tap or a racing resolve cannot stamp twice.
+  router.post('/requests/:id/objection', authenticateToken, async (req, res) => {
+    try {
+      const remark = String(req.body.remark || '').trim();
+      if (remark.length < 4 || remark.length > 500) throw fail(400, 'Objection remark is required (4–500 characters)');
+      const found = await loadPayoutByBusinessId(req.params.id);
+      if (found.userId !== req.user.userId) throw fail(404, 'Customer payout request not found');
+      if (found.status !== 'paid') throw fail(400, `Cannot raise an objection on a ${found.status} request`);
+      if (found.objectionStatus === 'open') throw fail(409, 'An objection is already open on this payout');
+      const updated = await withWalletLock(found.userId, LOCK_TTL_REQUEST, async () => {
+        const p = await databases.getDocument(DB, PAYOUTS, found.$id);
+        if (p.status !== 'paid' || p.objectionStatus === 'open') throw fail(409, 'Objection was already raised');
+        return databases.updateDocument(DB, PAYOUTS, p.$id, {
+          objectionStatus: 'open', objectionRemark: remark, objectionAt: nowIso(), objectionBy: req.user.userId, objectionCount: Number(p.objectionCount || 0) + 1,
+          objectionOutcome: null, objectionResolveRemark: null, objectionResolvedAt: null, objectionResolvedBy: null,
+        });
+      });
+      const payload = { type: 'objection_raised', userId: updated.userId, payoutId: updated.id, status: 'paid', displayStatus: 'objection_received', amountPaise: Number(updated.amountPaise || 0), customerName: updated.customerName, referenceNumber: updated.referenceNumber || null, paidAt: updated.paidAt || null, remark, objectionCount: Number(updated.objectionCount || 0) };
+      await notify(updated.userId, payload);                                   // payout:update — list refresh (user + staff)
+      await notify(updated.userId, payload, { event: 'payout:alert' });        // payout:alert — staff dialog + sound; always on, not behind the alerts toggle
+      res.json({ success: true, message: 'Objection raised', payout: await payoutView(updated, false) });
+    } catch (e) { sendError(res, e, 'Failed to raise objection'); }
+  });
+
   // Filters shared by the user list and the admin queue. `scopeQueries` = userId scope
   // ([] unrestricted, [query], or null = provably empty).
   //   status, mode, accountId, processedBy, from/to (IST days), minAmount/maxAmount (rupees),
@@ -1212,6 +1258,10 @@ module.exports = (
     }
     if (q.accountId) queries.push(Query.equal('accountId', String(q.accountId)));
     if (q.processedBy) queries.push(Query.equal('processedBy', String(q.processedBy)));
+    if (q.objection) {
+      if (!['open', 'resolved', 'any'].includes(q.objection)) throw fail(400, 'Invalid objection');
+      queries.push(q.objection === 'any' ? Query.isNotNull('objectionStatus') : Query.equal('objectionStatus', q.objection));
+    }
     const minP = rupeesFilter(q.minAmount, 'minAmount');
     const maxP = rupeesFilter(q.maxAmount, 'maxAmount');
     if (minP != null && maxP != null) {
@@ -1646,7 +1696,11 @@ module.exports = (
     try {
       const s = settingsView().alerts;
       const scope = await userScope(req, { userId: req.query.userId, subadminId: req.query.subadminId });
-      const lowBalance = [], stalePending = [];
+      const lowBalance = [], stalePending = [], openObjections = [];
+      if (scope !== null) {
+        const r = await databases.listDocuments(DB, PAYOUTS, [...scope, Query.equal('objectionStatus', 'open'), Query.orderAsc('objectionAt'), Query.limit(100)]);
+        for (const p of r.documents) openObjections.push({ payoutId: p.id, userId: p.userId, amountPaise: Number(p.amountPaise || 0), customerName: p.customerName, referenceNumber: p.referenceNumber || null, paidAt: p.paidAt || null, raisedAt: p.objectionAt || null, remark: p.objectionRemark || null, waitingMinutes: minutesBetween(p.objectionAt, nowIso()) });
+      }
       if (s.enabled && scope !== null) {
         if (s.lowBalanceThresholdPaise) {
           const base = [...scope, Query.orderAsc('$id'), Query.limit(100)];
@@ -1664,7 +1718,7 @@ module.exports = (
           for (const p of r.documents) stalePending.push({ payoutId: p.id, userId: p.userId, amountPaise: Number(p.amountPaise || 0), customerName: p.customerName, requestedAt: p.createdAt, waitingMinutes: minutesBetween(p.createdAt, nowIso()) });
         }
       }
-      res.json({ success: true, enabled: s.enabled, thresholds: { lowBalancePaise: s.lowBalanceThresholdPaise, pendingMinutes: s.pendingAlertMinutes }, lowBalance, stalePending, counts: { lowBalance: lowBalance.length, stalePending: stalePending.length } });
+      res.json({ success: true, enabled: s.enabled, thresholds: { lowBalancePaise: s.lowBalanceThresholdPaise, pendingMinutes: s.pendingAlertMinutes }, lowBalance, stalePending, openObjections, counts: { lowBalance: lowBalance.length, stalePending: stalePending.length, openObjections: openObjections.length } });
     } catch (e) { sendError(res, e, 'Failed to fetch payout alerts'); }
   });
 
@@ -2248,6 +2302,16 @@ module.exports = (
     return r || null;
   };
 
+  const refFormsOf = (referenceNumber) => {
+    const refKey = referenceNumber.toUpperCase();
+    return { refKey, refForms: [...new Set([referenceNumber, refKey, referenceNumber.toLowerCase()])] };
+  };
+  const assertReferenceUnused = async (refForms, selfDocId) => {
+    const clash = (await databases.listDocuments(DB, PAYOUTS, [Query.equal('referenceNumber', refForms), Query.equal('status', 'paid'), Query.limit(1)])).documents[0];
+    if (clash && clash.$id !== selfDocId) throw fail(409, `Reference number already used on payout ${clash.id}`, { conflictPayoutId: clash.id });
+  };
+  const REF_BUSY = 'This reference number is being processed on another payout. Please try again.';
+
   router.post('/admin/requests/:id/paid', adminEdit, async (req, res) => {
     try {
       const referenceNumber = String(req.body.referenceNumber || '').trim();
@@ -2266,16 +2330,11 @@ module.exports = (
       // Stored values are trimmed; the typed, UPPER and lower forms are all checked so "utr1" vs "UTR1 " collide
       // whatever the database's own case rule (Appwrite's equal() happens to be case-insensitive, but we
       // do not depend on it).
-      const refKey = referenceNumber.toUpperCase();
-      const refForms = [...new Set([referenceNumber, refKey, referenceNumber.toLowerCase()])];
-      const assertReferenceUnused = async () => {
-        const clash = (await databases.listDocuments(DB, PAYOUTS, [Query.equal('referenceNumber', refForms), Query.equal('status', 'paid'), Query.limit(1)])).documents[0];
-        if (clash && clash.$id !== found.$id) throw fail(409, `Reference number already used on payout ${clash.id}`, { conflictPayoutId: clash.id });
-      };
-      await assertReferenceUnused();
+      const { refKey, refForms } = refFormsOf(referenceNumber);
+      await assertReferenceUnused(refForms, found.$id);
 
       const updated = await withLock(`lock:payoutref:${refKey}`, LOCK_TTL_REQUEST, () => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
-        await assertReferenceUnused(); // re-check under the reference lock
+        await assertReferenceUnused(refForms, found.$id); // re-check under the reference lock
         const p = await databases.getDocument(DB, PAYOUTS, found.$id); // fresh read under lock
         if (p.status !== 'pending') throw fail(409, 'Request was already resolved');
         const total = Number(p.totalPaise);
@@ -2296,7 +2355,7 @@ module.exports = (
         });
         await bumpAccountStats(p.accountId, { paidCount: 1, totalPaidPaise: Number(p.amountPaise || 0), totalCommissionPaise: Number(p.commissionPaise || 0) }, { lastPaidAt: at });
         return doc;
-      }), 'This reference number is being processed on another payout. Please try again.');
+      }), REF_BUSY);
 
       const paidAmount = Number(updated.amountPaise || 0);
       await inc('totalCustomerPayoutPendingAmount', -paidAmount);
@@ -2343,6 +2402,50 @@ module.exports = (
       await notify(updated.userId, { type: 'request_rejected', userId: updated.userId, payoutId: updated.id, status: 'rejected', reason, adminRemark });
       res.json({ success: true, message: 'Payout rejected', payout: pickPayout(updated, true) });
     } catch (e) { sendError(res, e, 'Failed to reject payout'); }
+  });
+
+  // Resolve an open objection (staff). Body: { outcome: 'cleared' | 'repaid', remark? (≤500) }.
+  // 'repaid' additionally takes the SAME fields as mark-paid — referenceNumber (new UTR, required, must
+  // differ from the current one, unique platform-wide under lock:payoutref), fromCompany, paidBy
+  // (required, config lists), paidVia? — and overwrites them on the row, keeping the first UTR in
+  // originalReferenceNumber and stamping repaidAt. Nothing touches the wallet, commission, counters or
+  // the day report: the payout was paid once, we just re-sent the same money from our own bank.
+  router.post('/admin/requests/:id/objection/resolve', adminEdit, async (req, res) => {
+    try {
+      const outcome = String(req.body.outcome || '').trim().toLowerCase();
+      if (!OBJECTION_OUTCOMES.includes(outcome)) throw fail(400, 'outcome must be one of cleared, repaid');
+      const remark = remarkOf(req.body);
+      const found = await loadPayoutByBusinessId(req.params.id);
+      await assertCanAct(req, found.userId);
+      if (found.status !== 'paid' || found.objectionStatus !== 'open') throw fail(400, 'No open objection on this payout');
+      const resolveUnderLock = (extra) => withWalletLock(found.userId, LOCK_TTL_RESOLVE, async () => {
+        const p = await databases.getDocument(DB, PAYOUTS, found.$id);
+        if (p.status !== 'paid' || p.objectionStatus !== 'open') throw fail(409, 'Objection was already resolved');
+        return databases.updateDocument(DB, PAYOUTS, p.$id, {
+          objectionStatus: 'resolved', objectionOutcome: outcome, objectionResolveRemark: remark, objectionResolvedAt: nowIso(), objectionResolvedBy: req.user.userId,
+          ...extra(p),
+        });
+      });
+      let updated;
+      if (outcome === 'cleared') updated = await resolveUnderLock(() => ({}));
+      else {
+        const referenceNumber = String(req.body.referenceNumber || '').trim();
+        if (referenceNumber.length < 5 || referenceNumber.length > 100) throw fail(400, 'Payout reference number is required (5–100 characters)');
+        const paidVia = String(req.body.paidVia || '').trim().slice(0, 100) || null;
+        const fromCompany = companyOf(req.body);
+        const paidBy = paidByOf(req.body);
+        const { refKey, refForms } = refFormsOf(referenceNumber);
+        if (refKey === String(found.referenceNumber || '').trim().toUpperCase()) throw fail(400, 'New reference number must differ from the current one');
+        await assertReferenceUnused(refForms, found.$id);
+        updated = await withLock(`lock:payoutref:${refKey}`, LOCK_TTL_REQUEST, async () => {
+          await assertReferenceUnused(refForms, found.$id);
+          return resolveUnderLock((p) => ({ referenceNumber, paidVia, fromCompany, paidBy, repaidAt: nowIso(), originalReferenceNumber: p.originalReferenceNumber || p.referenceNumber || null }));
+        }, REF_BUSY);
+        await touchSource(paidVia, Number(updated.amountPaise || 0), req.user.userId);
+      }
+      await notify(updated.userId, { type: 'objection_resolved', userId: updated.userId, payoutId: updated.id, status: 'paid', displayStatus: displayStatusOf(updated), outcome, amountPaise: Number(updated.amountPaise || 0), referenceNumber: updated.referenceNumber || null, remark });
+      res.json({ success: true, message: outcome === 'repaid' ? 'Objection resolved — payout repaid' : 'Objection resolved — cleared', payout: pickPayout(updated, true) });
+    } catch (e) { sendError(res, e, 'Failed to resolve objection'); }
   });
 
   // ─── payout commission (separate from withdrawal commission) ───────────────

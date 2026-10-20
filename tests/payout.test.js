@@ -2586,3 +2586,140 @@ describe('withdraw.js — mode:wallet', () => {
         expect(res.body.error).toMatch(/utr/i);
     });
 });
+
+// Batch: objections on a PAID payout — status stays 'paid', no money moves on raise or on either outcome.
+describe('payout objections', () => {
+    const paidRow = (extra = {}) => ({
+        $id: 'p1', id: 'cpo_1', userId: 'user1', accountId: 'acc1', customerName: 'R', accountNumber: '1', mode: 'IMPS',
+        amountPaise: 10000, commissionPaise: 300, totalPaise: 10300, status: 'paid', referenceNumber: 'UTR11111', fromCompany: 'Kite Co', paidBy: 'Priya', paidVia: 'HDFC',
+        createdAt: '2026-10-01T05:00:00.000Z', paidAt: '2026-10-01T05:30:00.000Z', processedAt: '2026-10-01T05:30:00.000Z', processedBy: 'admin1', ...extra,
+    });
+    const seed = (rows = [paidRow()]) => ({
+        [COLS.WALLETS]: [{ $id: 'w1', userId: 'user1', balancePaise: 39700, holdPaise: 0 }],
+        [COLS.ACCOUNTS]: [{ $id: 'acc1', userId: 'user1', requestCount: 1, paidCount: 1, totalPaidPaise: 10000, totalCommissionPaise: 300 }],
+        [COLS.PAYOUTS]: rows,
+        [COLS.USERS]: [{ $id: 'admin1', userId: 'admin1', role: 'admin' }],
+    });
+    const raise = (app, remark = 'Customer says not received') => request(app).post('/requests/cpo_1/objection').send({ remark });
+    const resolve = (app, body) => request(app).post('/admin/requests/cpo_1/objection/resolve').send(body);
+
+    test('owner raises: status stays paid, displayStatus objection_received, remark + timestamps stamped, nothing moves, update + alert emitted', async () => {
+        const db = makeDb(seed());
+        const redis = makeRedis();
+        const { app } = buildPayout(db, redis);
+        const res = await raise(app);
+        expect(res.status).toBe(200);
+        expect(res.body.payout).toMatchObject({ status: 'paid', displayStatus: 'objection_received', referenceNumber: 'UTR11111', objection: { status: 'open', remark: 'Customer says not received', raisedBy: 'user1', count: 1, outcome: null, resolvedAt: null } });
+        expect(res.body.payout.objection.raisedAt).toBeTruthy();
+        expect(res.body.payout.objectionInMinutes).toBeGreaterThan(0);
+        expect(res.body.payout.paidVia).toBeUndefined(); // user view stays staff-free
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 39700, holdPaise: 0 });
+        expect(db.store[COLS.TXNS] || []).toHaveLength(0);
+        expect(counterDeltas()).toEqual([]);
+        expect(redis.set).toHaveBeenCalledWith('lock:payoutwallet:user1', expect.any(String), { NX: true, EX: 15 });
+        expect(redis.eval).toHaveBeenCalled();
+        const events = emitted().filter((e) => e.payload.type === 'objection_raised');
+        expect(events.map((e) => e.event).sort()).toEqual(['payout:alert', 'payout:update']);
+        expect(events[0]).toMatchObject({ userId: 'user1', toAdmins: true, payload: { payoutId: 'cpo_1', displayStatus: 'objection_received', remark: 'Customer says not received', amountPaise: 10000 } });
+        // second raise while open → 409; list filter + admin alerts list it
+        expect((await raise(app)).status).toBe(409);
+        expect((await request(app).get('/requests?objection=open')).body.payouts.map((p) => p.id)).toEqual(['cpo_1']);
+        expect((await request(app).get('/requests?objection=resolved')).body.payouts).toEqual([]);
+        expect((await request(app).get('/requests?objection=bogus')).status).toBe(400);
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const alerts = await request(adminApp).get('/admin/alerts');
+        expect(alerts.body.openObjections).toHaveLength(1);
+        expect(alerts.body.openObjections[0]).toMatchObject({ payoutId: 'cpo_1', userId: 'user1', referenceNumber: 'UTR11111', remark: 'Customer says not received' });
+        expect(alerts.body.counts.openObjections).toBe(1);
+    });
+
+    test('raise validation: not owner → 404, not paid → 400, remark too short → 400, lock busy → 409 and nothing stamped', async () => {
+        expect((await raise(buildPayout(makeDb(seed()), makeRedis(), asUser('user2')).app)).status).toBe(404);
+        const notPaid = await raise(buildPayout(makeDb(seed([paidRow({ status: 'pending', paidAt: null })])), makeRedis()).app);
+        expect(notPaid.status).toBe(400); expect(notPaid.body.error).toMatch(/pending/);
+        expect((await raise(buildPayout(makeDb(seed()), makeRedis()).app, 'no')).status).toBe(400);
+        const db = makeDb(seed());
+        expect((await raise(buildPayout(db, makeRedis({ set: jest.fn().mockResolvedValue(null) })).app)).status).toBe(409);
+        expect(db.store[COLS.PAYOUTS][0].objectionStatus).toBeUndefined();
+    });
+
+    test('resolve cleared: stamps outcome/remark/resolvedBy, reference untouched, displayStatus cleared; second resolve → 400; user may object again (count 2)', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        await raise(app);
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await resolve(adminApp, { outcome: 'refunded' })).status).toBe(400);
+        const res = await resolve(adminApp, { outcome: 'cleared', remark: ' Bank confirmed credit ' });
+        expect(res.status).toBe(200);
+        expect(res.body.payout).toMatchObject({ status: 'paid', displayStatus: 'cleared', referenceNumber: 'UTR11111', originalReferenceNumber: null, repaidAt: null, objection: { status: 'resolved', outcome: 'cleared', resolveRemark: 'Bank confirmed credit', resolvedBy: 'admin1', remark: 'Customer says not received' } });
+        expect(res.body.payout.objection.resolvedAt).toBeTruthy();
+        expect(res.body.payout.objectionResolvedInMinutes).toBe(0);
+        expect(emitted().at(-1)).toMatchObject({ event: 'payout:update', payload: { type: 'objection_resolved', outcome: 'cleared', displayStatus: 'cleared', payoutId: 'cpo_1' } });
+        expect((await resolve(adminApp, { outcome: 'cleared' })).status).toBe(400);
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 39700, holdPaise: 0 });
+        expect(counterDeltas()).toEqual([]);
+        // objects again after a resolve
+        const again = await raise(app, 'Still not received');
+        expect(again.status).toBe(200);
+        expect(again.body.payout.objection).toMatchObject({ status: 'open', count: 2, remark: 'Still not received', outcome: null, resolveRemark: null });
+        expect((await request(adminApp).get('/admin/requests?objection=any')).body.payouts).toHaveLength(1);
+    });
+
+    test('resolve repaid: needs new UTR + fromCompany + paidBy, overwrites them, keeps the first UTR, no wallet row, no counters, source touched', async () => {
+        const db = makeDb(seed());
+        const { app } = buildPayout(db, makeRedis());
+        await raise(app);
+        const redis = makeRedis();
+        const { app: adminApp } = buildPayout(db, redis, asUser('admin1', 'admin'));
+        expect((await resolve(adminApp, { outcome: 'repaid', fromCompany: 'Kite Co', paidBy: 'Priya' })).status).toBe(400);
+        expect((await resolve(adminApp, { outcome: 'repaid', referenceNumber: 'UTR22222', paidBy: 'Priya' })).body.error).toBe('fromCompany is required');
+        expect((await resolve(adminApp, { outcome: 'repaid', referenceNumber: 'UTR22222', fromCompany: 'Kite Co', paidBy: 'Nobody' })).status).toBe(400);
+        const same = await resolve(adminApp, { outcome: 'repaid', referenceNumber: ' utr11111 ', fromCompany: 'Kite Co', paidBy: 'Priya' });
+        expect(same.status).toBe(400); expect(same.body.error).toMatch(/differ/);
+        expect(db.store[COLS.PAYOUTS][0].objectionStatus).toBe('open');
+        const res = await resolve(adminApp, { outcome: 'repaid', referenceNumber: 'UTR22222', fromCompany: 'kite co', paidBy: 'priya', paidVia: 'ICICI', remark: 'Re-sent via IMPS' });
+        expect(res.status).toBe(200);
+        expect(res.body.payout).toMatchObject({ status: 'paid', displayStatus: 'repaid', referenceNumber: 'UTR22222', originalReferenceNumber: 'UTR11111', fromCompany: 'Kite Co', paidBy: 'Priya', paidVia: 'ICICI', objection: { status: 'resolved', outcome: 'repaid', resolveRemark: 'Re-sent via IMPS' } });
+        expect(res.body.payout.repaidAt).toBeTruthy();
+        expect(res.body.payout.paidAt).toBe('2026-10-01T05:30:00.000Z'); // the day report key never moves
+        expect(redis.set).toHaveBeenCalledWith('lock:payoutref:UTR22222', expect.any(String), { NX: true, EX: 15 });
+        expect(db.store[COLS.WALLETS][0]).toMatchObject({ balancePaise: 39700, holdPaise: 0 });
+        expect(db.store[COLS.TXNS] || []).toHaveLength(0);
+        expect(counterDeltas()).toEqual([]);
+        expect(db.store[COLS.ACCOUNTS][0]).toMatchObject({ paidCount: 1, totalPaidPaise: 10000 });
+        expect(db.store[COLS.SOURCES].find((s) => s.label === 'ICICI')).toMatchObject({ useCount: 1, totalPaidPaise: 10000 });
+        expect(emitted().at(-1)).toMatchObject({ payload: { type: 'objection_resolved', outcome: 'repaid', referenceNumber: 'UTR22222' } });
+        // a second repaid keeps the FIRST reference as original
+        await raise(app, 'Still not received');
+        const res2 = await resolve(adminApp, { outcome: 'repaid', referenceNumber: 'UTR33333', fromCompany: 'Kite Co', paidBy: 'Priya' });
+        expect(res2.body.payout).toMatchObject({ referenceNumber: 'UTR33333', originalReferenceNumber: 'UTR11111' });
+    });
+
+    test('resolve repaid: new UTR already on another paid payout → 409 and the objection stays open', async () => {
+        const db = makeDb(seed([paidRow(), paidRow({ $id: 'p9', id: 'cpo_9', referenceNumber: 'UTR99999' })]));
+        const { app } = buildPayout(db, makeRedis());
+        await raise(app);
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        const res = await resolve(adminApp, { outcome: 'repaid', referenceNumber: 'utr99999', fromCompany: 'Kite Co', paidBy: 'Priya' });
+        expect(res.status).toBe(409);
+        expect(res.body).toEqual({ error: 'Reference number already used on payout cpo_9', conflictPayoutId: 'cpo_9' });
+        expect(db.store[COLS.PAYOUTS][0]).toMatchObject({ objectionStatus: 'open', referenceNumber: 'UTR11111' });
+    });
+
+    test('resolve auth: no open objection → 400, racing resolve → 409, employee outside their subadmins → 403', async () => {
+        const db = makeDb(seed());
+        const { app: adminApp } = buildPayout(db, makeRedis(), asUser('admin1', 'admin'));
+        expect((await resolve(adminApp, { outcome: 'cleared' })).status).toBe(400);
+        await raise(buildPayout(db, makeRedis()).app);
+        db.getDocument.mockImplementationOnce(async () => ({ ...db.store[COLS.PAYOUTS][0], objectionStatus: 'resolved' }));
+        expect((await resolve(adminApp, { outcome: 'cleared' })).status).toBe(409);
+        expect(db.store[COLS.PAYOUTS][0].objectionStatus).toBe('open');
+        const emp = asUser('emp9', 'employee');
+        userMetaCache.getUserMeta.mockImplementation(async (id) => ({
+            user1: { $id: 'user1', userId: 'user1', role: 'user', parentId: 'sub1' },
+            sub1: { $id: 'sub1', userId: 'sub1', role: 'subadmin', assigned_to: 'emp1' },
+            emp9: { $id: 'emp9', userId: 'emp9', role: 'employee', labels: ['edit_payouts'] },
+        })[id] || null);
+        expect((await resolve(buildPayout(db, makeRedis(), emp, () => emp).app, { outcome: 'cleared' })).status).toBe(403);
+    });
+});

@@ -455,6 +455,36 @@ no ledger row, no commission), the row becomes `status: "cancelled"` with `cance
 rows with a confirmation; add a **Cancelled** tab/filter (`?status=cancelled`) — grey, "Cancelled by
 you", with "Request again". Admin queue rows show cancelled requests the same way.
 
+### 5.4b "Not received" — objection on a PAID payout — `POST /api/payout/requests/:id/objection`
+```jsonc
+{ "remark": "Customer says the money has not arrived" }   // required, 4–500 chars
+```
+Only the owner, only while `status == "paid"`, and only when no objection is already open (`409 An
+objection is already open on this payout`). **`status` stays `"paid"`** — nothing is refunded, nothing
+moves in the wallet; the row gains an `objection` block and `displayStatus` becomes `"objection_received"`.
+Staff get a realtime alert (§9.1) and resolve it as **cleared** (the transfer was fine) or **repaid** (we
+sent it again under a new reference) — see §6.2c. After a resolve the user may object again; `objection.count`
+counts the attempts and the row always holds the latest one. Not paid → `400 Cannot raise an objection on a
+<status> request`; not yours → `404`.
+
+Every row (user and admin) carries:
+```jsonc
+"displayStatus": "paid",          // paid | objection_received | cleared | repaid — for rows whose status != paid it equals status
+"objection": null,                // or:
+"objection": { "status": "open",  // open | resolved
+               "remark": "…", "raisedAt": "…", "raisedBy": "<userId>",
+               "outcome": null,   // cleared | repaid once resolved
+               "resolveRemark": null, "resolvedAt": null, "resolvedBy": null,
+               "count": 1 },
+"objectionInMinutes": 95,         // paidAt → raisedAt (null when no objection)
+"objectionResolvedInMinutes": 40, // raisedAt → resolvedAt (null until resolved)
+"repaidAt": null,                 // set when the last resolve was 'repaid'
+"originalReferenceNumber": null   // the FIRST UTR, kept once a 'repaid' resolve overwrote referenceNumber
+```
+**Filter:** `?objection=open|resolved|any` on `GET /requests` and `GET /admin/requests` (stacks with `status`
+and the rest). **Show `displayStatus`, not `status`, as the badge** — `status` is the accounting truth and
+stays `paid`; the user wants to see "Objection received" / "Cleared" / "Repaid".
+
 ### 5.4a Unique request id + lookup
 Every customer payout has a **unique, permanent id** `id` (format `cpo_<digits>`, e.g.
 `cpo_1725600000000456`) — distinct from the Appwrite `$id`. Show it on every row/detail with a copy
@@ -479,6 +509,9 @@ fields (whole minutes, clamped at 0, `null` when that step has not happened).
 | Paid | `paidAt` | `paidInMinutes` | "Paid in 31 min" (green) |
 | Rejected | `rejectedAt` | `rejectedInMinutes` | "Rejected after 5 min" (red) |
 | Cancelled (by the user) | `cancelledAt` | `cancelledInMinutes` | "Cancelled after 2 min" (grey) |
+| Objection raised (user, on a paid row) | `objection.raisedAt` | `objectionInMinutes` (from `paidAt`) | "Objection raised 95 min after payment" (orange) |
+| Objection resolved (staff) | `objection.resolvedAt` | `objectionResolvedInMinutes` (from `raisedAt`) | "Cleared in 40 min" / "Repaid in 40 min" (green) |
+| Repaid (staff) | `repaidAt` | — | "Repaid · new ref UTR…, original UTR… " |
 
 ### 5.6 Beneficiary verification (set by staff, shown to the user)
 Every saved account carries `verificationStatus`: `unverified` (default) · `verified` ·
@@ -565,6 +598,34 @@ internal record of the source account. Build the field as a **type-to-search dro
 source-account list (§6.2a)**: as the admin types, call `GET /admin/source-accounts?search=<text>`
 and offer matches; picking one fills the field; typing a new value is allowed and is saved to the
 list automatically the moment the payout is marked paid.
+
+#### 6.2c Resolve an objection — `POST /api/payout/admin/requests/:id/objection/resolve`
+A merchant raised "not received" on a paid payout (§5.4b). The row shows `displayStatus:"objection_received"`,
+`objection.status:"open"`, the merchant's `objection.remark`; it is listed by `?objection=open` and in
+`GET /admin/alerts.openObjections`. Staff (`edit_payouts`, same tenant scoping as Paid) resolve with one of two outcomes:
+```jsonc
+// 1. Checked — the transfer was fine (bank confirmed credit, customer found it, …)
+{ "outcome": "cleared", "remark": "Bank confirmed credit at 14:02" }          // remark optional, ≤500
+
+// 2. Repaid — we sent the money AGAIN under a NEW reference. Same fields as the Paid dialog:
+{ "outcome": "repaid",
+  "referenceNumber": "UTR2222222222",   // required, 5–100, must DIFFER from the current one, unique platform-wide (same 409s as Paid)
+  "fromCompany": "Sky Traders",         // required, §6.2b companies
+  "paidBy": "Priya",                    // required, §6.2b employees
+  "paidVia": "ICICI current ****1234",  // optional, source account (bumps its usage like Paid)
+  "remark": "Re-sent via IMPS" }        // optional, ≤500
+```
+Result: `objection.status:"resolved"`, `objection.outcome`, `objection.resolveRemark`, `objection.resolvedAt/By`,
+`displayStatus` = `"cleared"` or `"repaid"`. On **repaid** the row's `referenceNumber`, `fromCompany`, `paidBy`,
+`paidVia` are **overwritten** with the new values, `repaidAt` is stamped and the first UTR is preserved in
+`originalReferenceNumber` (a second repaid keeps the first one, not the previous). **Nothing else changes**:
+`status` stays `paid`, `paidAt` keeps its value (the day report, commission, counters and account stats are
+untouched — the merchant was debited once, we just re-sent our own money). A bank refund (transfer bounced,
+money back with us) has **no outcome yet** — handle it off-system for now.
+Errors: `400 outcome must be one of cleared, repaid`; `400 No open objection on this payout`; `400 New reference
+number must differ from the current one`; the Paid-dialog 400s for `fromCompany` / `paidBy` / reference length;
+`409 Reference number already used on payout cpo_…` (+`conflictPayoutId`); `409 Objection was already resolved`
+(someone else got there first — refresh). Use `GET /admin/payment-options` for the two pick lists, exactly as Paid.
 
 #### 6.2x Download / PDF export — `GET /api/payout/admin/requests/export`
 The queue with the **same filters**, un-paginated up to a chosen cap, every column, names resolved, and a
@@ -1447,6 +1508,8 @@ most also carry `payoutId`, `status`, `amountPaise`.
 | `request_paid` | admin marks paid | `payoutId`, `referenceNumber`, `amountPaise` | toast |
 | `request_rejected` | admin rejects | `payoutId`, `reason` | toast |
 | `request_cancelled` | user cancels their own pending request | `payoutId` | silent list refresh |
+| `objection_raised` | user says a PAID payout was not received | `payoutId`, `displayStatus:'objection_received'`, `amountPaise`, `customerName`, `referenceNumber`, `paidAt`, `remark`, `objectionCount` | staff: list refresh + badge (the **dialog + sound** comes on `payout:alert`, same type) |
+| `objection_resolved` | staff resolved it | `payoutId`, `outcome` (`cleared` \| `repaid`), `displayStatus`, `referenceNumber` (the new one when repaid), `remark` | toast on the user's device; list refresh |
 | `wallet_changed` | wallet balance moved | `reason`: `withdrawal_credit` \| `admin_credit` \| `admin_debit` \| `revert_to_qr`, plus `wallet` | silent refresh (sound on admin adjust) |
 | `account_created` | user saves a **new** beneficiary | `accountId`, `customerName`, `bankingStatus`, `verificationStatus` | toast — it needs staff verification |
 | `account_deleted` | beneficiary removed (user or admin) | `accountId`, `customerName` | silent list refresh |
@@ -1503,6 +1566,11 @@ kept for older builds that read them directly — new code should prefer `payloa
 |---|---|---|---|
 | `low_balance` | a wallet's available crosses below the threshold | `availablePaise`, `thresholdPaise` | **dialog + sound** |
 | `stale_pending` | a request has sat `pending` past `pendingAlertMinutes` | `payoutId`, `waitingMinutes`, `thresholdMinutes`, `amountPaise`, `customerName`, `requestedAt` | **dialog + sound** |
+| `objection_raised` | a merchant raised "not received" on a paid payout | same payload as the `payout:update` row above | **dialog + sound** — always on (not behind `alertsEnabled`); deep-link to the payout with its remark |
+
+`objection_raised` is pushed to the same staff rooms as the other events (admins + the merchant's subadmin and
+their labelled employees). `GET /admin/alerts` also returns `openObjections` (oldest first, ≤100, with
+`waitingMinutes` since it was raised) and `counts.openObjections` — use it for the badge on load.
 
 `stale_pending` is pushed by a server sweep (~every 60s) and fires **once per request** — it does
 not repeat every tick. A process restart may re-announce rows that are still stale. Both alert
