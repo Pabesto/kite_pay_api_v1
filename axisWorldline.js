@@ -13,13 +13,19 @@
 //
 // ONE FACTORY, ONE MOUNT PER WORLDLINE MERCHANT ACCOUNT. Each account Worldline onboards gets
 // its own AES key and its own URL, so server.js mounts this factory once per account with the
-// trailing `opts` — `{ path, aesKeyEnv }` (default: '/axis-worldline-webhook' + AXIS_WL_AES_KEY;
-// second account: '/axis-worldline-webhook-scan-serve' + AXIS_WL_AES_KEY_SCAN_SERVE; third:
-// '/axis-worldline-webhook-settle-flow' + AXIS_WL_AES_KEY_SETTLE_FLOW). Keys are
-// never shared across mounts: a payload for one account does not decrypt on the other's URL,
-// and a mount whose key is unset answers 503 FAILED (fails closed), never falls back to the
-// other key. Everything after decrypt (provider, mapping, dedup on ref_no, lock, finalize) is
-// identical — the `mid` → qrId identifies the merchant, not the URL.
+// trailing `opts`:
+//   { path, aesKeyEnv }  — a STRICT mount: exactly one key (second account:
+//                          '/axis-worldline-webhook-scan-serve' + AXIS_WL_AES_KEY_SCAN_SERVE; third:
+//                          '/axis-worldline-webhook-settle-flow' + AXIS_WL_AES_KEY_SETTLE_FLOW). A payload
+//                          for another account does not decrypt here, and an unset key answers 503 FAILED.
+//   { path, keyEnvs }    — a CATCH-ALL mount: tries every listed key and accepts whichever authenticates.
+//                          server.js uses this for the ORIGINAL URL '/axis-worldline-webhook' with all
+//                          three keys, because Worldline has been seen posting a second account's
+//                          notifications to the first account's URL (2026-10-24). Safe by construction:
+//                          AES-GCM's tag verifies under exactly one key, so a wrong key can never yield a
+//                          wrong plaintext — the key that authenticates IS the account.
+// Everything after decrypt (provider, mapping, dedup on ref_no, lock, finalize) is identical — the
+// `mid` → qrId identifies the merchant, not the URL or the key.
 //
 // MAPPING (decrypted §1.1.1 → webhook_data):
 //   mid → qrCodeId  (the QR doc must be registered with qrId = mid, else the txn is stored but
@@ -70,9 +76,11 @@ module.exports = (
 ) => {
     const router = express.Router();
     const ROUTE_PATH = opts.path || '/axis-worldline-webhook';
-    const AES_KEY_ENV = opts.aesKeyEnv || 'AXIS_WL_AES_KEY';
-    const AES_KEY = loadAesKey(console.warn, AES_KEY_ENV);
-    if (!AES_KEY) console.warn(`⚠️  ${AES_KEY_ENV} is not set — POST ${ROUTE_PATH} (LIVE) will answer 503 FAILED to every notification.`);
+    const KEY_ENVS = opts.keyEnvs || [opts.aesKeyEnv || 'AXIS_WL_AES_KEY'];
+    const KEYS = KEY_ENVS.map((env) => ({ env, key: loadAesKey(console.warn, env) })).filter((k) => k.key);
+    for (const env of KEY_ENVS) if (!KEYS.some((k) => k.env === env)) console.warn(`⚠️  ${env} is not set — POST ${ROUTE_PATH} (LIVE) will not decrypt that account's notifications.`);
+    if (!KEYS.length) console.warn(`⚠️  none of ${KEY_ENVS.join(', ')} is set — POST ${ROUTE_PATH} (LIVE) will answer 503 FAILED to every notification.`);
+    const KEY_LABEL = KEY_ENVS.join('/');
 
     // Best-effort raw capture of a notification we could not ingest. Never throws.
     async function captureRaw(req, warnings) {
@@ -104,21 +112,25 @@ module.exports = (
             if (!body || typeof body !== 'object' || typeof body.data !== 'string' || !body.data) {
                 return failed(res, 400, 'Expected encrypted { data } envelope');
             }
-            if (!AES_KEY) {
-                await captureRaw(req, [`${AES_KEY_ENV} not configured`]);
+            if (!KEYS.length) {
+                await captureRaw(req, [`${KEY_LABEL} not configured`]);
                 return failed(res, 503, 'Decryption key not configured');
             }
-            let decrypted;
-            try {
-                decrypted = decryptWorldlineData(body.data, AES_KEY);
-            } catch (e) {
+            // Try each configured key; the one whose GCM tag verifies is the account that sent this.
+            let decrypted, keyEnv;
+            const tried = [];
+            for (const { env, key } of KEYS) {
+                try { decrypted = decryptWorldlineData(body.data, key); keyEnv = env; break; }
+                catch (e) { tried.push(`${env}: ${e?.message || e}`); }
+            }
+            if (!decrypted) {
                 console.error('🔐 Axis Worldline LIVE DECRYPTION FAILED', JSON.stringify({
-                    route: ROUTE_PATH, keyEnv: AES_KEY_ENV, error: e?.message || String(e), sourceIp: req.ip, rawData: body.data, rawLength: body.data.length, keyBytes: AES_KEY.length,
+                    route: ROUTE_PATH, keysTried: KEYS.map((k) => k.env), errors: tried, sourceIp: req.ip, rawData: body.data, rawLength: body.data.length,
                 }));
-                await captureRaw(req, [`decryption failed: ${e?.message || e}`]);
+                await captureRaw(req, [`decryption failed with ${KEYS.map((k) => k.env).join(', ')}`, ...tried]);
                 return failed(res, 400, 'Unable to decrypt notification');
             }
-            wlLog('🔓 Axis Worldline LIVE decrypted:', JSON.stringify(decrypted));
+            wlLog(`🔓 Axis Worldline LIVE decrypted via ${keyEnv}:`, JSON.stringify(decrypted));
 
             const n = normalizeWorldline(decrypted, rupeesToPaiseStrict);
             const missing = !n.paymentId ? 'ref_no' : !n.qrCodeId ? 'mid' : !(n.amountPaise > 0) ? 'txn_amount' : null;

@@ -1061,9 +1061,11 @@ app.use('/pinelabs', digiqrRoutes);
 app.use('/uat',  uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_UAT_WEBHOOK_DATA_COLLECTION_ID, rupeesToPaiseStrict, authenticateAdmin));
 // Axis Worldline. One URL + one AES key per Worldline merchant account, same factory:
-//   /prod/axis-worldline-webhook             ← AXIS_WL_AES_KEY            (first account)
-//   /prod/axis-worldline-webhook-scan-serve  ← AXIS_WL_AES_KEY_SCAN_SERVE (SCANSERVE account)
-//   /prod/axis-worldline-webhook-settle-flow ← AXIS_WL_AES_KEY_SETTLE_FLOW (SETTLE FLOW account)
+//   /prod/axis-worldline-webhook             ← AXIS_WL_AES_KEY            (first account) — CATCH-ALL: also
+//                                              accepts the other two keys, because Worldline has posted a
+//                                              SCANSERVE payment here (2026-10-24); GCM makes trying keys safe.
+//   /prod/axis-worldline-webhook-scan-serve  ← AXIS_WL_AES_KEY_SCAN_SERVE (SCANSERVE account) — strict
+//   /prod/axis-worldline-webhook-settle-flow ← AXIS_WL_AES_KEY_SETTLE_FLOW (SETTLE FLOW account) — strict
 //   /prod → LIVE ingest (axisWorldline.js): credits money via the same lock → dedup → review
 //           gate → finalizeTransaction sequence as the webhooks above; encrypted envelope only.
 //           AXIS_WORLDLINE_LIVE=false swaps the capture-only UAT router back in at /prod (the
@@ -1071,7 +1073,8 @@ app.use('/prod', uatWebhookRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, AP
 //   /uat  → capture-only UAT router (axisWorldlineUat.js) + admin GET …/captures read-back.
 const AXIS_WORLDLINE_LIVE = process.env.AXIS_WORLDLINE_LIVE !== 'false';
 if (AXIS_WORLDLINE_LIVE) {
-  app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview));
+  app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview,
+    { path: '/axis-worldline-webhook', keyEnvs: ['AXIS_WL_AES_KEY', 'AXIS_WL_AES_KEY_SCAN_SERVE', 'AXIS_WL_AES_KEY_SETTLE_FLOW'] }));
   app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview,
     { path: '/axis-worldline-webhook-scan-serve', aesKeyEnv: 'AXIS_WL_AES_KEY_SCAN_SERVE' }));
   app.use('/prod', axisWorldlineRoutes(databases, ID, Query, APPWRITE_DATABASE_ID, APPWRITE_WEBHOOK_DATA_COLLECTION_ID, APPWRITE_AXIS_WORLDLINE_UAT_COLLECTION_ID, rupeesToPaiseStrict, acquireLock, releaseLock, resolveReviewOwners, reviewMode, ConfigManager, finalizeTransaction, emitPendingReview,

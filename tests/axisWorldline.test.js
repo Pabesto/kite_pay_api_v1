@@ -108,7 +108,32 @@ describe('second merchant account: /axis-worldline-webhook-scan-serve with its o
         expect(deps.finalizeTransaction).not.toHaveBeenCalled();
     });
 
-    test('the first account\'s mount ignores the scan-serve key', async () => {
+    test('catch-all mount (the ORIGINAL URL in server.js): accepts whichever configured key authenticates; unknown key still 400; strict mounts unchanged', async () => {
+        const KEY3 = Buffer.alloc(32, 7), UNKNOWN = Buffer.alloc(32, 8);
+        process.env.AXIS_WL_AES_KEY_SCAN_SERVE = KEY2.toString('hex');
+        process.env.AXIS_WL_AES_KEY_SETTLE_FLOW = KEY3.toString('hex');
+        const ALL = { path: '/axis-worldline-webhook', keyEnvs: ['AXIS_WL_AES_KEY', 'AXIS_WL_AES_KEY_SCAN_SERVE', 'AXIS_WL_AES_KEY_SETTLE_FLOW'] };
+        const { app, deps } = build({ opts: ALL });                                 // AXIS_WL_AES_KEY = KEY as well
+        for (const [k, ref] of [[KEY, 'r1'], [KEY2, 'r2'], [KEY3, 'r3']]) {
+            const res = await post(app, { data: encrypt({ ...LIVE_SAMPLE, ref_no: ref }, k) });
+            expect(res.status).toBe(200);
+            expect(res.body).toEqual({ status: 'SUCCESS', errorMsg: '' });
+        }
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(3);
+        expect(webhookWrites(deps.databases).map((c) => c[3].paymentId).sort()).toEqual(['r1', 'r2', 'r3']);
+        // a key nobody configured is still refused and captured raw, naming every key tried
+        const bad = await post(app, { data: encrypt(LIVE_SAMPLE, UNKNOWN) });
+        expect(bad.status).toBe(400);
+        expect(bad.body).toEqual({ status: 'FAILED', errorMsg: 'Unable to decrypt notification' });
+        expect(JSON.parse(uatWrites(deps.databases)[0][3].warningsJson)[1]).toBe('decryption failed with AXIS_WL_AES_KEY, AXIS_WL_AES_KEY_SCAN_SERVE, AXIS_WL_AES_KEY_SETTLE_FLOW');
+        expect(deps.finalizeTransaction).toHaveBeenCalledTimes(3);
+        // with the first account's key unset, the catch-all still serves the other two (no 503 while any key is set)
+        const { app: partial } = build({ key: null, opts: ALL });
+        expect((await post(partial, { data: encrypt(LIVE_SAMPLE, KEY2) })).status).toBe(200);
+        expect((await post(partial, { data: encrypt(LIVE_SAMPLE, KEY) })).status).toBe(400);
+    });
+
+    test('the strict scan-serve mount ignores the other keys', async () => {
         process.env.AXIS_WL_AES_KEY_SCAN_SERVE = KEY2.toString('hex');
         const { app } = build();
         expect((await post(app, { data: encrypt(LIVE_SAMPLE, KEY2) })).status).toBe(400);
